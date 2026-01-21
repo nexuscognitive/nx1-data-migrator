@@ -165,12 +165,13 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark, sc) -> st
 @task.pyspark(conn_id='spark_default')
 def parse_excel(excel_file_path: str, run_id: str, spark, sc) -> list:
     """Read Excel config from S3 using pyspark.pandas.read_excel."""
-    import pyspark.pandas as ps
+    import pandas as ps
     
     config = get_config()
     
     # Read Excel directly from S3 using pyspark.pandas
-    df = ps.read_excel(excel_file_path)
+    s3_path = excel_file_path.replace('s3a://', 's3://')
+    df = ps.read_excel(s3_path)
     
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
