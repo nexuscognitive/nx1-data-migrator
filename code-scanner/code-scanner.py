@@ -16,6 +16,8 @@ import re
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+import bisect
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -74,6 +76,31 @@ class ScanRule:
     suggestion: str
     documentation_url: Optional[str] = None
     file_extensions: tuple = (".py", ".scala", ".java", ".sql", ".conf", ".properties", ".xml", ".yaml", ".yml")
+    multiline: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Multi-line scanning helpers
+# ---------------------------------------------------------------------------
+
+def _build_line_start_offsets(source: str) -> list[int]:
+    """
+    Used to convert regex match.start() positions into 1-based line numbers.
+    """
+    offsets = [0]
+    for i, ch in enumerate(source):
+        if ch == '\n':
+            offsets.append(i + 1)
+    return offsets
+
+
+def _offset_to_line(offset: int, offsets: list[int]) -> int:
+    """
+    Returns the 1-based line number for a character offset
+    """
+    return bisect.bisect_right(offsets, offset)
+
+_MULTILINE_SIZE_LIMIT_BYTES = 1 * 1024 * 1024 
 
 
 # =============================================================================
@@ -110,7 +137,8 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.registerTempTable\s*\('),
         suggestion="Replace with .createOrReplaceTempView()",
-        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html"
+        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SPARK-004",
@@ -118,9 +146,10 @@ SPARK_API_RULES = [
         description="toJSON now returns Dataset[String] instead of RDD[String].",
         severity=Severity.HIGH,
         category=Category.SPARK_API,
-        pattern=re.compile(r'\.toJSON\s*\(\s*\)\.(?:map|flatMap|filter|collect)'),
+        pattern=re.compile(r'\.toJSON\s*\(\s*\)\s*\.(?:map|flatMap|filter|collect)'),
         suggestion="Update code to work with Dataset[String] or call .rdd explicitly",
-        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html"
+        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SPARK-005",
@@ -147,8 +176,9 @@ SPARK_API_RULES = [
         description="The preservesPartitioning parameter was removed from mapPartitionsWithIndex.",
         severity=Severity.HIGH,
         category=Category.SPARK_API,
-        pattern=re.compile(r'\.mapPartitionsWithIndex\s*\([^)]*preservesPartitioning'),
+        pattern=re.compile(r'\.mapPartitionsWithIndex\s*\([\s\S]*?preservesPartitioning'),
         suggestion="Remove preservesPartitioning parameter; use mapPartitions with index if needed",
+        multiline=True
     ),
     ScanRule(
         rule_id="SPARK-008",
@@ -167,6 +197,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.unionAll\s*\('),
         suggestion="Replace .unionAll() with .union()",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SPARK-010",
@@ -174,8 +205,9 @@ SPARK_API_RULES = [
         description="DataFrame.explode was removed. Use functions.explode with select/withColumn.",
         severity=Severity.CRITICAL,
         category=Category.SPARK_API,
-        pattern=re.compile(r'\.explode\s*\([^)]*\)\s*\{'),
+        pattern=re.compile(r'\.explode\s*\([\s\S]*?\)\s*\{'),
         suggestion="Use: df.select(col('*'), explode(col('array_col')).alias('exploded'))",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SPARK-011",
@@ -192,8 +224,9 @@ SPARK_API_RULES = [
         description="Window functions now require explicit frame specification in some cases.",
         severity=Severity.HIGH,
         category=Category.SPARK_API,
-        pattern=re.compile(r'Window\.(partitionBy|orderBy)\s*\([^)]+\)(?!\s*\.rows|\s*\.range)'),
+        pattern=re.compile(r'Window\.(partitionBy|orderBy)\s*\([\s\S]+?\)(?!\s*\.rows|\s*\.range)'),
         suggestion="Add explicit frame spec: .rowsBetween(Window.unboundedPreceding, Window.currentRow)",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SPARK-013",
@@ -203,6 +236,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.mode\s*\(\s*["\']?overwrite["\']?\s*\)\s*\.insertInto'),
         suggestion="Use .mode('overwrite').saveAsTable() or explicit partition overwrite",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SPARK-014",
@@ -210,8 +244,9 @@ SPARK_API_RULES = [
         description="UDF return type inference is stricter in Spark 3.x.",
         severity=Severity.HIGH,
         category=Category.SPARK_API,
-        pattern=re.compile(r'udf\s*\(\s*lambda[^:]+:[^,)]+\)(?!\s*,)'),
+        pattern=re.compile(r'udf\s*\(\s*lambda[\s\S]+?:[\s\S]+?\)(?!\s*,)'),
         suggestion="Explicitly specify return type: udf(lambda x: x, StringType())",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SPARK-015",
@@ -221,7 +256,8 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'@pandas_udf\s*\(\s*["\'][^"\']+["\']\s*,\s*PandasUDFType'),
         suggestion="Use new syntax: @pandas_udf(returnType) with type hints",
-        documentation_url="https://spark.apache.org/docs/3.5.0/api/python/user_guide/sql/arrow_pandas.html"
+        documentation_url="https://spark.apache.org/docs/3.5.0/api/python/user_guide/sql/arrow_pandas.html",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SPARK-016",
@@ -242,6 +278,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.foreach\s*\(\s*lambda'),
         suggestion="Use ForeachWriter class or foreachBatch with proper signature",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SPARK-021",
@@ -260,6 +297,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'Trigger\.ProcessingTime\s*\(\s*["\']'),
         suggestion="Use Trigger.ProcessingTime('interval') or processingTime='interval'",
+        multiline=True,
     ),
 
     # ML/MLlib Changes
@@ -320,8 +358,9 @@ SPARK_SQL_RULES = [
         description="from_json now requires explicit schema; inference removed.",
         severity=Severity.CRITICAL,
         category=Category.SPARK_SQL,
-        pattern=re.compile(r'from_json\s*\([^,]+\)(?!\s*,)'),
+        pattern=re.compile(r'from_json\s*\([\s\S]+?\)(?!\s*,)'),
         suggestion="Add explicit schema: from_json(col, schema)",
+        multiline=True, 
     ),
     ScanRule(
         rule_id="SQL-004",
@@ -329,8 +368,9 @@ SPARK_SQL_RULES = [
         description="Date and timestamp parsing is stricter in Spark 3.x.",
         severity=Severity.HIGH,
         category=Category.SPARK_SQL,
-        pattern=re.compile(r'to_date\s*\([^,]+\)(?!\s*,)|to_timestamp\s*\([^,]+\)(?!\s*,)'),
+        pattern=re.compile(r'to_date\s*\([\s\S]+?\)(?!\s*,)|to_timestamp\s*\([\s\S]+?\)(?!\s*,)'),
         suggestion="Add explicit format: to_date(col, 'yyyy-MM-dd')",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SQL-005",
@@ -347,8 +387,9 @@ SPARK_SQL_RULES = [
         description="Hive bucketing behavior changed; bucket sort order must match.",
         severity=Severity.HIGH,
         category=Category.SPARK_SQL,
-        pattern=re.compile(r'bucketBy\s*\([^)]+\)\.sortBy\s*\('),
+        pattern=re.compile(r'bucketBy\s*\([\s\S]+?\)\.sortBy\s*\('),
         suggestion="Ensure bucket and sort columns are consistent; review bucketing strategy",
+        multiline=True
     ),
     ScanRule(
         rule_id="SQL-007",
@@ -401,8 +442,9 @@ SPARK_SQL_RULES = [
         description="CREATE TABLE without USING clause defaults changed.",
         severity=Severity.HIGH,
         category=Category.SPARK_SQL,
-        pattern=re.compile(r'CREATE\s+(?:EXTERNAL\s+)?TABLE\s+(?!.*USING)', re.IGNORECASE),
+        pattern=re.compile(r'CREATE\s+(?:EXTERNAL\s+)?TABLE\s+(?![\s\S]*USING)', re.IGNORECASE),
         suggestion="Explicitly specify data source: CREATE TABLE ... USING parquet/delta/iceberg",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SQL-013",
@@ -412,6 +454,7 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r'INSERT\s+OVERWRITE\s+(?:TABLE\s+)?\w+\s+PARTITION', re.IGNORECASE),
         suggestion="Review spark.sql.sources.partitionOverwriteMode setting (dynamic vs static)",
+        multiline=True,
     ),
     ScanRule(
         rule_id="SQL-014",
@@ -428,8 +471,9 @@ SPARK_SQL_RULES = [
         description="Legacy datetime pattern letters removed (e.g., 'Y' vs 'y').",
         severity=Severity.HIGH,
         category=Category.SPARK_SQL,
-        pattern=re.compile(r"date_format\s*\([^)]*['\"][^'\"]*[YDHMS][^'\"]*['\"]", re.IGNORECASE),
+        pattern=re.compile(r'date_format\s*\([\s\S]*?[YDHMS]', re.IGNORECASE),
         suggestion="Use Java 8 datetime patterns: 'yyyy-MM-dd' not 'YYYY-MM-DD'",
+        multiline=True,
     ),
 
     # ==========================================================================
@@ -1371,7 +1415,8 @@ JDK_MIGRATION_RULES = [
         category=Category.JDK_MIGRATION,
         pattern=re.compile(r'ScriptEngineManager.*nashorn|getEngineByName\s*\(\s*["\'](?:nashorn|javascript)["\']', re.IGNORECASE),
         suggestion="Use GraalJS or another JavaScript engine",
-        documentation_url="https://openjdk.org/jeps/372"
+        documentation_url="https://openjdk.org/jeps/372",
+        multiline=True,
     ),
     ScanRule(
         rule_id="JDK-011",
@@ -1450,6 +1495,7 @@ JDK_MIGRATION_RULES = [
         category=Category.JDK_MIGRATION,
         pattern=re.compile(r'\.setAccessible\s*\(\s*true\s*\)'),
         suggestion="Avoid reflective access to internals; use --add-opens if required",
+        multiline=True,
     ),
     ScanRule(
         rule_id="JDK-024",
@@ -1581,9 +1627,10 @@ JDK_MIGRATION_RULES = [
         description="Object.finalize() deprecated for removal.",
         severity=Severity.HIGH,
         category=Category.JDK_MIGRATION,
-        pattern=re.compile(r'protected\s+void\s+finalize\s*\(|@Override.*finalize'),
+        pattern=re.compile(r'protected\s+void\s+finalize\s*\(|@Override[\s\S]*?finalize'),
         suggestion="Use try-with-resources, Cleaner, or PhantomReference",
-        documentation_url="https://openjdk.org/jeps/421"
+        documentation_url="https://openjdk.org/jeps/421",
+        multiline=True,
     ),
     ScanRule(
         rule_id="JDK-052",
@@ -1618,8 +1665,9 @@ JDK_MIGRATION_RULES = [
         description="Default charset is UTF-8 in JDK 18+; affects file I/O.",
         severity=Severity.MEDIUM,
         category=Category.JDK_MIGRATION,
-        pattern=re.compile(r'new\s+(?:FileReader|FileWriter|InputStreamReader|OutputStreamWriter)\s*\([^)]*\)(?!.*Charset|charset|UTF)'),
+        pattern=re.compile(r'new\s+(?:FileReader|FileWriter|InputStreamReader|OutputStreamWriter)\s*\([\s\S]*?\)(?![\s\S]*?(?:Charset|charset|UTF))'),
         suggestion="Explicitly specify charset: new FileReader(file, StandardCharsets.UTF_8)",
+        multiline=True,
     ),
     ScanRule(
         rule_id="JDK-056",
@@ -1722,7 +1770,8 @@ PYTHON_MIGRATION_RULES = [
         category=Category.PYTHON_MIGRATION,
         pattern=re.compile(r'print\s*>>'),
         suggestion="Use print(message, file=sys.stderr)",
-        file_extensions=(".py",)
+        file_extensions=(".py",),
+        multiline=True,
     ),
 
     # Division
@@ -1952,7 +2001,8 @@ PYTHON_MIGRATION_RULES = [
         category=Category.PYTHON_MIGRATION,
         pattern=re.compile(r'except\s+\w+\s*,\s*\w+\s*:'),
         suggestion="Use: except Exception as e:",
-        file_extensions=(".py",)
+        file_extensions=(".py",),
+        multiline=True,
     ),
     ScanRule(
         rule_id="PY-051",
@@ -1962,7 +2012,8 @@ PYTHON_MIGRATION_RULES = [
         category=Category.PYTHON_MIGRATION,
         pattern=re.compile(r'raise\s+\w+\s*,\s*["\']'),
         suggestion="Use: raise Exception('message')",
-        file_extensions=(".py",)
+        file_extensions=(".py",),
+        multiline=True,
     ),
     ScanRule(
         rule_id="PY-052",
@@ -2204,7 +2255,8 @@ PYTHON_MIGRATION_RULES = [
         category=Category.PYTHON_MIGRATION,
         pattern=re.compile(r'lambda\s*\(\s*\w+\s*,\s*\w+\s*\)\s*:'),
         suggestion="Use: lambda x: (x[0], x[1]) instead of lambda (a, b):",
-        file_extensions=(".py",)
+        file_extensions=(".py",),
+        multiline=True,
     ),
     ScanRule(
         rule_id="PY-111",
@@ -2256,21 +2308,33 @@ class SparkMigrationScanner:
 
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
+                content = f.read()
         except Exception as e:
             logger.warning(f"Could not read {file_path}: {e}")
             return issues
 
         self.lines_scanned += len(lines)
 
+        
+        lines = content.splitlines(keepends=True)
+        self.lines_scanned += len(lines)
+
+        already_reported: set[tuple[str, int]] = set()
+        
         for rule in self.rules:
-            # Check file extension
+            if rule.multiline:
+                continue
+
             if not str(file_path).endswith(rule.file_extensions):
                 continue
 
             for line_num, line in enumerate(lines, 1):
                 if rule.pattern.search(line):
-                    issue = Issue(
+                    key = (rule.rule_id, line_num)
+                    if key in already_reported:
+                        continue
+                    already_reported.add(key)
+                    issues.append(Issue(
                         rule_id=rule.rule_id,
                         title=rule.title,
                         description=rule.description,
@@ -2284,6 +2348,42 @@ class SparkMigrationScanner:
                     )
                     issues.append(issue)
 
+                    ))
+
+        if len(content.encode('utf-8')) > _MULTILINE_SIZE_LIMIT_BYTES:
+            logger.warning(
+                f"Skipping multi-line scan for large file (>1 MB): {file_path}"
+            )
+            return issues
+
+        offsets = _build_line_start_offsets(content)
+
+        for rule in self.rules:
+            if not rule.multiline:
+                continue  
+            if not str(file_path).endswith(rule.file_extensions):
+                continue
+            ml_pattern = re.compile(rule.pattern.pattern, rule.pattern.flags | re.DOTALL)
+            for match in ml_pattern.finditer(content):
+                line_num = _offset_to_line(match.start(), offsets)
+                key = (rule.rule_id, line_num)
+                if key in already_reported:
+                    continue
+                already_reported.add(key)
+                match_text = match.group(0).replace('\n', ' ')[:200]
+                issues.append(Issue(
+                    rule_id=rule.rule_id,
+                    title=rule.title,
+                    description=rule.description,
+                    severity=rule.severity,
+                    category=rule.category,
+                    file_path=str(file_path),
+                    line_number=line_num,
+                    line_content=match_text,
+                    suggestion=rule.suggestion,
+                    documentation_url=rule.documentation_url
+                ))
+        
         return issues
 
     def scan_directory(self, directory: Path, exclude_patterns: list[str] = None) -> list[Issue]:
