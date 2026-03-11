@@ -17,3 +17,8 @@ env.*
 
 # OS
 .DS_Store
+
+# Test / coverage artifacts
+.coverage
+coverage.xml
+htmlcov/
