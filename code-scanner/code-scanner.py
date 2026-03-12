@@ -9,6 +9,8 @@ Usage:
 """
 
 import argparse
+import ast
+import bisect
 import json
 import logging
 import os
@@ -16,12 +18,9 @@ import re
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-import bisect
-from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-import ast
 
 # Configure logging
 logging.basicConfig(
@@ -108,7 +107,7 @@ def _offset_to_line(offset: int, offsets: list[int]) -> int:
     """
     return bisect.bisect_right(offsets, offset)
 
-_MULTILINE_SIZE_LIMIT_BYTES = 1 * 1024 * 1024 
+_MULTILINE_SIZE_LIMIT_BYTES = 1 * 1024 * 1024
 
 
 # =============================================================================
@@ -391,7 +390,7 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r'from_json\s*\([\s\S]+?\)(?!\s*,)'),
         suggestion="Add explicit schema: from_json(col, schema)",
-        multiline=True, 
+        multiline=True,
         ast_aware=True,
     ),
     ScanRule(
@@ -2398,7 +2397,7 @@ class SparkMigrationScanner:
     """Scanner for Spark 2.4 -> 3.5 and HDFS -> S3 migration issues."""
 
     def __init__(self, rules: list[ScanRule] = None):
-        self.rules = rules or ALL_RULES
+        self.rules = rules if rules is not None else ALL_RULES
         self.issues: list[Issue] = []
         self.files_scanned = 0
         self.lines_scanned = 0
@@ -2414,9 +2413,6 @@ class SparkMigrationScanner:
             logger.warning(f"Could not read {file_path}: {e}")
             return issues
 
-        self.lines_scanned += len(lines)
-
-        
         lines = content.splitlines(keepends=True)
         self.lines_scanned += len(lines)
 
@@ -2426,7 +2422,7 @@ class SparkMigrationScanner:
             ast_extractor = ASTCodeExtractor(content)
 
         already_reported: set[tuple[str, int]] = set()
-        
+
         for rule in self.rules:
             if rule.multiline:
                 continue
@@ -2455,12 +2451,9 @@ class SparkMigrationScanner:
                     category=rule.category,
                     file_path=str(file_path),
                     line_number=line_num,
-                    line_content=line.strip()[:200], 
+                    line_content=line.strip()[:200],
                     suggestion=rule.suggestion,
                     documentation_url=rule.documentation_url
-                    )
-                    issues.append(issue)
-
                 ))
 
         if len(content.encode('utf-8')) > _MULTILINE_SIZE_LIMIT_BYTES:
@@ -2473,7 +2466,7 @@ class SparkMigrationScanner:
 
         for rule in self.rules:
             if not rule.multiline:
-                continue  
+                continue
             if not str(file_path).endswith(rule.file_extensions):
                 continue
             ml_pattern = re.compile(rule.pattern.pattern, rule.pattern.flags | re.DOTALL)
@@ -2496,7 +2489,7 @@ class SparkMigrationScanner:
                     suggestion=rule.suggestion,
                     documentation_url=rule.documentation_url
                 ))
-        
+
         return issues
 
     def scan_directory(self, directory: Path, exclude_patterns: list[str] = None) -> list[Issue]:
@@ -2598,7 +2591,7 @@ class SparkMigrationScanner:
             return dict(sorted(groups.items()))
 
         return dict(groups)
-    
+
     def to_markdown(self, group_by: GroupBy = GroupBy.CATEGORY) -> str:
         """Generate markdown report."""
         summary = self.get_summary()
@@ -2640,7 +2633,7 @@ class SparkMigrationScanner:
 
         for cat, count in sorted(summary['by_category'].items(), key=lambda x: -x[1]):
             lines.append(f"- **{cat}:** {count}")
-        
+
         # Group issues using the chosen grouping strategy
         grouped = self._group_issues(group_by)
 
@@ -2652,12 +2645,8 @@ class SparkMigrationScanner:
             f"*(grouped by {group_by.value})*",
             "",
         ])
-        
-        for category in Category:
-            cat_issues = issues_by_category.get(category.value, [])
-            if not cat_issues:
-                continue
-            
+
+        for group_label, group_issues in grouped.items():
             lines.extend([
                 f"### {group_label}",
                 "",
@@ -2691,11 +2680,11 @@ class SparkMigrationScanner:
                 lines.append("**Occurrences:**")
                 lines.append("")
 
-                for issue in rule_issues[:20]:  
+                for issue in rule_issues[:20]:
                     lines.append(f"- `{issue.file_path}:{issue.line_number}`")
                     lines.append("  ```")
                     lines.append(f"  {issue.line_content}")
-                    lines.append(f"  ```")
+                    lines.append("  ```")
 
                 if len(rule_issues) > 20:
                     lines.append(f"- ... and {len(rule_issues) - 20} more occurrences")
@@ -2770,7 +2759,7 @@ class SparkMigrationScanner:
         ])
 
         return '\n'.join(lines)
-    
+
     def to_json(self, group_by: GroupBy = GroupBy.CATEGORY) -> str:
         """Generate JSON report."""
         summary = self.get_summary()
@@ -2781,7 +2770,7 @@ class SparkMigrationScanner:
             issue_dict['severity'] = issue.severity.value
             issue_dict['category'] = issue.category.value
             issues_data.append(issue_dict)
-        
+
         grouped = self._group_issues(group_by)
         report = {
             "summary": summary,
@@ -2793,11 +2782,11 @@ class SparkMigrationScanner:
                 ]
                 for label, issues in grouped.items()
             },
-            "issues": issues_data  
+            "issues": issues_data
         }
 
         return json.dumps(report, indent=2)
-    
+
     def to_html(self, group_by: GroupBy = GroupBy.CATEGORY) -> str:
         """Generate HTML report."""
         summary = self.get_summary()
@@ -2880,7 +2869,7 @@ class SparkMigrationScanner:
 
         <h2>Detailed Findings</h2>
 '''
-        
+
         grouped = self._group_issues(group_by)
         html += f'        <p><em>Grouped by: {group_by.value}</em></p>\n'
 
@@ -2947,7 +2936,7 @@ def main():
         default='severity',
         help='How to group issues in the output report (default: severity)'
     )
-    
+
     args = parser.parse_args()
 
     # Configure logging level based on arguments
@@ -3001,7 +2990,7 @@ def main():
         report = scanner.to_json(group_by=group_by_enum)
     else:
         report = scanner.to_html(group_by=group_by_enum)
-    
+
     # Output
     if args.output:
         try:
