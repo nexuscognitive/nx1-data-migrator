@@ -51,6 +51,12 @@ class Category(Enum):
     JDK_MIGRATION = "JDK 8/11 to 17 Migration"
     PYTHON_MIGRATION = "Python 2 to 3 Migration"
 
+class GroupBy(Enum):
+    SEVERITY = "severity"
+    CATEGORY = "category"
+    FILE     = "file"
+    RULE     = "rule"
+
 
 @dataclass
 class Issue:
@@ -340,8 +346,7 @@ SPARK_API_RULES = [
         severity=Severity.HIGH,
         category=Category.SPARK_API,
         pattern=re.compile(r'\.load\s*\(\s*["\'][^"\']*model[^"\']*["\']\s*\)', re.IGNORECASE),
-        suggestion="Retrain models with Spark 3.x or use MLflow for versioned model management",
-        ast_aware=True,
+        suggestion="Retrain models with Spark 3.x or use MLflow for versioned model management"
     ),
     ScanRule(
         rule_id="SPARK-032",
@@ -646,7 +651,7 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.groupby\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.groupby.* properties; Spark handles GROUP BY differently",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")2,
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
         ast_aware=True,
     ),
     ScanRule(
@@ -2565,7 +2570,36 @@ class SparkMigrationScanner:
             "by_category": dict(category_counts)
         }
 
-    def to_markdown(self) -> str:
+    def _group_issues(self, group_by: GroupBy) -> dict[str, list[Issue]]:
+        """Returns an ordered dict mapping group label → list of issues."""
+        groups: dict[str, list[Issue]] = defaultdict(list)
+
+        if group_by == GroupBy.SEVERITY:
+            order = ["critical", "high", "medium", "low", "info"]
+            for issue in self.issues:
+                groups[issue.severity.value].append(issue)
+            return {k: groups[k] for k in order if k in groups}
+
+        elif group_by == GroupBy.CATEGORY:
+            for cat in Category:
+                cat_issues = [i for i in self.issues if i.category == cat]
+                if cat_issues:
+                    groups[cat.value] = cat_issues
+            return dict(groups)
+
+        elif group_by == GroupBy.FILE:
+            for issue in self.issues:
+                groups[issue.file_path].append(issue)
+            return dict(sorted(groups.items()))
+
+        elif group_by == GroupBy.RULE:
+            for issue in self.issues:
+                groups[issue.rule_id].append(issue)
+            return dict(sorted(groups.items()))
+
+        return dict(groups)
+    
+    def to_markdown(self, group_by: GroupBy = GroupBy.CATEGORY) -> str:
         """Generate markdown report."""
         summary = self.get_summary()
 
@@ -2606,36 +2640,35 @@ class SparkMigrationScanner:
 
         for cat, count in sorted(summary['by_category'].items(), key=lambda x: -x[1]):
             lines.append(f"- **{cat}:** {count}")
-
-        # Group issues by category and severity
-        issues_by_category = defaultdict(list)
-        for issue in self.issues:
-            issues_by_category[issue.category.value].append(issue)
+        
+        # Group issues using the chosen grouping strategy
+        grouped = self._group_issues(group_by)
 
         lines.extend([
             "",
             "---",
             "",
             "## Detailed Findings",
+            f"*(grouped by {group_by.value})*",
             "",
         ])
-
+        
         for category in Category:
             cat_issues = issues_by_category.get(category.value, [])
             if not cat_issues:
                 continue
-
+            
             lines.extend([
-                f"### {category.value}",
+                f"### {group_label}",
                 "",
             ])
 
-            # Sort by severity
-            cat_issues.sort(key=lambda x: severity_order.index(x.severity.value))
+            # Sort by severity within the group
+            group_issues.sort(key=lambda x: severity_order.index(x.severity.value))
 
-            # Group by rule
+            # Sub-group by rule
             issues_by_rule = defaultdict(list)
-            for issue in cat_issues:
+            for issue in group_issues:
                 issues_by_rule[issue.rule_id].append(issue)
 
             for rule_id, rule_issues in issues_by_rule.items():
@@ -2649,21 +2682,24 @@ class SparkMigrationScanner:
                     "",
                 ])
 
+
                 if first.documentation_url:
                     lines.append(f"**Documentation:** [{first.documentation_url}]({first.documentation_url})")
                     lines.append("")
 
+
                 lines.append("**Occurrences:**")
                 lines.append("")
 
-                for issue in rule_issues[:20]:  # Limit to first 20 occurrences per rule
+                for issue in rule_issues[:20]:  
                     lines.append(f"- `{issue.file_path}:{issue.line_number}`")
                     lines.append("  ```")
                     lines.append(f"  {issue.line_content}")
-                    lines.append("  ```")
+                    lines.append(f"  ```")
 
                 if len(rule_issues) > 20:
                     lines.append(f"- ... and {len(rule_issues) - 20} more occurrences")
+
 
                 lines.append("")
 
@@ -2734,8 +2770,8 @@ class SparkMigrationScanner:
         ])
 
         return '\n'.join(lines)
-
-    def to_json(self) -> str:
+    
+    def to_json(self, group_by: GroupBy = GroupBy.CATEGORY) -> str:
         """Generate JSON report."""
         summary = self.get_summary()
 
@@ -2745,15 +2781,24 @@ class SparkMigrationScanner:
             issue_dict['severity'] = issue.severity.value
             issue_dict['category'] = issue.category.value
             issues_data.append(issue_dict)
-
+        
+        grouped = self._group_issues(group_by)
         report = {
             "summary": summary,
-            "issues": issues_data
+            "group_by": group_by.value,
+            "grouped_issues": {
+                label: [
+                    {**asdict(i), "severity": i.severity.value, "category": i.category.value}
+                    for i in issues
+                ]
+                for label, issues in grouped.items()
+            },
+            "issues": issues_data  
         }
 
         return json.dumps(report, indent=2)
-
-    def to_html(self) -> str:
+    
+    def to_html(self, group_by: GroupBy = GroupBy.CATEGORY) -> str:
         """Generate HTML report."""
         summary = self.get_summary()
 
@@ -2835,27 +2880,23 @@ class SparkMigrationScanner:
 
         <h2>Detailed Findings</h2>
 '''
+        
+        grouped = self._group_issues(group_by)
+        html += f'        <p><em>Grouped by: {group_by.value}</em></p>\n'
 
-        # Group by category
-        issues_by_category = defaultdict(list)
-        for issue in self.issues:
-            issues_by_category[issue.category.value].append(issue)
+        for group_label, group_issues in grouped.items():
+            html += f'        <h3>{group_label} ({len(group_issues)} issues)</h3>\n'
 
-        for category in Category:
-            cat_issues = issues_by_category.get(category.value, [])
-            if not cat_issues:
-                continue
-
-            html += f'        <h3>{category.value} ({len(cat_issues)} issues)</h3>\n'
-
-            # Group by rule
+            # Sub-group by rule within the group
             issues_by_rule = defaultdict(list)
-            for issue in cat_issues:
+            for issue in group_issues:
                 issues_by_rule[issue.rule_id].append(issue)
+
 
             for rule_id, rule_issues in issues_by_rule.items():
                 first = rule_issues[0]
                 color = severity_colors.get(first.severity.value, '#666')
+
 
                 html += f'''        <div class="issue" style="border-color:{color}">
             <strong><span class="severity-badge" style="background:{color}">{first.severity.value.upper()}</span> [{rule_id}] {first.title}</strong>
@@ -2867,8 +2908,10 @@ class SparkMigrationScanner:
                 for issue in rule_issues[:10]:
                     html += f'                <li><code>{issue.file_path}:{issue.line_number}</code><pre>{issue.line_content}</pre></li>\n'
 
+
                 if len(rule_issues) > 10:
                     html += f'                <li><em>... and {len(rule_issues) - 10} more</em></li>\n'
+
 
                 html += '''            </ul>
         </div>
@@ -2898,7 +2941,13 @@ def main():
                         help='Enable verbose/debug logging')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Suppress info messages, only show warnings and errors')
-
+    parser.add_argument(
+        '--group-by', '-g',
+        choices=['severity', 'category', 'file', 'rule'],
+        default='severity',
+        help='How to group issues in the output report (default: severity)'
+    )
+    
     args = parser.parse_args()
 
     # Configure logging level based on arguments
@@ -2944,13 +2993,15 @@ def main():
             logger.debug(f"    {sev}: {count}")
 
     # Generate report
-    if args.format == 'md':
-        report = scanner.to_markdown()
-    elif args.format == 'json':
-        report = scanner.to_json()
-    else:
-        report = scanner.to_html()
+    group_by_enum = GroupBy(args.group_by)
 
+    if args.format == 'md':
+        report = scanner.to_markdown(group_by=group_by_enum)
+    elif args.format == 'json':
+        report = scanner.to_json(group_by=group_by_enum)
+    else:
+        report = scanner.to_html(group_by=group_by_enum)
+    
     # Output
     if args.output:
         try:
