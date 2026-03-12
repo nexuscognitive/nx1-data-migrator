@@ -21,6 +21,7 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+import ast
 
 # Configure logging
 logging.basicConfig(
@@ -77,6 +78,7 @@ class ScanRule:
     documentation_url: Optional[str] = None
     file_extensions: tuple = (".py", ".scala", ".java", ".sql", ".conf", ".properties", ".xml", ".yaml", ".yml")
     multiline: bool = False
+    ast_aware: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +119,8 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\b(SQLContext|sqlContext)\b', re.IGNORECASE),
         suggestion="Replace with SparkSession: spark = SparkSession.builder.getOrCreate()",
-        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html"
+        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-002",
@@ -127,7 +130,8 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\bHiveContext\b'),
         suggestion="Replace with: SparkSession.builder.enableHiveSupport().getOrCreate()",
-        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html"
+        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-003",
@@ -139,6 +143,7 @@ SPARK_API_RULES = [
         suggestion="Replace with .createOrReplaceTempView()",
         documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-004",
@@ -150,6 +155,7 @@ SPARK_API_RULES = [
         suggestion="Update code to work with Dataset[String] or call .rdd explicitly",
         documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-005",
@@ -159,7 +165,8 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'sc\.accumulator\s*\(|Accumulator\['),
         suggestion="Migrate to AccumulatorV2 API",
-        documentation_url="https://spark.apache.org/docs/3.5.0/rdd-programming-guide.html#accumulators"
+        documentation_url="https://spark.apache.org/docs/3.5.0/rdd-programming-guide.html#accumulators",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-006",
@@ -169,6 +176,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.broadcast\s*\([^)]+\)\.value'),
         suggestion="Review broadcast variable usage for API compatibility",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-007",
@@ -178,7 +186,8 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.mapPartitionsWithIndex\s*\([\s\S]*?preservesPartitioning'),
         suggestion="Remove preservesPartitioning parameter; use mapPartitions with index if needed",
-        multiline=True
+        multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-008",
@@ -188,6 +197,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.toLocalIterator\s*\('),
         suggestion="Consider using .collect() for small datasets or process partitions differently",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-009",
@@ -198,6 +208,7 @@ SPARK_API_RULES = [
         pattern=re.compile(r'\.unionAll\s*\('),
         suggestion="Replace .unionAll() with .union()",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-010",
@@ -208,6 +219,7 @@ SPARK_API_RULES = [
         pattern=re.compile(r'\.explode\s*\([\s\S]*?\)\s*\{'),
         suggestion="Use: df.select(col('*'), explode(col('array_col')).alias('exploded'))",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-011",
@@ -217,6 +229,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.rdd\s*\.toJavaRDD'),
         suggestion="Use JavaRDD.fromRDD() or work with Scala RDD directly",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-012",
@@ -227,6 +240,7 @@ SPARK_API_RULES = [
         pattern=re.compile(r'Window\.(partitionBy|orderBy)\s*\([\s\S]+?\)(?!\s*\.rows|\s*\.range)'),
         suggestion="Add explicit frame spec: .rowsBetween(Window.unboundedPreceding, Window.currentRow)",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-013",
@@ -237,6 +251,7 @@ SPARK_API_RULES = [
         pattern=re.compile(r'\.mode\s*\(\s*["\']?overwrite["\']?\s*\)\s*\.insertInto'),
         suggestion="Use .mode('overwrite').saveAsTable() or explicit partition overwrite",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-014",
@@ -247,6 +262,7 @@ SPARK_API_RULES = [
         pattern=re.compile(r'udf\s*\(\s*lambda[\s\S]+?:[\s\S]+?\)(?!\s*,)'),
         suggestion="Explicitly specify return type: udf(lambda x: x, StringType())",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-015",
@@ -258,6 +274,7 @@ SPARK_API_RULES = [
         suggestion="Use new syntax: @pandas_udf(returnType) with type hints",
         documentation_url="https://spark.apache.org/docs/3.5.0/api/python/user_guide/sql/arrow_pandas.html",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-016",
@@ -267,6 +284,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'spark\.conf\.set\s*\([^)]*arrow\.enabled[^)]*false', re.IGNORECASE),
         suggestion="Arrow is now required; ensure PyArrow is installed and compatible",
+        ast_aware=True,
     ),
 
     # Structured Streaming Changes
@@ -279,6 +297,7 @@ SPARK_API_RULES = [
         pattern=re.compile(r'\.foreach\s*\(\s*lambda'),
         suggestion="Use ForeachWriter class or foreachBatch with proper signature",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-021",
@@ -288,6 +307,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.isStreaming\s*\(\s*\)'),
         suggestion="Use .isStreaming (property, not method)",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-022",
@@ -298,6 +318,7 @@ SPARK_API_RULES = [
         pattern=re.compile(r'Trigger\.ProcessingTime\s*\(\s*["\']'),
         suggestion="Use Trigger.ProcessingTime('interval') or processingTime='interval'",
         multiline=True,
+        ast_aware=True,
     ),
 
     # ML/MLlib Changes
@@ -309,7 +330,8 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'from\s+pyspark\.mllib\b|import\s+org\.apache\.spark\.mllib\b'),
         suggestion="Migrate to DataFrame-based ML: pyspark.ml / org.apache.spark.ml",
-        documentation_url="https://spark.apache.org/docs/3.5.0/ml-guide.html"
+        documentation_url="https://spark.apache.org/docs/3.5.0/ml-guide.html",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-031",
@@ -319,6 +341,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'\.load\s*\(\s*["\'][^"\']*model[^"\']*["\']\s*\)', re.IGNORECASE),
         suggestion="Retrain models with Spark 3.x or use MLflow for versioned model management",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SPARK-032",
@@ -328,6 +351,7 @@ SPARK_API_RULES = [
         category=Category.SPARK_API,
         pattern=re.compile(r'OneHotEncoderEstimator'),
         suggestion="Use OneHotEncoder (renamed from OneHotEncoderEstimator in 3.0)",
+        ast_aware=True,
     ),
 ]
 
@@ -341,7 +365,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r'\bCAST\s*\([^)]+\s+AS\s+(INT|INTEGER|BIGINT|DOUBLE|FLOAT|DECIMAL)', re.IGNORECASE),
         suggestion="Review CAST usage; invalid values now return NULL. Use try_cast() if needed.",
-        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html"
+        documentation_url="https://spark.apache.org/docs/3.5.0/sql-migration-guide.html",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-002",
@@ -351,6 +376,7 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r'spark\.sql\.ansi\.enabled'),
         suggestion="Review ANSI mode settings; overflow behavior changed in Spark 3.x",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-003",
@@ -361,6 +387,7 @@ SPARK_SQL_RULES = [
         pattern=re.compile(r'from_json\s*\([\s\S]+?\)(?!\s*,)'),
         suggestion="Add explicit schema: from_json(col, schema)",
         multiline=True, 
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-004",
@@ -371,6 +398,7 @@ SPARK_SQL_RULES = [
         pattern=re.compile(r'to_date\s*\([\s\S]+?\)(?!\s*,)|to_timestamp\s*\([\s\S]+?\)(?!\s*,)'),
         suggestion="Add explicit format: to_date(col, 'yyyy-MM-dd')",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-005",
@@ -380,6 +408,7 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r'GROUP\s+BY\s+(?!.*(?:COUNT|SUM|AVG|MIN|MAX|FIRST|LAST|COLLECT_LIST|COLLECT_SET)\s*\()', re.IGNORECASE),
         suggestion="Ensure all non-grouped columns use aggregation functions",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-006",
@@ -389,7 +418,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r'bucketBy\s*\([\s\S]+?\)\.sortBy\s*\('),
         suggestion="Ensure bucket and sort columns are consistent; review bucketing strategy",
-        multiline=True
+        multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-007",
@@ -417,6 +447,7 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r'percentile_approx\s*\(', re.IGNORECASE),
         suggestion="Review percentile calculations; consider explicit accuracy parameter",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-010",
@@ -435,6 +466,7 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r'SORT\s+BY|DISTRIBUTE\s+BY|CLUSTER\s+BY', re.IGNORECASE),
         suggestion="Use ORDER BY with window functions or DataFrame API for explicit control",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-012",
@@ -445,6 +477,7 @@ SPARK_SQL_RULES = [
         pattern=re.compile(r'CREATE\s+(?:EXTERNAL\s+)?TABLE\s+(?![\s\S]*USING)', re.IGNORECASE),
         suggestion="Explicitly specify data source: CREATE TABLE ... USING parquet/delta/iceberg",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-013",
@@ -455,6 +488,7 @@ SPARK_SQL_RULES = [
         pattern=re.compile(r'INSERT\s+OVERWRITE\s+(?:TABLE\s+)?\w+\s+PARTITION', re.IGNORECASE),
         suggestion="Review spark.sql.sources.partitionOverwriteMode setting (dynamic vs static)",
         multiline=True,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-014",
@@ -464,6 +498,7 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r'COALESCE\s*\(', re.IGNORECASE),
         suggestion="Review COALESCE usage with complex expressions",
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="SQL-015",
@@ -474,6 +509,7 @@ SPARK_SQL_RULES = [
         pattern=re.compile(r'date_format\s*\([\s\S]*?[YDHMS]', re.IGNORECASE),
         suggestion="Use Java 8 datetime patterns: 'yyyy-MM-dd' not 'YYYY-MM-DD'",
         multiline=True,
+        ast_aware=True,
     ),
 
     # ==========================================================================
@@ -489,7 +525,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.execution\.engine\s*=", re.IGNORECASE),
         suggestion="Remove this SET command; Spark uses its own execution engine",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-002",
@@ -499,7 +536,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.exec\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.exec.* properties; use equivalent Spark configs (spark.sql.*)",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-003",
@@ -509,7 +547,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.mapred\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.mapred.* properties; Spark does not use MapReduce",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-004",
@@ -519,7 +558,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.tez\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.tez.* properties; Spark does not use Tez",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-005",
@@ -529,7 +569,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.vectorized\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.vectorized.* properties; Spark has its own vectorization (spark.sql.columnVector.*)",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-006",
@@ -539,7 +580,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.cbo\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.cbo.* properties; use spark.sql.cbo.* for Spark's CBO",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-007",
@@ -549,7 +591,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.stats\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.stats.* properties; use ANALYZE TABLE for Spark statistics",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-008",
@@ -559,7 +602,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.optimize\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.optimize.* properties; use spark.sql.* optimizer configs",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-009",
@@ -569,7 +613,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.merge\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.merge.* properties; use coalesce() or repartition() in Spark",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-010",
@@ -579,7 +624,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.auto\.convert\.join[a-zA-Z0-9_.]*\s*=", re.IGNORECASE),
         suggestion="Remove; use spark.sql.autoBroadcastJoinThreshold for Spark broadcast joins",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-011",
@@ -589,7 +635,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.map\.aggr[a-zA-Z0-9_.]*\s*=", re.IGNORECASE),
         suggestion="Remove; Spark handles aggregation optimization automatically",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-012",
@@ -599,7 +646,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.groupby\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.groupby.* properties; Spark handles GROUP BY differently",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")2,
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-013",
@@ -609,7 +657,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.skewjoin\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; use spark.sql.adaptive.skewJoin.* for Spark 3.x skew handling",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-014",
@@ -619,7 +668,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.input\.format\s*=", re.IGNORECASE),
         suggestion="Remove; Spark uses its own input format handling",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-015",
@@ -629,7 +679,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.fetch\.task\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.fetch.task.* properties; not applicable to Spark",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-016",
@@ -639,7 +690,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.compute\.query\.using\.stats\s*=", re.IGNORECASE),
         suggestion="Remove; use spark.sql.cbo.enabled for Spark statistics-based optimization",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-017",
@@ -649,7 +701,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.support\.concurrency\s*=", re.IGNORECASE),
         suggestion="Remove; Spark has different concurrency handling",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-018",
@@ -659,7 +712,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.txn\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; use Delta Lake or Iceberg for ACID transactions in Spark",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-019",
@@ -669,7 +723,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.compactor\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; use Delta Lake OPTIMIZE or Iceberg compaction",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-020",
@@ -679,7 +734,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.enforce\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.enforce.* properties; review Spark equivalents",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-021",
@@ -689,7 +745,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.server2\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; use Spark Thrift Server configs (spark.sql.thriftServer.*)",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-022",
@@ -699,7 +756,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.metastore\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Review; some may be needed for metastore connection, others should be removed",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-023",
@@ -709,7 +767,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.session\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.session.* properties; not applicable to Spark",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-024",
@@ -719,7 +778,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.llap\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.llap.* properties; LLAP is not used by Spark",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-025",
@@ -729,7 +789,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.prewarm\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; use Spark dynamic allocation settings instead",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-026",
@@ -739,7 +800,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.smbjoin\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; use Spark's built-in join optimization",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-027",
@@ -749,7 +811,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.limit\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; Spark handles LIMIT optimization automatically",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-028",
@@ -759,7 +822,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.hashtable\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; Spark manages hash tables internally",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-029",
@@ -769,7 +833,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.query\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; use spark.sql.* for query configuration",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-030",
@@ -779,7 +844,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.resultset\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove hive.resultset.* properties; not applicable to Spark",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
 
     # Generic Hive SET pattern (catch-all)
@@ -791,7 +857,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+hive\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Review and remove Hive-specific properties; migrate to Spark equivalents",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
 
     # MapReduce SET properties (often in legacy Hive scripts)
@@ -803,7 +870,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+mapred\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove mapred.* properties; Spark does not use MapReduce",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-101",
@@ -813,7 +881,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+mapreduce\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove mapreduce.* properties; Spark does not use MapReduce",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-102",
@@ -823,7 +892,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+yarn\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove; configure YARN settings in spark-defaults.conf or submit command",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-103",
@@ -833,7 +903,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"SET\s+tez\.[a-zA-Z0-9_.]+\s*=", re.IGNORECASE),
         suggestion="Remove tez.* properties; Spark does not use Tez",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
 
     # Additional Hive-specific SQL patterns
@@ -845,7 +916,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"ADD\s+JAR\s+", re.IGNORECASE),
         suggestion="Remove ADD JAR; use --jars in spark-submit or spark.jars config",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-111",
@@ -855,7 +927,8 @@ SPARK_SQL_RULES = [
         category=Category.SPARK_SQL,
         pattern=re.compile(r"ADD\s+FILE\s+", re.IGNORECASE),
         suggestion="Remove ADD FILE; use --files in spark-submit or spark.files config",
-        file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
+        file_extensions=(".sql", ".hql", ".py", ".scala", ".java"),
+        ast_aware=True,
     ),
     ScanRule(
         rule_id="HIVE-112",
@@ -2292,6 +2365,29 @@ ALL_RULES = (
     PYTHON_MIGRATION_RULES
 )
 
+class ASTCodeExtractor:
+    def __init__(self, source: str):
+        self._executable_lines: set[int] = set()
+        try:
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if hasattr(node, "lineno"):
+                    self._executable_lines.add(node.lineno)
+                    if hasattr(node, "end_lineno") and node.end_lineno:
+                        for ln in range(node.lineno, node.end_lineno + 1):
+                            self._executable_lines.add(ln)
+        except SyntaxError:
+            self._executable_lines = None
+
+    def is_executable(self, line_number: int) -> bool:
+        if self._executable_lines is None:
+            return True
+        return line_number in self._executable_lines
+
+    @property
+    def parse_succeeded(self) -> bool:
+        return self._executable_lines is not None
+
 
 class SparkMigrationScanner:
     """Scanner for Spark 2.4 -> 3.5 and HDFS -> S3 migration issues."""
@@ -2319,6 +2415,11 @@ class SparkMigrationScanner:
         lines = content.splitlines(keepends=True)
         self.lines_scanned += len(lines)
 
+        # Build AST extractor for Python files
+        ast_extractor = None
+        if str(file_path).endswith('.py'):
+            ast_extractor = ASTCodeExtractor(content)
+
         already_reported: set[tuple[str, int]] = set()
         
         for rule in self.rules:
@@ -2329,26 +2430,33 @@ class SparkMigrationScanner:
                 continue
 
             for line_num, line in enumerate(lines, 1):
-                if rule.pattern.search(line):
-                    key = (rule.rule_id, line_num)
-                    if key in already_reported:
-                        continue
-                    already_reported.add(key)
-                    issues.append(Issue(
-                        rule_id=rule.rule_id,
-                        title=rule.title,
-                        description=rule.description,
-                        severity=rule.severity,
-                        category=rule.category,
-                        file_path=str(file_path),
-                        line_number=line_num,
-                        line_content=line.strip()[:200],  # Truncate long lines
-                        suggestion=rule.suggestion,
-                        documentation_url=rule.documentation_url
+                if not rule.pattern.search(line):
+                    continue
+
+                if (rule.ast_aware
+                        and ast_extractor is not None
+                        and not ast_extractor.is_executable(line_num)):
+                    continue
+
+                key = (rule.rule_id, line_num)
+                if key in already_reported:
+                    continue
+                already_reported.add(key)
+                issues.append(Issue(
+                    rule_id=rule.rule_id,
+                    title=rule.title,
+                    description=rule.description,
+                    severity=rule.severity,
+                    category=rule.category,
+                    file_path=str(file_path),
+                    line_number=line_num,
+                    line_content=line.strip()[:200], 
+                    suggestion=rule.suggestion,
+                    documentation_url=rule.documentation_url
                     )
                     issues.append(issue)
 
-                    ))
+                ))
 
         if len(content.encode('utf-8')) > _MULTILINE_SIZE_LIMIT_BYTES:
             logger.warning(
