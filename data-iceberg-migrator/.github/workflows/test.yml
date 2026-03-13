@@ -76,3 +76,10 @@ jobs:
             --max-line-length=120 \
             --ignore=E501,W503,E203 \
             --count
+
+      - name: Run flake8 on test files
+        run: |
+          flake8 tests/ \
+            --max-line-length=120 \
+            --ignore=E501,W503,E203 \
+            --count

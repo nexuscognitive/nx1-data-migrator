@@ -490,3 +490,68 @@ def sample_iceberg_migration_result(sample_iceberg_run_id):
         ],
         '_task_duration': 45.0,
     }
+
+# ---------------------------------------------------------------------------
+# Folder-copy fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sample_folder_run_id():
+    return 'folder_run_20250101_120000_abcd1234'
+
+
+@pytest.fixture
+def sample_folder_config(sample_folder_run_id):
+    return {
+        'run_id': sample_folder_run_id,
+        'source_path': '/data/sales/raw',
+        'dest_bucket': 's3a://test-bucket',
+        'dest_folder': 'raw',
+    }
+
+
+@pytest.fixture
+def sample_folder_distcp_result(sample_folder_run_id):
+    return {
+        'run_id': sample_folder_run_id,
+        'source_path': '/data/sales/raw',
+        'dest_bucket': 's3a://test-bucket',
+        'dest_path': 'raw',
+        'status': 'COMPLETED',
+        'started_at': '2025-01-01 12:00:00',
+        'completed_at': '2025-01-01 12:05:00',
+        'source_file_count': 20,
+        'source_size_bytes': 50 * 1024 * 1024,
+        'dest_file_count': 20,
+        'dest_size_bytes': 50 * 1024 * 1024,
+        'files_copied': 20,
+        'bytes_copied': 50 * 1024 * 1024,
+        'is_incremental': False,
+        'file_count_match': True,
+        'size_match': True,
+        'error': None,
+    }
+
+
+@pytest.fixture
+def sample_folder_validation_result(sample_folder_distcp_result):
+    return {
+        **sample_folder_distcp_result,
+        'dest_file_count': 20,
+        'dest_size_bytes': 50 * 1024 * 1024,
+        'file_count_match': True,
+        'size_match': True,
+        'validation_status': 'VALIDATED',
+        'validation_error': None,
+    }
+
+
+@pytest.fixture
+def sample_folder_finalize_result(sample_folder_run_id):
+    return {
+        'run_id': sample_folder_run_id,
+        'status': 'COMPLETED',
+        'total_folders': 2,
+        'successful_folders': 2,
+        'failed_folders': 0,
+    }
