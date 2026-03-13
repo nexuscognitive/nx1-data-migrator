@@ -983,8 +983,8 @@ Copies raw folders from MapR-FS/HDFS to S3 using Hadoop DistCp via SSH, with no 
 | hdfs://namenode:8020/user/hive/warehouse/features  | s3a://ml-data-lake     |                     |
 ```
 
-> Row 3: `dest_folder` is empty → defaults to `finance` (basename of source path)  
-> Row 4: HDFS path uses `hdfs://namenode:8020/` prefix; `s3://` bucket is automatically normalised to `s3a://`  
+> Row 3: `dest_folder` is empty → defaults to `finance` (basename of source path)
+> Row 4: HDFS path uses `hdfs://namenode:8020/` prefix; `s3://` bucket is automatically normalised to `s3a://`
 > Row 5: `dest_folder` is empty → defaults to `features`
 
 ---
@@ -1006,10 +1006,12 @@ cluster_login_setup  (edge node auth)
 │  Dynamic Task Mapping (one instance per Excel row)           │
 │                                                              │
 │  run_folder_distcp_ssh (SSH: DistCp -update, 24h timeout)   │
-│      ↓                          ↓                           │
-│  record_data_copy_status   validate_data_copy (SSH)          │
-│                                 ↓                           │
-│                        update_data_copy_validation           │
+│      ↓                                                       │
+│  record_data_copy_status                                     │
+│      ↓                                                       │
+│  validate_data_copy (SSH)                                    │
+│      ↓                                                       │
+│  update_data_copy_validation                                 │
 └──────────────────────────────────────────────────────────────┘
     ↓ (all mapped tasks done)
 finalize_data_copy_run
@@ -1041,14 +1043,30 @@ send_data_copy_report_email
 
 #### Step 2 - `init_folder_copy_tracking_tables`
 
-**Type:** PySpark  
+**Type:** SSH
+**Purpose:** Validate SSH connectivity and Hadoop tooling before starting the folder copy
+
+- Connects to the cluster edge node via SSH
+- Runs three sequential checks:
+  1. **SSH Connectivity** — verifies SSH connection with a simple echo command
+  2. **Hadoop DistCp** — checks `hadoop distcp` is available on the edge node
+  3. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
+- Sources `~/.profile` before each check to ensure environment variables are loaded
+- If **all checks pass**, returns a `checks` dict and proceeds
+- If **any check fails**, raises an exception with a detailed summary, halting the DAG before any tracking tables or run records are created
+
+---
+
+#### Step 2 - `init_folder_copy_tracking_tables`
+
+**Type:** PySpark
 **Purpose:** Create `data_copy_runs` and `data_copy_status` Iceberg tables if they do not exist
 
 ---
 
 #### Step 3 - `create_data_copy_run`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Insert a `RUNNING` record into `data_copy_runs` and return the `run_id`
 
 - Run ID format: `folder_run_{YYYYMMDD_HHMMSS}_{uuid8}`
@@ -1057,7 +1075,7 @@ send_data_copy_report_email
 
 #### Step 4 - `parse_folder_copy_excel`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Read and parse the Excel config file from S3
 
 - Reads `source_path`, `target_bucket`, `dest_folder` columns
@@ -1081,7 +1099,15 @@ send_data_copy_report_email
 
 #### Step 6 - `run_folder_distcp_ssh`
 
-**Type:** SSH (mapped per folder)  
+- Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
+- Performs cluster authentication using the configured `auth_method` (`mapr`, `kinit`, or `none`)
+- Returns a `cluster_setup` dict consumed by downstream SSH tasks
+
+---
+
+#### Step 6 - `run_folder_distcp_ssh`
+
+**Type:** SSH (mapped per folder)
 **Purpose:** Copy a single source folder to S3 via Hadoop DistCp
 
 - Always uses `-update` flag — safe for both full and incremental runs
@@ -1096,14 +1122,14 @@ send_data_copy_report_email
 
 #### Step 7 - `record_data_copy_status`
 
-**Type:** PySpark (mapped per folder)  
+**Type:** PySpark (mapped per folder)
 **Purpose:** Insert one row into `data_copy_status` with DistCp metrics
 
 ---
 
 #### Step 8 - `validate_data_copy`
 
-**Type:** SSH (mapped per folder)  
+**Type:** SSH (mapped per folder)
 **Purpose:** Re-verify the S3 destination after copy
 
 - Skips (marks `VALIDATION_SKIPPED`) if the copy step already failed
@@ -1115,14 +1141,14 @@ send_data_copy_report_email
 
 #### Step 9 - `update_data_copy_validation`
 
-**Type:** PySpark (mapped per folder)  
+**Type:** PySpark (mapped per folder)
 **Purpose:** Update `data_copy_status` with final validation metrics and status
 
 ---
 
 #### Step 10 - `finalize_data_copy_run`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Aggregate folder counts and mark the run as complete
 
 - Queries `data_copy_status` for authoritative counts
@@ -1133,7 +1159,7 @@ send_data_copy_report_email
 
 #### Step 11 - `generate_data_copy_html_report`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Generate an HTML report and write it to S3
 
 - Summary cards: run status, total/validated/failed folders, incremental count, total GB, files, bytes copied
@@ -1145,7 +1171,7 @@ send_data_copy_report_email
 
 #### Step 12 - `send_data_copy_report_email`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Email the HTML report via SMTP
 
 - Subject: `Folder Data Copy Report - {run_id}`
@@ -1319,5 +1345,18 @@ Tests run automatically on every push to `main`, `develop`, or any `feature/**` 
 
 **Matrix:** Python 3.9, 3.10, 3.11  
 **Steps:** checkout → setup Python → cache pip → install `requirements-test.txt` → run pytest with coverage → upload coverage to Codecov → upload HTML coverage report as artifact
+
+## Notes for Dev
+
+Env files are loaded from `/opt/airflow/utils/migration_configs/`:
+
+- `env.shared` — shared config (S3, SSH, Spark credentials, etc.)
+- `env.<dag_stem>` — per-developer overrides (e.g. `env.migration_dags_combined`)
+
+Copy the `env.*.example` files there, drop the `.example` suffix, and fill in your values. If the directory doesn't exist the DAG logs a warning and falls back to Airflow Variables / defaults.
+
+Config resolution: Airflow Variable → `os.getenv()` → hardcoded default in `get_config()`.
+
+---
 
 End of Document

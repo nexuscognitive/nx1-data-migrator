@@ -4,6 +4,9 @@
 __pycache__/
 *.py[cod]
 
+# Packaging
+*.egg-info/
+
 # IDE
 .idea/
 .vscode/
@@ -13,6 +16,9 @@ __pycache__/
 env.shared
 env.*
 !*.example
+
+# Coverage
+.coverage
 
 # OS
 .DS_Store
