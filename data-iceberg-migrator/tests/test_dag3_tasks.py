@@ -193,28 +193,33 @@ class TestParseFolderCopyExcel:
         assert configs[0]['dest_folder'] == 'events'
 
     def test_skips_rows_with_empty_source_path(self, mock_spark, sample_folder_run_id):
+        import pandas as pd
         m = _import_module()
-        excel_bytes = _make_excel_bytes([
-            {'source_path': '',           'target_bucket': 's3a://bkt', 'dest_folder': 'x'},
+        fake_df = pd.DataFrame([
+            {'source_path': None,         'target_bucket': 's3a://bkt', 'dest_folder': 'x'},
             {'source_path': '/data/good', 'target_bucket': 's3a://bkt', 'dest_folder': 'good'},
         ])
+        excel_bytes = _make_excel_bytes([{'source_path': '', 'target_bucket': '', 'dest_folder': ''}])
         spark = _spark_with_excel(mock_spark, excel_bytes)
-        configs = m.parse_folder_copy_excel.function(
-            's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
-        )
+        with patch('pandas.read_excel', return_value=fake_df):
+            configs = m.parse_folder_copy_excel.function(
+                's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
+            )
         assert len(configs) == 1
         assert configs[0]['source_path'] == '/data/good'
 
     def test_skips_rows_with_missing_target_bucket(self, mock_spark, sample_folder_run_id):
         m = _import_module()
-        excel_bytes = _make_excel_bytes([
-            {'source_path': '/data/no_bucket', 'target_bucket': '', 'dest_folder': 'x'},
+        fake_df = pd.DataFrame([
+            {'source_path': '/data/no_bucket',  'target_bucket': None,        'dest_folder': 'x'},
             {'source_path': '/data/with_bucket', 'target_bucket': 's3a://bkt', 'dest_folder': 'y'},
         ])
+        excel_bytes = _make_excel_bytes([{'source_path': '', 'target_bucket': '', 'dest_folder': ''}])
         spark = _spark_with_excel(mock_spark, excel_bytes)
-        configs = m.parse_folder_copy_excel.function(
-            's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
-        )
+        with patch('pandas.read_excel', return_value=fake_df):
+            configs = m.parse_folder_copy_excel.function(
+                's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
+            )
         assert len(configs) == 1
         assert configs[0]['source_path'] == '/data/with_bucket'
 
@@ -914,7 +919,6 @@ class TestSendDataCopyReportEmail:
             mock_smtp.return_value.__enter__ = MagicMock(return_value=smtp_instance)
             mock_smtp.return_value.__exit__ = MagicMock(return_value=False)
 
-            from airflow.hooks.base import BaseHook
             conn_mock = MagicMock()
             conn_mock.host = 'smtp.example.com'
             conn_mock.port = 587

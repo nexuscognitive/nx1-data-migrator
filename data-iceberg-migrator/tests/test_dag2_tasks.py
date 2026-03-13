@@ -186,14 +186,23 @@ class TestDiscoverHiveTables:
         sample_iceberg_db_config['table_pattern'] = 'trans*'
 
         def sql_router(sql):
+            import fnmatch, re
             df = MagicMock()
             sql_lower = sql.lower()
             if 'show tables' in sql_lower:
-                r1, r2, r3 = MagicMock(), MagicMock(), MagicMock()
-                r1.tableName = 'transactions'
-                r2.tableName = 'orders'
-                r3.tableName = 'trans_history'
-                df.collect.return_value = [r1, r2, r3]
+                all_tables = ['transactions', 'orders', 'trans_history']
+                like_match = re.search(r"like '([^']+)'", sql_lower)
+                if like_match:
+                    pattern = like_match.group(1).replace('%', '*')
+                    matched = [t for t in all_tables if fnmatch.fnmatch(t, pattern)]
+                else:
+                    matched = all_tables
+                rows = []
+                for name in matched:
+                    r = MagicMock()
+                    r.tableName = name
+                    rows.append(r)
+                df.collect.return_value = rows
             elif 'describe formatted' in sql_lower:
                 loc_row = MagicMock()
                 loc_row.col_name = 'Location'
