@@ -139,7 +139,7 @@ jobs:
           echo "::error::One or more test jobs failed. See individual job logs for details."
           exit 1
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v7
         with:
           pattern: coverage-*
           path: coverage
@@ -182,4 +182,3 @@ jobs:
           else
             gh api "repos/${REPO}/issues/${PR}/comments" -f body="$BODY"
           fi
-
