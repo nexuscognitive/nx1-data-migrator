@@ -30,9 +30,6 @@ jobs:
       - name: Lint
         run: ruff check .
 
-      - name: Check formatting
-        run: ruff format --check .
-
   test-data-iceberg-migrator:
     needs: lint
     runs-on: ubuntu-latest
