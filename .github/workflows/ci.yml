@@ -168,16 +168,17 @@ jobs:
         if: steps.check.outputs.has_data == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
-          PR=${{ github.event.pull_request.number }}
           MARKER="<!-- coverage-report -->"
           BODY="${MARKER}"$'\n'"$(cat code-coverage-results.md)"
 
-          EXISTING=$(gh api repos/${{ github.repository }}/issues/${PR}/comments \
+          EXISTING=$(gh api "repos/${REPO}/issues/${PR}/comments" \
             --jq "[.[] | select(.body | startswith(\"${MARKER}\")) | .id] | first // empty")
 
           if [ -n "$EXISTING" ]; then
-            gh api repos/${{ github.repository }}/issues/comments/${EXISTING} -X PATCH -f body="$BODY"
+            gh api "repos/${REPO}/issues/comments/${EXISTING}" -X PATCH -f body="$BODY"
           else
-            gh pr comment "$PR" --body "$BODY"
+            gh api "repos/${REPO}/issues/${PR}/comments" -f body="$BODY"
           fi
