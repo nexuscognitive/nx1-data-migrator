@@ -51,7 +51,7 @@ jobs:
       - name: Run tests
         run: >
           pytest tests/
-          --cov=migration_dags_combined
+          --cov
           --cov-report=term-missing
           --cov-report=xml:coverage.xml
 
@@ -97,8 +97,7 @@ jobs:
       - name: Run tests
         run: >
           pytest tests/
-          --cov=ranger_policies_generator_airflow3
-          --cov=ranger_utils
+          --cov
           --cov-report=term-missing
           --cov-report=xml:coverage.xml
 
