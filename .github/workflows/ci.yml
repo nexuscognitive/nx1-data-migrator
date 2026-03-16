@@ -51,9 +51,13 @@ jobs:
       - name: Run tests
         run: >
           pytest tests/
-          --cov
+          --cov=migration_dags_combined
           --cov-report=term-missing
           --cov-report=xml:coverage.xml
+
+      - name: Label coverage package
+        if: always()
+        run: sed -i 's/package name="\."/package name="data-iceberg-migrator"/' coverage.xml
 
       - name: Coverage summary
         if: always()
@@ -93,9 +97,14 @@ jobs:
       - name: Run tests
         run: >
           pytest tests/
-          --cov
+          --cov=ranger_policies_generator_airflow3
+          --cov=ranger_utils
           --cov-report=term-missing
           --cov-report=xml:coverage.xml
+
+      - name: Label coverage package
+        if: always()
+        run: sed -i 's/package name="\."/package name="ranger-policies-generator"/' coverage.xml
 
       - name: Coverage summary
         if: always()
