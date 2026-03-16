@@ -36,7 +36,7 @@ class TestParseExcelRows:
         assert set(role_entry["permissions"]) == {"read", "write"}
         assert "analyst" in result["role_principals"]
         assert result["skipped_rows"] == []
-        assert False, "TEMPORARY: testing CI failure reporting"
+        assert False, "TEMPORARY: testing CI failure reporting"  # noqa: B011
 
     def test_url_policy(self, dag_module):
         df = _make_df([{
