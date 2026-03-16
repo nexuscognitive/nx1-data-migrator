@@ -1,11 +1,12 @@
 """DAG 1 Task Tests: mapr_to_s3_migration pipeline."""
 
-import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from .helpers import make_excel_bytes, setup_spark_excel, mock_ssh_stdout
 
 import migration_dags_combined as m
+import pytest
+
+from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
 
 
 class TestValidatePrerequisites:
@@ -121,7 +122,7 @@ class TestClusterLoginSetup:
         stdout_mock.read.return_value = b'ERROR'
         stderr_mock.read.return_value = b'auth error'
 
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="Cluster login setup failed"):
             m.cluster_login_setup.function(run_id='run_test')
 
     def test_missing_success_marker_raises(self, mock_ssh_hook):

@@ -1,11 +1,12 @@
 """DAG 3 Task Tests: folder_only_data_copy pipeline."""
 
-import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from .helpers import make_excel_bytes, setup_spark_excel, mock_ssh_stdout
 
 import migration_dags_combined as m
+import pytest
+
+from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
 
 
 class TestValidatePrerequisitesFolderCopy:
@@ -179,7 +180,7 @@ class TestValidateDataCopy:
         stdout_mock.channel.recv_exit_status.return_value = 0
         ti = MagicMock()
 
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="VALIDATION_FAILED"):
             m.validate_data_copy.function(copy_status=sample_folder_distcp_result, ti=ti)
         assert ti.xcom_push.call_args[1]['value']['validation_status'] == 'VALIDATION_FAILED'
 
@@ -189,7 +190,7 @@ class TestValidateDataCopy:
         stdout_mock.channel.recv_exit_status.return_value = 0
         ti = MagicMock()
 
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="file count or size mismatch"):
             m.validate_data_copy.function(copy_status=sample_folder_distcp_result, ti=ti)
         assert ti.xcom_push.call_args[1]['value']['file_count_match'] is False
 

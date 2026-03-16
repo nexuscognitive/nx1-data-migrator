@@ -1,11 +1,12 @@
 """DAG 2 Task Tests: iceberg_migration pipeline."""
 
-import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from .helpers import make_excel_bytes, setup_spark_excel
 
 import migration_dags_combined as m
+import pytest
+
+from .helpers import make_excel_bytes, setup_spark_excel
 
 
 class TestInitIcebergTrackingTables:

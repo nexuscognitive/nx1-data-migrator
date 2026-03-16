@@ -6,10 +6,10 @@ Tests for shared utility functions:
 """
 
 import time
-import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import migration_dags_combined as m
+import pytest
 
 
 class TestGetConfig:

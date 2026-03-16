@@ -6,6 +6,7 @@ All external dependencies (SSH, Spark, Airflow Variables, SMTP) are mocked.
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
 import pytest
 
 _MODULE_DIR = Path(__file__).resolve().parent.parent
