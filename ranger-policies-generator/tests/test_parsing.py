@@ -36,7 +36,7 @@ class TestParseExcelRows:
         assert set(role_entry["permissions"]) == {"read", "write"}
         assert "analyst" in result["role_principals"]
         assert result["skipped_rows"] == []
-        assert False, "TEMPORARY: testing CI failure reporting"  # noqa: B011
+
 
     def test_url_policy(self, dag_module):
         df = _make_df([{
@@ -47,7 +47,7 @@ class TestParseExcelRows:
 
         assert "s3a://bucket/path" in result["policies"]
         assert result["policies"]["s3a://bucket/path"]["type"] == "url"
-        assert False, "TEMPORARY: testing CI failure reporting"  # noqa: B011
+
 
     def test_skip_row_with_both_db_and_url(self, dag_module):
         df = _make_df([{"role": "r1", "database": "db1", "url": "s3a://b/p", "groups": "g1"}])
@@ -55,7 +55,7 @@ class TestParseExcelRows:
 
         assert len(result["policies"]) == 0
         assert len(result["skipped_rows"]) == 1
-        assert False, "TEMPORARY: testing CI failure reporting"  # noqa: B011
+
 
     def test_users_only_creates_synthetic_role(self, dag_module):
         df = _make_df([{"database": "db1", "users": "alice"}])
@@ -63,7 +63,7 @@ class TestParseExcelRows:
 
         assert len(result["policies"]) == 1
         assert "role_alice" in result["role_principals"]
-        assert False, "TEMPORARY: testing CI failure reporting"  # noqa: B011
+
 
     def test_cartesian_expansion(self, dag_module):
         df = _make_df([{
@@ -72,7 +72,7 @@ class TestParseExcelRows:
         }])
         result = dag_module.parse_excel_rows(df)
         assert len(result["policies"]) == 8  # 2 * 2 * 2
-        assert False, "TEMPORARY: testing CI failure reporting"  # noqa: B011
+
 
     def test_merge_permissions_for_same_role(self, dag_module):
         df = _make_df([
@@ -84,7 +84,7 @@ class TestParseExcelRows:
         policy = result["policies"]["iceberg.db1.t1"]
         assert len(policy["roles"]) == 1
         assert {"read", "write"} <= set(policy["roles"][0]["permissions"])
-        assert False, "TEMPORARY: testing CI failure reporting"  # noqa: B011
+
 
 
 class TestPatchPoliciesWithKeycloak:
