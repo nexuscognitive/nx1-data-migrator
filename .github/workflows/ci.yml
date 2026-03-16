@@ -70,7 +70,7 @@ jobs:
           fi
 
       - name: Upload coverage
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: coverage-data-iceberg-migrator
@@ -117,7 +117,7 @@ jobs:
           fi
 
       - name: Upload coverage
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: coverage-ranger-policies-generator
@@ -139,7 +139,7 @@ jobs:
           echo "::error::One or more test jobs failed. See individual job logs for details."
           exit 1
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v6
         with:
           pattern: coverage-*
           path: coverage
@@ -166,7 +166,18 @@ jobs:
 
       - name: Post PR comment
         if: steps.check.outputs.has_data == 'true'
-        uses: marocchino/sticky-pull-request-comment@v2.9.4
-        with:
-          recreate: true
-          path: code-coverage-results.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          MARKER="<!-- coverage-report -->"
+          BODY="${MARKER}"$'\n'"$(cat code-coverage-results.md)"
+
+          EXISTING=$(gh api repos/${{ github.repository }}/issues/${PR}/comments \
+            --jq "[.[] | select(.body | startswith(\"${MARKER}\")) | .id] | first // empty")
+
+          if [ -n "$EXISTING" ]; then
+            gh api repos/${{ github.repository }}/issues/comments/${EXISTING} -X PATCH -f body="$BODY"
+          else
+            gh pr comment "$PR" --body "$BODY"
+          fi
