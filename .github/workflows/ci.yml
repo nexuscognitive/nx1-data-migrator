@@ -131,14 +131,6 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Fail if tests failed
-        if: >-
-          needs.test-data-iceberg-migrator.result == 'failure' ||
-          needs.test-ranger-policies-generator.result == 'failure'
-        run: |
-          echo "::error::One or more test jobs failed. See individual job logs for details."
-          exit 1
-
       - uses: actions/download-artifact@v7
         with:
           pattern: coverage-*
@@ -182,3 +174,11 @@ jobs:
           else
             gh api "repos/${REPO}/issues/${PR}/comments" -f body="$BODY"
           fi
+
+      - name: Fail if tests failed
+        if: >-
+          needs.test-data-iceberg-migrator.result == 'failure' ||
+          needs.test-ranger-policies-generator.result == 'failure'
+        run: |
+          echo "::error::One or more test jobs failed. See individual job logs for details."
+          exit 1
