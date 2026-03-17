@@ -507,6 +507,7 @@ def sample_folder_config(sample_folder_run_id):
         'source_path': '/data/sales/raw',
         'dest_bucket': 's3a://test-bucket',
         'dest_folder': 'raw',
+        'dest_endpoint': '',
     }
 
 
@@ -517,6 +518,7 @@ def sample_folder_distcp_result(sample_folder_run_id):
         'source_path': '/data/sales/raw',
         'dest_bucket': 's3a://test-bucket',
         'dest_path': 'raw',
+        'dest_endpoint': '',
         'status': 'COMPLETED',
         'started_at': '2025-01-01 12:00:00',
         'completed_at': '2025-01-01 12:05:00',
