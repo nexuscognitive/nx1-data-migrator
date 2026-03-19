@@ -1143,7 +1143,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
     temp_dir = cluster_setup['temp_dir']
     mappers = config['distcp_mappers']
     bandwidth = config['distcp_bandwidth']
-    
+
     s3_opts = _build_s3_opts(discovery['dest_bucket'], config, discovery.get('dest_endpoint', ''))
 
     source_profile = "source ~/.profile 2>/dev/null || true\n"
@@ -4312,7 +4312,7 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
             continue
 
         raw_bucket = str(row.get('target_bucket', '') or '').strip()
-        if not raw_bucket:
+        if not raw_bucket or raw_bucket.lower() in ('nan', 'none'):
             logger.warning(f"[FolderCopy] Skipping row — missing target_bucket for source_path={source_path!r}")
             skipped += 1
             continue

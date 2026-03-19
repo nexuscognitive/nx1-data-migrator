@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import migration_dags_combined as m
+import pandas as pd
 import pytest
 
 from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
@@ -75,17 +76,16 @@ class TestParseFolderCopyExcel:
         assert result[0]['dest_bucket'] == expected
 
     def test_skips_rows_with_missing_target_bucket(self, mock_spark, sample_folder_run_id):
-        import pandas as pd
-        m = _import_module()
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '', 'target_bucket': '', 'dest_folder': ''},
+        ]))
         fake_df = pd.DataFrame([
-            {'source_path': '/data/no_bucket',  'target_bucket': None,        'dest_folder': 'x'},
+            {'source_path': '/data/no_bucket',   'target_bucket': None,        'dest_folder': 'x'},
             {'source_path': '/data/with_bucket', 'target_bucket': 's3a://bkt', 'dest_folder': 'y'},
         ])
-        excel_bytes = _make_excel_bytes([{'source_path': '', 'target_bucket': '', 'dest_folder': ''}])
-        spark = _spark_with_excel(mock_spark, excel_bytes)
         with patch('pandas.read_excel', return_value=fake_df):
             configs = m.parse_folder_copy_excel.function(
-                's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
+                's3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark,
             )
         assert len(configs) == 1
         assert configs[0]['source_path'] == '/data/with_bucket'
@@ -96,70 +96,49 @@ class TestParseFolderCopyExcel:
         ]))
         with pytest.raises(ValueError, match="No valid rows"):
             m.parse_folder_copy_excel.function(
-                's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
+                's3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark,
             )
 
     def test_multiple_rows_all_parsed(self, mock_spark, sample_folder_run_id):
-        m = _import_module()
-        excel_bytes = _make_excel_bytes([
+        setup_spark_excel(mock_spark, make_excel_bytes([
             {'source_path': '/data/a', 'target_bucket': 's3a://bkt', 'dest_folder': 'a'},
             {'source_path': '/data/b', 'target_bucket': 's3a://bkt', 'dest_folder': 'b'},
             {'source_path': '/data/c', 'target_bucket': 's3a://bkt', 'dest_folder': 'c'},
-        ])
-        spark = _spark_with_excel(mock_spark, excel_bytes)
-        configs = m.parse_folder_copy_excel.function(
-            's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
-        )
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
         assert len(configs) == 3
 
     def test_trailing_slash_stripped_from_source_path_basename(self, mock_spark, sample_folder_run_id):
-        m = _import_module()
-        excel_bytes = _make_excel_bytes([
-            {'source_path': '/data/mydir/', 'target_bucket': 's3a://bkt'},
-        ])
-        spark = _spark_with_excel(mock_spark, excel_bytes)
-        configs = m.parse_folder_copy_excel.function(
-            's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
-        )
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '/data/mydir/', 'target_bucket': 's3a://bkt', 'dest_folder': 'mydir'},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
         assert configs[0]['dest_folder'] == 'mydir'
 
     def test_endpoint_emitted_when_present(self, mock_spark, sample_folder_run_id):
-        m = _import_module()
-        excel_bytes = _make_excel_bytes([
+        setup_spark_excel(mock_spark, make_excel_bytes([
             {'source_path': '/data/sales', 'target_bucket': 's3a://bkt', 'dest_folder': 'sales',
-             'endpoint': 'https://s3.tenant-a.example.com'},
-        ])
-        spark = _spark_with_excel(mock_spark, excel_bytes)
-        configs = m.parse_folder_copy_excel.function(
-            's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
-        )
+            'endpoint': 'https://s3.tenant-a.example.com'},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
         assert configs[0]['dest_endpoint'] == 'https://s3.tenant-a.example.com'
 
     def test_endpoint_defaults_to_empty_when_absent(self, mock_spark, sample_folder_run_id):
-        m = _import_module()
-        # No 'endpoint' column in the sheet
-        excel_bytes = _make_excel_bytes([
+        setup_spark_excel(mock_spark, make_excel_bytes([
             {'source_path': '/data/sales', 'target_bucket': 's3a://bkt', 'dest_folder': 'sales'},
-        ])
-        spark = _spark_with_excel(mock_spark, excel_bytes)
-        configs = m.parse_folder_copy_excel.function(
-            's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
-        )
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
         assert configs[0]['dest_endpoint'] == ''
 
     def test_each_row_independent_regardless_of_matching_bucket(self, mock_spark, sample_folder_run_id):
         """Two rows with same bucket but different endpoints must both appear as separate jobs."""
-        m = _import_module()
-        excel_bytes = _make_excel_bytes([
+        setup_spark_excel(mock_spark, make_excel_bytes([
             {'source_path': '/data/a', 'target_bucket': 's3a://data-lake',
-             'endpoint': 'https://s3.tenant-a.example.com'},
+            'endpoint': 'https://s3.tenant-a.example.com'},
             {'source_path': '/data/b', 'target_bucket': 's3a://data-lake',
-             'endpoint': 'https://s3.tenant-b.example.com'},
-        ])
-        spark = _spark_with_excel(mock_spark, excel_bytes)
-        configs = m.parse_folder_copy_excel.function(
-            's3a://b/f.xlsx', sample_folder_run_id, spark=spark,
-        )
+            'endpoint': 'https://s3.tenant-b.example.com'},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
         assert len(configs) == 2
         endpoints = {c['dest_endpoint'] for c in configs}
         assert endpoints == {'https://s3.tenant-a.example.com', 'https://s3.tenant-b.example.com'}
