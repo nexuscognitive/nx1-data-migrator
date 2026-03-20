@@ -238,6 +238,109 @@ def _build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') 
     return s3_opts
 
 
+def _validate_bucket_endpoint_pairs(grouped: dict, config: dict) -> None:
+    """Pre-flight check: verify each (bucket, endpoint) pair in the Excel config is reachable"""
+    try:
+        from urllib.parse import urlparse as _urlparse
+
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError:
+        logger.warning(
+            "[ValidateBucketEndpoint] boto3 not available — skipping pre-flight validation"
+        )
+        return
+
+    errors = []
+    checked: set = set()
+
+    for (src_db, _dest_db, bucket_val, endpoint_val), _group in grouped.items():
+        if not endpoint_val:
+            continue
+
+        pair = (bucket_val, endpoint_val)
+        if pair in checked:
+            continue
+        checked.add(pair)
+
+        raw = bucket_val.strip()
+        for prefix in ('s3a://', 's3n://', 's3://'):
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+                break
+        bucket_name = _urlparse(f's3a://{raw}').netloc.lower().strip()
+
+        if not bucket_name:
+            errors.append(
+                f"  - src_db={src_db}: could not extract bucket name from '{bucket_val}'"
+            )
+            continue
+
+        ep_hostname = (
+            _urlparse(endpoint_val).hostname
+            or _urlparse(endpoint_val).netloc
+            or endpoint_val
+        )
+        ep_hostname = ep_hostname.lower().strip()
+        env_slug = ep_hostname.upper().replace('.', '_').replace('-', '_')
+
+        access_key = (
+            Variable.get(f'{ep_hostname}_access_key',
+                         default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
+            or config.get('s3_access_key') or ''
+        )
+        secret_key = (
+            Variable.get(f'{ep_hostname}_secret_key',
+                         default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
+            or config.get('s3_secret_key') or ''
+        )
+
+        try:
+            s3 = boto3.client(
+                's3',
+                endpoint_url=endpoint_val,
+                aws_access_key_id=access_key or None,
+                aws_secret_access_key=secret_key or None,
+            )
+            s3.head_bucket(Bucket=bucket_name)
+            logger.info(
+                f"[ValidateBucketEndpoint] ✓ bucket='{bucket_name}' "
+                f"reachable at endpoint='{endpoint_val}'"
+            )
+        except ClientError as exc:
+            code = exc.response.get('Error', {}).get('Code', '')
+            if code in ('403', 'AccessDenied'):
+                logger.warning(
+                    f"[ValidateBucketEndpoint] bucket='{bucket_name}' at "
+                    f"endpoint='{endpoint_val}' returned 403 — bucket exists but "
+                    f"credentials may lack full access. Proceeding."
+                )
+            elif code in ('404', 'NoSuchBucket'):
+                errors.append(
+                    f"  - src_db={src_db}: bucket='{bucket_name}' does NOT exist at "
+                    f"endpoint='{endpoint_val}' (HTTP 404) — "
+                    f"likely a bucket/endpoint mismatch in the Excel config"
+                )
+            else:
+                errors.append(
+                    f"  - src_db={src_db}: bucket='{bucket_name}' at "
+                    f"endpoint='{endpoint_val}' returned unexpected S3 error "
+                    f"{code}: {exc}"
+                )
+        except Exception as exc:
+            errors.append(
+                f"  - src_db={src_db}: could not reach endpoint='{endpoint_val}' "
+                f"for bucket='{bucket_name}': {exc}"
+            )
+
+    if errors:
+        raise Exception(
+            f"[ParseExcel] Bucket/endpoint validation failed for {len(errors)} "
+            f"pair(s). Fix the Excel config and re-trigger the DAG:\n"
+            + "\n".join(errors)
+        )
+
+
 # =============================================================================
 # DAG 1: MAPR TO S3 MIGRATION TASKS
 # =============================================================================
@@ -578,6 +681,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
             if tok:
                 grouped[key]['tokens'].append(tok)
 
+    _validate_bucket_endpoint_pairs(grouped, config)
     configs = []
 
     for (src_db, dest_db, bucket_val, endpoint_val), group in grouped.items():
