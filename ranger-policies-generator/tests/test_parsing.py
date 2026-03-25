@@ -188,13 +188,15 @@ class TestPatchPoliciesWithKeycloak:
         assert len(result["failure_statuses"]) == 0
 
     def test_user_only_role_excluded_when_user_mapping_failed(self, dag_module):
+        # KC realm role was created but alice is not in KC → assignment failed → no mapping.
+        # Policy must NOT proceed; a broken Ranger policy with an empty group is worse than no policy.
         policies = {
             "iceberg.hr_db.employees": {
                 "type": "table",
                 "roles": [{"role": "role_alice", "permissions": ["read"], "groups": [], "users": ["alice"], "rowfilter": ""}],
             }
         }
-        kc = self._keycloak_result()
+        kc = self._keycloak_result()  # no mappings — user assignment failed
         result = dag_module.patch_policies_with_keycloak(policies, kc, "run1")
 
         assert "iceberg.hr_db.employees" not in result["patched_policies"]
@@ -202,6 +204,7 @@ class TestPatchPoliciesWithKeycloak:
         assert result["failure_statuses"][0]["status"] == "FAILED"
 
     def test_user_only_role_passes_when_user_mapping_succeeded(self, dag_module):
+        # If alice exists in KC and the user mapping succeeded, policy must proceed.
         policies = {
             "iceberg.hr_db.employees": {
                 "type": "table",
