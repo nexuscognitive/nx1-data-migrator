@@ -43,9 +43,9 @@ class TestInitTrackingTables:
     def test_creates_database_and_all_tables(self, mock_spark):
         result = m.init_tracking_tables.function(spark=mock_spark)
         assert result == {'status': 'initialized', 'database': 'migration_tracking'}
-        assert mock_spark.sql.call_count >= 4
+        assert mock_spark.sql.call_count >= 3
         all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
-        for table in ['migration_runs', 'migration_table_status', 'validation_results']:
+        for table in ['migration_runs', 'migration_table_status']:
             assert table in all_sql
 
 
@@ -104,7 +104,80 @@ class TestParseExcel:
         result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
         assert set(result[0]['table_tokens']) == {'tbl_a', 'tbl_b', 'tbl_c'}
 
+    def test_s3_bucket_normalized(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'mydb', 'table': '*', 'dest database': '', 'bucket': 's3://plain-bucket'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['dest_bucket'].startswith('s3a://')
 
+    def test_dest_database_defaults_to_source(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'sourcedb', 'table': '*', 'dest database': None, 'bucket': None},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['dest_database'] == 'sourcedb'
+
+    def test_wildcard_overrides_other_tokens(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db', 'table': 'tbl_a', 'dest database': '', 'bucket': ''},
+            {'database': 'db', 'table': '*', 'dest database': '', 'bucket': ''},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        # When * is present, tokens should collapse to ['*']
+        assert result[0]['table_tokens'] == ['*']
+
+    def test_run_id_embedded_in_each_config(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': '*', 'dest database': '', 'bucket': ''},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_xyz', spark=mock_spark)
+        assert result[0]['run_id'] == 'run_xyz'
+
+    def test_dest_endpoint_emitted_when_present(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': '*', 'dest database': '', 'bucket': 's3a://bkt',
+            'endpoint': 'https://s3.tenant-a.example.com'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_xyz', spark=mock_spark)
+        assert result[0]['dest_endpoint'] == 'https://s3.tenant-a.example.com'
+
+    def test_dest_endpoint_defaults_to_empty_when_absent(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': '*', 'dest database': '', 'bucket': 's3a://bkt'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['dest_endpoint'] == ''
+
+    def test_same_bucket_different_endpoint_produces_two_configs(self, mock_spark):
+        """Same (src_db, dest_db, bucket) but different endpoints must not be merged."""
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': 'tbl_a', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
+            'endpoint': 'https://s3.tenant-a.example.com'},
+            {'database': 'db1', 'table': 'tbl_b', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
+            'endpoint': 'https://s3.tenant-b.example.com'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert len(result) == 2
+        endpoints = {r['dest_endpoint'] for r in result}
+        assert endpoints == {'https://s3.tenant-a.example.com', 'https://s3.tenant-b.example.com'}
+
+    def test_same_bucket_same_endpoint_merged_into_one_config(self, mock_spark):
+        """Same (src_db, dest_db, bucket, endpoint) on two rows must merge tokens."""
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': 'tbl_a', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
+            'endpoint': 'https://s3.tenant-a.example.com'},
+            {'database': 'db1', 'table': 'tbl_b', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
+            'endpoint': 'https://s3.tenant-a.example.com'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert len(result) == 1
+        assert set(result[0]['table_tokens']) == {'tbl_a', 'tbl_b'}
+
+
+# ---------------------------------------------------------------------------
+# cluster_login_setup
+# ---------------------------------------------------------------------------
 class TestClusterLoginSetup:
 
     def test_success_returns_temp_dir(self, mock_ssh_hook):
@@ -396,20 +469,11 @@ class TestValidateDestinationTables:
 
 class TestUpdateValidationStatus:
 
-    def _setup_metrics(self, mock_spark):
-        metrics_row = MagicMock()
-        metrics_row.__getitem__ = lambda self, k: 0
-        df = MagicMock()
-        df.collect.return_value = [metrics_row]
-        mock_spark.sql.return_value = df
-
     def test_sets_validated_on_match(self, mock_spark, sample_validation_result, mock_iceberg_retry):
-        self._setup_metrics(mock_spark)
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
         assert any('VALIDATED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
     def test_sets_validation_failed_on_mismatch(self, mock_spark, sample_validation_result, mock_iceberg_retry):
-        self._setup_metrics(mock_spark)
         sample_validation_result['validation_results'][0]['row_count_match'] = False
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
         assert any('VALIDATION_FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
@@ -435,6 +499,7 @@ class TestGenerateHtmlReport:
             s3_file_count_before=0, s3_file_count_after=5,
             s3_files_transferred=5, file_count_match=True,
             distcp_status='COMPLETED',
+            file_format='PARQUET',
         )
         vs_row = MagicMock()
         vs_row.__getitem__ = lambda self, k: 1
