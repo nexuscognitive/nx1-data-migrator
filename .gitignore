@@ -1,4 +1,4 @@
-.venv/
+**/.venv/
 
 # Bytecode
 __pycache__/
@@ -10,6 +10,8 @@ __pycache__/
 # IDE
 .idea/
 .vscode/
+!embedded-scripts/.vscode
+!embedded-scripts/.vscode/**
 
 # Environment
 .env
@@ -19,13 +21,10 @@ env.*
 
 # Coverage
 .coverage
+coverage.xml
 
 # OS
 .DS_Store
-
-# Test / coverage artifacts
-.coverage
-coverage.xml
 htmlcov/
 
 # Pytest cache

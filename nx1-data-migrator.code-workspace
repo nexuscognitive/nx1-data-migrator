@@ -1,0 +1,22 @@
+{
+    "folders": [
+        {
+            "name": "nx1-data-migrator",
+            "path": "."
+        },
+        {
+            "name": "embedded-scripts",
+            "path": "embedded-scripts"
+        }
+    ],
+    "settings": {
+        "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+        "python.testing.pytestArgs": ["data-iceberg-migrator"],
+        "python.testing.unittestEnabled": false,
+        "python.testing.pytestEnabled": true,
+        "flake8.args": ["--select=E999"]
+    },
+    "extensions": {
+        "recommendations": ["ms-python.python", "ms-python.flake8"]
+    }
+}
