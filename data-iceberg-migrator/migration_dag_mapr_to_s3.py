@@ -428,7 +428,7 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     pyspark_script = '''
 import json
 import sys
-import fnmatch
+
 from pyspark.sql import SparkSession
 
 spark = SparkSession.builder \\
@@ -549,7 +549,7 @@ for tbl in table_list:
             row_count = spark.sql(
                 "SELECT COUNT(*) as c FROM {{0}}.{{1}}".format(src_db, tbl)
             ).collect()[0].c
-        except:
+        except Exception:
             pass
 
         partition_cols_from_describe = []
@@ -577,7 +577,7 @@ for tbl in table_list:
             )
             partitions = [row.partition for row in parts_df.collect()]
             registered_partition_count = len(partitions)
-        except:
+        except Exception:
             pass
 
         is_partitioned = partition_definition
