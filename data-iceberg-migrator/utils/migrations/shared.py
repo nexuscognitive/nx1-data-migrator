@@ -153,36 +153,50 @@ def normalize_s3(path: str) -> str:
 
 def get_config() -> dict:
     """Shared configuration for all migration DAGs."""
+    try:
+        from airflow.operators.python import get_current_context
+        _ctx = get_current_context()
+        _run_id = _ctx["run_id"]
+    except Exception:
+        _run_id = None
+
+    def _var(base_key: str, env_var: str, default: str) -> str:
+        if _run_id:
+            scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
+            if scoped is not None:
+                return scoped
+        return Variable.get(base_key, default_var=os.getenv(env_var, default))
+
     return {
         # SSH Configuration (for MapR migration)
         'ssh_conn_id': Variable.get('cluster_ssh_conn_id', default_var=os.getenv('CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh')),
         'edge_temp_path': Variable.get('cluster_edge_temp_path', default_var=os.getenv('CLUSTER_EDGE_TEMP_PATH', '/tmp/migration')),
 
         # S3 Configuration
-        'default_s3_bucket': Variable.get('migration_default_s3_bucket', default_var=os.getenv('MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake')),
-        's3_endpoint': Variable.get('s3_endpoint', default_var=os.getenv('S3_ENDPOINT', '')),
-        's3_access_key': Variable.get('s3_access_key', default_var=os.getenv('S3_ACCESS_KEY', '')),
-        's3_secret_key': Variable.get('s3_secret_key', default_var=os.getenv('S3_SECRET_KEY', '')),
+        'default_s3_bucket': _var('migration_default_s3_bucket', 'MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake'),
+        's3_endpoint': _var('s3_endpoint', 'S3_ENDPOINT', ''),
+        's3_access_key': _var('s3_access_key', 'S3_ACCESS_KEY', ''),
+        's3_secret_key': _var('s3_secret_key', 'S3_SECRET_KEY', ''),
 
         # DistCp Configuration
-        'distcp_mappers': Variable.get('migration_distcp_mappers', default_var=os.getenv('MIGRATION_DISTCP_MAPPERS', '50')),
-        'distcp_bandwidth': Variable.get('migration_distcp_bandwidth', default_var=os.getenv('MIGRATION_DISTCP_BANDWIDTH', '100')),
+        'distcp_mappers': _var('migration_distcp_mappers', 'MIGRATION_DISTCP_MAPPERS', '50'),
+        'distcp_bandwidth': _var('migration_distcp_bandwidth', 'MIGRATION_DISTCP_BANDWIDTH', '100'),
 
         # Spark Configuration
         'spark_conn_id': Variable.get('migration_spark_conn_id', default_var=os.getenv('MIGRATION_SPARK_CONN_ID', 'spark_default')),
 
         # Tracking Configuration
-        'tracking_database': Variable.get('migration_tracking_database', default_var=os.getenv('MIGRATION_TRACKING_DATABASE', 'migration_tracking')),
-        'tracking_location': Variable.get('migration_tracking_location', default_var=os.getenv('MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking')),
-        'report_output_location': Variable.get('migration_report_location', default_var=os.getenv('MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports')),
+        'tracking_database': _var('migration_tracking_database', 'MIGRATION_TRACKING_DATABASE', 'migration_tracking'),
+        'tracking_location': _var('migration_tracking_location', 'MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking'),
+        'report_output_location': _var('migration_report_location', 'MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports'),
 
         # Cluster Authentication (MapR or Kerberos)
-        'auth_method': Variable.get('auth_method', default_var=os.getenv('AUTH_METHOD', 'mapr')),  # 'mapr' or 'kinit'
-        'mapr_user': Variable.get('mapr_user', default_var=os.getenv('MAPR_USER', '')),
-        'mapr_ticketfile_location': Variable.get('mapr_ticketfile_location', default_var=os.getenv('MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}')),
-        'kinit_principal': Variable.get('kinit_principal', default_var=os.getenv('KINIT_PRINCIPAL', '')),
-        'kinit_keytab': Variable.get('kinit_keytab', default_var=os.getenv('KINIT_KEYTAB', '')),
-        'kinit_password': Variable.get('kinit_password', default_var=os.getenv('KINIT_PASSWORD', '')),
+        'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr'),  # 'mapr' or 'kinit'
+        'mapr_user': _var('mapr_user', 'MAPR_USER', ''),
+        'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}'),
+        'kinit_principal': _var('kinit_principal', 'KINIT_PRINCIPAL', ''),
+        'kinit_keytab': _var('kinit_keytab', 'KINIT_KEYTAB', ''),
+        'kinit_password': _var('kinit_password', 'KINIT_PASSWORD', ''),
 
         # Listing tool
         's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
@@ -199,7 +213,7 @@ def get_config() -> dict:
 
         # Email / SMTP Configuration
         'smtp_conn_id': Variable.get('migration_smtp_conn_id', default_var=os.getenv('MIGRATION_SMTP_CONN_ID', 'smtp_default')),
-        'email_recipients': Variable.get('migration_email_recipients', default_var=os.getenv('MIGRATION_EMAIL_RECIPIENTS', '')),
+        'email_recipients': _var('migration_email_recipients', 'MIGRATION_EMAIL_RECIPIENTS', ''),
     }
 
 # SSH timeout: 24 hours
