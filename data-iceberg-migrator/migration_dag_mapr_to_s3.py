@@ -526,6 +526,14 @@ for tbl in table_list:
     input_format = None
     serde_properties = {{}}
     in_serde_section = False
+    filter_expr = "{filter_expr_escaped}"
+    row_count = 0
+    filtered_partitions = []
+    partition_filter_active = False
+    filtered_source_size = 0
+    filtered_file_count = 0
+    full_row_count = 0
+    full_partition_count = 0
     try:
         desc_df = spark.sql(
             "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
