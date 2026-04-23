@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+  <property>
+    <n>dfs.replication</n>
+    <value>1</value>
+  </property>
+  <property>
+    <n>dfs.namenode.name.dir</n>
+    <value>/hadoop/data/namenode</value>
+  </property>
+  <property>
+    <n>dfs.datanode.data.dir</n>
+    <value>/hadoop/data/datanode</value>
+  </property>
+  <property>
+    <n>dfs.permissions.enabled</n>
+    <value>false</value>
+  </property>
+</configuration>

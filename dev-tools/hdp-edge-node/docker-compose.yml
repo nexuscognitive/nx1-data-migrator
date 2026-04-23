@@ -1,0 +1,19 @@
+services:
+  hdp-edge:
+    build: .
+    container_name: hdp-edge-node
+    hostname: hdp-edge-node
+    ports:
+      - "2224:22"       # SSH  (hadoop=2222, mapr=2223, hdp=2224)
+      - "8090:8088"     # YARN UI
+      - "9872:9870"     # HDFS UI
+      - "10002:10000"   # HiveServer2
+    volumes:
+      - hdp_data:/hadoop/data
+    environment:
+      - JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+    stdin_open: true
+    tty: true
+
+volumes:
+  hdp_data:

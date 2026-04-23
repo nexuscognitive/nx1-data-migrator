@@ -1,27 +1,26 @@
-# MapR Edge Node — Dev Setup
+# HDP Edge Node — Dev Setup
 
-Docker-based environment that simulates a MapR Hadoop 2.7.0-mapr-1808 edge node
+Docker-based environment that simulates an HDP 3.1.1 Hadoop cluster edge node
 for end-to-end local testing of the `source_to_s3_migration` DAG.
 
-MapR's distribution is not publicly available, so this image uses the Apache
-upstream versions that MapR 2.7.0-mapr-1808 (MEP 5.0) is built on. The Hadoop
-APIs used by the DAG — Hive metastore queries, `hadoop distcp`, and HDFS FS
-commands — are identical between the two, making this image functionally
-equivalent for testing discover and distcp tasks.
+HDP 3.1.1 is based on Apache Hadoop 3.1.1, Hive 3.1.0, and Spark 2.4.x. The
+Hadoop APIs used by the DAG — Hive metastore queries, `hadoop distcp`, and HDFS
+FS commands — are identical to those on the real HDP cluster, making this image
+functionally equivalent for testing discover and distcp tasks.
 
 ---
 
 ## Stack
 
-| Component | This Image                            | Client (MapR)         |
-| --------- | ------------------------------------- | --------------------- |
-| OS        | Ubuntu 18.04                          | —                     |
-| Java      | OpenJDK 8                             | —                     |
-| Hadoop    | 2.7.7                                 | 2.7.0-mapr-1808       |
-| Hive      | 1.2.2                                 | MEP 5.0 (Hive 1.2.x)  |
-| Spark     | 2.3.4                                 | MEP 5.0 (Spark 2.3.x) |
-| Python    | 2.7                                   | —                     |
-| SSH port  | 2223 (user: `root`, password: `root`) | —                     |
+| Component | This Image                            | Client (HDP) |
+| --------- | ------------------------------------- | ------------ |
+| OS        | Ubuntu 20.04                          | —            |
+| Java      | OpenJDK 8                             | —            |
+| Hadoop    | 3.1.1                                 | HDP 3.1.1    |
+| Hive      | 3.1.0                                 | HDP 3.1.1    |
+| Spark     | 2.4.8                                 | HDP 3.1.1    |
+| Python    | 3.x                                   | —            |
+| SSH port  | 2224 (user: `root`, password: `root`) | —            |
 
 ---
 
@@ -36,7 +35,7 @@ equivalent for testing discover and distcp tasks.
 ## Directory Structure
 
 ```
-dev-tools/mapr-edge-node/
+dev-tools/hdp-edge-node/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── README.md
@@ -59,12 +58,12 @@ dev-tools/mapr-edge-node/
 
 ## Quick Start
 
-All commands run from a terminal in the `dev-tools/mapr-edge-node/` directory.
+All commands run from a terminal in the `dev-tools/hdp-edge-node/` directory.
 On Windows use PowerShell; on Linux/Mac use bash.
 
 ### Step 1 — Build the image
 
-> First build downloads ~1.2 GB and takes 20–40 minutes.
+> First build downloads ~1.5 GB and takes 25–45 minutes.
 > Subsequent builds use Docker layer cache and finish in under 30 seconds.
 
 ```powershell
@@ -84,38 +83,39 @@ docker compose build --no-cache
 docker compose up -d
 ```
 
-Wait ~90 seconds for HiveServer2 to be ready, then check:
+Wait ~90–120 seconds for HiveServer2 to be ready, then check:
 
 ```powershell
-docker logs mapr-edge-node --tail 10
+docker logs hdp-edge-node --tail 10
 ```
 
 Expected output:
 
 ```
 ===============================
-MapR-equivalent edge node ready!
-Hadoop: 2.7.7 (simulates MapR 2.7.0-mapr-1808)
-Hive:   1.2.2
-Spark:  2.3.4
-SSH:  ssh root@localhost -p 2223  (password: root)
-HDFS: http://localhost:9871
-YARN: http://localhost:8089
+HDP-equivalent edge node ready!
+Hadoop: 3.1.1 (simulates HDP 3.1.1)
+Hive:   3.1.0
+Spark:  2.4.8
+SSH:  ssh root@localhost -p 2224  (password: root)
+HDFS: http://localhost:9872
+YARN: http://localhost:8090
 ===============================
 ```
 
-If the banner never appears after 2 minutes, see [Troubleshooting](#troubleshooting).
+If the banner never appears after 3 minutes, see [Troubleshooting](#troubleshooting).
 
 ### Step 3 — Verify services
 
 ```powershell
-docker exec -u root mapr-edge-node hdfs dfsadmin -report
+docker exec -u root hdp-edge-node hdfs dfsadmin -report
 # Expected: Live datanodes (1)
 
-docker exec -u root mapr-edge-node netstat -tlnp 2>/dev/null | grep -e 9083 -e 10000
+docker exec -u root hdp-edge-node netstat -tlnp 2>/dev/null | grep -e 9083 -e 10000
 # Expected: both ports listening (9083 = metastore thrift, 10000 = HiveServer2)
 
-docker exec -u root mapr-edge-node /opt/hive/bin/beeline -u jdbc:hive2://localhost:10000 --silent=true -e "SHOW DATABASES;"
+docker exec -u root hdp-edge-node /opt/hive/bin/beeline `
+  -u jdbc:hive2://localhost:10000 --silent=true -e "SHOW DATABASES;"
 # Expected: default
 ```
 
@@ -124,7 +124,7 @@ docker exec -u root mapr-edge-node /opt/hive/bin/beeline -u jdbc:hive2://localho
 Run once after starting the container (or after any full reset):
 
 ```powershell
-docker exec -u root mapr-edge-node bash /setup-test-data.sh
+docker exec -u root hdp-edge-node bash /setup-test-data.sh
 ```
 
 This creates 4 databases and 10 tables covering the migration DAG test cases.
@@ -134,9 +134,9 @@ See [Test Data Reference](#test-data-reference) below for the full table invento
 
 ```powershell
 # Clear stale host key if you rebuilt the image
-ssh-keygen -f "$env:USERPROFILE\.ssh\known_hosts" -R '[localhost]:2223'
+ssh-keygen -f "$env:USERPROFILE\.ssh\known_hosts" -R '[localhost]:2224'
 
-ssh root@localhost -p 2223
+ssh root@localhost -p 2224
 # password: root
 ```
 
@@ -144,7 +144,7 @@ ssh root@localhost -p 2223
 
 ## Connecting to Airflow for End-to-End Testing
 
-The nx1 tenant Airflow runs in Kubernetes and cannot reach `localhost:2223`
+The nx1 tenant Airflow runs in Kubernetes and cannot reach `localhost:2224`
 directly. Use a TCP tunnel to expose the container's SSH port publicly.
 
 ### Step 1 — Install bore (one time, in WSL)
@@ -159,7 +159,7 @@ curl -sSL https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x
 Open a dedicated terminal and keep it running throughout your test session:
 
 ```bash
-bore local 2223 --to bore.pub
+bore local 2224 --to bore.pub
 # Output: listening at bore.pub:XXXXX  ← note this port number
 ```
 
@@ -218,7 +218,7 @@ Also writes `partition_utils.py` alongside it, exactly as the DAG does via SFTP.
 **Signature:**
 
 ```powershell
-docker exec -u root mapr-edge-node bash /test-discover.sh `
+docker exec -u root hdp-edge-node bash /test-discover.sh `
   <src_db> <tables> <dest_db> <dest_bucket> [partition_filter]
 ```
 
@@ -229,31 +229,31 @@ No special quoting needed — `tables` accepts comma-separated names or `*`.
 Single table:
 
 ```powershell
-docker exec -u root mapr-edge-node bash /test-discover.sh sales_db orders sales_db s3a://my-bucket 2>$null
+docker exec -u root hdp-edge-node bash /test-discover.sh sales_db orders sales_db s3a://my-bucket 2>$null
 ```
 
 All tables in a database (wildcard):
 
 ```powershell
-docker exec -u root mapr-edge-node bash /test-discover.sh hr_db "*" hr_db s3a://my-bucket 2>$null
+docker exec -u root hdp-edge-node bash /test-discover.sh hr_db "*" hr_db s3a://my-bucket 2>$null
 ```
 
 Multiple specific tables:
 
 ```powershell
-docker exec -u root mapr-edge-node bash /test-discover.sh sales_db orders,customers sales_db s3a://my-bucket 2>$null
+docker exec -u root hdp-edge-node bash /test-discover.sh sales_db orders,customers sales_db s3a://my-bucket 2>$null
 ```
 
 Table with partition filter:
 
 ```powershell
-docker exec -u root mapr-edge-node bash /test-discover.sh logs_db app_logs logs_db s3a://my-bucket dt>=2024-01-15 2>$null
+docker exec -u root hdp-edge-node bash /test-discover.sh logs_db app_logs logs_db s3a://my-bucket dt>=2024-01-15 2>$null
 ```
 
 3-level partition:
 
 ```powershell
-docker exec -u root mapr-edge-node bash /test-discover.sh analytics_db events analytics_db s3a://my-bucket 2>$null
+docker exec -u root hdp-edge-node bash /test-discover.sh analytics_db events analytics_db s3a://my-bucket 2>$null
 ```
 
 > The `2>$null` suffix suppresses Spark INFO/WARN log noise. Remove it if you
@@ -283,13 +283,13 @@ per-partition path.
 
 > **Container-only note:** This script adds `-Dmapreduce.framework.name=local`
 > to the `hadoop distcp` call. This is required because YARN cannot launch
-> MapReduce containers inside Docker (Hadoop 2.7.x limitation). This flag is
-> **not** in the DAG — real MapR clusters run YARN normally.
+> MapReduce containers inside Docker. This flag is **not** in the DAG — real
+> HDP clusters run YARN normally.
 
 **Signature:**
 
 ```powershell
-docker exec -u root mapr-edge-node bash /test-distcp.sh `
+docker exec -u root hdp-edge-node bash /test-distcp.sh `
   <source_location> <s3_location> [mappers] [bandwidth] [partition_filter_active] [filtered_partitions_json]
 ```
 
@@ -298,7 +298,7 @@ docker exec -u root mapr-edge-node bash /test-distcp.sh `
 Full table copy, HDFS → HDFS (local testing, no AWS creds needed):
 
 ```powershell
-docker exec -u root mapr-edge-node bash /test-distcp.sh `
+docker exec -u root hdp-edge-node bash /test-distcp.sh `
   hdfs://localhost:9000/user/hive/warehouse/sales_db.db/orders `
   hdfs://localhost:9000/tmp/distcp-test/orders 2>$null
 ```
@@ -306,7 +306,7 @@ docker exec -u root mapr-edge-node bash /test-distcp.sh `
 Run the same command again to test the incremental (`-update -delete`) path:
 
 ```powershell
-docker exec -u root mapr-edge-node bash /test-distcp.sh `
+docker exec -u root hdp-edge-node bash /test-distcp.sh `
   hdfs://localhost:9000/user/hive/warehouse/sales_db.db/orders `
   hdfs://localhost:9000/tmp/distcp-test/orders 2>$null
 ```
@@ -315,8 +315,8 @@ Partition filter active — write the JSON array via Python first to avoid
 PowerShell quoting issues, then pass it:
 
 ```powershell
-docker exec -u root mapr-edge-node python2.7 -c "import json; open('/tmp/parts.json','w').write(json.dumps(['dt=2024-01-15','dt=2024-02-01'],separators=(',',':')))"
-docker exec -u root mapr-edge-node bash -c 'PARTS=$(cat /tmp/parts.json) && bash /test-distcp.sh hdfs://localhost:9000/user/hive/warehouse/logs_db.db/app_logs hdfs://localhost:9000/tmp/distcp-test/app_logs 1 100 true "$PARTS"'
+docker exec -u root hdp-edge-node python3 -c "import json; open('/tmp/parts.json','w').write(json.dumps(['dt=2024-01-15','dt=2024-02-01'],separators=(',',':')))"
+docker exec -u root hdp-edge-node bash -c 'PARTS=$(cat /tmp/parts.json) && bash /test-distcp.sh hdfs://localhost:9000/user/hive/warehouse/logs_db.db/app_logs hdfs://localhost:9000/tmp/distcp-test/app_logs 1 100 true "$PARTS"'
 ```
 
 Real S3 destination — pass AWS credentials via `-e`:
@@ -326,7 +326,7 @@ docker exec -u root `
   -e AWS_ACCESS_KEY_ID=AKIA... `
   -e AWS_SECRET_ACCESS_KEY=... `
   -e S3_ENDPOINT=https://s3.amazonaws.com `
-  mapr-edge-node bash /test-distcp.sh `
+  hdp-edge-node bash /test-distcp.sh `
   hdfs://localhost:9000/user/hive/warehouse/sales_db.db/orders `
   s3a://your-bucket/dest-db/orders
 ```
@@ -344,17 +344,17 @@ docker exec -u root `
 
 ## Useful Commands
 
-| Task                   | Command                                                       |
-| ---------------------- | ------------------------------------------------------------- |
-| Start container        | `docker compose up -d`                                        |
-| Stop (keep data)       | `docker compose down`                                         |
-| Full reset (wipe data) | `docker compose down -v && docker compose up -d`              |
-| View logs              | `docker logs -f mapr-edge-node`                               |
-| Restart                | `docker restart mapr-edge-node`                               |
-| Run a command          | `docker exec -u root mapr-edge-node <cmd>`                    |
-| Populate test data     | `docker exec -u root mapr-edge-node bash /setup-test-data.sh` |
-| HDFS Web UI            | http://localhost:9871                                         |
-| YARN Web UI            | http://localhost:8089                                         |
+| Task                   | Command                                                      |
+| ---------------------- | ------------------------------------------------------------ |
+| Start container        | `docker compose up -d`                                       |
+| Stop (keep data)       | `docker compose down`                                        |
+| Full reset (wipe data) | `docker compose down -v && docker compose up -d`             |
+| View logs              | `docker logs -f hdp-edge-node`                               |
+| Restart                | `docker restart hdp-edge-node`                               |
+| Run a command          | `docker exec -u root hdp-edge-node <cmd>`                    |
+| Populate test data     | `docker exec -u root hdp-edge-node bash /setup-test-data.sh` |
+| HDFS Web UI            | http://localhost:9872                                        |
+| YARN Web UI            | http://localhost:8090                                        |
 
 ---
 
@@ -420,55 +420,80 @@ For `analytics_db.events`:
 
 ### Container never prints the ready banner
 
-HiveServer2 takes ~90 seconds to start after a fresh build because the metastore
-thrift service must bind on port 9083 before HiveServer2 can connect to it.
-Check if both are up:
+HDP takes longer than MapR to start (~2–3 minutes on first run) because Hadoop 3.x
+initialises more services and the Guava/metastore schema setup takes longer.
+Check if both Hive services are up:
 
 ```powershell
-docker exec -u root mapr-edge-node netstat -tlnp 2>/dev/null | grep -e 9083 -e 10000
+docker exec -u root hdp-edge-node netstat -tlnp 2>/dev/null | grep -e 9083 -e 10000
 ```
 
 If only 9083 is shown, HiveServer2 is still starting — wait another 30 seconds.
-If neither port is shown after 3 minutes, the HDFS volume may be corrupted. Wipe it:
+If neither port is shown after 4 minutes, wipe the volume and restart:
 
 ```powershell
 docker compose down -v
 docker compose up -d
 ```
 
-### Hive errors after `docker restart`
+### `start-dfs.sh` or `start-yarn.sh` fails with "user not set" error
 
-After a restart the container takes ~90 seconds to become ready, not 30. The
-metastore thrift service must start and bind to 9083 before HiveServer2 can
-start. Wait for both ports to appear in netstat before running tests:
+Hadoop 3.x requires explicit user env vars (`HDFS_NAMENODE_USER`, etc.) that
+Hadoop 2.x inferred automatically. These are set in both `hadoop-env.sh` and
+`entrypoint.sh`. If you see this error, the image needs to be rebuilt:
 
 ```powershell
-docker exec -u root mapr-edge-node netstat -tlnp 2>/dev/null | grep -e 9083 -e 10000
+docker compose build --no-cache
+```
+
+### Guava `NoSuchMethodError` on startup
+
+```
+NoSuchMethodError: com.google.common.base.Preconditions.checkArgument
+```
+
+Hive 3.1.0 ships `guava-19.0.jar` but Hadoop 3.1.1 requires `guava-27.0-jre.jar`.
+The Dockerfile already fixes this at build time. If you see this error, verify
+the Guava fix was applied and rebuild:
+
+```powershell
+docker exec -u root hdp-edge-node ls /opt/hive/lib/guava*.jar
+# Should show: guava-27.0-jre.jar only — if guava-19 is present, rebuild
+docker compose build --no-cache
+```
+
+### Hive errors after `docker restart`
+
+After a restart the container takes ~2 minutes to become fully ready. The
+metastore thrift service must start and bind to port 9083 before HiveServer2
+can connect. Wait for both ports to appear before running tests:
+
+```powershell
+docker exec -u root hdp-edge-node netstat -tlnp 2>/dev/null | grep -e 9083 -e 10000
 ```
 
 **Never kill HiveServer2 manually.** If you do, restart the whole container
-with `docker restart mapr-edge-node` and wait ~90 seconds. Manually restarting
-just HiveServer2 does not work in this container because the entropy and startup
-environment are only set correctly by the entrypoint.
+with `docker restart hdp-edge-node` and wait ~2 minutes. Manually restarting
+just HiveServer2 does not work because the entropy and startup environment are
+only set correctly by the entrypoint.
 
 ### `Database 'X' not found` in PySpark discover
 
 Test data has not been populated. Run:
 
 ```powershell
-docker exec -u root mapr-edge-node bash /setup-test-data.sh
+docker exec -u root hdp-edge-node bash /setup-test-data.sh
 ```
 
 ### `Unable to instantiate SessionHiveMetaStoreClient` in PySpark
 
-The metastore thrift service on port 9083 is not running. This should not
-happen after a normal start, but if it does, restart the container:
+The metastore thrift service on port 9083 is not running. Restart the container:
 
 ```powershell
-docker restart mapr-edge-node
+docker restart hdp-edge-node
 ```
 
-Wait 90 seconds, verify both 9083 and 10000 are listening, then re-run setup.
+Wait 2 minutes, verify both 9083 and 10000 are listening, then re-run setup.
 
 ### YARN container launch failure in distcp
 
@@ -476,23 +501,30 @@ Wait 90 seconds, verify both 9083 and 10000 are listening, then re-run setup.
 AM Container for appattempt_XXX exited with exitCode: 1
 ```
 
-This is expected in Docker. Hadoop 2.7.x cannot launch YARN MapReduce containers
-inside a Docker container due to cgroup limitations. `test-distcp.sh` already
-works around this with `-Dmapreduce.framework.name=local`. This flag is only in
-the test script — the DAG itself does not include it, so real MapR clusters are
+This is expected in Docker. YARN cannot launch MapReduce containers inside a
+Docker container due to cgroup limitations. `test-distcp.sh` already works
+around this with `-Dmapreduce.framework.name=local`. This flag is only in the
+test script — the DAG itself does not include it, so real HDP clusters are
 unaffected.
 
-### PySpark exits with `ClassNotFoundException` or `NoSuchMethodError`
+### `SPARK_DIST_CLASSPATH` not set over SSH
 
-The Spark and Hive JAR versions in this image are pinned to match MapR MEP 5.0.
-Do not modify the versions in the Dockerfile without testing the combination.
+PySpark needs `SPARK_DIST_CLASSPATH=$(hadoop classpath)` to find Hadoop 3.x JARs
+since the Spark 2.4.8 binary was built for Hadoop 2.7. This is set in
+`profile-additions.sh` and sourced by all SSH sessions. If PySpark fails with
+`ClassNotFoundException` for Hadoop classes, verify:
+
+```powershell
+docker exec -u root hdp-edge-node bash -l -c 'echo $SPARK_DIST_CLASSPATH' | head -c 80
+# Should print a long classpath starting with /opt/hadoop/...
+```
 
 ### Script fails with `\r: command not found`
 
 Windows line endings crept in. Fix all scripts at once:
 
 ```powershell
-docker exec -u root mapr-edge-node bash -c 'sed -i "s/\r//" /test-discover.sh /test-distcp.sh /setup-test-data.sh /entrypoint.sh'
+docker exec -u root hdp-edge-node bash -c 'sed -i "s/\r//" /test-discover.sh /test-distcp.sh /setup-test-data.sh /entrypoint.sh'
 ```
 
 ### bore tunnel drops during a DAG run
@@ -503,11 +535,11 @@ connection with the new port, and re-trigger the DAG from the failed task.
 ### Passing JSON partition arrays from PowerShell
 
 PowerShell strips double-quotes from arguments before passing them to external
-programs. To pass a JSON array to `test-distcp.sh`, write it via Python first:
+programs. Write the JSON via Python first:
 
 ```powershell
-docker exec -u root mapr-edge-node python2.7 -c "import json; open('/tmp/parts.json','w').write(json.dumps(['dt=2024-01-15','dt=2024-02-01'],separators=(',',':')))"
-docker exec -u root mapr-edge-node bash -c 'PARTS=$(cat /tmp/parts.json) && bash /test-distcp.sh <source> <dest> 1 100 true "$PARTS"'
+docker exec -u root hdp-edge-node python3 -c "import json; open('/tmp/parts.json','w').write(json.dumps(['dt=2024-01-15','dt=2024-02-01'],separators=(',',':')))"
+docker exec -u root hdp-edge-node bash -c 'PARTS=$(cat /tmp/parts.json) && bash /test-distcp.sh <source> <dest> 1 100 true "$PARTS"'
 ```
 
 ### Running alongside other edge node containers
