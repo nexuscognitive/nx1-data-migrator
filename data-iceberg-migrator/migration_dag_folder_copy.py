@@ -37,8 +37,18 @@ if os.path.isdir(_config_dir):
 else:
     logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
 
+def _resolve_dag_owner() -> str:
+    try:
+        from airflow.models import Variable
+        owner = Variable.get('migration_dag_owner', default_var='')
+        if owner:
+            return owner
+    except Exception:
+        pass
+    return 'data-migration'
+
 default_args = {
-    'owner': 'data-migration',
+    'owner': _resolve_dag_owner(),
     'depends_on_past': False,
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
@@ -724,7 +734,7 @@ def finalize_data_copy_run(run_id: str, spark) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark) -> dict:
+def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **context) -> dict:
     """Generate HTML report for folder-only data copy run and write to S3."""
     from datetime import datetime
 
@@ -926,7 +936,9 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark) ->
 </html>
 """
 
-    report_path = f"{report_location}/{run_id}_data_copy_report.html"
+    portal_run_id = context.get('params', {}).get('run_id') or run_id
+    report_filename = f"{portal_run_id}_report.html"
+    report_path = f"{report_location}/{report_filename}"
     hadoop_conf = spark._jsc.hadoopConfiguration()
     fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
         spark._jvm.java.net.URI(report_path),
@@ -1069,7 +1081,8 @@ with DAG(
     # Report and email
     t_fc_report = generate_data_copy_html_report.override(trigger_rule='all_done')(
         run_id=t_fc_run_id,
-        finalize_result=t_fc_final
+        finalize_result=t_fc_final,
+        params="{{ params }}"
     )
 
     t_fc_email = send_data_copy_report_email.override(trigger_rule='all_done')(

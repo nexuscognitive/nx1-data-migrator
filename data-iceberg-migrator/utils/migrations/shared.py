@@ -140,12 +140,12 @@ def normalize_s3(path: str) -> str:
     if not path:
         return path
     if path.startswith('s3n://'):
-        return 's3a://' + path[6:]
-    if path.startswith('s3://'):
-        return 's3a://' + path[5:]
-    if not path.startswith('s3a://'):
-        return 's3a://' + path
-    return path
+        path = 's3a://' + path[6:]
+    elif path.startswith('s3://'):
+        path = 's3a://' + path[5:]
+    elif not path.startswith('s3a://'):
+        path = 's3a://' + path
+    return path.rstrip('/')
 
 # =============================================================================
 # SHARED CONFIGURATION
@@ -166,6 +166,7 @@ def get_config() -> dict:
             if scoped is not None:
                 return scoped
         return Variable.get(base_key, default_var=os.getenv(env_var, default))
+
 
     return {
         # SSH Configuration (for MapR migration)
@@ -214,6 +215,8 @@ def get_config() -> dict:
         # Email / SMTP Configuration
         'smtp_conn_id': Variable.get('migration_smtp_conn_id', default_var=os.getenv('MIGRATION_SMTP_CONN_ID', 'smtp_default')),
         'email_recipients': _var('migration_email_recipients', 'MIGRATION_EMAIL_RECIPIENTS', ''),
+
+        'dag_owner': _var('migration_dag_owner', 'MIGRATION_DAG_OWNER', ''),
     }
 
 # SSH timeout: 24 hours

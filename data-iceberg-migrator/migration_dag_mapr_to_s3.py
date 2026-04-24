@@ -47,8 +47,18 @@ if os.path.isdir(_config_dir):
 else:
     logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
 
+def _resolve_dag_owner() -> str:
+    try:
+        from airflow.models import Variable
+        owner = Variable.get('migration_dag_owner', default_var='')
+        if owner:
+            return owner
+    except Exception:
+        pass
+    return 'data-migration'
+
 default_args = {
-    'owner': 'data-migration',
+    'owner': _resolve_dag_owner(),
     'depends_on_past': False,
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
@@ -694,7 +704,7 @@ for tbl in table_list:
 
             schema.append({{"name": col_name, "type": data_type}})
 
-        s3_location = "{{0}}/{{1}}/{{2}}".format(dest_bucket, dest_db, tbl)
+        s3_location = "{{0}}/{{1}}/{{2}}".format(dest_bucket.rstrip('/'), dest_db, tbl)
 
         metadata.append({{
             "source_database": src_db,
@@ -732,7 +742,7 @@ for tbl in table_list:
             "dest_database": dest_db,
             "dest_bucket": dest_bucket,
             "source_location": "",
-            "s3_location": dest_bucket + "/" + dest_db + "/" + tbl,
+            "s3_location": dest_bucket.rstrip('/') + "/" + dest_db + "/" + tbl,
             "file_format": "PARQUET",
             "schema": [],
             "partitions": [],
@@ -2044,7 +2054,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def generate_html_report(run_id: str, spark) -> str:
+def generate_html_report(run_id: str, spark, **context) -> str:
     """Generate comprehensive HTML migration report."""
     from datetime import datetime
 
@@ -2590,7 +2600,8 @@ def generate_html_report(run_id: str, spark) -> str:
 """
 
     # Write HTML to S3
-    report_filename = f"{run_id}_report.html"
+    portal_run_id = context.get('params', {}).get('run_id') or run_id
+    report_filename = f"{portal_run_id}_report.html"
     report_path = f"{report_location}/{report_filename}"
 
     # Use Spark to write HTML
@@ -2811,7 +2822,7 @@ with DAG(
     t_val_status.operator.trigger_rule = 'all_done'
 
     # Report generation
-    t_report = generate_html_report(run_id=t_run_id)
+    t_report = generate_html_report(run_id=t_run_id, params="{{ params }}")
     t_report.operator.trigger_rule = 'all_done'
 
     # Email report
