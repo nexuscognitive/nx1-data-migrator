@@ -510,6 +510,22 @@ def _map_iceberg_type(iceberg_type):
     return 'STRING'
 
 
+def _rebase_table_path(table_path: str, from_prefix: str, to_prefix: str) -> str:
+    """Return table_path with its leading from_prefix replaced by to_prefix.
+
+    Raises ValueError if table_path does not start with from_prefix, which
+    would indicate a misconfigured Excel row (dest path outside dest_prefix).
+    """
+    base = from_prefix.rstrip('/')
+    if not table_path.startswith(base):
+        raise ValueError(
+            f"table_path {table_path!r} does not start with prefix {base!r} — "
+            "check that source_s3_prefix / dest_s3_prefix in the Excel config "
+            "match the actual table locations"
+        )
+    return to_prefix.rstrip('/') + table_path[len(base):]
+
+
 def _resolve_metadata_file(spark, table_path):
     """Resolve the path to the latest Iceberg metadata.json file for a table."""
     from py4j.java_gateway import java_import

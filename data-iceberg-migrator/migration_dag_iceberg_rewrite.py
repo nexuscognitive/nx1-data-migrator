@@ -143,6 +143,7 @@ def init_rewrite_tracking_tables(spark) -> dict:
             row_count_match                 BOOLEAN,
             partition_count_match           BOOLEAN,
             schema_match                    BOOLEAN,
+            path_rewrite_verified           BOOLEAN,
             schema_differences              STRING,
             overall_status  STRING,
             error_message   STRING,
@@ -283,7 +284,7 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
     dest_prefix = db_config['dest_s3_prefix']
     source_prefix = db_config['source_s3_prefix']
     tokens = db_config.get('table_tokens', ['*'])
-    db_path = f"{dest_prefix.rstrip('/')}/{database}"
+    tables_root = dest_prefix.rstrip('/')
 
     apply_bucket_credentials(
         spark, dest_prefix,
@@ -292,7 +293,7 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
         config.get('_dest_secret_key', ''),
     )
 
-    available_tables = _list_iceberg_tables(spark, db_path)
+    available_tables = _list_iceberg_tables(spark, tables_root)
     matched = _match_tokens(available_tables, tokens)
 
     logger.info(
@@ -302,7 +303,7 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
 
     metadata_list = []
     for tbl_name in matched:
-        dest_path = f"{db_path}/{tbl_name}"
+        dest_path = f"{tables_root}/{tbl_name}"
         full_name = f"{database}.{tbl_name}"
 
         try:
@@ -454,7 +455,7 @@ def record_rewrite_discovered_tables(discovery: dict, spark) -> dict:
                     table_already_existed,
                     validation_status, validation_completed_at, validation_duration_seconds,
                     dest_hive_row_count, dest_partition_count, source_partition_count,
-                    row_count_match, partition_count_match, schema_match, schema_differences,
+                    row_count_match, partition_count_match, schema_match, path_rewrite_verified, schema_differences,
                     overall_status, error_message, updated_at
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
@@ -470,7 +471,7 @@ def record_rewrite_discovered_tables(discovery: dict, spark) -> dict:
                     NULL, NULL, NULL, NULL,
                     NULL, NULL, NULL,
                     NULL, NULL, {t['partition_count']},
-                    NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL,
                     'DISCOVERED', NULL, current_timestamp()
                 )
             """, task_label=f"record_rewrite_discovered_tables:insert:{t['source_table']}")
@@ -649,24 +650,11 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
       5. Permanently register in HMS via register_table using the rewritten
          metadata now present at dest_path/metadata.
     """
-    from utils.migrations.shared import _resolve_metadata_file
+    from utils.migrations.shared import _rebase_table_path, _resolve_metadata_file
 
     if not isinstance(presence_result, dict) or 'tables' not in presence_result:
         logger.warning("[create_rewrite_dest_tables] Skipping invalid input")
         return {}
-
-    def _delete_hadoop_dir(path):
-        from py4j.java_gateway import java_import
-        java_import(spark._jvm, 'org.apache.hadoop.fs.*')
-        conf = spark._jsc.hadoopConfiguration()
-        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-            spark._jvm.java.net.URI(path), conf
-        )
-        path_obj = spark._jvm.org.apache.hadoop.fs.Path(path)
-        if fs.exists(path_obj):
-            fs.delete(path_obj, True)
-            logger.info(f"[create_rewrite_dest_tables] Deleted {path}")
-
 
     config = get_config()
     configure_spark_s3(spark, config)
@@ -702,7 +690,6 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
 
         dest_path = t['dest_location']
         full_name = f"{dest_db}.{tbl}"
-        staging_path = f"{dest_prefix}/{dest_db}/_staging_rewrite/{tbl}"
 
         apply_bucket_credentials(
             spark, dest_path,
@@ -729,11 +716,7 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
             # rewrite_table_path rewrites source/ → dest/ paths and writes the
             # new metadata directly to dest_path/metadata, so the source metadata
             # must be registered here for it to find the original path references.
-            source_table_path = dest_path.replace(
-                dest_prefix.rstrip('/'),
-                source_prefix.rstrip('/'),
-                1
-            )
+            source_table_path = _rebase_table_path(dest_path, dest_prefix, source_prefix)
             source_metadata_file = _resolve_metadata_file(spark, source_table_path)
             spark.sql(f"""
                 CALL spark_catalog.system.register_table(
@@ -755,10 +738,9 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
                 )
             spark.sql(f"""
                 CALL spark_catalog.system.rewrite_table_path(
-                    table            => '{full_name}',
-                    source_prefix    => '{source_prefix}',
-                    target_prefix    => '{dest_prefix}',
-                    staging_location => '{staging_path}'
+                    table         => '{full_name}',
+                    source_prefix => '{source_prefix}',
+                    target_prefix => '{dest_prefix}'
                 )
             """)
             logger.info(f"[create_rewrite_dest_tables] rewrite_table_path completed for {full_name}")
@@ -796,9 +778,6 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
                 f"{imported_row_count} rows, {imported_partition_count} partitions"
             )
 
-            with contextlib.suppress(Exception):
-                _delete_hadoop_dir(staging_path)
-
             results.append({
                 'source_table': tbl,
                 'status': 'COMPLETED',
@@ -811,8 +790,6 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
         except Exception as e:
             error_msg = str(e)[:2000]
             logger.error(f"[create_rewrite_dest_tables] FAILED for {full_name}: {error_msg}")
-            with contextlib.suppress(Exception):
-                _delete_hadoop_dir(staging_path)
             results.append({
                 'source_table': tbl,
                 'status': 'FAILED',
@@ -999,10 +976,27 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
                 if src_partition_count > 0 else True
             )
 
+            # Path rewrite check — verify metadata no longer references source paths
+            path_rewrite_verified = True
+            src_prefix = t.get('source_s3_prefix', '').rstrip('/')
+            try:
+                from utils.migrations.shared import _read_iceberg_metadata
+                dest_metadata = _read_iceberg_metadata(spark, t['dest_location'])
+                metadata_str = json.dumps(dest_metadata)
+                if src_prefix and src_prefix in metadata_str:
+                    path_rewrite_verified = False
+            except Exception as path_e:
+                logger.warning(
+                    f"[validate_rewrite_destination_tables] Could not verify path rewrite "
+                    f"for {dest_tbl}: {path_e}"
+                )
+                path_rewrite_verified = False
+
             match_str = (
                 f"rows={'✓' if row_count_match else '✗'} "
                 f"parts={'✓' if partition_count_match else '⚠'} "
-                f"schema={'✓' if schema_match else '✗'}"
+                f"schema={'✓' if schema_match else '✗'} "
+                f"paths={'✓' if path_rewrite_verified else '✗'}"
             )
             logger.info(f"[validate_rewrite_destination_tables] {dest_tbl} | {match_str}")
 
@@ -1013,6 +1007,8 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
                 mismatch_parts.append(f"Partition mismatch: source={src_partition_count} dest={dest_partition_count}")
             if not schema_match:
                 mismatch_parts.append(f"Schema differences: {'; '.join(schema_diffs[:3])}")
+            if not path_rewrite_verified:
+                mismatch_parts.append(f"Metadata still contains source paths ({src_prefix})")
 
             validation_results.append({
                 'source_table': tbl,
@@ -1024,6 +1020,7 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
                 'row_count_match': row_count_match,
                 'partition_count_match': partition_count_match,
                 'schema_match': schema_match,
+                'path_rewrite_verified': path_rewrite_verified,
                 'schema_differences': '; '.join(schema_diffs),
                 'error': '; '.join(mismatch_parts) if mismatch_parts else None,
             })
@@ -1070,7 +1067,8 @@ def update_rewrite_validation_status(validation_result: dict, spark) -> dict:
         is_validated = (
             v.get('row_count_match', False) and
             v.get('partition_count_match', False) and
-            v.get('schema_match', False)
+            v.get('schema_match', False) and
+            v.get('path_rewrite_verified', False)
         )
         final_status = 'VALIDATED' if is_validated else 'VALIDATION_FAILED'
         error_message_sql = 'NULL' if is_validated else f"'{error_msg}'"
@@ -1086,6 +1084,7 @@ def update_rewrite_validation_status(validation_result: dict, spark) -> dict:
                 row_count_match = {str(v.get('row_count_match', False)).lower()},
                 partition_count_match = {str(v.get('partition_count_match', False)).lower()},
                 schema_match = {str(v.get('schema_match', False)).lower()},
+                path_rewrite_verified = {str(v.get('path_rewrite_verified', False)).lower()},
                 schema_differences = '{schema_diffs}',
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
@@ -1109,6 +1108,7 @@ def update_rewrite_validation_status(validation_result: dict, spark) -> dict:
                 UPDATE {tracking_db}.rewrite_migration_table_status
                 SET validation_status = 'FAILED',
                     overall_status = 'VALIDATION_FAILED',
+                    path_rewrite_verified = false,
                     error_message = '{per_err}',
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
@@ -1276,13 +1276,16 @@ def generate_rewrite_html_report(run_id: str, spark) -> dict:
     <th>Database</th><th>Table</th>
     <th>Source Rows</th><th>Dest Rows</th><th>Row Match</th>
     <th>Src Parts</th><th>Dest Parts</th><th>Part Match</th>
-    <th>Schema Match</th>
+    <th>Schema Match</th><th>Path Rewrite</th>
   </tr></thead><tbody>
 """
     for t in table_status:
         if not t.validation_status or t.validation_status == 'SKIPPED':
             continue
-        rm, pm, sm = t.row_count_match, t.partition_count_match, t.schema_match
+        rm, pm, sm, pr = (
+            t.row_count_match, t.partition_count_match,
+            t.schema_match, t.path_rewrite_verified,
+        )
         html += f"""
   <tr>
     <td>{t.source_database}</td>
@@ -1294,6 +1297,7 @@ def generate_rewrite_html_report(run_id: str, spark) -> dict:
     <td class="metric">{t.dest_partition_count or 0}</td>
     <td class="{'vp' if pm else 'vw'}">{'✓ PASS' if pm else '⚠ WARN'}</td>
     <td class="{'vp' if sm else 'vf'}">{'✓ PASS' if sm else '✗ FAIL'}</td>
+    <td class="{'vp' if pr else 'vf'}">{'✓ PASS' if pr else '✗ FAIL'}</td>
   </tr>"""
 
     html += """
