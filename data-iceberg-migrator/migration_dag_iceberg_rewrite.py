@@ -286,92 +286,8 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
     tokens = db_config.get('table_tokens', ['*'])
     tables_root = dest_prefix.rstrip('/')
 
-    apply_bucket_credentials(
-        spark, dest_prefix,
-        config.get('_dest_endpoint', ''),
-        config.get('_dest_access_key', ''),
-        config.get('_dest_secret_key', ''),
-    )
-
-    available_tables = _list_iceberg_tables(spark, tables_root)
-    matched = _match_tokens(available_tables, tokens)
-
-    logger.info(
-        f"[discover_rewrite_tables] '{database}': {len(available_tables)} table(s) found, "
-        f"{len(matched)} matched tokens {tokens[:5]}"
-    )
-
+    # Initialise early so the except block can always push partial results to xcom.
     metadata_list = []
-    for tbl_name in matched:
-        dest_path = f"{tables_root}/{tbl_name}"
-        full_name = f"{database}.{tbl_name}"
-
-        try:
-            iceberg_meta = _read_iceberg_metadata(spark, dest_path)
-            schema = _extract_schema(iceberg_meta)
-            partition_spec, is_partitioned = _extract_partition_spec(iceberg_meta)
-            row_count = _extract_row_count(iceberg_meta)
-            file_format = iceberg_meta.get('properties', {}).get(
-                'write.format.default', 'parquet'
-            ).upper()
-            format_version = str(iceberg_meta.get('format-version', 2))
-            file_count, total_size = _get_fs_stats(spark, dest_path)
-
-            logger.info(
-                f"[discover_rewrite_tables] {full_name} | fmt={file_format} | "
-                f"rows={row_count} | size={total_size / (1024 ** 2):.1f}MB | "
-                f"partitioned={is_partitioned}"
-            )
-
-            metadata_list.append({
-                'source_database': database,
-                'source_table': tbl_name,
-                'dest_database': database,
-                'source_location': dest_path,
-                'dest_location': dest_path,
-                'source_s3_prefix': source_prefix,
-                'dest_s3_prefix': dest_prefix,
-                'file_format': file_format,
-                'table_type': 'ICEBERG',
-                'schema': schema,
-                'partition_columns': ','.join(
-                    p['source_column'] for p in partition_spec
-                ),
-                'partition_spec_detail': partition_spec,
-                'partitions': [],
-                'partition_count': 0,
-                'is_partitioned': is_partitioned,
-                'source_row_count': row_count,
-                'source_file_count': file_count,
-                'source_total_size_bytes': total_size,
-                'format_version': format_version,
-            })
-
-        except Exception as e:
-            logger.error(f"[discover_rewrite_tables] FAILED for {full_name}: {e}")
-            metadata_list.append({
-                'source_database': database,
-                'source_table': tbl_name,
-                'dest_database': database,
-                'source_location': dest_path,
-                'dest_location': '',
-                'source_s3_prefix': source_prefix,
-                'dest_s3_prefix': dest_prefix,
-                'file_format': 'UNKNOWN',
-                'table_type': 'UNKNOWN',
-                'schema': [],
-                'partition_columns': '',
-                'partition_spec_detail': [],
-                'partitions': [],
-                'partition_count': 0,
-                'is_partitioned': False,
-                'source_row_count': 0,
-                'source_file_count': 0,
-                'source_total_size_bytes': 0,
-                'format_version': '2',
-                'error': str(e)[:500],
-            })
-
     result_dict = {
         'run_id': db_config['run_id'],
         'source_database': db_config['source_database'],
@@ -382,16 +298,117 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
         'tables': metadata_list,
     }
 
-    failed = [t for t in metadata_list if 'error' in t]
-    if failed:
-        context['ti'].xcom_push(key='return_value', value=result_dict)
-        raise Exception(
-            f"Discovery failed for {len(failed)}/{len(metadata_list)} table(s) in "
-            f"'{database}': "
-            + ', '.join(t['source_table'] for t in failed[:3])
+    try:
+        apply_bucket_credentials(
+            spark, dest_prefix,
+            config.get('_dest_endpoint', ''),
+            config.get('_dest_access_key', ''),
+            config.get('_dest_secret_key', ''),
         )
 
-    return result_dict
+        available_tables = _list_iceberg_tables(spark, tables_root)
+        matched = _match_tokens(available_tables, tokens)
+
+        logger.info(
+            f"[discover_rewrite_tables] '{database}': {len(available_tables)} table(s) found, "
+            f"{len(matched)} matched tokens {tokens[:5]}"
+        )
+
+        if not matched:
+            context['ti'].xcom_push(key='return_value', value=result_dict)
+            raise Exception(
+                f"No Iceberg tables found at '{tables_root}' matching tokens {tokens}. "
+                f"Found {len(available_tables)} subdirectory(s) with a metadata/ folder. "
+                "Check that dest_s3_prefix points to the correct S3 location and that "
+                "data + metadata have been pre-copied there."
+            )
+
+        for tbl_name in matched:
+            dest_path = f"{tables_root}/{tbl_name}"
+            full_name = f"{database}.{tbl_name}"
+
+            try:
+                iceberg_meta = _read_iceberg_metadata(spark, dest_path)
+                schema = _extract_schema(iceberg_meta)
+                partition_spec, is_partitioned = _extract_partition_spec(iceberg_meta)
+                row_count = _extract_row_count(iceberg_meta)
+                file_format = iceberg_meta.get('properties', {}).get(
+                    'write.format.default', 'parquet'
+                ).upper()
+                format_version = str(iceberg_meta.get('format-version', 2))
+                file_count, total_size = _get_fs_stats(spark, dest_path)
+
+                logger.info(
+                    f"[discover_rewrite_tables] {full_name} | fmt={file_format} | "
+                    f"rows={row_count} | size={total_size / (1024 ** 2):.1f}MB | "
+                    f"partitioned={is_partitioned}"
+                )
+
+                metadata_list.append({
+                    'source_database': database,
+                    'source_table': tbl_name,
+                    'dest_database': database,
+                    'source_location': f"{source_prefix.rstrip('/')}/{tbl_name}",
+                    'dest_location': dest_path,
+                    'source_s3_prefix': source_prefix,
+                    'dest_s3_prefix': dest_prefix,
+                    'file_format': file_format,
+                    'table_type': 'ICEBERG',
+                    'schema': schema,
+                    'partition_columns': ','.join(
+                        p['source_column'] for p in partition_spec
+                    ),
+                    'partition_spec_detail': partition_spec,
+                    'partitions': [],
+                    'partition_count': 0,
+                    'is_partitioned': is_partitioned,
+                    'source_row_count': row_count,
+                    'source_file_count': file_count,
+                    'source_total_size_bytes': total_size,
+                    'format_version': format_version,
+                })
+
+            except Exception as e:
+                logger.error(f"[discover_rewrite_tables] FAILED for {full_name}: {e}")
+                metadata_list.append({
+                    'source_database': database,
+                    'source_table': tbl_name,
+                    'dest_database': database,
+                    'source_location': f"{source_prefix.rstrip('/')}/{tbl_name}",
+                    'dest_location': '',
+                    'source_s3_prefix': source_prefix,
+                    'dest_s3_prefix': dest_prefix,
+                    'file_format': 'UNKNOWN',
+                    'table_type': 'UNKNOWN',
+                    'schema': [],
+                    'partition_columns': '',
+                    'partition_spec_detail': [],
+                    'partitions': [],
+                    'partition_count': 0,
+                    'is_partitioned': False,
+                    'source_row_count': 0,
+                    'source_file_count': 0,
+                    'source_total_size_bytes': 0,
+                    'format_version': '2',
+                    'error': str(e)[:500],
+                })
+
+        failed = [t for t in metadata_list if 'error' in t]
+        context['ti'].xcom_push(key='return_value', value=result_dict)
+        if failed:
+            raise Exception(
+                f"Discovery failed for {len(failed)}/{len(metadata_list)} table(s) in "
+                f"'{database}': "
+                + ', '.join(t['source_table'] for t in failed[:3])
+            )
+        return result_dict
+
+    except Exception:
+        # Outer failures (bad credentials, unreachable bucket, etc.) would otherwise
+        # leave the downstream record task with no xcom to read. Always push here so
+        # record_rewrite_discovered_tables gets whatever was collected before the failure.
+        context['ti'].xcom_push(key='return_value', value=result_dict)
+        raise
 
 
 @task.pyspark(conn_id='spark_default')
@@ -410,6 +427,10 @@ def record_rewrite_discovered_tables(discovery: dict, spark) -> dict:
     for t in discovery['tables']:
         schema_json = json.dumps(t.get('schema', [])).replace("'", "''")
         parts_json = json.dumps(t.get('partitions', [])).replace("'", "''")
+        has_error = 'error' in t
+        disc_status = 'FAILED' if has_error else 'COMPLETED'
+        overall_status = 'FAILED' if has_error else 'DISCOVERED'
+        disc_error_sql = f"'{t['error'][:2000].replace(chr(39), chr(39)*2)}'" if has_error else 'NULL'
 
         existing = spark.sql(f"""
             SELECT COUNT(*) as cnt
@@ -422,7 +443,7 @@ def record_rewrite_discovered_tables(discovery: dict, spark) -> dict:
         if existing > 0:
             execute_with_iceberg_retry(spark, f"""
                 UPDATE {tracking_db}.rewrite_migration_table_status
-                SET discovery_status = 'COMPLETED',
+                SET discovery_status = '{disc_status}',
                     discovery_completed_at = current_timestamp(),
                     discovery_duration_seconds = {duration},
                     source_s3_location = '{t['source_location']}',
@@ -434,6 +455,8 @@ def record_rewrite_discovered_tables(discovery: dict, spark) -> dict:
                     source_total_size_bytes = {t['source_total_size_bytes']},
                     partition_count = {t['partition_count']},
                     source_partition_count = {t['partition_count']},
+                    overall_status = '{overall_status}',
+                    error_message = CASE WHEN '{disc_status}' = 'FAILED' THEN {disc_error_sql} ELSE error_message END,
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
                   AND source_database = '{t['source_database']}'
@@ -467,12 +490,12 @@ def record_rewrite_discovered_tables(discovery: dict, spark) -> dict:
                     '{schema_json}', '{parts_json}', '{t['table_type']}',
                     {t['source_row_count']}, {t['source_file_count']}, {t['source_total_size_bytes']},
                     NULL, NULL, NULL, NULL,
-                    'COMPLETED', current_timestamp(), {duration},
+                    '{disc_status}', current_timestamp(), {duration},
                     NULL, NULL, NULL, NULL,
                     NULL, NULL, NULL,
                     NULL, NULL, {t['partition_count']},
                     NULL, NULL, NULL, NULL, NULL,
-                    'DISCOVERED', NULL, current_timestamp()
+                    '{overall_status}', {disc_error_sql}, current_timestamp()
                 )
             """, task_label=f"record_rewrite_discovered_tables:insert:{t['source_table']}")
 
@@ -730,7 +753,8 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
             )
 
             # Step 3: Rewrite metadata — rewrites all source/ path references to
-            # dest/ and writes the new metadata directly to dest_path/metadata.
+            # dest/ and stages new manifest + metadata files at dest_path so they
+            # don't remain at the source location (Iceberg's default staging target).
             if not source_prefix or not dest_prefix:
                 raise ValueError(
                     f"source_s3_prefix and dest_s3_prefix are required "
@@ -738,9 +762,10 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
                 )
             spark.sql(f"""
                 CALL spark_catalog.system.rewrite_table_path(
-                    table         => '{full_name}',
-                    source_prefix => '{source_prefix}',
-                    target_prefix => '{dest_prefix}'
+                    table            => '{full_name}',
+                    source_prefix    => '{source_prefix}',
+                    target_prefix    => '{dest_prefix}',
+                    staging_location => '{dest_path}'
                 )
             """)
             logger.info(f"[create_rewrite_dest_tables] rewrite_table_path completed for {full_name}")
@@ -976,15 +1001,23 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
                 if src_partition_count > 0 else True
             )
 
-            # Path rewrite check — verify metadata no longer references source paths
+            # Path rewrite check — verify the current snapshot's manifest-list is at dest.
+            # Checking only the current snapshot avoids false positives from historical
+            # snapshot entries that legitimately still reference source paths.
             path_rewrite_verified = True
             src_prefix = t.get('source_s3_prefix', '').rstrip('/')
             try:
                 from utils.migrations.shared import _read_iceberg_metadata
                 dest_metadata = _read_iceberg_metadata(spark, t['dest_location'])
-                metadata_str = json.dumps(dest_metadata)
-                if src_prefix and src_prefix in metadata_str:
-                    path_rewrite_verified = False
+                if src_prefix:
+                    current_snap_id = dest_metadata.get('current-snapshot-id')
+                    current_snap = next(
+                        (s for s in dest_metadata.get('snapshots', [])
+                         if s.get('snapshot-id') == current_snap_id),
+                        None
+                    )
+                    if current_snap is None or src_prefix in current_snap.get('manifest-list', ''):
+                        path_rewrite_verified = False
             except Exception as path_e:
                 logger.warning(
                     f"[validate_rewrite_destination_tables] Could not verify path rewrite "
@@ -1008,7 +1041,7 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
             if not schema_match:
                 mismatch_parts.append(f"Schema differences: {'; '.join(schema_diffs[:3])}")
             if not path_rewrite_verified:
-                mismatch_parts.append(f"Metadata still contains source paths ({src_prefix})")
+                mismatch_parts.append(f"Current snapshot manifest still references source prefix ({src_prefix})")
 
             validation_results.append({
                 'source_table': tbl,

@@ -557,10 +557,18 @@ def _resolve_metadata_file(spark, table_path):
     for i in range(len(status_list)):
         name = status_list[i].getPath().getName()
         if name.endswith('.metadata.json'):
-            metadata_files.append(status_list[i].getPath().toString())
+            metadata_files.append(name)
     if not metadata_files:
         raise FileNotFoundError(f"No metadata.json files found in {metadata_dir}")
-    return sorted(metadata_files)[-1]
+    import re as _re
+
+    def _version_key(name):
+        # handles v{N}.metadata.json and {N:05d}-{uuid}.metadata.json
+        m = _re.match(r'(?:v)?(\d+)', name)
+        return int(m.group(1)) if m else -1
+
+    latest = sorted(metadata_files, key=_version_key)[-1]
+    return f"{metadata_dir}/{latest}"
 
 
 def _read_iceberg_metadata(spark, table_path):
