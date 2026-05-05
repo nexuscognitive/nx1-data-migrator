@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "SSH_COMMAND_TIMEOUT",
+    "_login_shell",
     "apply_bucket_credentials",
     "build_s3_opts",
     "cell_str",
@@ -167,6 +168,12 @@ def get_config() -> dict:
         # DistCp Configuration
         'distcp_mappers': Variable.get('migration_distcp_mappers', default_var=os.getenv('MIGRATION_DISTCP_MAPPERS', '50')),
         'distcp_bandwidth': Variable.get('migration_distcp_bandwidth', default_var=os.getenv('MIGRATION_DISTCP_BANDWIDTH', '100')),
+        'distcp_preserve_delete': str(
+            Variable.get(
+                'migration_distcp_preserve_delete',
+                default_var=os.getenv('MIGRATION_DISTCP_PRESERVE_DELETE', 'true')
+            )
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
         # Spark Configuration
         'spark_conn_id': Variable.get('migration_spark_conn_id', default_var=os.getenv('MIGRATION_SPARK_CONN_ID', 'spark_default')),
@@ -176,13 +183,14 @@ def get_config() -> dict:
         'tracking_location': Variable.get('migration_tracking_location', default_var=os.getenv('MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking')),
         'report_output_location': Variable.get('migration_report_location', default_var=os.getenv('MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports')),
 
-        # Cluster Authentication (MapR or Kerberos)
+        # Cluster type for display/reporting purposes ('MapR' or 'HDP')
+        'cluster_type': Variable.get('cluster_type', default_var=os.getenv('CLUSTER_TYPE', 'MapR')),
+        # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': Variable.get('auth_method', default_var=os.getenv('AUTH_METHOD', 'mapr')),  # 'mapr' or 'kinit'
         'mapr_user': Variable.get('mapr_user', default_var=os.getenv('MAPR_USER', '')),
         'mapr_ticketfile_location': Variable.get('mapr_ticketfile_location', default_var=os.getenv('MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}')),
-        'kinit_principal': Variable.get('kinit_principal', default_var=os.getenv('KINIT_PRINCIPAL', '')),
-        'kinit_keytab': Variable.get('kinit_keytab', default_var=os.getenv('KINIT_KEYTAB', '')),
-        'kinit_password': Variable.get('kinit_password', default_var=os.getenv('KINIT_PASSWORD', '')),
+        # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
+        'hdfs_nameservice': Variable.get('hdfs_nameservice', default_var=os.getenv('HDFS_NAMESERVICE', '')),
 
         # Listing tool
         's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
@@ -200,10 +208,32 @@ def get_config() -> dict:
         # Email / SMTP Configuration
         'smtp_conn_id': Variable.get('migration_smtp_conn_id', default_var=os.getenv('MIGRATION_SMTP_CONN_ID', 'smtp_default')),
         'email_recipients': Variable.get('migration_email_recipients', default_var=os.getenv('MIGRATION_EMAIL_RECIPIENTS', '')),
+
+        # Path structure: when True (default), dest path is {bucket}/{database}/{table}.
+        # When False, dest path is {bucket}/{table} (database folder omitted).
+        'include_db_in_path': str(
+            Variable.get(
+                'migration_include_db_in_path',
+                default_var=os.getenv('MIGRATION_INCLUDE_DB_IN_PATH', 'true'),
+            )
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
     }
 
 # SSH timeout: 24 hours
 SSH_COMMAND_TIMEOUT = 86400
+
+
+def _login_shell(cmd: str, cluster_type: str = 'MapR') -> str:
+    """Wrap a shell command for execution over SSH.
+
+    - MapR: sources ``~/.profile`` directly (customer-tested approach).
+    - HDP (and any non-MapR cluster): uses ``bash -l`` (login shell) so
+      /etc/profile.d/*.sh is sourced, ensuring JAVA_HOME, SPARK_HOME,
+      HADOOP_HOME, HADOOP_CONF_DIR and PATH are set.
+    """
+    if cluster_type.upper() == 'MAPR':
+        return f"source ~/.profile 2>/dev/null || true\n{cmd}"
+    return f"bash -l <<'__LOGIN_SHELL_EOF__'\n{cmd}\n__LOGIN_SHELL_EOF__\n"
 
 
 def cluster_login(run_id: str) -> dict:
@@ -217,24 +247,11 @@ def cluster_login(run_id: str) -> dict:
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
     temp_dir = f"{config['edge_temp_path']}/{run_id}"
 
-    auth_script_parts = []
-
-    auth_script_parts.append("""
-echo "=== Sourcing User Profile ==="
-if [ -f ~/.profile ]; then
-    source ~/.profile
-    echo "Profile sourced: ~/.profile"
-else
-    echo "WARNING: Profile not found at ~/.profile"
-fi
-""")
-
     auth_method = config.get('auth_method', 'mapr')
     mapr_user = config.get('mapr_user', '')
-    mapr_ticketfile = config.get('mapr_ticketfile_location', '')
-    kinit_principal = config.get('kinit_principal', '')
-    kinit_keytab = config.get('kinit_keytab', '')
-    kinit_password = config.get('kinit_password', '')
+    mapr_ticketfile = config.get('mapr_ticketfile_location', '/tmp/maprticket_${USER}')
+
+    auth_script_parts = []
 
     auth_script_parts.append(f"""
 echo "=== Cluster Authentication ({auth_method}) ==="
@@ -252,14 +269,7 @@ if [ "{auth_method}" = "mapr" ]; then
     fi
 
 elif [ "{auth_method}" = "kinit" ]; then
-    if [ -n "{kinit_keytab}" ] && [ -n "{kinit_principal}" ]; then
-        kinit -kt "{kinit_keytab}" "{kinit_principal}"
-    elif [ -n "{kinit_principal}" ] && [ -n "{kinit_password}" ]; then
-        echo "{kinit_password}" | kinit "{kinit_principal}"
-    else
-        echo "ERROR: kinit requires principal and keytab or password"
-        exit 1
-    fi
+    echo "Kerberos authentication handled via login shell"
 
 elif [ "{auth_method}" = "none" ]; then
     echo "No authentication required (auth_method=none)"
@@ -282,10 +292,10 @@ echo "TEMP_DIR={temp_dir}"
 """)
     full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
-        _, stdout, stderr = client.exec_command(full_script, timeout=300)
-        exit_code = stdout.channel.recv_exit_status()
+        _, stdout, stderr = client.exec_command(_login_shell(full_script), timeout=300)
         output = stdout.read().decode()
         error = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
 
         logger.info("=== Cluster Login Output ===")
         logger.info(output)
@@ -306,6 +316,23 @@ echo "TEMP_DIR={temp_dir}"
             )
 
     return {'temp_dir': temp_dir, 'run_id': run_id}
+
+
+def _s3a_committer_opts(config: dict) -> str:
+    """Return S3A magic-committer JVM flags for HDP clusters.
+
+    MapR has its own S3 connector and doesn't use FileOutputCommitter, so no
+    flags are needed there. HDP 3.x uses vanilla S3A whose default v1 committer
+    tries an atomic rename on S3 (unsupported), causing CommitterEventHandler
+    failures. The magic committer bypasses that with S3 multipart uploads.
+    """
+    if config.get('cluster_type', 'MapR').upper() == 'HDP':
+        return (
+            " -Dmapreduce.outputcommitter.factory.scheme.s3a="
+            "org.apache.hadoop.fs.s3a.commit.S3ACommitterFactory"
+            " -Dfs.s3a.committer.name=magic"
+        )
+    return ""
 
 
 def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -> str:
@@ -366,6 +393,7 @@ def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -
             s3_opts += f" -Dfs.s3a.bucket.{bucket_name}.access.key={access_key}"
         if secret_key:
             s3_opts += f" -Dfs.s3a.bucket.{bucket_name}.secret.key={secret_key}"
+        s3_opts += _s3a_committer_opts(config)
         return s3_opts
 
     global_endpoint   = config.get('s3_endpoint')   or ''
@@ -379,6 +407,7 @@ def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -
         s3_opts += f" -Dfs.s3a.access.key={global_access_key}"
     if global_secret_key:
         s3_opts += f" -Dfs.s3a.secret.key={global_secret_key}"
+    s3_opts += _s3a_committer_opts(config)
     return s3_opts
 
 

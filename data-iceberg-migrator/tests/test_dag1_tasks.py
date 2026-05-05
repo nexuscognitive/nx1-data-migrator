@@ -15,9 +15,9 @@ class TestValidatePrerequisites:
         hook, client, stdout_mock, _ = mock_ssh_hook
         responses = [
             (MagicMock(), mock_ssh_stdout(0, b'SSH_TEST_OK'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'PySpark 3.4.0'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'Hive 3.1.0'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'Hadoop 3.3.0\nHADOOP_FS_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b'CLUSTER_AUTH_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b'PYSPARK_HIVE_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b'HADOOP_FS_OK'), MagicMock()),
         ]
         for r in responses:
             r[2].read.return_value = b''
@@ -25,6 +25,7 @@ class TestValidatePrerequisites:
 
         result = m.validate_prerequisites.function(run_id='test_run')
         assert result['ssh_connectivity'] is True
+        assert result['cluster_auth'] is True
         assert result['pyspark_available'] is True
         assert result['hive_available'] is True
         assert result['hadoop_fs_available'] is True
@@ -379,11 +380,13 @@ class TestRunDistcpSsh:
 
     def _make_distcp_stdout(self, incremental=False):
         return mock_ssh_stdout(0, (
+            "===DISTCP_METRICS_START===\n"
             f"INCREMENTAL={'true' if incremental else 'false'}\n"
             "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\nDISTCP_EXIT_CODE=0\n"
             "BYTES_COPIED=10485760\nFILES_COPIED=5\n"
             "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
             "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
+            "===DISTCP_METRICS_END===\n"
         ).encode())
 
     def test_successful_copy_detects_incremental(self, mock_ssh_hook, sample_discovery):
@@ -461,6 +464,47 @@ class TestRunDistcpSsh:
 
         assert s3_loc in ssh_cmd
         assert 'PARTITIONS_REQUESTED=2' in ssh_cmd
+
+    def test_filtered_partitions_can_use_path_list_when_delete_not_preserved(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+        )
+
+        filtered_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'partition_filter': 'dt>=2024-01-01',
+                'filtered_partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+                'partition_filter_active': True,
+                'filtered_row_count': 500,
+                'filtered_source_size_bytes': 5 * 1024 * 1024,
+                'filtered_file_count': 2,
+                'full_table_row_count': 1000,
+                'full_table_partition_count': 2,
+                'serde_properties': {},
+            }],
+        }
+
+        cfg = {**m.get_config(), 'distcp_preserve_delete': False}
+        with patch.object(m, 'get_config', return_value=cfg):
+            result = m.run_distcp_ssh.function.__wrapped__(
+                discovery=filtered_discovery,
+                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+                ti=MagicMock(),
+            )
+
+        assert result['distcp_results'][0]['status'] == 'COMPLETED'
+
+        ssh_cmd = client.exec_command.call_args[0][0]
+        assert 'PATHLIST=' in ssh_cmd
+        assert '-f "$PATHLIST"' in ssh_cmd
+        assert '-delete' not in ssh_cmd
+        assert 'dt=2024-01-01' in ssh_cmd
+        assert 'dt=2024-01-02' in ssh_cmd
 
     def test_zero_filtered_partitions_skips_table(self, mock_ssh_hook, sample_discovery):
         """If partition_filter_active=True but filtered_partitions=[], table must be SKIPPED
