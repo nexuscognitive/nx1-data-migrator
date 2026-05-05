@@ -50,6 +50,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     | `source_to_s3_migration`, `folder_only_data_copy`                                       |
 | `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            | `source_to_s3_migration`, `folder_only_data_copy`                                       |
 | `migration_distcp_preserve_delete` | `true`     | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes)) | `source_to_s3_migration` |
+| `migration_include_db_in_path`     | `true`     | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted) | `source_to_s3_migration` |
 | `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`     | Currently unused                                                                      |
 | `migration_smtp_conn_id`     | `smtp_default`   | Airflow SMTP connection ID for email reports | All DAGs                                                                              |
 | `migration_email_recipients` | _(empty)_        | Comma-separated email addresses for reports  | All DAGs                                                                              |
@@ -424,7 +425,7 @@ cleanup_edge (SSH: Cleanup temp files)
   - **Partition columns** - Extracted from table metadata
   - **Partition filter** - If `partition_filter` is set in the Excel config, only matching partitions are included; full-table row and partition counts are also captured as a baseline
 - Generates JSON output with all discovered metadata
-- Determines S3 destination path: `{bucket}/{dest_database}/{table_name}`
+- Determines S3 destination path: `{bucket}/{dest_database}/{table_name}` (default) or `{bucket}/{table_name}` when `migration_include_db_in_path=false`
 
 ---
 

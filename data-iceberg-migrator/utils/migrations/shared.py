@@ -208,6 +208,15 @@ def get_config() -> dict:
         # Email / SMTP Configuration
         'smtp_conn_id': Variable.get('migration_smtp_conn_id', default_var=os.getenv('MIGRATION_SMTP_CONN_ID', 'smtp_default')),
         'email_recipients': Variable.get('migration_email_recipients', default_var=os.getenv('MIGRATION_EMAIL_RECIPIENTS', '')),
+
+        # Path structure: when True (default), dest path is {bucket}/{database}/{table}.
+        # When False, dest path is {bucket}/{table} (database folder omitted).
+        'include_db_in_path': str(
+            Variable.get(
+                'migration_include_db_in_path',
+                default_var=os.getenv('MIGRATION_INCLUDE_DB_IN_PATH', 'true'),
+            )
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
     }
 
 # SSH timeout: 24 hours

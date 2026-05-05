@@ -480,6 +480,7 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
 
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
+    include_db_in_path = config.get('include_db_in_path', True)
 
     run_id = db_config['run_id']
     src_db = db_config['source_database']
@@ -725,7 +726,10 @@ for tbl in table_list:
 
             schema.append({{"name": col_name, "type": data_type}})
 
-        s3_location = "{{0}}/{{1}}/{{2}}".format(dest_bucket, dest_db, tbl)
+        if {include_db_in_path}:
+            s3_location = "{{0}}/{{1}}/{{2}}".format(dest_bucket, dest_db, tbl)
+        else:
+            s3_location = "{{0}}/{{1}}".format(dest_bucket, tbl)
 
         metadata.append({{
             "source_database": src_db,
@@ -763,7 +767,7 @@ for tbl in table_list:
             "dest_database": dest_db,
             "dest_bucket": dest_bucket,
             "source_location": "",
-            "s3_location": dest_bucket + "/" + dest_db + "/" + tbl,
+            "s3_location": (dest_bucket + "/" + dest_db + "/" + tbl) if {include_db_in_path} else (dest_bucket + "/" + tbl),
             "file_format": "PARQUET",
             "schema": [],
             "partitions": [],
@@ -804,6 +808,7 @@ spark.stop()
         dest_bucket_slug=dest_bucket_slug,
         filter_expr_escaped=partition_filter.replace("'", "\\'").replace('"', '\\"'),
         temp_dir=temp_dir,
+        include_db_in_path=include_db_in_path,
         )
 
         script_path = f"{temp_dir}/discover_tables.py"
