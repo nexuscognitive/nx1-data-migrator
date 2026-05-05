@@ -21,8 +21,8 @@ Requirements:
 Pipeline stages:
   1. Init tracking tables & create run record
   2. Parse Excel config (database, table tokens, source_s3_prefix, dest_s3_prefix)
-  3. Discover source table metadata (schema, partitions, row counts from metadata.json)
-  4. Validate data presence at destination S3 paths
+  3. Validate data presence at destination S3 paths
+  4. Discover source table metadata (schema, partitions, row counts from metadata.json)
   5. Create destination tables (rewrite_table_path + register_table)
   6. Validate destination tables (row count, partition, schema comparison)
   7. Generate HTML report & send email
@@ -76,7 +76,7 @@ default_args = {
 # =============================================================================
 
 @task.pyspark(conn_id='spark_default')
-def init_rewrite_tracking_tables(spark) -> dict:
+def init_tracking_tables(spark) -> dict:
     """Create Iceberg tracking tables for the rewrite migration if they don't exist."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -154,12 +154,12 @@ def init_rewrite_tracking_tables(spark) -> dict:
         LOCATION '{tracking_loc}/rewrite_migration_table_status'
     """)
 
-    logger.info(f"[init_rewrite_tracking_tables] Tracking tables ready in '{tracking_db}'")
+    logger.info(f"[init_tracking_tables] Tracking tables ready in '{tracking_db}'")
     return {'status': 'initialized', 'database': tracking_db}
 
 
 @task.pyspark(conn_id='spark_default')
-def create_rewrite_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
+def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
     """Create run record and return run_id."""
     import uuid
     config = get_config()
@@ -175,12 +175,12 @@ def create_rewrite_migration_run(excel_file_path: str, dag_run_id: str, spark) -
             '{json.dumps(config).replace("'", "''")}'
         )
     """)
-    logger.info(f"[create_rewrite_migration_run] Run created: {run_id}")
+    logger.info(f"[create_migration_run] Run created: {run_id}")
     return run_id
 
 
 @task.pyspark(conn_id='spark_default')
-def parse_rewrite_excel(excel_file_path: str, run_id: str, spark) -> list:
+def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read Excel config and parse rows for the rewrite_table_path migration.
 
     Required columns: database, table, source_s3_prefix, dest_s3_prefix.
@@ -209,14 +209,14 @@ def parse_rewrite_excel(excel_file_path: str, run_id: str, spark) -> list:
 
         if not dest_s3_prefix:
             logger.warning(
-                f"[parse_rewrite_excel] Skipping '{database}' — "
+                f"[parse_excel] Skipping '{database}' — "
                 "missing 'dest_s3_prefix'"
             )
             continue
 
         if not source_s3_prefix:
             logger.warning(
-                f"[parse_rewrite_excel] Skipping '{database}' — "
+                f"[parse_excel] Skipping '{database}' — "
                 "missing 'source_s3_prefix'"
             )
             continue
@@ -245,23 +245,251 @@ def parse_rewrite_excel(excel_file_path: str, run_id: str, spark) -> list:
             'run_id': run_id,
         })
         logger.info(
-            f"[parse_rewrite_excel] {database} | "
+            f"[parse_excel] {database} | "
             f"src={source_s3_prefix} | dest={dest_s3_prefix} | "
             f"tokens={unique_tokens[:5]}"
         )
 
     if not configs:
-        logger.error("[parse_rewrite_excel] No valid rows found in Excel config")
+        logger.error("[parse_excel] No valid rows found in Excel config")
         return []
 
-    logger.info(f"[parse_rewrite_excel] Emitting {len(configs)} database config(s)")
+    logger.info(f"[parse_excel] Emitting {len(configs)} database config(s)")
     return configs
 
 
 @task.pyspark(conn_id='spark_default')
+def validate_data_presence(db_config: dict, spark, **context) -> dict:
+    """Check that destination S3 paths contain both data and metadata files.
+
+    Takes db_config (parse_excel output) and enumerates table dirs under
+    dest_s3_prefix using _list_iceberg_tables and _match_tokens.
+    """
+    from utils.migrations.shared import (
+        _list_iceberg_tables,
+        _match_tokens,
+    )
+
+    if not isinstance(db_config, dict) or 'run_id' not in db_config:
+        logger.warning(f"[validate_data_presence] Skipping invalid input: {type(db_config)}")
+        return {}
+
+    config = get_config()
+    configure_spark_s3(spark, config)
+
+    dest_prefix = db_config['dest_s3_prefix'].rstrip('/')
+    source_prefix = db_config['source_s3_prefix'].rstrip('/')
+    tokens = db_config.get('table_tokens', ['*'])
+    run_id = db_config['run_id']
+    src_db = db_config['source_database']
+
+    apply_bucket_credentials(
+        spark, dest_prefix,
+        config.get('_dest_endpoint', ''),
+        config.get('_dest_access_key', ''),
+        config.get('_dest_secret_key', ''),
+    )
+
+    available_tables = _list_iceberg_tables(spark, dest_prefix)
+    matched = _match_tokens(available_tables, tokens)
+
+    logger.info(
+        f"[validate_data_presence] '{src_db}': {len(available_tables)} table(s) found, "
+        f"{len(matched)} matched tokens {tokens[:5]}"
+    )
+
+    results = []
+    for tbl_name in matched:
+        dest_path = f"{dest_prefix}/{tbl_name}"
+
+        try:
+            from py4j.java_gateway import java_import
+            java_import(spark._jvm, 'org.apache.hadoop.fs.*')
+
+            fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+                spark._jvm.java.net.URI(dest_path),
+                spark._jsc.hadoopConfiguration()
+            )
+            path_obj = spark._jvm.org.apache.hadoop.fs.Path(dest_path)
+
+            if not fs.exists(path_obj):
+                results.append({
+                    'source_table': tbl_name, 'dest_path': dest_path,
+                    'status': 'MISSING', 'file_count': 0, 'size_bytes': 0,
+                    'error': f'Destination path does not exist: {dest_path}',
+                })
+                continue
+
+            # Verify metadata directory is present (required for rewrite_table_path)
+            metadata_path = spark._jvm.org.apache.hadoop.fs.Path(f"{dest_path}/metadata")
+            if not fs.exists(metadata_path):
+                results.append({
+                    'source_table': tbl_name, 'dest_path': dest_path,
+                    'status': 'MISSING', 'file_count': 0, 'size_bytes': 0,
+                    'error': (
+                        f'Metadata directory missing at {dest_path}/metadata — '
+                        'rewrite_table_path requires pre-copied metadata files'
+                    ),
+                })
+                continue
+
+            summary = fs.getContentSummary(path_obj)
+            file_count = int(summary.getFileCount())
+            size_bytes = int(summary.getLength())
+
+            if file_count == 0:
+                results.append({
+                    'source_table': tbl_name, 'dest_path': dest_path,
+                    'status': 'MISSING', 'file_count': 0, 'size_bytes': 0,
+                    'error': f'Destination path exists but contains 0 files: {dest_path}',
+                })
+            else:
+                logger.info(
+                    f"[validate_data_presence] CONFIRMED: {src_db}.{tbl_name} | "
+                    f"files={file_count} | size={size_bytes / (1024 ** 2):.1f}MB"
+                )
+                results.append({
+                    'source_table': tbl_name, 'dest_path': dest_path,
+                    'status': 'CONFIRMED', 'file_count': file_count,
+                    'size_bytes': size_bytes, 'error': None,
+                })
+
+        except Exception as e:
+            logger.error(f"[validate_data_presence] FAILED for {src_db}.{tbl_name}: {e}")
+            results.append({
+                'source_table': tbl_name, 'dest_path': dest_path,
+                'status': 'FAILED', 'file_count': 0, 'size_bytes': 0,
+                'error': str(e)[:500],
+            })
+
+    failed = [r for r in results if r['status'] == 'FAILED']
+    result_dict = {
+        'run_id': run_id,
+        'source_database': src_db,
+        'dest_database': db_config['dest_database'],
+        'dest_bucket': db_config.get('dest_bucket', ''),
+        'dest_s3_prefix': dest_prefix,
+        'source_s3_prefix': source_prefix,
+        'presence_results': results,
+    }
+
+    if failed:
+        context['ti'].xcom_push(key='return_value', value=result_dict)
+        raise Exception(
+            f"[validate_data_presence] Data presence check FAILED for "
+            f"{len(failed)}/{len(results)} table(s) in '{src_db}'"
+        )
+
+    return result_dict
+
+
+@task.pyspark(conn_id='spark_default')
+def update_data_presence_in_tracking(presence_result: dict, spark) -> dict:
+    """Insert initial tracking records with data presence check results.
+
+    Since this runs before discover_tables, no records exist yet — this task
+    INSERTs the initial rows. On reruns the existing INSERT/UPDATE check pattern
+    keeps the function idempotent.
+    """
+    if not isinstance(presence_result, dict) or 'run_id' not in presence_result:
+        logger.warning("[update_data_presence_in_tracking] Skipping invalid input")
+        return {}
+
+    config = get_config()
+    tracking_db = config['tracking_database']
+    run_id = presence_result['run_id']
+    src_db = presence_result.get('source_database', '')
+    dest_db = presence_result.get('dest_database', '')
+    dest_bucket = presence_result.get('dest_bucket', '')
+    source_s3_prefix = presence_result.get('source_s3_prefix', '')
+    dest_s3_prefix = presence_result.get('dest_s3_prefix', '')
+
+    for r in presence_result.get('presence_results', []):
+        overall = {
+            'CONFIRMED': 'DATA_CONFIRMED',
+            'MISSING': 'DATA_MISSING',
+            'FAILED': 'FAILED',
+        }.get(r['status'], 'FAILED')
+        error_msg = (r.get('error') or '').replace("'", "''")[:2000]
+        source_table = r['source_table']
+        dest_path = r.get('dest_path', '')
+        source_s3_location = f"{source_s3_prefix}/{source_table}"
+
+        existing = spark.sql(f"""
+            SELECT COUNT(*) as cnt
+            FROM {tracking_db}.rewrite_migration_table_status
+            WHERE run_id = '{run_id}'
+              AND source_database = '{src_db}'
+              AND source_table = '{source_table}'
+        """).collect()[0]['cnt']
+
+        if existing > 0:
+            execute_with_iceberg_retry(spark, f"""
+                UPDATE {tracking_db}.rewrite_migration_table_status
+                SET data_presence_status = '{r['status']}',
+                    data_presence_checked_at = current_timestamp(),
+                    data_presence_file_count = {r['file_count']},
+                    data_presence_size_bytes = {r['size_bytes']},
+                    overall_status = '{overall}',
+                    error_message = CASE WHEN '{r['status']}' != 'CONFIRMED'
+                                         THEN '{error_msg}'
+                                         ELSE error_message END,
+                    updated_at = current_timestamp()
+                WHERE run_id = '{run_id}'
+                  AND source_database = '{src_db}'
+                  AND source_table = '{source_table}'
+            """, task_label=f"update_data_presence_in_tracking:update:{source_table}")
+        else:
+            execute_with_iceberg_retry(spark, f"""
+                INSERT INTO {tracking_db}.rewrite_migration_table_status (
+                    run_id, source_database, source_table, dest_database, dest_bucket,
+                    source_s3_location, dest_s3_location,
+                    source_s3_prefix, dest_s3_prefix,
+                    file_format, is_partitioned, partition_columns, partition_count,
+                    schema_json, partitions_json, table_type,
+                    source_row_count, source_file_count, source_total_size_bytes,
+                    data_presence_status, data_presence_checked_at,
+                    data_presence_file_count, data_presence_size_bytes,
+                    discovery_status, discovery_completed_at, discovery_duration_seconds,
+                    table_create_status, table_create_completed_at, table_create_duration_seconds,
+                    table_already_existed,
+                    validation_status, validation_completed_at, validation_duration_seconds,
+                    dest_hive_row_count, dest_partition_count, source_partition_count,
+                    row_count_match, partition_count_match, schema_match, path_rewrite_verified, schema_differences,
+                    overall_status, error_message, updated_at
+                ) VALUES (
+                    '{run_id}', '{src_db}', '{source_table}',
+                    '{dest_db}', '{dest_bucket}',
+                    '{source_s3_location}', '{dest_path}',
+                    '{source_s3_prefix}', '{dest_s3_prefix}',
+                    NULL,
+                    NULL, NULL, NULL,
+                    NULL, NULL, NULL,
+                    NULL, NULL, NULL,
+                    '{r['status']}', current_timestamp(),
+                    {r['file_count']}, {r['size_bytes']},
+                    NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL,
+                    NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL,
+                    '{overall}',
+                    {'NULL' if r['status'] == 'CONFIRMED' else f"'{error_msg}'"},
+                    current_timestamp()
+                )
+            """, task_label=f"update_data_presence_in_tracking:insert:{source_table}")
+
+    return presence_result
+
+
+@task.pyspark(conn_id='spark_default')
 @track_duration
-def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
+def discover_tables(presence_result: dict, spark, **context) -> dict:
     """Discover Iceberg tables at the destination and read their metadata.
+
+    Takes presence_result (update_data_presence_in_tracking output) and reads
+    metadata only for CONFIRMED tables — iterates over presence_results directly
+    instead of listing the filesystem again.
 
     Always reads schema/partition spec from metadata.json rather than HMS
     because HMS may not have the table registered yet and would not preserve
@@ -272,29 +500,21 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
         _extract_row_count,
         _extract_schema,
         _get_fs_stats,
-        _list_iceberg_tables,
-        _match_tokens,
         _read_iceberg_metadata,
     )
 
     config = get_config()
     configure_spark_s3(spark, config)
 
-    database = db_config['dest_database']
-    dest_prefix = db_config['dest_s3_prefix']
-    source_prefix = db_config['source_s3_prefix']
-    tokens = db_config.get('table_tokens', ['*'])
-    tables_root = dest_prefix.rstrip('/')
+    database = presence_result['dest_database']
+    dest_prefix = presence_result['dest_s3_prefix']
+    source_prefix = presence_result['source_s3_prefix']
+    run_id = presence_result['run_id']
 
     # Initialise early so the except block can always push partial results to xcom.
     metadata_list = []
     result_dict = {
-        'run_id': db_config['run_id'],
-        'source_database': db_config['source_database'],
-        'dest_database': db_config['dest_database'],
-        'dest_bucket': db_config.get('dest_bucket', ''),
-        'dest_s3_prefix': db_config.get('dest_s3_prefix', ''),
-        'source_s3_prefix': db_config.get('source_s3_prefix', ''),
+        **presence_result,
         'tables': metadata_list,
     }
 
@@ -306,25 +526,19 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
             config.get('_dest_secret_key', ''),
         )
 
-        available_tables = _list_iceberg_tables(spark, tables_root)
-        matched = _match_tokens(available_tables, tokens)
+        confirmed = [
+            r for r in presence_result.get('presence_results', [])
+            if r.get('status') == 'CONFIRMED'
+        ]
 
         logger.info(
-            f"[discover_rewrite_tables] '{database}': {len(available_tables)} table(s) found, "
-            f"{len(matched)} matched tokens {tokens[:5]}"
+            f"[discover_tables] '{database}': reading metadata for "
+            f"{len(confirmed)} CONFIRMED table(s)"
         )
 
-        if not matched:
-            context['ti'].xcom_push(key='return_value', value=result_dict)
-            raise Exception(
-                f"No Iceberg tables found at '{tables_root}' matching tokens {tokens}. "
-                f"Found {len(available_tables)} subdirectory(s) with a metadata/ folder. "
-                "Check that dest_s3_prefix points to the correct S3 location and that "
-                "data + metadata have been pre-copied there."
-            )
-
-        for tbl_name in matched:
-            dest_path = f"{tables_root}/{tbl_name}"
+        for r in confirmed:
+            tbl_name = r['source_table']
+            dest_path = r['dest_path']
             full_name = f"{database}.{tbl_name}"
 
             try:
@@ -339,7 +553,7 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
                 file_count, total_size = _get_fs_stats(spark, dest_path)
 
                 logger.info(
-                    f"[discover_rewrite_tables] {full_name} | fmt={file_format} | "
+                    f"[discover_tables] {full_name} | fmt={file_format} | "
                     f"rows={row_count} | size={total_size / (1024 ** 2):.1f}MB | "
                     f"partitioned={is_partitioned}"
                 )
@@ -369,7 +583,7 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
                 })
 
             except Exception as e:
-                logger.error(f"[discover_rewrite_tables] FAILED for {full_name}: {e}")
+                logger.error(f"[discover_tables] FAILED for {full_name}: {e}")
                 metadata_list.append({
                     'source_database': database,
                     'source_table': tbl_name,
@@ -406,16 +620,20 @@ def discover_rewrite_tables(db_config: dict, spark, **context) -> dict:
     except Exception:
         # Outer failures (bad credentials, unreachable bucket, etc.) would otherwise
         # leave the downstream record task with no xcom to read. Always push here so
-        # record_rewrite_discovered_tables gets whatever was collected before the failure.
+        # update_discovered_tables_in_tracking gets whatever was collected before the failure.
         context['ti'].xcom_push(key='return_value', value=result_dict)
         raise
 
 
 @task.pyspark(conn_id='spark_default')
-def record_rewrite_discovered_tables(discovery: dict, spark) -> dict:
-    """Persist discovered table metadata into the rewrite_migration_table_status table."""
+def update_discovered_tables_in_tracking(discovery: dict, spark) -> dict:
+    """Update existing tracking records with discovered table metadata.
+
+    Records were already inserted by update_data_presence_in_tracking, so this
+    task only UPDATEs — no INSERT branch needed.
+    """
     if not isinstance(discovery, dict) or 'tables' not in discovery:
-        logger.warning(f"[record_rewrite_discovered_tables] Skipping invalid input: {type(discovery)}")
+        logger.warning(f"[update_discovered_tables_in_tracking] Skipping invalid input: {type(discovery)}")
         return {}
 
     config = get_config()
@@ -432,243 +650,48 @@ def record_rewrite_discovered_tables(discovery: dict, spark) -> dict:
         overall_status = 'FAILED' if has_error else 'DISCOVERED'
         disc_error_sql = f"'{t['error'][:2000].replace(chr(39), chr(39)*2)}'" if has_error else 'NULL'
 
-        existing = spark.sql(f"""
-            SELECT COUNT(*) as cnt
-            FROM {tracking_db}.rewrite_migration_table_status
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.rewrite_migration_table_status
+            SET discovery_status = '{disc_status}',
+                discovery_completed_at = current_timestamp(),
+                discovery_duration_seconds = {duration},
+                source_s3_location = '{t['source_location']}',
+                dest_s3_location = '{t['dest_location']}',
+                file_format = '{t['file_format']}',
+                table_type = '{t['table_type']}',
+                source_row_count = {t['source_row_count']},
+                source_file_count = {t['source_file_count']},
+                source_total_size_bytes = {t['source_total_size_bytes']},
+                partition_count = {t['partition_count']},
+                source_partition_count = {t['partition_count']},
+                schema_json = '{schema_json}',
+                partitions_json = '{parts_json}',
+                is_partitioned = {str(t['is_partitioned']).lower()},
+                partition_columns = '{t['partition_columns']}',
+                overall_status = CASE WHEN '{disc_status}' = 'FAILED' THEN 'FAILED' ELSE 'DISCOVERED' END,
+                error_message = CASE WHEN '{disc_status}' = 'FAILED' THEN {disc_error_sql} ELSE error_message END,
+                updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
               AND source_database = '{t['source_database']}'
               AND source_table = '{t['source_table']}'
-        """).collect()[0]['cnt']
-
-        if existing > 0:
-            execute_with_iceberg_retry(spark, f"""
-                UPDATE {tracking_db}.rewrite_migration_table_status
-                SET discovery_status = '{disc_status}',
-                    discovery_completed_at = current_timestamp(),
-                    discovery_duration_seconds = {duration},
-                    source_s3_location = '{t['source_location']}',
-                    dest_s3_location = '{t['dest_location']}',
-                    file_format = '{t['file_format']}',
-                    table_type = '{t['table_type']}',
-                    source_row_count = {t['source_row_count']},
-                    source_file_count = {t['source_file_count']},
-                    source_total_size_bytes = {t['source_total_size_bytes']},
-                    partition_count = {t['partition_count']},
-                    source_partition_count = {t['partition_count']},
-                    overall_status = '{overall_status}',
-                    error_message = CASE WHEN '{disc_status}' = 'FAILED' THEN {disc_error_sql} ELSE error_message END,
-                    updated_at = current_timestamp()
-                WHERE run_id = '{run_id}'
-                  AND source_database = '{t['source_database']}'
-                  AND source_table = '{t['source_table']}'
-            """, task_label=f"record_rewrite_discovered_tables:{t['source_table']}")
-        else:
-            execute_with_iceberg_retry(spark, f"""
-                INSERT INTO {tracking_db}.rewrite_migration_table_status (
-                    run_id, source_database, source_table, dest_database, dest_bucket,
-                    source_s3_location, dest_s3_location,
-                    source_s3_prefix, dest_s3_prefix,
-                    file_format, is_partitioned, partition_columns, partition_count,
-                    schema_json, partitions_json, table_type,
-                    source_row_count, source_file_count, source_total_size_bytes,
-                    data_presence_status, data_presence_checked_at,
-                    data_presence_file_count, data_presence_size_bytes,
-                    discovery_status, discovery_completed_at, discovery_duration_seconds,
-                    table_create_status, table_create_completed_at, table_create_duration_seconds,
-                    table_already_existed,
-                    validation_status, validation_completed_at, validation_duration_seconds,
-                    dest_hive_row_count, dest_partition_count, source_partition_count,
-                    row_count_match, partition_count_match, schema_match, path_rewrite_verified, schema_differences,
-                    overall_status, error_message, updated_at
-                ) VALUES (
-                    '{run_id}', '{t['source_database']}', '{t['source_table']}',
-                    '{t['dest_database']}', '{t.get('dest_bucket', '')}',
-                    '{t['source_location']}', '{t['dest_location']}',
-                    '{t.get('source_s3_prefix', '')}', '{t.get('dest_s3_prefix', '')}',
-                    '{t['file_format']}',
-                    {str(t['is_partitioned']).lower()}, '{t['partition_columns']}', {t['partition_count']},
-                    '{schema_json}', '{parts_json}', '{t['table_type']}',
-                    {t['source_row_count']}, {t['source_file_count']}, {t['source_total_size_bytes']},
-                    NULL, NULL, NULL, NULL,
-                    '{disc_status}', current_timestamp(), {duration},
-                    NULL, NULL, NULL, NULL,
-                    NULL, NULL, NULL,
-                    NULL, NULL, {t['partition_count']},
-                    NULL, NULL, NULL, NULL, NULL,
-                    '{overall_status}', {disc_error_sql}, current_timestamp()
-                )
-            """, task_label=f"record_rewrite_discovered_tables:insert:{t['source_table']}")
+        """, task_label=f"update_discovered_tables_in_tracking:{t['source_table']}")
 
     return discovery
 
 
 @task.pyspark(conn_id='spark_default')
-def validate_rewrite_data_presence(discovery: dict, spark, **context) -> dict:
-    """Check that destination S3 paths contain both data and metadata files."""
-    if not isinstance(discovery, dict) or 'tables' not in discovery:
-        logger.warning(f"[validate_rewrite_data_presence] Skipping invalid input: {type(discovery)}")
-        return {}
-
-    config = get_config()
-    configure_spark_s3(spark, config)
-
-    results = []
-    for t in discovery['tables']:
-        dest_path = t.get('dest_location', '')
-        tbl = t['source_table']
-        src_db = t['source_database']
-
-        if not dest_path:
-            results.append({
-                'source_database': src_db, 'source_table': tbl,
-                'status': 'MISSING', 'file_count': 0, 'size_bytes': 0,
-                'error': 'No destination S3 path computed',
-            })
-            continue
-
-        try:
-            from py4j.java_gateway import java_import
-            java_import(spark._jvm, 'org.apache.hadoop.fs.*')
-
-            apply_bucket_credentials(
-                spark, dest_path,
-                config.get('_dest_endpoint', ''),
-                config.get('_dest_access_key', ''),
-                config.get('_dest_secret_key', ''),
-            )
-
-            fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-                spark._jvm.java.net.URI(dest_path),
-                spark._jsc.hadoopConfiguration()
-            )
-            path_obj = spark._jvm.org.apache.hadoop.fs.Path(dest_path)
-
-            if not fs.exists(path_obj):
-                results.append({
-                    'source_database': src_db, 'source_table': tbl,
-                    'status': 'MISSING', 'file_count': 0, 'size_bytes': 0,
-                    'error': f'Destination path does not exist: {dest_path}',
-                })
-                continue
-
-            # Verify metadata directory is present (required for rewrite_table_path)
-            metadata_path = spark._jvm.org.apache.hadoop.fs.Path(f"{dest_path}/metadata")
-            if not fs.exists(metadata_path):
-                results.append({
-                    'source_database': src_db, 'source_table': tbl,
-                    'status': 'MISSING', 'file_count': 0, 'size_bytes': 0,
-                    'error': (
-                        f'Metadata directory missing at {dest_path}/metadata — '
-                        'rewrite_table_path requires pre-copied metadata files'
-                    ),
-                })
-                continue
-
-            summary = fs.getContentSummary(path_obj)
-            file_count = int(summary.getFileCount())
-            size_bytes = int(summary.getLength())
-
-            if file_count == 0:
-                results.append({
-                    'source_database': src_db, 'source_table': tbl,
-                    'status': 'MISSING', 'file_count': 0, 'size_bytes': 0,
-                    'error': f'Destination path exists but contains 0 files: {dest_path}',
-                })
-            else:
-                logger.info(
-                    f"[validate_rewrite_data_presence] CONFIRMED: {src_db}.{tbl} | "
-                    f"files={file_count} | size={size_bytes / (1024 ** 2):.1f}MB"
-                )
-                results.append({
-                    'source_database': src_db, 'source_table': tbl,
-                    'status': 'CONFIRMED', 'file_count': file_count,
-                    'size_bytes': size_bytes, 'error': None,
-                })
-
-        except Exception as e:
-            logger.error(f"[validate_rewrite_data_presence] FAILED for {src_db}.{tbl}: {e}")
-            results.append({
-                'source_database': src_db, 'source_table': tbl,
-                'status': 'FAILED', 'file_count': 0, 'size_bytes': 0,
-                'error': str(e)[:500],
-            })
-
-    failed = [r for r in results if r['status'] == 'FAILED']
-    result_dict = {**discovery, 'presence_results': results}
-
-    if failed:
-        context['ti'].xcom_push(key='return_value', value=result_dict)
-        raise Exception(
-            f"[validate_rewrite_data_presence] Data presence check FAILED for "
-            f"{len(failed)}/{len(results)} table(s) in '{discovery['source_database']}'"
-        )
-
-    return result_dict
-
-
-@task.pyspark(conn_id='spark_default')
-def update_rewrite_data_presence_status(presence_result: dict, spark) -> dict:
-    """Update tracking table with data presence check results."""
-    if not isinstance(presence_result, dict) or 'run_id' not in presence_result:
-        logger.warning("[update_rewrite_data_presence_status] Skipping invalid input")
-        return {}
-
-    config = get_config()
-    tracking_db = config['tracking_database']
-    run_id = presence_result['run_id']
-    src_db = presence_result.get('source_database', '')
-
-    for r in presence_result.get('presence_results', []):
-        overall = {
-            'CONFIRMED': 'DATA_CONFIRMED',
-            'MISSING': 'DATA_MISSING',
-            'FAILED': 'FAILED',
-        }.get(r['status'], 'FAILED')
-        error_msg = (r.get('error') or '').replace("'", "''")[:2000]
-
-        execute_with_iceberg_retry(spark, f"""
-            UPDATE {tracking_db}.rewrite_migration_table_status
-            SET data_presence_status = '{r['status']}',
-                data_presence_checked_at = current_timestamp(),
-                data_presence_file_count = {r['file_count']},
-                data_presence_size_bytes = {r['size_bytes']},
-                overall_status = '{overall}',
-                error_message = CASE WHEN '{r['status']}' != 'CONFIRMED'
-                                     THEN '{error_msg}'
-                                     ELSE error_message END,
-                updated_at = current_timestamp()
-            WHERE run_id = '{run_id}'
-              AND source_database = '{r['source_database']}'
-              AND source_table = '{r['source_table']}'
-        """, task_label=f"update_rewrite_data_presence_status:{r['source_table']}")
-
-    if src_db:
-        execute_with_iceberg_retry(spark, f"""
-            UPDATE {tracking_db}.rewrite_migration_table_status
-            SET data_presence_status = 'FAILED',
-                overall_status = 'FAILED',
-                error_message = COALESCE(error_message, 'Data presence check did not process this table'),
-                updated_at = current_timestamp()
-            WHERE run_id = '{run_id}'
-              AND source_database = '{src_db}'
-              AND discovery_status = 'COMPLETED'
-              AND data_presence_status IS NULL
-        """, task_label="update_rewrite_data_presence_status:catchall")
-
-    return presence_result
-
-
-@task.pyspark(conn_id='spark_default')
 @track_duration
-def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
+def create_dest_tables(presence_result: dict, spark, **context) -> dict:
     """Register destination tables using rewrite_table_path + register_table.
 
     Pipeline per table:
       1. Drop from HMS if already registered.
       2. Temporarily register using the source metadata file so
          rewrite_table_path can locate the original source paths.
-      3. Call rewrite_table_path — rewrites all source/ path references to
-         dest/ and writes the new metadata directly to dest_path/metadata.
+      3. Call rewrite_table_path — rewrites every path reference (all snapshots)
+         source/→dest/ and writes new metadata into dest_path/metadata.
+         Use latest_version from the result (not _resolve_metadata_file) because
+         version-hint.text is stale after the rewrite.
       4. Drop temporary registration.
       5. Permanently register in HMS via register_table using the rewritten
          metadata now present at dest_path/metadata.
@@ -676,7 +699,7 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
     from utils.migrations.shared import _rebase_table_path, _resolve_metadata_file
 
     if not isinstance(presence_result, dict) or 'tables' not in presence_result:
-        logger.warning("[create_rewrite_dest_tables] Skipping invalid input")
+        logger.warning("[create_dest_tables] Skipping invalid input")
         return {}
 
     config = get_config()
@@ -700,7 +723,7 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
 
         if p_status != 'CONFIRMED':
             logger.info(
-                f"[create_rewrite_dest_tables] Skipping {dest_db}.{tbl}, "
+                f"[create_dest_tables] Skipping {dest_db}.{tbl}, "
                 f"data_presence={p_status}"
             )
             results.append({
@@ -733,7 +756,7 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
 
             if exists:
                 spark.sql(f"DROP TABLE {full_name}")
-                logger.info(f"[create_rewrite_dest_tables] Dropped {full_name} from HMS")
+                logger.info(f"[create_dest_tables] Dropped {full_name} from HMS")
 
             # Step 2: Temporary HMS registration using the SOURCE metadata file.
             # rewrite_table_path rewrites source/ → dest/ paths and writes the
@@ -748,19 +771,23 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
                 )
             """)
             logger.info(
-                f"[create_rewrite_dest_tables] Temporarily registered "
+                f"[create_dest_tables] Temporarily registered "
                 f"{full_name} via source metadata at {source_metadata_file}"
             )
 
             # Step 3: Rewrite metadata — rewrites all source/ path references to
-            # dest/ and stages new manifest + metadata files inside dest_path/metadata
-            # so they land alongside the existing metadata files, not in the table root.
+            # dest/ across every snapshot (full history preserved). New manifest
+            # and metadata files are written to dest_path/metadata so they land
+            # alongside the existing metadata files, not in the table root.
+            # version-hint.text is NOT updated by the procedure, so we use
+            # latest_version from the result rather than re-resolving via
+            # _resolve_metadata_file, which would return the pre-rewrite file.
             if not source_prefix or not dest_prefix:
                 raise ValueError(
                     f"source_s3_prefix and dest_s3_prefix are required "
                     f"(got: '{source_prefix}', '{dest_prefix}')"
                 )
-            spark.sql(f"""
+            rewrite_result = spark.sql(f"""
                 CALL spark_catalog.system.rewrite_table_path(
                     table            => '{full_name}',
                     source_prefix    => '{source_prefix}',
@@ -768,14 +795,17 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
                     staging_location => '{dest_path}/metadata'
                 )
             """)
-            logger.info(f"[create_rewrite_dest_tables] rewrite_table_path completed for {full_name}")
+            latest_version = rewrite_result.collect()[0]['latest_version']
+            new_metadata_file = f"{dest_path}/metadata/{latest_version}"
+            logger.info(
+                f"[create_dest_tables] rewrite_table_path completed for {full_name}; "
+                f"new metadata: {new_metadata_file}"
+            )
 
             # Step 4: Drop temporary registration
             spark.sql(f"DROP TABLE {full_name}")
 
-            # Step 5: Permanent HMS registration using the rewritten metadata
-            # now present at dest_path/metadata.
-            new_metadata_file = _resolve_metadata_file(spark, dest_path)
+            # Step 5: Permanent HMS registration using the rewritten metadata file.
             spark.sql(f"""
                 CALL spark_catalog.system.register_table(
                     table => '{full_name}',
@@ -783,7 +813,7 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
                 )
             """)
             logger.info(
-                f"[create_rewrite_dest_tables] Registered {full_name} "
+                f"[create_dest_tables] Registered {full_name} "
                 f"via {new_metadata_file}"
             )
 
@@ -799,7 +829,7 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
                     ).count()
 
             logger.info(
-                f"[create_rewrite_dest_tables] {full_name} registered: "
+                f"[create_dest_tables] {full_name} registered: "
                 f"{imported_row_count} rows, {imported_partition_count} partitions"
             )
 
@@ -814,7 +844,7 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
 
         except Exception as e:
             error_msg = str(e)[:2000]
-            logger.error(f"[create_rewrite_dest_tables] FAILED for {full_name}: {error_msg}")
+            logger.error(f"[create_dest_tables] FAILED for {full_name}: {error_msg}")
             results.append({
                 'source_table': tbl,
                 'status': 'FAILED',
@@ -835,10 +865,10 @@ def create_rewrite_dest_tables(presence_result: dict, spark, **context) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_rewrite_table_create_status(table_result: dict, spark) -> dict:
+def update_table_create_in_tracking(table_result: dict, spark) -> dict:
     """Update tracking table with table creation results."""
     if not isinstance(table_result, dict) or 'run_id' not in table_result:
-        logger.warning("[update_rewrite_table_create_status] Skipping invalid input")
+        logger.warning("[update_table_create_in_tracking] Skipping invalid input")
         return {}
 
     config = get_config()
@@ -885,7 +915,7 @@ def update_rewrite_table_create_status(table_result: dict, spark) -> dict:
             WHERE run_id = '{run_id}'
               AND dest_database = '{dest_db}'
               AND source_table = '{r['source_table']}'
-        """, task_label=f"update_rewrite_table_create_status:{r['source_table']}")
+        """, task_label=f"update_table_create_in_tracking:{r['source_table']}")
 
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.rewrite_migration_table_status
@@ -897,17 +927,17 @@ def update_rewrite_table_create_status(table_result: dict, spark) -> dict:
           AND source_database = '{src_db}'
           AND table_create_status IS NULL
           AND data_presence_status = 'CONFIRMED'
-    """, task_label="update_rewrite_table_create_status:catchall")
+    """, task_label="update_table_create_in_tracking:catchall")
 
     return table_result
 
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def validate_rewrite_destination_tables(table_result: dict, spark, **context) -> dict:
+def validate_dest_tables(table_result: dict, spark, **context) -> dict:
     """Validate destination tables — row counts, partition counts, schema comparison."""
     if not isinstance(table_result, dict) or 'tables' not in table_result:
-        logger.warning("[validate_rewrite_destination_tables] Skipping invalid input")
+        logger.warning("[validate_dest_tables] Skipping invalid input")
         return {}
 
     config = get_config()
@@ -940,7 +970,7 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
                 })
                 continue
 
-        logger.info(f"[validate_rewrite_destination_tables] Validating {dest_tbl}")
+        logger.info(f"[validate_dest_tables] Validating {dest_tbl}")
 
         try:
             src_metrics = spark.sql(f"""
@@ -1002,8 +1032,6 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
             )
 
             # Path rewrite check — verify the current snapshot's manifest-list is at dest.
-            # Checking only the current snapshot avoids false positives from historical
-            # snapshot entries that legitimately still reference source paths.
             path_rewrite_verified = True
             src_prefix = t.get('source_s3_prefix', '').rstrip('/')
             try:
@@ -1020,7 +1048,7 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
                         path_rewrite_verified = False
             except Exception as path_e:
                 logger.warning(
-                    f"[validate_rewrite_destination_tables] Could not verify path rewrite "
+                    f"[validate_dest_tables] Could not verify path rewrite "
                     f"for {dest_tbl}: {path_e}"
                 )
                 path_rewrite_verified = False
@@ -1031,7 +1059,7 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
                 f"schema={'✓' if schema_match else '✗'} "
                 f"paths={'✓' if path_rewrite_verified else '✗'}"
             )
-            logger.info(f"[validate_rewrite_destination_tables] {dest_tbl} | {match_str}")
+            logger.info(f"[validate_dest_tables] {dest_tbl} | {match_str}")
 
             mismatch_parts = []
             if not row_count_match:
@@ -1059,7 +1087,7 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
             })
 
         except Exception as e:
-            logger.error(f"[validate_rewrite_destination_tables] FAILED for {dest_tbl}: {e}")
+            logger.error(f"[validate_dest_tables] FAILED for {dest_tbl}: {e}")
             validation_results.append({
                 'source_table': tbl, 'status': 'FAILED', 'error': str(e)[:2000],
             })
@@ -1076,10 +1104,10 @@ def validate_rewrite_destination_tables(table_result: dict, spark, **context) ->
 
 
 @task.pyspark(conn_id='spark_default')
-def update_rewrite_validation_status(validation_result: dict, spark) -> dict:
+def update_validation_in_tracking(validation_result: dict, spark) -> dict:
     """Update tracking table with validation results."""
     if not isinstance(validation_result, dict) or 'run_id' not in validation_result:
-        logger.warning("[update_rewrite_validation_status] Skipping invalid input")
+        logger.warning("[update_validation_in_tracking] Skipping invalid input")
         return {}
 
     config = get_config()
@@ -1132,7 +1160,7 @@ def update_rewrite_validation_status(validation_result: dict, spark) -> dict:
               AND source_database = '{src_db}'
               AND dest_database = '{dest_db}'
               AND source_table = '{v['source_table']}'
-        """, task_label=f"update_rewrite_validation_status:{v['source_table']}")
+        """, task_label=f"update_validation_in_tracking:{v['source_table']}")
 
     for v in validation_result.get('validation_results', []):
         if v.get('status') == 'FAILED' and v.get('error'):
@@ -1148,7 +1176,7 @@ def update_rewrite_validation_status(validation_result: dict, spark) -> dict:
                   AND source_database = '{src_db}'
                   AND source_table = '{v['source_table']}'
                   AND validation_status IS NULL
-            """, task_label=f"update_rewrite_validation_status:failure_patch:{v['source_table']}")
+            """, task_label=f"update_validation_in_tracking:failure_patch:{v['source_table']}")
 
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.rewrite_migration_table_status
@@ -1164,13 +1192,13 @@ def update_rewrite_validation_status(validation_result: dict, spark) -> dict:
           AND data_presence_status = 'CONFIRMED'
           AND table_create_status = 'COMPLETED'
           AND validation_status IS NULL
-    """, task_label="update_rewrite_validation_status:catchall")
+    """, task_label="update_validation_in_tracking:catchall")
 
     return validation_result
 
 
 @task.pyspark(conn_id='spark_default')
-def generate_rewrite_html_report(run_id: str, spark) -> dict:
+def generate_html_report(run_id: str, spark) -> dict:
     """Generate HTML report for the rewrite_table_path migration."""
     from datetime import datetime
 
@@ -1194,7 +1222,13 @@ def generate_rewrite_html_report(run_id: str, spark) -> dict:
     failed_tables = sum(1 for t in table_status if 'FAILED' in (t.overall_status or ''))
     missing_tables = sum(1 for t in table_status if t.overall_status == 'DATA_MISSING')
     total_rows = sum(t.source_row_count or 0 for t in table_status)
-    total_dest_size = sum(t.data_presence_size_bytes or 0 for t in table_status) / (1024 ** 3)
+    _total_bytes = sum(t.data_presence_size_bytes or 0 for t in table_status)
+    if _total_bytes >= 1024 ** 3:
+        total_dest_size_str = f"{_total_bytes / (1024 ** 3):.2f} GB"
+    elif _total_bytes >= 1024 ** 2:
+        total_dest_size_str = f"{_total_bytes / (1024 ** 2):.1f} MB"
+    else:
+        total_dest_size_str = f"{_total_bytes / 1024:.0f} KB"
     dag_run_id = run_row.dag_run_id if run_row else 'N/A'
 
     html = f"""<!DOCTYPE html>
@@ -1245,7 +1279,7 @@ def generate_rewrite_html_report(run_id: str, spark) -> dict:
   <div class="card c3"><h3>FAILED</h3><p class="v">{failed_tables}</p></div>
   <div class="card c5"><h3>DATA MISSING</h3><p class="v">{missing_tables}</p></div>
   <div class="card c4"><h3>SOURCE ROWS</h3><p class="v">{total_rows:,}</p></div>
-  <div class="card c4"><h3>DEST DATA SIZE</h3><p class="v">{total_dest_size:.3f} GB</p></div>
+  <div class="card c4"><h3>DEST DATA SIZE</h3><p class="v">{total_dest_size_str}</p></div>
 </div>
 
 <div class="divider"></div>
@@ -1347,12 +1381,12 @@ def generate_rewrite_html_report(run_id: str, spark) -> dict:
     stream = fs.create(spark._jvm.org.apache.hadoop.fs.Path(report_path), True)
     stream.write(html.encode('utf-8'))
     stream.close()
-    logger.info(f"[generate_rewrite_html_report] Report written to {report_path}")
+    logger.info(f"[generate_html_report] Report written to {report_path}")
     return {'report_path': report_path}
 
 
 @task.pyspark(conn_id='spark_default')
-def send_rewrite_report_email(report_result: dict, run_id: str, spark) -> dict:
+def send_report_email(report_result: dict, run_id: str, spark) -> dict:
     """Send rewrite migration HTML report via email."""
     import os
     import tempfile
@@ -1364,7 +1398,7 @@ def send_rewrite_report_email(report_result: dict, run_id: str, spark) -> dict:
     recipients_str = config.get('email_recipients', '')
 
     if not recipients_str:
-        logger.warning("[send_rewrite_report_email] No recipients configured. Skipping.")
+        logger.warning("[send_report_email] No recipients configured. Skipping.")
         return {'sent': False, 'reason': 'no_recipients'}
 
     recipients = [r.strip() for r in recipients_str.split(',') if r.strip()]
@@ -1405,15 +1439,15 @@ def send_rewrite_report_email(report_result: dict, run_id: str, spark) -> dict:
             conn_id=smtp_conn_id,
         )
         os.unlink(tmp.name)
-        logger.info(f"[send_rewrite_report_email] Report sent to: {recipients}")
+        logger.info(f"[send_report_email] Report sent to: {recipients}")
         return {'sent': True, 'recipients': recipients, 'report_path': report_path}
     except Exception as e:
-        logger.error(f"[send_rewrite_report_email] Failed: {e}")
+        logger.error(f"[send_report_email] Failed: {e}")
         raise Exception(f"Failed to send rewrite migration report email: {e}") from e
 
 
 @task.pyspark(conn_id='spark_default')
-def finalize_rewrite_run(run_id: str, spark) -> dict:
+def finalize_run(run_id: str, spark) -> dict:
     """Aggregate final statistics and mark the run complete."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -1446,7 +1480,7 @@ def finalize_rewrite_run(run_id: str, spark) -> dict:
             else:
                 final_status = 'COMPLETED_WITH_FAILURES'
     except Exception as e:
-        logger.error(f"[finalize_rewrite_run] Error querying tracking table: {e}")
+        logger.error(f"[finalize_run] Error querying tracking table: {e}")
 
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.rewrite_migration_runs
@@ -1457,10 +1491,10 @@ def finalize_rewrite_run(run_id: str, spark) -> dict:
             failed_tables = {stats['failed']},
             missing_tables = {stats['missing']}
         WHERE run_id = '{run_id}'
-    """, task_label="finalize_rewrite_run:update")
+    """, task_label="finalize_run:update")
 
     logger.info(
-        f"[finalize_rewrite_run] Run '{run_id}' → {final_status} | "
+        f"[finalize_run] Run '{run_id}' → {final_status} | "
         f"total={stats['total']} validated={stats['successful']} "
         f"failed={stats['failed']} missing={stats['missing']}"
     )
@@ -1497,50 +1531,52 @@ with DAG(
     render_template_as_native_obj=True,
 ) as dag_iceberg_rewrite:
 
-    t_init = init_rewrite_tracking_tables()
-    t_run_id = create_rewrite_migration_run(
+    t_init = init_tracking_tables()
+    t_run_id = create_migration_run(
         excel_file_path="{{ params.excel_file_path }}",
         dag_run_id="{{ run_id }}",
     )
-    t_excel = parse_rewrite_excel(
+    t_excel = parse_excel(
         excel_file_path="{{ params.excel_file_path }}",
         run_id=t_run_id,
     )
 
     # Dynamic task mapping (one set of tasks per database group)
-    t_discover = discover_rewrite_tables.expand(db_config=t_excel)
-    t_record = record_rewrite_discovered_tables.expand(discovery=t_discover)
-    t_record.operator.trigger_rule = 'all_done'
-
-    t_presence = validate_rewrite_data_presence.expand(discovery=t_record)
+    t_presence    = validate_data_presence.expand(db_config=t_excel)
     t_presence.operator.trigger_rule = 'all_done'
 
-    t_pres_status = update_rewrite_data_presence_status.expand(presence_result=t_presence)
+    t_pres_status = update_data_presence_in_tracking.expand(presence_result=t_presence)
     t_pres_status.operator.trigger_rule = 'all_done'
 
-    t_tables = create_rewrite_dest_tables.expand(presence_result=t_pres_status)
+    t_discover    = discover_tables.expand(presence_result=t_pres_status)
+    t_discover.operator.trigger_rule = 'all_done'
+
+    t_record      = update_discovered_tables_in_tracking.expand(discovery=t_discover)
+    t_record.operator.trigger_rule = 'all_done'
+
+    t_tables      = create_dest_tables.expand(presence_result=t_record)
     t_tables.operator.trigger_rule = 'all_done'
 
-    t_tbl_status = update_rewrite_table_create_status.expand(table_result=t_tables)
+    t_tbl_status = update_table_create_in_tracking.expand(table_result=t_tables)
     t_tbl_status.operator.trigger_rule = 'all_done'
 
-    t_validate = validate_rewrite_destination_tables.expand(table_result=t_tbl_status)
+    t_validate = validate_dest_tables.expand(table_result=t_tbl_status)
     t_validate.operator.max_active_tis_per_dagrun = 3
     t_validate.operator.trigger_rule = 'all_done'
 
-    t_val_status = update_rewrite_validation_status.expand(validation_result=t_validate)
+    t_val_status = update_validation_in_tracking.expand(validation_result=t_validate)
     t_val_status.operator.trigger_rule = 'all_done'
 
-    t_report = generate_rewrite_html_report(run_id=t_run_id)
+    t_report = generate_html_report(run_id=t_run_id)
     t_report.operator.trigger_rule = 'all_done'
 
-    t_email = send_rewrite_report_email(run_id=t_run_id, report_result=t_report)
+    t_email = send_report_email(run_id=t_run_id, report_result=t_report)
     t_email.operator.trigger_rule = 'all_done'
 
-    t_final = finalize_rewrite_run(run_id=t_run_id)
+    t_final = finalize_run(run_id=t_run_id)
     t_final.operator.trigger_rule = 'all_done'
 
     # Dependency chain
-    t_init >> t_run_id >> t_excel >> t_discover >> t_record
-    t_record >> t_presence >> t_pres_status >> t_tables >> t_tbl_status
+    t_init >> t_run_id >> t_excel >> t_presence >> t_pres_status
+    t_pres_status >> t_discover >> t_record >> t_tables >> t_tbl_status
     t_tbl_status >> t_validate >> t_val_status >> t_report >> t_email >> t_final

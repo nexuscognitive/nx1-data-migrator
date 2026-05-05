@@ -112,44 +112,44 @@ Rows are grouped by `(database, source_s3_prefix, dest_s3_prefix)`. Multiple row
 ## Task Flow
 
 ```
-init_rewrite_tracking_tables
+init_tracking_tables
     ↓
-create_rewrite_migration_run
+create_migration_run
     ↓
-parse_rewrite_excel
+parse_excel
     ↓
 ┌───────────────────────────────────────────────────────────────────┐
 │  Dynamic Task Mapping (one set of tasks per database config)      │
 │                                                                   │
-│  discover_rewrite_tables (PySpark)                                │
+│  validate_data_presence  [trigger: all_done]                      │
 │    ↓                                                              │
-│  record_rewrite_discovered_tables  [trigger: all_done]            │
+│  update_data_presence_in_tracking  [trigger: all_done]            │
 │    ↓                                                              │
-│  validate_rewrite_data_presence  [trigger: all_done]              │
+│  discover_tables (PySpark)  [trigger: all_done]                   │
 │    ↓                                                              │
-│  update_rewrite_data_presence_status  [trigger: all_done]         │
+│  update_discovered_tables_in_tracking  [trigger: all_done]        │
 │    ↓                                                              │
-│  create_rewrite_dest_tables  [trigger: all_done]                  │
+│  create_dest_tables  [trigger: all_done]                          │
 │    ↓                                                              │
-│  update_rewrite_table_create_status  [trigger: all_done]          │
+│  update_table_create_in_tracking  [trigger: all_done]             │
 │    ↓                                                              │
-│  validate_rewrite_destination_tables  [trigger: all_done, max=3]  │
+│  validate_dest_tables  [trigger: all_done, max=3]                 │
 │    ↓                                                              │
-│  update_rewrite_validation_status  [trigger: all_done]            │
+│  update_validation_in_tracking  [trigger: all_done]               │
 └───────────────────────────────────────────────────────────────────┘
     ↓
-generate_rewrite_html_report  [trigger: all_done]
+generate_html_report  [trigger: all_done]
     ↓
-send_rewrite_report_email  [trigger: all_done]
+send_report_email  [trigger: all_done]
     ↓
-finalize_rewrite_run  [trigger: all_done]
+finalize_run  [trigger: all_done]
 ```
 
 ---
 
 ## Task Summaries
 
-### Step 0 — `init_rewrite_tracking_tables`
+### Step 0 — `init_tracking_tables`
 
 **Type:** PySpark
 
@@ -160,7 +160,7 @@ finalize_rewrite_run  [trigger: all_done]
 
 ---
 
-### Step 1 — `create_rewrite_migration_run`
+### Step 1 — `create_migration_run`
 
 **Type:** PySpark
 
@@ -170,7 +170,7 @@ finalize_rewrite_run  [trigger: all_done]
 
 ---
 
-### Step 2 — `parse_rewrite_excel`
+### Step 2 — `parse_excel`
 
 **Type:** PySpark
 
@@ -183,48 +183,54 @@ finalize_rewrite_run  [trigger: all_done]
 
 ---
 
-### Step 3 — `discover_rewrite_tables`
-
-**Type:** PySpark (mapped per database config) · **@track_duration**
-
-- Reads schema, partition spec, row count, and file stats from `metadata.json` at the **destination** S3 path (not from HMS — HMS may not have the table registered yet and would not preserve partition transform details).
-- Lists tables under `{dest_s3_prefix}/{database}/` and filters by the `table_tokens` pattern.
-- On per-table failure, records an error entry and raises after processing all tables.
-
----
-
-### Step 4 — `record_rewrite_discovered_tables`
+### Step 3 — `validate_data_presence`
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done`
 
-- Inserts or updates records in `rewrite_migration_table_status` with schema, partition spec, file count, and size from discovery.
-- Sets `discovery_status = COMPLETED` and `overall_status = DISCOVERED`.
-
----
-
-### Step 5 — `validate_rewrite_data_presence`
-
-**Type:** PySpark (mapped per database config) · trigger: `all_done`
-
-- Uses the Hadoop FileSystem API to verify each destination table path:
+- Takes `db_config` (the `parse_excel` output dict) directly.
+- Lists table directories under `dest_s3_prefix` using `_list_iceberg_tables` and filters by `table_tokens` via `_match_tokens`.
+- For each matched table, uses the Hadoop FileSystem API to verify:
   - Path must exist.
   - A `metadata/` subdirectory must be present (required for `rewrite_table_path`).
   - At least one file must be present.
+- Each presence result includes a `dest_path` key used by `discover_tables` downstream.
 - Sets status `CONFIRMED`, `MISSING`, or `FAILED` per table.
 - Raises only on `FAILED` (API/connectivity errors); `MISSING` tables continue and are tracked.
 
 ---
 
-### Step 6 — `update_rewrite_data_presence_status`
+### Step 4 — `update_data_presence_in_tracking`
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done`
 
-- Updates `data_presence_status`, `data_presence_file_count`, `data_presence_size_bytes`, and `overall_status` in the tracking table.
-- Tables with `DATA_MISSING` are skipped by all downstream steps but remain visible in the report.
+- Inserts the initial tracking records into `rewrite_migration_table_status` (no records exist yet at this stage).
+- On reruns, checks for existing rows first — UPDATEs if found, INSERTs otherwise (idempotent).
+- Populated fields at this stage: `run_id`, `source_database`, `source_table`, `dest_database`, `dest_bucket`, `source_s3_location`, `dest_s3_location`, `source_s3_prefix`, `dest_s3_prefix`, `data_presence_status`, `data_presence_checked_at`, `data_presence_file_count`, `data_presence_size_bytes`, `overall_status` (`DATA_CONFIRMED`, `DATA_MISSING`, or `FAILED`).
 
 ---
 
-### Step 7 — `create_rewrite_dest_tables`
+### Step 5 — `discover_tables`
+
+**Type:** PySpark (mapped per database config) · trigger: `all_done` · **@track_duration**
+
+- Takes `presence_result` (the `update_data_presence_in_tracking` output) directly.
+- Iterates over `presence_results` where `status == 'CONFIRMED'` — no additional filesystem listing needed.
+- Reads schema, partition spec, row count, and file stats from `metadata.json` at the destination S3 path for each confirmed table (not from HMS — HMS may not have the table registered yet and would not preserve partition transform details).
+- Returns `{**presence_result, 'tables': metadata_list}` so `presence_results` remains available to downstream tasks.
+- On per-table failure, records an error entry and raises after processing all tables.
+
+---
+
+### Step 6 — `update_discovered_tables_in_tracking`
+
+**Type:** PySpark (mapped per database config) · trigger: `all_done`
+
+- UPDATEs existing records in `rewrite_migration_table_status` (records were already inserted by `update_data_presence_in_tracking`).
+- Sets `discovery_status`, `discovery_completed_at`, `discovery_duration_seconds`, `source_s3_location`, `dest_s3_location`, `file_format`, `table_type`, `source_row_count`, `source_file_count`, `source_total_size_bytes`, `partition_count`, `source_partition_count`, `schema_json`, `partitions_json`, `is_partitioned`, `partition_columns`, and `overall_status` (set to `DISCOVERED` for successful tables).
+
+---
+
+### Step 7 — `create_dest_tables`
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done` · **@track_duration**
 
@@ -232,17 +238,15 @@ Skips tables where data presence is not `CONFIRMED`. For each confirmed table, e
 
 1. **Drop from HMS** if already registered (no `PURGE` — data files are preserved).
 2. **Temporarily register** using the **source** metadata file: constructs the equivalent source path by swapping `dest_s3_prefix` → `source_s3_prefix` in `dest_path`, resolves the metadata file there, and calls `CALL spark_catalog.system.register_table(table, source_metadata_file)`. This is required so `rewrite_table_path` sees a `location` field that starts with `source_s3_prefix` and knows which paths to rewrite.
-3. **Rewrite metadata**: `CALL spark_catalog.system.rewrite_table_path(table, source_prefix, target_prefix, staging_location)` — rewrites all `source/` path references to `dest/` and writes the new metadata directly to `dest_path/metadata`.
+3. **Rewrite metadata**: `CALL spark_catalog.system.rewrite_table_path(table, source_prefix, target_prefix, staging_location => '{dest_path}/metadata')` — rewrites all `source/` path references to `dest/` across every snapshot (full history). New manifest and metadata files are written to `dest_path/metadata`. The `latest_version` filename is read from the procedure result row and used directly to construct the new metadata file path — `version-hint.text` is not consulted because it is not updated by the procedure.
 4. **Drop the temporary registration**.
-5. **Permanently register in HMS** via `CALL spark_catalog.system.register_table(table, metadata_file)` using `_resolve_metadata_file(spark, dest_path)` — picks up the newly written metadata at `dest_path/metadata`.
+5. **Permanently register in HMS** via `CALL spark_catalog.system.register_table(table, metadata_file)` using `{dest_path}/metadata/{latest_version}` from the rewrite result.
 
-`staging_location` (`{dest_s3_prefix}/{dest_database}/_staging_rewrite/{table_name}`) is passed to `rewrite_table_path` as required by the procedure but is used internally for coordination only — it is not the output directory. It is cleaned up after successful registration, and on failure.
-
-On failure, staging is cleaned up automatically. The task raises after all tables are processed if any failed.
+The task raises after all tables are processed if any failed.
 
 ---
 
-### Step 8 — `update_rewrite_table_create_status`
+### Step 8 — `update_table_create_in_tracking`
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done`
 
@@ -251,7 +255,7 @@ On failure, staging is cleaned up automatically. The task raises after all table
 
 ---
 
-### Step 9 — `validate_rewrite_destination_tables`
+### Step 9 — `validate_dest_tables`
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done` · max 3 concurrent · **@track_duration**
 
@@ -259,21 +263,22 @@ For each table that was successfully created:
 - Queries `SELECT COUNT(*)` and `.partitions` on the destination table.
 - Compares against source row count and partition count stored in the tracking table.
 - Performs schema comparison between source `metadata.json` schema and `DESCRIBE` output.
+- Reads the destination metadata JSON and verifies the current snapshot's `manifest-list` field references `dest_s3_prefix`, not `source_s3_prefix` (`path_rewrite_verified`).
 - Partition count mismatches are treated as warnings.
-- Schema and row count mismatches are failures.
+- Schema, row count, and path rewrite mismatches are failures.
 
 ---
 
-### Step 10 — `update_rewrite_validation_status`
+### Step 10 — `update_validation_in_tracking`
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done`
 
-- Updates `validation_status`, `row_count_match`, `partition_count_match`, `schema_match`, `schema_differences`, and `overall_status` (`VALIDATED` or `VALIDATION_FAILED`).
+- Updates `validation_status`, `row_count_match`, `partition_count_match`, `schema_match`, `path_rewrite_verified`, `schema_differences`, and `overall_status` (`VALIDATED` or `VALIDATION_FAILED`).
 - Applies catch-all updates for tables that were not processed by the validation task.
 
 ---
 
-### Step 11 — `generate_rewrite_html_report`
+### Step 11 — `generate_html_report`
 
 **Type:** PySpark · trigger: `all_done`
 
@@ -287,7 +292,7 @@ Report sections:
 
 ---
 
-### Step 12 — `send_rewrite_report_email`
+### Step 12 — `send_report_email`
 
 **Type:** PySpark · trigger: `all_done`
 
@@ -298,7 +303,7 @@ Report sections:
 
 ---
 
-### Step 13 — `finalize_rewrite_run`
+### Step 13 — `finalize_run`
 
 **Type:** PySpark · trigger: `all_done`
 
@@ -321,9 +326,9 @@ Report sections:
 **Per-table `overall_status`:**
 
 ```
-DISCOVERED
-    ↓
 DATA_CONFIRMED  (metadata and data files found at destination)
+    ↓
+DISCOVERED  (metadata read from destination, tracking record updated)
     ↓
 TABLE_CREATED  (rewrite_table_path + register_table executed)
     ↓
@@ -335,13 +340,13 @@ DATA_MISSING → skipped in all downstream steps, visible in report
 
 | Status | Meaning |
 |---|---|
-| `DISCOVERED` | Metadata read from destination, tracking record inserted |
-| `DATA_CONFIRMED` | Data and metadata files present at destination S3 |
+| `DATA_CONFIRMED` | Data and metadata files present at destination S3 — initial tracking record inserted |
+| `DISCOVERED` | Metadata read from destination, tracking record updated with schema/partition info |
 | `DATA_MISSING` | No files or missing `metadata/` directory — skipped |
 | `TABLE_CREATED` | `rewrite_table_path` + `register_table` completed, validation pending |
 | `VALIDATED` | All validations passed — migration success |
 | `VALIDATION_FAILED` | Row count, partition count, or schema mismatch |
-| `FAILED` | Error at discovery, data presence check, or table creation |
+| `FAILED` | Error at data presence check, discovery, or table creation |
 
 ---
 
