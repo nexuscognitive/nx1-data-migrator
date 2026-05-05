@@ -14,9 +14,9 @@ Excel columns: database | table | dest database | bucket | endpoint
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
-import re
 
 from airflow import DAG
 from airflow.decorators import task
