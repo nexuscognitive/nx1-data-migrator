@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import shlex
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -1073,6 +1074,9 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             )
 
         if partition_filter_active and filtered_partitions:
+            dest_part_paths_quoted = ' '.join(
+                shlex.quote(f"{s3_loc}/{p}") for p in filtered_partitions
+            )
             if preserve_delete:
                 partition_copy_pairs = []
                 for part_str in filtered_partitions:
@@ -1129,8 +1133,25 @@ run_distcp_with_retry() {{
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 
-echo "=== Calculating S3 metrics BEFORE distcp ==="
-S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")
+DEST_PART_PATHS=({dest_part_paths_quoted})
+
+sum_s3_metrics_over_paths() {{
+    local fc=0 ts=0 pfc pts result
+    for path in "$@"; do
+        result=$(calculate_s3_metrics_hadoop "$path")
+        pfc=$(echo "$result" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+        pts=$(echo "$result" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+        [ -z "$pfc" ] && pfc=0
+        [ -z "$pts" ] && pts=0
+        fc=$((fc + pfc))
+        ts=$((ts + pts))
+    done
+    echo "S3_FILE_COUNT=$fc"
+    echo "S3_TOTAL_SIZE=$ts"
+}}
+
+echo "=== Calculating S3 metrics BEFORE distcp (scoped to filtered partitions) ==="
+S3_BEFORE=$(sum_s3_metrics_over_paths "${{DEST_PART_PATHS[@]}}")
 S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
 S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
 [ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
@@ -1139,8 +1160,8 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 echo "=== Running distcp per-partition ==="
 {distcp_calls}
 
-echo "=== Calculating S3 metrics AFTER distcp ==="
-S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")
+echo "=== Calculating S3 metrics AFTER distcp (scoped to filtered partitions) ==="
+S3_AFTER=$(sum_s3_metrics_over_paths "${{DEST_PART_PATHS[@]}}")
 S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
 S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
 [ -z "$S3_FILE_COUNT_AFTER" ] && S3_FILE_COUNT_AFTER=0
@@ -1190,8 +1211,25 @@ cat > "$PATHLIST" <<'EOF'
 {pathlist_entries}
 EOF
 
-echo "=== Calculating S3 metrics BEFORE distcp ==="
-S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")
+DEST_PART_PATHS=({dest_part_paths_quoted})
+
+sum_s3_metrics_over_paths() {{
+    local fc=0 ts=0 pfc pts result
+    for path in "$@"; do
+        result=$(calculate_s3_metrics_hadoop "$path")
+        pfc=$(echo "$result" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+        pts=$(echo "$result" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+        [ -z "$pfc" ] && pfc=0
+        [ -z "$pts" ] && pts=0
+        fc=$((fc + pfc))
+        ts=$((ts + pts))
+    done
+    echo "S3_FILE_COUNT=$fc"
+    echo "S3_TOTAL_SIZE=$ts"
+}}
+
+echo "=== Calculating S3 metrics BEFORE distcp (scoped to filtered partitions) ==="
+S3_BEFORE=$(sum_s3_metrics_over_paths "${{DEST_PART_PATHS[@]}}")
 S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
 S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
 [ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
@@ -1211,8 +1249,8 @@ FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Number of files copied" | awk '{
 [ -z "$BYTES_COPIED" ] && BYTES_COPIED=0
 [ -z "$FILES_COPIED" ] && FILES_COPIED=0
 
-echo "=== Calculating S3 metrics AFTER distcp ==="
-S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")
+echo "=== Calculating S3 metrics AFTER distcp (scoped to filtered partitions) ==="
+S3_AFTER=$(sum_s3_metrics_over_paths "${{DEST_PART_PATHS[@]}}")
 S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
 S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
 [ -z "$S3_FILE_COUNT_AFTER" ] && S3_FILE_COUNT_AFTER=0
@@ -1524,16 +1562,8 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 s3_file_count_after = {s3_files_after},
                 s3_bytes_transferred = {s3_bytes_transfer},
                 s3_files_transferred = {s3_files_transfer},
-                file_count_match = CASE
-                    WHEN partition_filter IS NOT NULL AND partition_filter != ''
-                    THEN (source_file_count = {s3_files_transfer})
-                    ELSE (source_file_count = {s3_files_after})
-                END,
-                file_size_match = CASE
-                    WHEN partition_filter IS NOT NULL AND partition_filter != ''
-                    THEN (ABS(source_total_size_bytes - {s3_bytes_transfer}) / GREATEST(source_total_size_bytes, 1) < 0.01)
-                    ELSE (ABS(source_total_size_bytes - {s3_size_after}) / GREATEST(source_total_size_bytes, 1) < 0.01)
-                END,
+                file_count_match = (source_file_count = {s3_files_after}),
+                file_size_match  = (source_total_size_bytes = {s3_size_after}),
                 overall_status = '{overall}',
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
                 updated_at = current_timestamp()
