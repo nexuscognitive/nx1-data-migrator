@@ -1053,6 +1053,61 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             })
             continue
 
+        if t.get('partition_filter_active'):
+            effective_file_count = t.get('filtered_file_count', t.get('source_file_count', 0))
+        else:
+            effective_file_count = t.get('source_file_count', 0)
+
+        if effective_file_count == 0:
+            logger.warning(
+                f"[DistCp] EMPTY_SOURCE: {t['source_database']}.{t['source_table']} "
+                f"has 0 source files (source_file_count={t.get('source_file_count', 0)}, "
+                f"partition_filter_active={t.get('partition_filter_active', False)}). "
+                f"Skipping DistCp — will create S3 prefix so downstream tasks can proceed."
+            )
+            from datetime import datetime as _dt
+            distcp_started_at = _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            _mkdir_cmd = (
+                f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}' 2>/dev/null || true"
+            )
+            try:
+                with ssh.get_conn() as client:
+                    _, stdout, stderr = client.exec_command(_mkdir_cmd, timeout=SSH_COMMAND_TIMEOUT)
+                    exit_code = stdout.channel.recv_exit_status()
+                logger.info(f"[DistCp] Created S3 prefix: {t['s3_location']}")
+            except Exception as _me:
+                logger.warning(
+                    f"[DistCp] Could not create S3 prefix for {t['s3_location']}: {_me}"
+                )
+
+            _end_dt = _dt.utcnow()
+            distcp_completed_at = _end_dt.strftime('%Y-%m-%d %H:%M:%S')
+            distcp_duration_secs = (_end_dt - _dt.strptime(distcp_started_at, '%Y-%m-%d %H:%M:%S')).total_seconds()
+            results.append({
+                'source_database': t['source_database'],
+                'source_table': t['source_table'],
+                'dest_database': t['dest_database'],
+                'status': 'EMPTY_SOURCE',
+                'distcp_started_at': distcp_started_at,
+                'distcp_duration_secs': distcp_duration_secs,
+                'distcp_completed_at': distcp_completed_at,
+                'is_incremental': False,
+                'bytes_copied': 0,
+                'files_copied': 0,
+                's3_total_size_bytes_before': 0,
+                's3_file_count_before': 0,
+                's3_total_size_bytes_after': 0,
+                's3_file_count_after': 0,
+                's3_bytes_transferred': 0,
+                's3_files_transferred': 0,
+                'partition_filter_active': t.get('partition_filter_active', False),
+                'partitions_requested': 0,
+                'error': None,
+                'yarn_application_id': None,
+                'yarn_application_ids': [],
+            })
+            continue
+
         src_db = t['source_database']
         tbl = t['source_table']
         dest_db_for_table = t['dest_database']
@@ -1492,7 +1547,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
     src_db = distcp_result['source_database']
 
     for r in distcp_result.get('distcp_results', []):
-        if r.get('status') == 'SKIPPED':
+        if r.get('status') in ('SKIPPED', 'EMPTY_SOURCE'):
             continue
         overall = 'COPIED' if r['status'] == 'COMPLETED' else 'FAILED'
         error_msg = r.get('error', '').replace("'", "''") if r.get('error') else ''
@@ -1559,6 +1614,34 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                   AND distcp_status IS NULL
             """,
             task_label=f"update_distcp_status:failure_patch:{r['source_table']}")
+
+    for r in distcp_result.get('distcp_results', []):
+        if r.get('status') != 'EMPTY_SOURCE':
+            continue
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.migration_table_status
+            SET distcp_status = 'EMPTY_SOURCE',
+                distcp_started_at = CAST('{r['distcp_started_at']}' AS TIMESTAMP),
+                distcp_completed_at = CAST('{r['distcp_completed_at']}' AS TIMESTAMP),
+                distcp_duration_seconds = 0,
+                distcp_is_incremental = false,
+                distcp_bytes_copied = 0,
+                distcp_files_copied = 0,
+                s3_total_size_bytes_before = 0,
+                s3_file_count_before = 0,
+                s3_total_size_bytes_after = 0,
+                s3_file_count_after = 0,
+                s3_bytes_transferred = 0,
+                s3_files_transferred = 0,
+                file_size_match = true,
+                file_count_match = true,
+                overall_status = 'EMPTY_SOURCE',
+                updated_at = current_timestamp()
+            WHERE run_id = '{run_id}'
+              AND source_database = '{r['source_database']}'
+              AND source_table = '{r['source_table']}'
+              AND dest_database = '{r['dest_database']}'
+        """, task_label=f"update_distcp_status:empty_source:{r['source_table']}")
 
     _distcp_processed_dbs = set(
         r.get('dest_database', distcp_result['dest_database'])
@@ -1833,7 +1916,11 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                 table_create_completed_at = current_timestamp(),
                 table_create_duration_seconds = {table_duration},
                 table_already_existed = {str(r.get('existed', False)).lower()},
-                overall_status = CASE WHEN overall_status != 'FAILED' THEN '{overall}' ELSE overall_status END,
+                overall_status = CASE
+                    WHEN overall_status = 'FAILED' THEN overall_status
+                    WHEN overall_status = 'EMPTY_SOURCE' THEN overall_status
+                    ELSE '{overall}'
+                END,
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
@@ -2170,6 +2257,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 schema_differences = '{schema_diffs}',
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
+                    WHEN overall_status = 'EMPTY_SOURCE' THEN overall_status
                     ELSE '{final_overall_status}'
                 END,
                 error_message = CASE
@@ -2259,7 +2347,7 @@ def generate_html_report(run_id: str, spark) -> str:
 
     # Calculate summary stats
     total_tables = len(table_status)
-    successful_tables = sum(1 for t in table_status if t.overall_status in ['VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED'])
+    successful_tables = sum(1 for t in table_status if t.overall_status in ['VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED', 'EMPTY_SOURCE'])
     failed_tables = sum(1 for t in table_status if 'FAILED' in (t.overall_status or ''))
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (1024**3)
     total_files = sum(t.s3_file_count_after or 0 for t in table_status)
@@ -2373,6 +2461,10 @@ def generate_html_report(run_id: str, spark) -> str:
         .status-skipped {{
             background-color: #fff3cd;
             color: #856404;
+        }}
+        .status-empty {{
+            background-color: #e8f4fd;
+            color: #1a6fa3;
         }}
         .status-warning {{
             background-color: #fff3cd;
@@ -2581,6 +2673,8 @@ def generate_html_report(run_id: str, spark) -> str:
         status = t.overall_status or ''
         if 'VALIDATED_WITH_WARNINGS' in status:
             status_class = 'status-warning'
+        elif 'EMPTY_SOURCE' in status:
+            status_class = 'status-empty'
         elif 'VALIDATED' in status or 'TABLE_CREATED' in status:
             status_class = 'status-completed'
         else:
@@ -2824,7 +2918,7 @@ def finalize_run(run_id: str, spark) -> dict:
         stats_result = spark.sql(f"""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED') THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED', 'EMPTY_SOURCE') THEN 1 ELSE 0 END) as successful,
                 SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'
