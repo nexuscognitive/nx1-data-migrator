@@ -1121,6 +1121,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
         logger.info(f"[DistCp]   Source : {source_loc}")
         logger.info(f"[DistCp]   Dest   : {s3_loc}")
         logger.info(f"[DistCp]   Mappers: {mappers} | Bandwidth: {bandwidth} MB/s")
+
         if partition_filter_active:
             logger.info(
                 f"[DistCp]   Partition mode: "
@@ -1641,6 +1642,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
               AND source_database = '{r['source_database']}'
               AND source_table = '{r['source_table']}'
               AND dest_database = '{r['dest_database']}'
+              AND distcp_status IS NULL
         """, task_label=f"update_distcp_status:empty_source:{r['source_table']}")
 
     _distcp_processed_dbs = set(
@@ -1782,6 +1784,20 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                             if c.get('name') and c['name'] not in part_col_list]
                     col_def = ", ".join(cols)
                 else:
+                    if distcp_status == 'EMPTY_SOURCE':
+                        logger.warning(
+                            f"[HiveTable] SKIPPING {full_name} — EMPTY_SOURCE table has no "
+                            f"schema from discovery. Cannot infer schema from empty S3 prefix."
+                        )
+                        results.append({
+                            'source_table': tbl,
+                            'dest_database': dest_db,
+                            'status': 'SKIPPED',
+                            'action': 'skipped_no_schema',
+                            'existed': False,
+                            'error': 'EMPTY_SOURCE table has no schema from discovery; cannot infer schema from empty S3 prefix'
+                        })
+                        continue
                     df = spark.read.format(fmt.lower()).load(s3_loc)
                     col_def = ", ".join([
                         f"`{f.name}` {f.dataType.simpleString()}"
@@ -2803,6 +2819,17 @@ def generate_html_report(run_id: str, spark) -> str:
 
     for t in table_status:
         if not t.distcp_status:
+            continue
+        if t.distcp_status == 'EMPTY_SOURCE':
+            html += f"""
+                <tr>
+                    <td>{t.source_database}</td>
+                    <td><strong>{t.source_table}</strong></td>
+                    <td colspan="10" style="color:var(--color-text-secondary);font-style:italic;font-size:12px;">
+                        Empty source: No data transferred
+                    </td>
+                </tr>
+"""
             continue
 
         source_total_size_gb = (t.source_total_size_bytes or 0) / (1024**3)
