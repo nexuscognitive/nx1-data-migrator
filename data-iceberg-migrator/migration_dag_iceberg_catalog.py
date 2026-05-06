@@ -144,6 +144,9 @@ def init_tracking_tables(spark) -> dict:
             partition_count_match           BOOLEAN,
             schema_match                    BOOLEAN,
             path_rewrite_verified           BOOLEAN,
+            snapshot_count_match            BOOLEAN,
+            source_snapshot_count           BIGINT,
+            dest_snapshot_count             BIGINT,
             schema_differences              STRING,
             overall_status  STRING,
             error_message   STRING,
@@ -455,7 +458,9 @@ def update_data_presence_in_tracking(presence_result: dict, spark) -> dict:
                     table_already_existed,
                     validation_status, validation_completed_at, validation_duration_seconds,
                     dest_hive_row_count, dest_partition_count, source_partition_count,
-                    row_count_match, partition_count_match, schema_match, path_rewrite_verified, schema_differences,
+                    row_count_match, partition_count_match, schema_match, path_rewrite_verified,
+                    snapshot_count_match, source_snapshot_count, dest_snapshot_count,
+                    schema_differences,
                     overall_status, error_message, updated_at
                 ) VALUES (
                     '{run_id}', '{src_db}', '{source_table}',
@@ -472,7 +477,9 @@ def update_data_presence_in_tracking(presence_result: dict, spark) -> dict:
                     NULL, NULL, NULL, NULL,
                     NULL, NULL, NULL,
                     NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL,
+                    NULL,
                     '{overall}',
                     {'NULL' if r['status'] == 'CONFIRMED' else f"'{error_msg}'"},
                     current_timestamp()
@@ -551,11 +558,12 @@ def discover_tables(presence_result: dict, spark, **context) -> dict:
                 ).upper()
                 format_version = str(iceberg_meta.get('format-version', 2))
                 file_count, total_size = _get_fs_stats(spark, dest_path)
+                source_snapshot_count = len(iceberg_meta.get('snapshots', []))
 
                 logger.info(
                     f"[discover_tables] {full_name} | fmt={file_format} | "
                     f"rows={row_count} | size={total_size / (1024 ** 2):.1f}MB | "
-                    f"partitioned={is_partitioned}"
+                    f"partitioned={is_partitioned} | snapshots={source_snapshot_count}"
                 )
 
                 metadata_list.append({
@@ -580,6 +588,7 @@ def discover_tables(presence_result: dict, spark, **context) -> dict:
                     'source_file_count': file_count,
                     'source_total_size_bytes': total_size,
                     'format_version': format_version,
+                    'source_snapshot_count': source_snapshot_count,
                 })
 
             except Exception as e:
@@ -604,6 +613,7 @@ def discover_tables(presence_result: dict, spark, **context) -> dict:
                     'source_file_count': 0,
                     'source_total_size_bytes': 0,
                     'format_version': '2',
+                    'source_snapshot_count': 0,
                     'error': str(e)[:500],
                 })
 
@@ -664,12 +674,19 @@ def update_discovered_tables_in_tracking(discovery: dict, spark) -> dict:
                 source_total_size_bytes = {t['source_total_size_bytes']},
                 partition_count = {t['partition_count']},
                 source_partition_count = {t['partition_count']},
+                source_snapshot_count = {t.get('source_snapshot_count', 0)},
                 schema_json = '{schema_json}',
                 partitions_json = '{parts_json}',
                 is_partitioned = {str(t['is_partitioned']).lower()},
                 partition_columns = '{t['partition_columns']}',
-                overall_status = CASE WHEN '{disc_status}' = 'FAILED' THEN 'FAILED' ELSE 'DISCOVERED' END,
-                error_message = CASE WHEN '{disc_status}' = 'FAILED' THEN {disc_error_sql} ELSE error_message END,
+                overall_status = CASE
+                    WHEN '{disc_status}' = 'FAILED' THEN 'FAILED'
+                    ELSE 'DISCOVERED'
+                END,
+                error_message = CASE
+                    WHEN '{disc_status}' = 'FAILED' THEN {disc_error_sql}
+                    ELSE error_message
+                END,
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
               AND source_database = '{t['source_database']}'
@@ -681,7 +698,7 @@ def update_discovered_tables_in_tracking(discovery: dict, spark) -> dict:
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def create_dest_tables(presence_result: dict, spark, **context) -> dict:
+def rewrite_and_register_tables(presence_result: dict, spark, **context) -> dict:
     """Register destination tables using rewrite_table_path + register_table.
 
     Pipeline per table:
@@ -699,7 +716,7 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
     from utils.migrations.shared import _rebase_table_path, _resolve_metadata_file
 
     if not isinstance(presence_result, dict) or 'tables' not in presence_result:
-        logger.warning("[create_dest_tables] Skipping invalid input")
+        logger.warning("[rewrite_and_register_tables] Skipping invalid input")
         return {}
 
     config = get_config()
@@ -723,7 +740,7 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
 
         if p_status != 'CONFIRMED':
             logger.info(
-                f"[create_dest_tables] Skipping {dest_db}.{tbl}, "
+                f"[rewrite_and_register_tables] Skipping {dest_db}.{tbl}, "
                 f"data_presence={p_status}"
             )
             results.append({
@@ -756,7 +773,7 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
 
             if exists:
                 spark.sql(f"DROP TABLE {full_name}")
-                logger.info(f"[create_dest_tables] Dropped {full_name} from HMS")
+                logger.info(f"[rewrite_and_register_tables] Dropped {full_name} from HMS")
 
             # Step 2: Temporary HMS registration using the SOURCE metadata file.
             # rewrite_table_path rewrites source/ → dest/ paths and writes the
@@ -771,7 +788,7 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
                 )
             """)
             logger.info(
-                f"[create_dest_tables] Temporarily registered "
+                f"[rewrite_and_register_tables] Temporarily registered "
                 f"{full_name} via source metadata at {source_metadata_file}"
             )
 
@@ -798,7 +815,7 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
             latest_version = rewrite_result.collect()[0]['latest_version']
             new_metadata_file = f"{dest_path}/metadata/{latest_version}"
             logger.info(
-                f"[create_dest_tables] rewrite_table_path completed for {full_name}; "
+                f"[rewrite_and_register_tables] rewrite_table_path completed for {full_name}; "
                 f"new metadata: {new_metadata_file}"
             )
 
@@ -813,7 +830,7 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
                 )
             """)
             logger.info(
-                f"[create_dest_tables] Registered {full_name} "
+                f"[rewrite_and_register_tables] Registered {full_name} "
                 f"via {new_metadata_file}"
             )
 
@@ -829,7 +846,7 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
                     ).count()
 
             logger.info(
-                f"[create_dest_tables] {full_name} registered: "
+                f"[rewrite_and_register_tables] {full_name} registered: "
                 f"{imported_row_count} rows, {imported_partition_count} partitions"
             )
 
@@ -844,7 +861,7 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
 
         except Exception as e:
             error_msg = str(e)[:2000]
-            logger.error(f"[create_dest_tables] FAILED for {full_name}: {error_msg}")
+            logger.error(f"[rewrite_and_register_tables] FAILED for {full_name}: {error_msg}")
             results.append({
                 'source_table': tbl,
                 'status': 'FAILED',
@@ -865,10 +882,10 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_table_create_in_tracking(table_result: dict, spark) -> dict:
+def update_rewrite_and_register_in_tracking(table_result: dict, spark) -> dict:
     """Update tracking table with table creation results."""
     if not isinstance(table_result, dict) or 'run_id' not in table_result:
-        logger.warning("[update_table_create_in_tracking] Skipping invalid input")
+        logger.warning("[update_rewrite_and_register_in_tracking] Skipping invalid input")
         return {}
 
     config = get_config()
@@ -915,7 +932,7 @@ def update_table_create_in_tracking(table_result: dict, spark) -> dict:
             WHERE run_id = '{run_id}'
               AND dest_database = '{dest_db}'
               AND source_table = '{r['source_table']}'
-        """, task_label=f"update_table_create_in_tracking:{r['source_table']}")
+        """, task_label=f"update_rewrite_and_register_in_tracking:{r['source_table']}")
 
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.rewrite_migration_table_status
@@ -927,7 +944,7 @@ def update_table_create_in_tracking(table_result: dict, spark) -> dict:
           AND source_database = '{src_db}'
           AND table_create_status IS NULL
           AND data_presence_status = 'CONFIRMED'
-    """, task_label="update_table_create_in_tracking:catchall")
+    """, task_label="update_rewrite_and_register_in_tracking:catchall")
 
     return table_result
 
@@ -974,7 +991,7 @@ def validate_dest_tables(table_result: dict, spark, **context) -> dict:
 
         try:
             src_metrics = spark.sql(f"""
-                SELECT source_row_count, source_partition_count
+                SELECT source_row_count, source_partition_count, source_snapshot_count
                 FROM {tracking_db}.rewrite_migration_table_status
                 WHERE run_id = '{run_id}'
                   AND source_database = '{src_db}'
@@ -989,7 +1006,10 @@ def validate_dest_tables(table_result: dict, spark, **context) -> dict:
                 continue
 
             src_row_count = src_metrics[0]['source_row_count'] or 0
-            src_partition_count = src_metrics[0]['source_partition_count'] or t.get('partition_count', 0)
+            src_partition_count = (
+                src_metrics[0]['source_partition_count'] or t.get('partition_count', 0)
+            )
+            src_snapshot_count = src_metrics[0]['source_snapshot_count'] or 0
 
             dest_row_count = spark.sql(
                 f"SELECT COUNT(*) as c FROM {dest_tbl}"
@@ -1019,33 +1039,39 @@ def validate_dest_tables(table_result: dict, spark, **context) -> dict:
                     schema_diffs.append(f"Missing column: {cn}")
                 elif dest_schema[cn] != ct:
                     schema_match = False
-                    schema_diffs.append(f"Type mismatch {cn}: source={ct} dest={dest_schema[cn]}")
+                    schema_diffs.append(
+                        f"Type mismatch {cn}: source={ct} dest={dest_schema[cn]}"
+                    )
             for cn in dest_schema:
                 if cn not in src_schema:
                     schema_match = False
                     schema_diffs.append(f"Extra column in dest: {cn}")
 
-            row_count_match = (src_row_count == dest_row_count)
+            row_count_match = src_row_count == dest_row_count
             partition_count_match = (
                 src_partition_count == dest_partition_count
                 if src_partition_count > 0 else True
             )
 
-            # Path rewrite check — verify the current snapshot's manifest-list is at dest.
+            # Path rewrite check — query {dest_tbl}.snapshots via SQL and verify
+            # that NO snapshot's manifest_list references the source prefix.
+            # This checks ALL snapshots (full history), not just the current one.
             path_rewrite_verified = True
             src_prefix = t.get('source_s3_prefix', '').rstrip('/')
+            dest_snapshot_count = 0
             try:
-                from utils.migrations.shared import _read_iceberg_metadata
-                dest_metadata = _read_iceberg_metadata(spark, t['dest_location'])
+                snaps_df = spark.sql(f"SELECT manifest_list FROM {dest_tbl}.snapshots")
+                dest_snapshot_count = snaps_df.count()
                 if src_prefix:
-                    current_snap_id = dest_metadata.get('current-snapshot-id')
-                    current_snap = next(
-                        (s for s in dest_metadata.get('snapshots', [])
-                         if s.get('snapshot-id') == current_snap_id),
-                        None
-                    )
-                    if current_snap is None or src_prefix in current_snap.get('manifest-list', ''):
+                    stale = snaps_df.filter(
+                        snaps_df.manifest_list.startswith(src_prefix)
+                    ).count()
+                    if stale > 0:
                         path_rewrite_verified = False
+                        logger.warning(
+                            f"[validate_dest_tables] {dest_tbl}: {stale} snapshot(s) "
+                            f"still reference source prefix"
+                        )
             except Exception as path_e:
                 logger.warning(
                     f"[validate_dest_tables] Could not verify path rewrite "
@@ -1053,23 +1079,43 @@ def validate_dest_tables(table_result: dict, spark, **context) -> dict:
                 )
                 path_rewrite_verified = False
 
+            snapshot_count_match = (
+                src_snapshot_count == dest_snapshot_count
+                if src_snapshot_count > 0 else True
+            )
+
             match_str = (
                 f"rows={'✓' if row_count_match else '✗'} "
                 f"parts={'✓' if partition_count_match else '⚠'} "
                 f"schema={'✓' if schema_match else '✗'} "
-                f"paths={'✓' if path_rewrite_verified else '✗'}"
+                f"paths={'✓' if path_rewrite_verified else '✗'} "
+                f"snapshots={'✓' if snapshot_count_match else '✗'}({dest_snapshot_count})"
             )
             logger.info(f"[validate_dest_tables] {dest_tbl} | {match_str}")
 
             mismatch_parts = []
             if not row_count_match:
-                mismatch_parts.append(f"Row count mismatch: source={src_row_count} dest={dest_row_count}")
+                mismatch_parts.append(
+                    f"Row count mismatch: source={src_row_count} dest={dest_row_count}"
+                )
             if not partition_count_match:
-                mismatch_parts.append(f"Partition mismatch: source={src_partition_count} dest={dest_partition_count}")
+                mismatch_parts.append(
+                    f"Partition mismatch: "
+                    f"source={src_partition_count} dest={dest_partition_count}"
+                )
             if not schema_match:
-                mismatch_parts.append(f"Schema differences: {'; '.join(schema_diffs[:3])}")
+                mismatch_parts.append(
+                    f"Schema differences: {'; '.join(schema_diffs[:3])}"
+                )
             if not path_rewrite_verified:
-                mismatch_parts.append(f"Current snapshot manifest still references source prefix ({src_prefix})")
+                mismatch_parts.append(
+                    f"Snapshot manifest(s) still reference source prefix ({src_prefix})"
+                )
+            if not snapshot_count_match:
+                mismatch_parts.append(
+                    f"Snapshot count mismatch: "
+                    f"source={src_snapshot_count} dest={dest_snapshot_count}"
+                )
 
             validation_results.append({
                 'source_table': tbl,
@@ -1082,6 +1128,9 @@ def validate_dest_tables(table_result: dict, spark, **context) -> dict:
                 'partition_count_match': partition_count_match,
                 'schema_match': schema_match,
                 'path_rewrite_verified': path_rewrite_verified,
+                'source_snapshot_count': src_snapshot_count,
+                'dest_snapshot_count': dest_snapshot_count,
+                'snapshot_count_match': snapshot_count_match,
                 'schema_differences': '; '.join(schema_diffs),
                 'error': '; '.join(mismatch_parts) if mismatch_parts else None,
             })
@@ -1129,7 +1178,8 @@ def update_validation_in_tracking(validation_result: dict, spark) -> dict:
             v.get('row_count_match', False) and
             v.get('partition_count_match', False) and
             v.get('schema_match', False) and
-            v.get('path_rewrite_verified', False)
+            v.get('path_rewrite_verified', False) and
+            v.get('snapshot_count_match', False)
         )
         final_status = 'VALIDATED' if is_validated else 'VALIDATION_FAILED'
         error_message_sql = 'NULL' if is_validated else f"'{error_msg}'"
@@ -1146,6 +1196,9 @@ def update_validation_in_tracking(validation_result: dict, spark) -> dict:
                 partition_count_match = {str(v.get('partition_count_match', False)).lower()},
                 schema_match = {str(v.get('schema_match', False)).lower()},
                 path_rewrite_verified = {str(v.get('path_rewrite_verified', False)).lower()},
+                snapshot_count_match = {str(v.get('snapshot_count_match', False)).lower()},
+                source_snapshot_count = {v.get('source_snapshot_count', 0)},
+                dest_snapshot_count = {v.get('dest_snapshot_count', 0)},
                 schema_differences = '{schema_diffs}',
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
@@ -1320,7 +1373,7 @@ def generate_html_report(run_id: str, spark) -> dict:
         d_dur = f"{t.discovery_duration_seconds:.1f}s" if t.discovery_duration_seconds else 'N/A'
         c_dur = f"{t.table_create_duration_seconds:.1f}s" if t.table_create_duration_seconds else 'N/A'
         v_dur = f"{t.validation_duration_seconds:.1f}s" if t.validation_duration_seconds else 'N/A'
-        part_str = f"Yes ({t.partition_count or 0})" if t.is_partitioned else 'No'
+        part_str = f"Yes ({t.source_partition_count or 0})" if t.is_partitioned else 'No'
         html += f"""
   <tr>
     <td>{t.source_database}</td>
@@ -1342,16 +1395,19 @@ def generate_html_report(run_id: str, spark) -> dict:
   <thead><tr>
     <th>Database</th><th>Table</th>
     <th>Source Rows</th><th>Dest Rows</th><th>Row Match</th>
-    <th>Src Parts</th><th>Dest Parts</th><th>Part Match</th>
-    <th>Schema Match</th><th>Path Rewrite</th>
+    <th>Src Partitions</th><th>Dest Partitions</th><th>Partition Match</th>
+    <th>Schema Match</th>
+    <th>Src Snapshots</th><th>Dest Snapshots</th><th>Snapshot Match</th>
+    <th>Path Rewrite</th>
   </tr></thead><tbody>
 """
     for t in table_status:
         if not t.validation_status or t.validation_status == 'SKIPPED':
             continue
-        rm, pm, sm, pr = (
+        rm, pm, sm, pr, scm = (
             t.row_count_match, t.partition_count_match,
             t.schema_match, t.path_rewrite_verified,
+            t.snapshot_count_match,
         )
         html += f"""
   <tr>
@@ -1364,6 +1420,9 @@ def generate_html_report(run_id: str, spark) -> dict:
     <td class="metric">{t.dest_partition_count or 0}</td>
     <td class="{'vp' if pm else 'vw'}">{'✓ PASS' if pm else '⚠ WARN'}</td>
     <td class="{'vp' if sm else 'vf'}">{'✓ PASS' if sm else '✗ FAIL'}</td>
+    <td class="metric">{t.source_snapshot_count or 0}</td>
+    <td class="metric">{t.dest_snapshot_count or 0}</td>
+    <td class="{'vp' if scm else 'vf'}">{'✓ PASS' if scm else '✗ FAIL'}</td>
     <td class="{'vp' if pr else 'vf'}">{'✓ PASS' if pr else '✗ FAIL'}</td>
   </tr>"""
 
@@ -1506,7 +1565,7 @@ def finalize_run(run_id: str, spark) -> dict:
 # =============================================================================
 
 with DAG(
-    dag_id='iceberg_rewrite_table_path_migration',
+    dag_id='iceberg_catalog_migration',
     default_args=default_args,
     description=(
         'Iceberg-to-Iceberg migration via rewrite_table_path. '
@@ -1517,7 +1576,7 @@ with DAG(
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=5,
-    tags=['migration', 'iceberg', 'rewrite-table-path', 'approach-2'],
+    tags=['migration', 'iceberg', 'rewrite-table-path'],
     params={
         'excel_file_path': Param(
             default='s3a://config-bucket/iceberg_rewrite_migration.xlsx',
@@ -1554,10 +1613,10 @@ with DAG(
     t_record      = update_discovered_tables_in_tracking.expand(discovery=t_discover)
     t_record.operator.trigger_rule = 'all_done'
 
-    t_tables      = create_dest_tables.expand(presence_result=t_record)
+    t_tables      = rewrite_and_register_tables.expand(presence_result=t_record)
     t_tables.operator.trigger_rule = 'all_done'
 
-    t_tbl_status = update_table_create_in_tracking.expand(table_result=t_tables)
+    t_tbl_status = update_rewrite_and_register_in_tracking.expand(table_result=t_tables)
     t_tbl_status.operator.trigger_rule = 'all_done'
 
     t_validate = validate_dest_tables.expand(table_result=t_tbl_status)

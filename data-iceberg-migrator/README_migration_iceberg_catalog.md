@@ -129,9 +129,9 @@ parse_excel
 │    ↓                                                              │
 │  update_discovered_tables_in_tracking  [trigger: all_done]        │
 │    ↓                                                              │
-│  create_dest_tables  [trigger: all_done]                          │
+│  rewrite_and_register_tables  [trigger: all_done]                          │
 │    ↓                                                              │
-│  update_table_create_in_tracking  [trigger: all_done]             │
+│  update_rewrite_and_register_in_tracking  [trigger: all_done]             │
 │    ↓                                                              │
 │  validate_dest_tables  [trigger: all_done, max=3]                 │
 │    ↓                                                              │
@@ -230,7 +230,7 @@ finalize_run  [trigger: all_done]
 
 ---
 
-### Step 7 — `create_dest_tables`
+### Step 7 — `rewrite_and_register_tables`
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done` · **@track_duration**
 
@@ -246,7 +246,7 @@ The task raises after all tables are processed if any failed.
 
 ---
 
-### Step 8 — `update_table_create_in_tracking`
+### Step 8 — `update_rewrite_and_register_in_tracking`
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done`
 
@@ -363,8 +363,8 @@ DATA_MISSING → skipped in all downstream steps, visible in report
 
 | Property | Value |
 |---|---|
-| DAG ID | `iceberg_rewrite_table_path_migration` |
-| Tags | `migration`, `iceberg`, `rewrite-table-path`, `approach-2` |
+| DAG ID | `iceberg_catalog_migration` |
+| Tags | `migration`, `iceberg`, `rewrite-table-path` |
 | Max active runs | 5 |
 | Schedule | Manual (`None`) |
 | Retries | 2, 5-minute delay |
