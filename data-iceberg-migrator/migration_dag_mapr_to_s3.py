@@ -1265,7 +1265,7 @@ exit 0
                     for p in empty_partitions
                 )
                 pathlist_entries = "\n".join(f"{source_loc}/{p}" for p in non_empty_partitions)
-                
+
                 cmd = f'''set -e
 
 calculate_s3_metrics_hadoop() {{
@@ -2610,8 +2610,6 @@ def generate_html_report(run_id: str, spark) -> str:
         </div>
 
         <div class="section-divider"></div>
-
-        <h2>Validation Summary</h2>
 """
     validation_summary_data = spark.sql(f"""
         SELECT
@@ -2656,52 +2654,58 @@ def generate_html_report(run_id: str, spark) -> str:
         )
 
         html += f"""
-        <div class="summary-grid">
-            <div class="summary-card info">
-                <h3>TABLES VALIDATED</h3>
-                <p class="value">{vs.total_tables_validated}</p>
-            </div>
-            <div class="summary-card success">
-                <h3>PASSED VALIDATION</h3>
-                <p class="value">{vs.tables_passed_validation}</p>
-            </div>
-            <div class="summary-card warning">
-                <h3>FAILED VALIDATION</h3>
-                <p class="value">{vs.tables_failed_validation}</p>
-            </div>
-            <div class="summary-card warning">
-                <h3>ROW COUNT MISMATCHES</h3>
-                <p class="value">{vs.total_row_count_mismatches}</p>
-            </div>
-            <div class="summary-card warning">
-                <h3>PARTITION MISMATCHES</h3>
-                <p class="value">{vs.total_partition_count_mismatches}</p>
-            </div>
-            <div class="summary-card warning">
-                <h3>SCHEMA MISMATCHES</h3>
-                <p class="value">{vs.total_schema_mismatches}</p>
-            </div>
-            <div class="summary-card {'success' if size_mismatch_count == 0 else 'warning'}">
-                <h3>SIZE MATCH</h3>
-                <p class="value">{size_match_count} / {size_match_count + size_mismatch_count}</p>
-            </div>
-            <div class="summary-card {'success' if fcount_mismatch_count == 0 else 'warning'}">
-                <h3>FILE COUNT MATCH</h3>
-                <p class="value">{fcount_match_count} / {fcount_match_count + fcount_mismatch_count}</p>
-            </div>
-            <div class="summary-card info">
-                <h3>SOURCE SIZE</h3>
-                <p class="value">{total_src_gb:.6f} GB</p>
-            </div>
-            <div class="summary-card info">
-                <h3>DEST SIZE</h3>
-                <p class="value">{total_dest_gb:.6f} GB</p>
-            </div>
-            <div class="summary-card {'success' if size_diff_pct < 1.0 else 'warning'}">
-                <h3>SIZE DELTA</h3>
-                <p class="value">{size_diff_pct:.2f}%</p>
-            </div>
+    <h2>Data Validation Summary</h2>
+    <div class="summary-grid">
+        <div class="summary-card {'success' if size_mismatch_count == 0 else 'warning'}">
+            <h3>SIZE MATCH</h3>
+            <p class="value">{size_match_count} / {size_match_count + size_mismatch_count}</p>
         </div>
+        <div class="summary-card {'success' if fcount_mismatch_count == 0 else 'warning'}">
+            <h3>FILE COUNT MATCH</h3>
+            <p class="value">{fcount_match_count} / {fcount_match_count + fcount_mismatch_count}</p>
+        </div>
+        <div class="summary-card info">
+            <h3>SOURCE SIZE</h3>
+            <p class="value">{total_src_gb:.6f} GB</p>
+        </div>
+        <div class="summary-card info">
+            <h3>DEST SIZE</h3>
+            <p class="value">{total_dest_gb:.6f} GB</p>
+        </div>
+        <div class="summary-card {'success' if size_diff_pct < 1.0 else 'warning'}">
+            <h3>SIZE DELTA</h3>
+            <p class="value">{size_diff_pct:.2f}%</p>
+        </div>
+    </div>
+
+    <div class="section-divider"></div>
+    <h2>Metadata Validation Summary</h2>
+    <div class="summary-grid">
+        <div class="summary-card info">
+            <h3>TABLES VALIDATED</h3>
+            <p class="value">{vs.total_tables_validated}</p>
+        </div>
+        <div class="summary-card success">
+            <h3>PASSED VALIDATION</h3>
+            <p class="value">{vs.tables_passed_validation}</p>
+        </div>
+        <div class="summary-card warning">
+            <h3>FAILED VALIDATION</h3>
+            <p class="value">{vs.tables_failed_validation}</p>
+        </div>
+        <div class="summary-card warning">
+            <h3>ROW COUNT MISMATCHES</h3>
+            <p class="value">{vs.total_row_count_mismatches}</p>
+        </div>
+        <div class="summary-card warning">
+            <h3>PARTITION MISMATCHES</h3>
+            <p class="value">{vs.total_partition_count_mismatches}</p>
+        </div>
+        <div class="summary-card warning">
+            <h3>SCHEMA MISMATCHES</h3>
+            <p class="value">{vs.total_schema_mismatches}</p>
+        </div>
+    </div>
 """
     else:
         html += """
@@ -2817,7 +2821,12 @@ def generate_html_report(run_id: str, spark) -> str:
         row_match_icon = '✓ PASS' if t.row_count_match else '✗ FAIL'
 
         part_match_class = 'validation-pass' if t.partition_count_match else 'validation-warn'
-        part_match_icon = '✓ PASS' if t.partition_count_match else '⚠ WARN: Stale partitions on source, Run MSCK'
+        if t.partition_count_match:
+            part_match_icon = '✓ PASS'
+        elif t.row_count_match:
+            part_match_icon = '⚠ WARN: Stale partitions on source, Run MSCK'
+        else:
+            part_match_icon = '⚠ WARN: Data mismatch, investigate source vs dest'
 
         schema_match_class = 'validation-pass' if t.schema_match else 'validation-fail'
         schema_match_icon = '✓ PASS' if t.schema_match else '✗ FAIL'
