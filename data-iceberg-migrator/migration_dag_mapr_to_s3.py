@@ -1088,9 +1088,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                 for part_idx, (src_part, dst_part) in enumerate(partition_copy_pairs):
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
-DELETE_FLAG=""
-hadoop fs{s3_opts} -test -d "{dst_part}" 2>/dev/null && DELETE_FLAG="-delete"
-run_distcp_with_retry hadoop distcp{s3_opts} -update $DELETE_FLAG -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+run_distcp_with_retry hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
 """
@@ -1308,11 +1306,9 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 [ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
 [ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
 
-DELETE_FLAG=""
-[ "$INCR" = "true" ] && DELETE_FLAG="-delete"
 echo "=== Running distcp ==="
 set +e
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update $DELETE_FLAG -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
