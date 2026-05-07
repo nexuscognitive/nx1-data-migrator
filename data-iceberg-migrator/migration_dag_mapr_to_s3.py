@@ -1139,25 +1139,25 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                 partition_file_counts = t.get('partition_file_counts', {})
                 non_empty_partitions = [
                     p for p in filtered_partitions
-                    if partition_file_counts.get(p, 1) > 0 
+                    if partition_file_counts.get(p, 1) > 0
                 ]
                 empty_partitions = [
                     p for p in filtered_partitions
                     if partition_file_counts.get(p, 1) == 0
                 ]
-                
+
                 if empty_partitions:
                     logger.info(
                         f"[DistCp] {len(empty_partitions)} empty partition(s) in "
                         f"{src_db}.{tbl} will use mkdir instead of distcp: "
                         f"{empty_partitions[:5]}"
                     )
-    
+
                 partition_copy_pairs = [
                     (f"{source_loc}/{p}", f"{s3_loc}/{p}")
                     for p in non_empty_partitions
                 ]
-                
+
                 mkdir_calls = "\n".join(
                     f'hadoop fs{s3_opts} -mkdir -p "{s3_loc}/{p}" 2>/dev/null || true'
                     for p in empty_partitions
@@ -1259,7 +1259,7 @@ exit 0
                     p for p in filtered_partitions
                     if partition_file_counts.get(p, 1) == 0
                 ]
-                
+
                 mkdir_calls = "\n".join(
                     f'hadoop fs{s3_opts} -mkdir -p "{s3_loc}/{p}" 2>/dev/null || true'
                     for p in empty_partitions
@@ -2654,30 +2654,6 @@ def generate_html_report(run_id: str, spark) -> str:
         )
 
         html += f"""
-    <h2>Data Validation Summary</h2>
-    <div class="summary-grid">
-        <div class="summary-card {'success' if size_mismatch_count == 0 else 'warning'}">
-            <h3>SIZE MATCH</h3>
-            <p class="value">{size_match_count} / {size_match_count + size_mismatch_count}</p>
-        </div>
-        <div class="summary-card {'success' if fcount_mismatch_count == 0 else 'warning'}">
-            <h3>FILE COUNT MATCH</h3>
-            <p class="value">{fcount_match_count} / {fcount_match_count + fcount_mismatch_count}</p>
-        </div>
-        <div class="summary-card info">
-            <h3>SOURCE SIZE</h3>
-            <p class="value">{total_src_gb:.6f} GB</p>
-        </div>
-        <div class="summary-card info">
-            <h3>DEST SIZE</h3>
-            <p class="value">{total_dest_gb:.6f} GB</p>
-        </div>
-        <div class="summary-card {'success' if size_diff_pct < 1.0 else 'warning'}">
-            <h3>SIZE DELTA</h3>
-            <p class="value">{size_diff_pct:.2f}%</p>
-        </div>
-    </div>
-
     <div class="section-divider"></div>
     <h2>Metadata Validation Summary</h2>
     <div class="summary-grid">
@@ -2704,6 +2680,30 @@ def generate_html_report(run_id: str, spark) -> str:
         <div class="summary-card warning">
             <h3>SCHEMA MISMATCHES</h3>
             <p class="value">{vs.total_schema_mismatches}</p>
+        </div>
+    </div>
+
+    <h2>Data Validation Summary</h2>
+    <div class="summary-grid">
+        <div class="summary-card {'success' if size_mismatch_count == 0 else 'warning'}">
+            <h3>SIZE MATCH</h3>
+            <p class="value">{size_match_count} / {size_match_count + size_mismatch_count}</p>
+        </div>
+        <div class="summary-card {'success' if fcount_mismatch_count == 0 else 'warning'}">
+            <h3>FILE COUNT MATCH</h3>
+            <p class="value">{fcount_match_count} / {fcount_match_count + fcount_mismatch_count}</p>
+        </div>
+        <div class="summary-card info">
+            <h3>SOURCE SIZE</h3>
+            <p class="value">{total_src_gb:.6f} GB</p>
+        </div>
+        <div class="summary-card info">
+            <h3>DEST SIZE</h3>
+            <p class="value">{total_dest_gb:.6f} GB</p>
+        </div>
+        <div class="summary-card {'success' if size_diff_pct < 1.0 else 'warning'}">
+            <h3>SIZE DELTA</h3>
+            <p class="value">{size_diff_pct:.2f}%</p>
         </div>
     </div>
 """
@@ -2815,10 +2815,26 @@ def generate_html_report(run_id: str, spark) -> str:
 
     for t in table_status:
         if not t.validation_status:
+            html += f"""
+                    <tr>
+                        <td>{t.source_database}</td>
+                        <td><strong>{t.source_table}</strong></td>
+                        <td colspan="7" style="color:#7f8c8d;font-style:italic;font-size:12px;">
+                            Skipped: {t.error_message or 'upstream task did not complete'}
+                        </td>
+                    </tr>
+    """
             continue
 
-        row_match_class = 'validation-pass' if t.row_count_match else 'validation-fail'
-        row_match_icon = '✓ PASS' if t.row_count_match else '✗ FAIL'
+        if t.row_count_match:
+            row_match_class = 'validation-pass'
+            row_match_icon = '✓ PASS'
+        elif not t.partition_count_match:
+            row_match_class = 'validation-warn'
+            row_match_icon = '⚠ WARN: Data mismatch. Check source data accuracy.'
+        else:
+            row_match_class = 'validation-warn'
+            row_match_icon = '⚠ WARN: Data mismatch. Check source data accuracy.'
 
         part_match_class = 'validation-pass' if t.partition_count_match else 'validation-warn'
         if t.partition_count_match:
@@ -2826,7 +2842,7 @@ def generate_html_report(run_id: str, spark) -> str:
         elif t.row_count_match:
             part_match_icon = '⚠ WARN: Stale partitions on source, Run MSCK'
         else:
-            part_match_icon = '⚠ WARN: Data mismatch, investigate source vs dest'
+            part_match_icon = '⚠ WARN: Data mismatch. Check source data accuracy.'
 
         schema_match_class = 'validation-pass' if t.schema_match else 'validation-fail'
         schema_match_icon = '✓ PASS' if t.schema_match else '✗ FAIL'
@@ -2873,6 +2889,15 @@ def generate_html_report(run_id: str, spark) -> str:
 
     for t in table_status:
         if not t.distcp_status:
+            html += f"""
+                    <tr>
+                        <td>{t.source_database}</td>
+                        <td><strong>{t.source_table}</strong></td>
+                        <td colspan="10" style="color:#7f8c8d;font-style:italic;font-size:12px;">
+                            Skipped: {t.error_message or 'partition filter matched 0 partitions or upstream failure'}
+                        </td>
+                    </tr>
+    """
             continue
         if t.distcp_status == 'EMPTY_SOURCE':
             html += f"""
