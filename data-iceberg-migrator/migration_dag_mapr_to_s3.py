@@ -685,20 +685,24 @@ for tbl in table_list:
             filtered_partitions = partitions
 
         # Filtered size and file count
-        filtered_source_size = source_total_size
-        filtered_file_count  = source_file_count
+        filtered_source_size = 0
+        filtered_file_count  = 0
+        partition_file_counts = {{}}
         if partition_filter_active and filtered_partitions and loc:
-            filtered_source_size = 0
-            filtered_file_count  = 0
             for part_str in filtered_partitions:
                 try:
                     part_path = spark._jvm.org.apache.hadoop.fs.Path(loc + "/" + part_str)
                     if fs.exists(part_path):
                         cs = fs.getContentSummary(part_path)
-                        filtered_source_size += int(cs.getLength())
-                        filtered_file_count  += int(cs.getFileCount())
+                        part_size  = int(cs.getLength())
+                        part_files = int(cs.getFileCount())
+                    else:
+                        part_size, part_files = 0, 0
                 except Exception:
-                    pass
+                    part_size, part_files = 0, 0
+                partition_file_counts[part_str] = part_files
+                filtered_source_size += part_size
+                filtered_file_count  += part_files
 
         # Filtered row count
         if partition_filter_active and filtered_partitions:
@@ -758,6 +762,7 @@ for tbl in table_list:
             "filtered_file_count": filtered_file_count,
             "full_table_row_count": full_row_count,
             "full_table_partition_count": full_partition_count,
+            "partition_file_counts": partition_file_counts,
         }})
 
     except Exception as e:
@@ -788,6 +793,7 @@ for tbl in table_list:
             "filtered_file_count": filtered_file_count,
             "full_table_row_count": full_row_count,
             "full_table_partition_count": full_partition_count,
+            "partition_file_counts": {{}},
             "error": str(e)[:500]
         }})
 
@@ -1130,11 +1136,32 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
         if partition_filter_active and filtered_partitions:
             if preserve_delete:
-                partition_copy_pairs = []
-                for part_str in filtered_partitions:
-                    src_part = f"{source_loc}/{part_str}"
-                    dst_part = f"{s3_loc}/{part_str}"
-                    partition_copy_pairs.append((src_part, dst_part))
+                partition_file_counts = t.get('partition_file_counts', {})
+                non_empty_partitions = [
+                    p for p in filtered_partitions
+                    if partition_file_counts.get(p, 1) > 0 
+                ]
+                empty_partitions = [
+                    p for p in filtered_partitions
+                    if partition_file_counts.get(p, 1) == 0
+                ]
+                
+                if empty_partitions:
+                    logger.info(
+                        f"[DistCp] {len(empty_partitions)} empty partition(s) in "
+                        f"{src_db}.{tbl} will use mkdir instead of distcp: "
+                        f"{empty_partitions[:5]}"
+                    )
+    
+                partition_copy_pairs = [
+                    (f"{source_loc}/{p}", f"{s3_loc}/{p}")
+                    for p in non_empty_partitions
+                ]
+                
+                mkdir_calls = "\n".join(
+                    f'hadoop fs{s3_opts} -mkdir -p "{s3_loc}/{p}" 2>/dev/null || true'
+                    for p in empty_partitions
+                )
 
                 distcp_calls = ""
                 for part_idx, (src_part, dst_part) in enumerate(partition_copy_pairs):
@@ -1192,6 +1219,9 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 [ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
 [ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
 
+echo "=== Creating empty partition directories ==="
+{mkdir_calls}
+
 echo "=== Running distcp per-partition ==="
 {distcp_calls}
 
@@ -1220,7 +1250,22 @@ echo "PARTITIONS_REQUESTED={len(filtered_partitions)}"
 exit 0
 '''
             else:
-                pathlist_entries = "\n".join(f"{source_loc}/{part_str}" for part_str in filtered_partitions)
+                partition_file_counts = t.get('partition_file_counts', {})
+                non_empty_partitions = [
+                    p for p in filtered_partitions
+                    if partition_file_counts.get(p, 1) > 0
+                ]
+                empty_partitions = [
+                    p for p in filtered_partitions
+                    if partition_file_counts.get(p, 1) == 0
+                ]
+                
+                mkdir_calls = "\n".join(
+                    f'hadoop fs{s3_opts} -mkdir -p "{s3_loc}/{p}" 2>/dev/null || true'
+                    for p in empty_partitions
+                )
+                pathlist_entries = "\n".join(f"{source_loc}/{p}" for p in non_empty_partitions)
+                
                 cmd = f'''set -e
 
 calculate_s3_metrics_hadoop() {{
