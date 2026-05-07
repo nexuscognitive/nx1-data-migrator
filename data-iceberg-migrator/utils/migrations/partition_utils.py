@@ -3,7 +3,11 @@ Pure-Python partition filtering and SQL clause helpers.
 """
 
 import re
-import urllib
+
+try:
+    from urllib.parse import unquote
+except ImportError:
+    from urllib import unquote
 
 
 def apply_partition_filter(partitions, filter_expr):
@@ -17,7 +21,7 @@ def apply_partition_filter(partitions, filter_expr):
         for segment in part_str.split('/'):
             if '=' in segment:
                 k, _, v = segment.partition('=')
-                result[k.strip()] = urllib.parse.unquote(v.strip())
+                result[k.strip()] = unquote(v.strip())
         return result
 
     def try_numeric(val):

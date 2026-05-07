@@ -15,7 +15,7 @@ PROJECTS = {
         "dags": {
             "mapr": {
                 "file": "migration_dag_mapr_to_s3.py",
-                "dag_id": "mapr_to_s3_migration",
+                "dag_id": "source_to_s3_migration",
                 "owner_marker": "'owner': 'data-migration'",
             },
             "iceberg": {

@@ -1088,7 +1088,9 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                 for part_idx, (src_part, dst_part) in enumerate(partition_copy_pairs):
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
-run_distcp_with_retry hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+DELETE_FLAG=""
+hadoop fs{s3_opts} -test -d "{dst_part}" 2>/dev/null && DELETE_FLAG="-delete"
+run_distcp_with_retry hadoop distcp{s3_opts} -update $DELETE_FLAG -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
 """
@@ -1244,8 +1246,8 @@ set -e
 echo "$DISTCP_OUTPUT"
 rm -f "$PATHLIST"
 
-BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | awk '{{print $NF}}' | tr -d ',')
-FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Number of files copied" | awk '{{print $NF}}' | tr -d ',')
+BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | grep -oE '[0-9,]+' | tail -1 | tr -d ',')
+FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -iE "Files Copied|Number of files copied" | grep -oE '[0-9,]+' | tail -1 | tr -d ',')
 [ -z "$BYTES_COPIED" ] && BYTES_COPIED=0
 [ -z "$FILES_COPIED" ] && FILES_COPIED=0
 
@@ -1306,16 +1308,18 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 [ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
 [ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
 
+DELETE_FLAG=""
+[ "$INCR" = "true" ] && DELETE_FLAG="-delete"
 echo "=== Running distcp ==="
 set +e
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update $DELETE_FLAG -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
 echo "$DISTCP_OUTPUT"
 
-BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | awk '{{print $NF}}' | tr -d ',')
-FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Number of files copied" | awk '{{print $NF}}' | tr -d ',')
+BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | grep -oE '[0-9,]+' | tail -1 | tr -d ',')
+FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -iE "Files Copied|Number of files copied" | grep -oE '[0-9,]+' | tail -1 | tr -d ',')
 [ -z "$BYTES_COPIED" ] && BYTES_COPIED=0
 [ -z "$FILES_COPIED" ] && FILES_COPIED=0
 
@@ -1355,8 +1359,11 @@ exit 0
                 error_output = stderr.read().decode()
                 exit_code = stdout.channel.recv_exit_status()
 
-                logger.info(f"=== DistCp for {src_db}.{tbl} (last 1000 chars) ===")
-                logger.info(output[-1000:])
+                logger.info(f"=== DistCp for {src_db}.{tbl} (FULL output) ===")
+                logger.info(output)
+                if error_output.strip():
+                    logger.info(f"=== DistCp for {src_db}.{tbl} (FULL stderr) ===")
+                    logger.info(error_output)
 
                 combined_output = output + "\n" + error_output
 
