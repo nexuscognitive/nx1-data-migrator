@@ -566,6 +566,14 @@ for tbl in table_list:
     input_format = None
     serde_properties = {{}}
     in_serde_section = False
+    filter_expr = "{filter_expr_escaped}"
+    partition_filter_active = False
+    filtered_partitions = []
+    filtered_source_size = 0
+    filtered_file_count = 0
+    row_count = 0
+    full_row_count = 0
+    full_partition_count = 0
     try:
         desc_df = spark.sql(
             "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
@@ -600,6 +608,7 @@ for tbl in table_list:
 
         source_total_size = 0
         source_file_count = 0
+        fs = None
         if loc:
             try:
                 from py4j.java_gateway import java_import
@@ -654,7 +663,7 @@ for tbl in table_list:
         partition_definition = len(partition_cols_from_describe) > 0
         partition_columns = ",".join(partition_cols_from_describe)
 
-        partitions = []
+        metastore_partitions = []
         registered_partition_count = 0
         filtered_partitions = []
         partition_filter_active = False
@@ -666,29 +675,65 @@ for tbl in table_list:
             parts_df = spark.sql(
                 "SHOW PARTITIONS {{0}}.{{1}}".format(src_db, tbl)
             )
-            partitions = [row.partition for row in parts_df.collect()]
-            registered_partition_count = len(partitions)
+            metastore_partitions = [row.partition.strip() for row in parts_df.collect()]
+            registered_partition_count = len(metastore_partitions)
         except Exception:
             pass
 
         # Apply partition filter
         filter_expr = "{filter_expr_escaped}"
-        full_partition_count = len(partitions)
-        full_row_count = row_count  # already computed above
-        filtered_partitions = apply_partition_filter(partitions, filter_expr)
-        partition_filter_active = bool(filter_expr) and len(filtered_partitions) < len(partitions)
+        full_partition_count = len(metastore_partitions)
+        full_row_count = row_count
 
-        # Warn edge cases
-        if filter_expr and not partition_definition:
-            import sys as _sys
+        if filter_expr and partition_definition and loc:
+            fs_partitions = []
+            target_depth = len(partition_cols_from_describe)
+
+            def list_fs_partitions(base_path_str, current_depth, rel_prefix=""):
+                if fs is None:
+                    return
+                try:
+                    path = spark._jvm.org.apache.hadoop.fs.Path(base_path_str)
+                    if not fs.exists(path):
+                        return
+                    statuses = fs.listStatus(path)
+                    for status in statuses:
+                        if status.isDirectory():
+                            dir_name = status.getPath().getName()
+                            if "=" not in dir_name:
+                                continue  # skip non-partition dirs
+                            rel = (rel_prefix + "/" + dir_name).lstrip("/").strip()
+                            if current_depth == target_depth:
+                                fs_partitions.append(rel)
+                            else:
+                                list_fs_partitions(
+                                    base_path_str + "/" + dir_name,
+                                    current_depth + 1,
+                                    rel
+                                )
+                except Exception:
+                    pass
+
+            list_fs_partitions(loc, 1)
+
+            # Apply filter against filesystem-discovered partitions
+            filtered_partitions = apply_partition_filter(fs_partitions, filter_expr)
+            partition_filter_active = bool(filter_expr) and len(filtered_partitions) < len(fs_partitions)
+
+        else:
+            filtered_partitions = metastore_partitions
             partition_filter_active = False
-            filtered_partitions = partitions
+
+        # Edge case: filter expr given but table has no partition definition
+        if filter_expr and not partition_definition:
+            partition_filter_active = False
+            filtered_partitions = metastore_partitions
 
         # Filtered size and file count
-        filtered_source_size = 0
-        filtered_file_count  = 0
         partition_file_counts = {{}}
         if partition_filter_active and filtered_partitions and loc:
+            filtered_source_size = 0
+            filtered_file_count  = 0
             for part_str in filtered_partitions:
                 try:
                     part_path = spark._jvm.org.apache.hadoop.fs.Path(loc + "/" + part_str)
@@ -746,7 +791,7 @@ for tbl in table_list:
             "schema": schema,
             "partitions": filtered_partitions,
             "partition_columns": partition_columns,
-            "partition_count": len(partitions),
+            "partition_count": len(metastore_partitions),
             "row_count": row_count,
             "is_partitioned": is_partitioned,
             "unregistered_partitions": unregistered_partitions,
@@ -1073,12 +1118,19 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             )
             from datetime import datetime as _dt
             distcp_started_at = _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-            _mkdir_cmd = (
-                f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}' 2>/dev/null || true"
-            )
+
+            filtered_partitions_for_mkdir = t.get('filtered_partitions', []) if t.get('partition_filter_active') else []
+
+            if filtered_partitions_for_mkdir:
+                mkdir_cmds = " && ".join(
+                    f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}/{p}' 2>/dev/null || true"
+                    for p in filtered_partitions_for_mkdir
+                )
+            else:
+                mkdir_cmds = f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}' 2>/dev/null || true"
             try:
                 with ssh.get_conn() as client:
-                    _, stdout, stderr = client.exec_command(_mkdir_cmd, timeout=SSH_COMMAND_TIMEOUT)
+                    _, stdout, stderr = client.exec_command(mkdir_cmds, timeout=SSH_COMMAND_TIMEOUT)
                     exit_code = stdout.channel.recv_exit_status()
                 logger.info(f"[DistCp] Created S3 prefix: {t['s3_location']}")
             except Exception as _me:
@@ -1111,6 +1163,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                 'error': None,
                 'yarn_application_id': None,
                 'yarn_application_ids': [],
+                'partition_filter': t.get('partition_filter'),
             })
             continue
 
@@ -1297,6 +1350,9 @@ S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_FILE_COUNT=" | cut -d'=' -f
 S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
 [ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
 [ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
+
+echo "=== Creating empty partition directories ==="
+{mkdir_calls}
 
 echo "=== Running distcp using source path list (delete disabled) ==="
 set +e
@@ -1524,6 +1580,7 @@ exit 0
                     'error': None,
                     'yarn_application_id': yarn_application_id,
                     'yarn_application_ids': yarn_application_ids,
+                    'partition_filter': t.get('partition_filter'),
                 })
         except Exception as e:
             error_msg = f"DistCp failed for {src_db}.{tbl}: {str(e)[:2000]}"
@@ -1549,7 +1606,8 @@ exit 0
                 'partitions_requested': len(filtered_partitions) if partition_filter_active else None,
                 'error': str(e)[:2000],
                 'yarn_application_id': yarn_application_id,
-                'yarn_application_ids': yarn_application_ids
+                'yarn_application_ids': yarn_application_ids,
+                'partition_filter': t.get('partition_filter'),
             })
             logger.error(f"ERROR: {error_msg}")
 
@@ -1746,15 +1804,19 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
             spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
             created_dbs.add(dest_db)
 
+        table_partition_filter = t.get('partition_filter')
         distcp_entry = next(
             (r for r in distcp_result.get('distcp_results', [])
-             if r['source_table'] == tbl and r.get('dest_database') == dest_db),
+             if r['source_table'] == tbl
+             and r.get('dest_database') == dest_db
+             and r.get('partition_filter') == table_partition_filter),
             None
         )
         if distcp_entry is None:
             distcp_entry = next(
                 (r for r in distcp_result.get('distcp_results', [])
-                 if r['source_table'] == tbl),
+                 if r['source_table'] == tbl
+                 and r.get('dest_database') == dest_db),
                 None
             )
 
@@ -2087,6 +2149,8 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
         logger.info(f"[Validation] Starting validation for {per_table_dest_db}.{tbl}")
 
         try:
+            pf_val = t.get('partition_filter') or ''
+            pf_clause = f"AND partition_filter = '{pf_val}'" if pf_val else "AND (partition_filter IS NULL OR partition_filter = '')"
             source_metrics = spark.sql(f"""
                 SELECT source_row_count, source_partition_count, partition_filter
                 FROM {tracking_db}.migration_table_status
@@ -2094,6 +2158,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                   AND source_database = '{src_db}'
                   AND source_table = '{tbl}'
                   AND dest_database = '{per_table_dest_db}'
+                  {pf_clause}
             """).collect()
 
             if not source_metrics:
