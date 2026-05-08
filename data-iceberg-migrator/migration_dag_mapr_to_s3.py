@@ -970,12 +970,21 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
         filtered_partition_count   = len(t.get('filtered_partitions', [])) if partition_filter_active else None
         filtered_partition_count_sql = str(filtered_partition_count) if filtered_partition_count is not None else 'NULL'
 
+        pf_check_val = partition_filter_val
+        pf_check_clause = (
+            f"AND partition_filter = '{pf_check_val}'"
+            if pf_check_val
+            else "AND (partition_filter IS NULL OR partition_filter = '')"
+        )
+
         existing = spark.sql(f"""
             SELECT COUNT(*) as cnt
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'
               AND source_database = '{t['source_database']}'
               AND source_table = '{t['source_table']}'
+              AND dest_database = '{t['dest_database']}'
+              {pf_check_clause}
         """).collect()[0]['cnt']
 
         if existing > 0:
@@ -1001,6 +1010,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                   AND source_database = '{t['source_database']}'
                   AND source_table = '{t['source_table']}'
                   AND dest_database = '{t['dest_database']}'
+                  {pf_check_clause}
             """,
             task_label=f"record_discovered_tables:{t['source_table']}")
         else:
@@ -2127,6 +2137,13 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
         per_table_dest_db = t.get('dest_database', dest_db)
         dest_tbl = f"{per_table_dest_db}.{tbl}"
 
+        pf_val_upstream = (t.get('partition_filter') or '').replace("'", "''")
+        pf_clause_upstream = (
+            f"AND partition_filter = '{pf_val_upstream}'"
+            if pf_val_upstream
+            else "AND (partition_filter IS NULL OR partition_filter = '')"
+        )
+
         upstream = spark.sql(f"""
             SELECT distcp_status, table_create_status, overall_status, error_message
             FROM {tracking_db}.migration_table_status
@@ -2134,6 +2151,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
               AND source_database = '{src_db}'
               AND dest_database = '{per_table_dest_db}'
               AND source_table = '{tbl}'
+              {pf_clause_upstream}
         """).collect()
 
         if upstream:
@@ -2141,15 +2159,36 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             if row['distcp_status'] == 'FAILED' or row['table_create_status'] in ('FAILED', 'SKIPPED') or row['overall_status'] == 'FAILED':
                 validation_results.append({
                     'source_table': tbl,
+                    'dest_database': per_table_dest_db,
                     'status': 'SKIPPED',
                     'error': f"Skipped validation — upstream failure: {row['error_message']}"
+                })
+                continue
+
+            if row['distcp_status'] == 'EMPTY_SOURCE':
+                logger.info(
+                    f"[Validation] SKIPPING row-count query for {per_table_dest_db}.{tbl} "
+                )
+                validation_results.append({
+                    'source_table': tbl,
+                    'dest_database': per_table_dest_db,
+                    'status': 'COMPLETED',
+                    'source_row_count': 0,
+                    'dest_hive_row_count': 0,
+                    'source_partition_count': 0,
+                    'dest_partition_count': 0,
+                    'row_count_match': True,
+                    'partition_count_match': True,
+                    'schema_match': True,
+                    'schema_differences': '',
+                    'error': None
                 })
                 continue
 
         logger.info(f"[Validation] Starting validation for {per_table_dest_db}.{tbl}")
 
         try:
-            pf_val = t.get('partition_filter') or ''
+            pf_val = (t.get('partition_filter') or '').replace("'", "''")
             pf_clause = f"AND partition_filter = '{pf_val}'" if pf_val else "AND (partition_filter IS NULL OR partition_filter = '')"
             source_metrics = spark.sql(f"""
                 SELECT source_row_count, source_partition_count, partition_filter
@@ -2164,6 +2203,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             if not source_metrics:
                 validation_results.append({
                     'source_table': tbl,
+                    'dest_database': per_table_dest_db,
                     'status': 'SKIPPED',
                     'error': 'Source metrics not found in tracking table'
                 })
@@ -2189,9 +2229,8 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                         f"SELECT COUNT(*) as c FROM {dest_tbl} WHERE {where_clause}"
                     ).collect()[0]['c']
                 else:
-                    dest_row_count = spark.sql(
-                        f"SELECT COUNT(*) as c FROM {dest_tbl}"
-                    ).collect()[0]['c']
+                    # Filter matched 0 partitions — nothing was copied, dest scope is 0
+                    dest_row_count = 0
             else:
                 dest_row_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_tbl}").collect()[0]['c']
 
@@ -2263,6 +2302,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
 
             validation_results.append({
                 'source_table': tbl,
+                'dest_database': per_table_dest_db,
                 'status': 'COMPLETED',
                 'source_row_count': source_row_count,
                 'dest_hive_row_count': dest_row_count,
@@ -2279,6 +2319,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             error_msg = f"Validation failed for {dest_db}.{tbl}: {str(e)[:2000]}"
             validation_results.append({
                 'source_table': tbl,
+                'dest_database': per_table_dest_db,
                 'status': 'FAILED',
                 'error': str(e)[:2000]
             })
@@ -2343,6 +2384,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
         if v['status'] != 'COMPLETED':
             continue
 
+        per_val_dest_db = v.get('dest_database', dest_db)
         error_msg = (v.get('error', '') or '').replace("'", "''")[:2000]
         schema_diffs = (v.get('schema_differences', '') or '').replace("'", "''")[:2000]
 
@@ -2393,7 +2435,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
               AND source_database = '{src_db}'
-              AND dest_database = '{dest_db}'
+              AND dest_database = '{per_val_dest_db}'
               AND source_table = '{v['source_table']}'
         """,
         task_label=f"update_validation_status:{v['source_table']}")
@@ -2401,6 +2443,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
     for v in validation_result.get('validation_results', []):
         if v.get('status') == 'FAILED' and v.get('error'):
             per_table_error = str(v['error'])[:2000].replace("'", "''")
+            per_val_dest_db = v.get('dest_database', dest_db)
             execute_with_iceberg_retry(spark, f"""
                 UPDATE {tracking_db}.migration_table_status
                 SET validation_status = 'FAILED',
@@ -2409,7 +2452,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
                   AND source_database = '{src_db}'
-                  AND dest_database = '{dest_db}'
+                  AND dest_database = '{per_val_dest_db}'
                   AND source_table = '{v['source_table']}'
                   AND validation_status IS NULL
             """,
@@ -2433,7 +2476,11 @@ def update_validation_status(validation_result: dict, spark) -> dict:
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.migration_table_status
             SET validation_status = 'SKIPPED',
-                overall_status = CASE WHEN overall_status = 'FAILED' THEN 'FAILED' ELSE 'VALIDATION_FAILED' END,
+                overall_status = CASE
+                    WHEN overall_status = 'FAILED' THEN 'FAILED'
+                    WHEN overall_status = 'EMPTY_SOURCE' THEN 'EMPTY_SOURCE'
+                    ELSE 'VALIDATION_FAILED'
+                END,
                 error_message = COALESCE(error_message, 'Validation task did not process this table'),
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
