@@ -37,6 +37,3 @@ venv/
 .pytest_tmp/
 
 docs/superpowers
-
-# Notebooks
-notebooks/
