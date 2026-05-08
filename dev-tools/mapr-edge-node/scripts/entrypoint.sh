@@ -1,7 +1,23 @@
 #!/bin/bash
 set -e
 
-service ssh start
+if [ -f /etc/ssh/external-keys/authorized_keys ]; then
+    cat /etc/ssh/external-keys/authorized_keys >> /root/.ssh/authorized_keys
+    chmod 0600 /root/.ssh/authorized_keys
+fi
+
+# ── Start sshd directly — 'service ssh start' is unreliable in K8s ───────────
+/usr/sbin/sshd
+
+# Wait until sshd is actually listening before proceeding
+for i in $(seq 1 30); do
+    if nc -z localhost 22; then
+        echo "sshd ready on port 22"
+        break
+    fi
+    [ $i -eq 30 ] && echo "ERROR: sshd never became ready" && exit 1
+    sleep 1
+done
 
 mkdir -p ~/.ssh
 cat >> ~/.ssh/config << 'SSHEOF'

@@ -45,7 +45,9 @@ RUN wget -q --tries=5 --waitretry=10 \
 # guava-27.0-jre.jar. Without this fix Hive fails on startup with:
 #   NoSuchMethodError: com.google.common.base.Preconditions.checkArgument
 RUN rm -f /opt/hive/lib/guava-*.jar \
-    && cp /opt/hadoop/share/hadoop/common/lib/guava-27.0-jre.jar /opt/hive/lib/
+    && GUAVA=$(ls /opt/hadoop/share/hadoop/common/lib/guava-*.jar | head -1) \
+    && echo "Copying Guava: $GUAVA" \
+    && cp "$GUAVA" /opt/hive/lib/
 
 COPY conf/core-site.xml   $HADOOP_HOME/etc/hadoop/core-site.xml
 COPY conf/hdfs-site.xml   $HADOOP_HOME/etc/hadoop/hdfs-site.xml

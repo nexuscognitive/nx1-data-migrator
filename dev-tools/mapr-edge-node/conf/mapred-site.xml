@@ -1,12 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
 <configuration>
+  <!--
+    Use local MapReduce framework — YARN cannot launch containers when the
+    NodeManager runs as root (Hadoop 2.7.x DefaultContainerExecutor hard block).
+    This setting makes DistCp work without any -Dmapreduce.framework.name=local
+    override flag on the command line.
+  -->
   <property>
     <name>mapreduce.framework.name</name>
-    <value>yarn</value>
+    <value>local</value>
   </property>
   <property>
-    <name>mapreduce.application.classpath</name>
-    <value>$HADOOP_HOME/share/hadoop/mapreduce/*:$HADOOP_HOME/share/hadoop/mapreduce/lib/*</value>
+    <name>mapreduce.local.map.tasks.maximum</name>
+    <value>1</value>
+  </property>
+  <property>
+    <name>mapreduce.local.reduce.tasks.maximum</name>
+    <value>1</value>
   </property>
 </configuration>

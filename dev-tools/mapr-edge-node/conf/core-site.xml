@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
 <configuration>
+
   <property>
     <name>fs.defaultFS</name>
     <value>hdfs://localhost:9000</value>
@@ -9,9 +10,42 @@
     <name>hadoop.tmp.dir</name>
     <value>/hadoop/data/tmp</value>
   </property>
+
   <!-- Simulates MapR's maprfs fallback to hdfs for local testing -->
   <property>
     <name>fs.maprfs.impl</name>
     <value>org.apache.hadoop.hdfs.DistributedFileSystem</value>
   </property>
+
+  <!-- S3A filesystem implementation — required for hadoop fs and hadoop distcp -->
+  <property>
+    <name>fs.s3a.impl</name>
+    <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+  </property>
+  <property>
+    <name>fs.AbstractFileSystem.s3a.impl</name>
+    <value>org.apache.hadoop.fs.s3a.S3A</value>
+  </property>
+  <property>
+    <name>fs.s3a.path.style.access</name>
+    <value>false</value>
+  </property>
+  <!-- FileOutputCommitter required — S3 does not support atomic rename -->
+  <property>
+    <name>fs.s3a.committer.name</name>
+    <value>file</value>
+  </property>
+  <property>
+    <name>mapreduce.outputcommitter.factory.scheme.s3a</name>
+    <value>org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.maximum</name>
+    <value>100</value>
+  </property>
+  <property>
+    <name>fs.s3a.threads.max</name>
+    <value>20</value>
+  </property>
+
 </configuration>

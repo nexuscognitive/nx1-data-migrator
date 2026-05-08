@@ -164,7 +164,7 @@ for p in parts:
         DST_PART="${S3_LOC}/${PART_STR}"
         DISTCP_CALLS="${DISTCP_CALLS}
 echo \"=== Copying partition: ${SRC_PART} -> ${DST_PART} ===\"
-hadoop distcp -Dmapreduce.framework.name=local${S3_OPTS} -update -delete -m ${MAPPERS} -bandwidth ${BANDWIDTH} -strategy dynamic \\
+hadoop distcp${S3_OPTS} -update -delete -m ${MAPPERS} -bandwidth ${BANDWIDTH} -strategy dynamic \\
     -log ${TEMP_DIR}/distcp_${TBL}_part${PART_IDX}.log \\
     \"${SRC_PART}\" \"${DST_PART}\"
 "
@@ -274,7 +274,7 @@ echo "S3_TOTAL_SIZE_BEFORE=\$S3_TOTAL_SIZE_BEFORE"
 echo "=== Running distcp ==="
 DISTCP_LOG_FILE="${TEMP_DIR}/distcp_${TBL}.log"
 set +e
-hadoop distcp -Dmapreduce.framework.name=local${S3_OPTS} -update -delete -m ${MAPPERS} -bandwidth ${BANDWIDTH} -strategy dynamic -log ${TEMP_DIR}/distcp_${TBL}_joblog "${SOURCE_LOC}" "${S3_LOC}" 2>&1 | tee "\$DISTCP_LOG_FILE"
+hadoop distcp${S3_OPTS} -update -delete -m ${MAPPERS} -bandwidth ${BANDWIDTH} -strategy dynamic -log ${TEMP_DIR}/distcp_${TBL}_joblog "${SOURCE_LOC}" "${S3_LOC}" 2>&1 | tee "\$DISTCP_LOG_FILE"
 DISTCP_EXIT=\${PIPESTATUS[0]}
 set -e
 echo "DISTCP_EXIT_CODE=\$DISTCP_EXIT"

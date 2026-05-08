@@ -20,7 +20,7 @@ equivalent for testing discover and distcp tasks.
 | Hadoop    | 2.7.7                                 | 2.7.0-mapr-1808       |
 | Hive      | 1.2.2                                 | MEP 5.0 (Hive 1.2.x)  |
 | Spark     | 2.3.4                                 | MEP 5.0 (Spark 2.3.x) |
-| Python    | 2.7                                   | —                     |
+| Python    | 2.7 (default) / 3 (setup script only) | —                     |
 | SSH port  | 2223 (user: `root`, password: `root`) | —                     |
 
 ---
@@ -41,15 +41,15 @@ dev-tools/mapr-edge-node/
 ├── docker-compose.yml
 ├── README.md
 ├── conf/
-│   ├── core-site.xml
+│   ├── core-site.xml        # HDFS + S3A filesystem registration
 │   ├── hdfs-site.xml
-│   ├── mapred-site.xml
+│   ├── mapred-site.xml      # local framework (YARN blocked in Docker, see Troubleshooting)
 │   ├── yarn-site.xml
 │   └── hive-site.xml
 └── scripts/
     ├── entrypoint.sh        # container startup — starts SSH, HDFS, YARN, Hive metastore thrift, HiveServer2
     ├── bootstrap-hdfs.sh    # first-run only — formats namenode, inits Hive metastore schema
-    ├── profile-additions.sh # sets PATH/PYTHONPATH for all SSH sessions
+    ├── profile-additions.sh # sets PATH/PYTHONPATH/HADOOP_CLASSPATH for all SSH sessions
     ├── setup-test-data.sh   # populates HDFS + Hive with test databases and tables
     ├── test-discover.sh     # runs the exact PySpark discover script from the DAG
     └── test-distcp.sh       # runs the exact distcp shell command from the DAG
@@ -127,7 +127,7 @@ Run once after starting the container (or after any full reset):
 docker exec -u root mapr-edge-node bash /setup-test-data.sh
 ```
 
-This creates 4 databases and 10 tables covering the migration DAG test cases.
+This creates 4 databases and 16 tables covering all migration DAG test scenarios.
 See [Test Data Reference](#test-data-reference) below for the full table inventory.
 
 ### Step 5 — SSH into the container (optional)
@@ -178,7 +178,23 @@ In **Airflow UI → Admin → Connections**, find or create `cluster_edge_ssh`:
 | Password  | `root`                                                                            |
 | Extra     | `{"timeout": "30", "no_host_key_check": "true", "allow_host_key_change": "true"}` |
 
-### Step 4 — Trigger the DAG
+### Step 4 — Set Airflow Variables
+
+In **Airflow UI → Admin → Variables**, set these before triggering a DAG run:
+
+| Key                        | Value                      |
+| -------------------------- | -------------------------- |
+| `auth_method`              | `mapr`                     |
+| `mapr_user`                | `root`                     |
+| `mapr_ticketfile_location` | `/tmp/maprticket`          |
+| `s3_access_key`            | Your AWS Access Key ID     |
+| `s3_secret_key`            | Your AWS Secret Access Key |
+| `migration_distcp_mappers` | `1`                        |
+
+> `maprlogin` and `/tmp/maprticket` are baked into the image. No manual
+> ticket creation steps are needed.
+
+### Step 5 — Trigger the DAG
 
 Trigger `source_to_s3_migration` with your Excel config pointing at the test
 data in this container. The DAG will SSH into the container via bore, run the
@@ -281,10 +297,10 @@ Runs the exact `cmd` string that `run_distcp_ssh()` sends over SSH, with your
 parameters substituted in. Supports both the full-table path and the
 per-partition path.
 
-> **Container-only note:** This script adds `-Dmapreduce.framework.name=local`
-> to the `hadoop distcp` call. This is required because YARN cannot launch
-> MapReduce containers inside Docker (Hadoop 2.7.x limitation). This flag is
-> **not** in the DAG — real MapR clusters run YARN normally.
+> **Note:** DistCp runs with `-Dmapreduce.framework.name=local` on this
+> container, set via `conf/mapred-site.xml`. The DAG also includes this flag
+> in its distcp commands when targeting this container. Real MapR clusters are
+> unaffected because their YARN NodeManager does not run as root.
 
 **Signature:**
 
@@ -360,40 +376,53 @@ docker exec -u root `
 
 ## Test Data Reference
 
-`setup-test-data.sh` creates 4 databases with 10 tables. Each table is designed
+`setup-test-data.sh` creates 4 databases with 16 tables. Each table is designed
 to exercise a specific scenario in the migration DAG.
 
 ### `sales_db`
 
-| Table          | Format   | Partitioned | Partition Keys  | Rows | Tests                                                                                   |
-| -------------- | -------- | ----------- | --------------- | ---- | --------------------------------------------------------------------------------------- |
-| `orders`       | TEXTFILE | Yes         | `year`, `month` | 10   | Partitioned table, 3 partitions. Exact filter, `>=` comparison, all-partition migration |
-| `customers`    | TEXTFILE | No          | —               | 5    | Non-partitioned CSV (`,` delimiter)                                                     |
-| `products`     | TEXTFILE | No          | —               | 5    | Non-partitioned TSV (`\t` delimiter)                                                    |
-| `transactions` | TEXTFILE | No          | —               | 4    | Pipe-delimited (`\|`). Tests `field.delim` serde property                               |
-| `orders_empty` | TEXTFILE | Yes         | `year`, `month` | 0    | Empty partitioned table — zero rows, no registered partitions                           |
+| Table          | Format   | Partitioned | Partition Keys  | Rows | Tests                                                                                    |
+| -------------- | -------- | ----------- | --------------- | ---- | ---------------------------------------------------------------------------------------- |
+| `orders`       | TEXTFILE | Yes         | `year`, `month` | 10   | Partitioned table, 3 partitions — exact filter, `>=` comparison, all-partition migration |
+| `customers`    | TEXTFILE | No          | —               | 5    | Non-partitioned CSV (`,` delimiter)                                                      |
+| `products`     | TEXTFILE | No          | —               | 5    | Non-partitioned TSV (`\t` delimiter)                                                     |
+| `transactions` | TEXTFILE | No          | —               | 4    | Pipe-delimited (`\|`) — tests `field.delim` serde property                               |
+| `orders_empty` | TEXTFILE | Yes         | `year`, `month` | 0    | EMPTY_SOURCE — zero files, no registered partitions                                      |
 
 ### `hr_db`
 
-| Table         | Format   | Partitioned | Partition Keys | Rows | Tests                                                              |
-| ------------- | -------- | ----------- | -------------- | ---- | ------------------------------------------------------------------ |
-| `employees`   | TEXTFILE | No          | —              | 5    | `\N` null values. Tests `serialization.null.format` serde property |
-| `departments` | TEXTFILE | No          | —              | 0    | Empty non-partitioned table                                        |
+| Table               | Format   | Partitioned | Partition Keys | Rows | Tests                                                               |
+| ------------------- | -------- | ----------- | -------------- | ---- | ------------------------------------------------------------------- |
+| `employees`         | TEXTFILE | No          | —              | 5    | `\N` null values — tests `serialization.null.format` serde property |
+| `departments`       | TEXTFILE | No          | —              | 0    | EMPTY_SOURCE — empty non-partitioned table                          |
+| `employees_parquet` | PARQUET  | No          | —              | 5    | PARQUET format — schema inferred from files                         |
+| `employees_avro`    | AVRO     | No          | —              | 3    | AVRO format — tests `STORED AS AVRO` DDL                            |
 
-> `hr_db` is used for the **wildcard `*` test** — discovers both tables in one call.
+> `hr_db` is used for the **wildcard `*` test** — discovers all tables in one call.
 
 ### `analytics_db`
 
-| Table      | Format   | Partitioned | Partition Keys            | Rows | Tests                                                                                                                   |
-| ---------- | -------- | ----------- | ------------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------- |
-| `events`   | TEXTFILE | Yes         | `region`, `year`, `month` | 9    | 3-level partition. Wildcard filter `region=US/*` and exact 3-level filter                                               |
-| `sessions` | TEXTFILE | Yes         | `year`, `month`           | 4    | **Unregistered partitions** — data in HDFS but not registered in metastore. DAG must set `unregistered_partitions=True` |
+| Table                      | Format   | Partitioned | Partition Keys            | Rows | Tests                                                                                                                          |
+| -------------------------- | -------- | ----------- | ------------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `events`                   | TEXTFILE | Yes         | `region`, `year`, `month` | 9    | 3-level partition, 4 partitions (3 US + 1 EU) — wildcard filter `region=US/*` and exact 3-level filter                         |
+| `sessions`                 | TEXTFILE | Yes         | `year`, `month`           | 4    | **Unregistered partitions** — data exists in HDFS but not registered in metastore. DAG must set `unregistered_partitions=True` |
+| `events_orc`               | ORC      | Yes         | `region`, `year`, `month` | 5    | ORC format — tests `STORED AS ORC` DDL                                                                                         |
+| `events_empty_partitioned` | TEXTFILE | Yes         | `region`, `year`, `month` | 0    | EMPTY_SOURCE — 3-level partition key, zero files                                                                               |
 
 ### `logs_db`
 
-| Table      | Format   | Partitioned | Partition Keys | Rows | Tests                                                             |
-| ---------- | -------- | ----------- | -------------- | ---- | ----------------------------------------------------------------- |
-| `app_logs` | TEXTFILE | Yes         | `dt`           | 7    | 3 date partitions. Used for all partition filter expression types |
+| Table                          | Format   | Partitioned | Partition Keys | Rows | Tests                                                                     |
+| ------------------------------ | -------- | ----------- | -------------- | ---- | ------------------------------------------------------------------------- |
+| `app_logs`                     | TEXTFILE | Yes         | `dt`           | 7    | 3 date partitions — used for all partition filter expression types        |
+| `error_logs_empty`             | TEXTFILE | Yes         | `dt`           | 0    | EMPTY_SOURCE — most common real-world case: log table never received data |
+| `metrics_empty_nonpartitioned` | TEXTFILE | No          | —              | 0    | EMPTY_SOURCE — simplest case: flat table, no partition logic              |
+
+### Partition Keys Note
+
+Hive partition specs use **unpadded integers** (`month=1`, `month=2`,
+`month=3`). The HDFS directories match exactly. Using zero-padded paths
+(`month=01`) would create a mismatch between the metastore partition spec and
+the HDFS location, causing `COUNT(*) = 0` for all partitioned tables.
 
 ### Partition Filter Expressions
 
@@ -405,14 +434,14 @@ These all apply to `logs_db.app_logs` (partitions: `dt=2024-01-01`, `dt=2024-01-
 | `dt>=2024-01-15`               | `dt=2024-01-15`, `dt=2024-02-01` | Comparison  |
 | `last_n_partitions=2`          | `dt=2024-01-15`, `dt=2024-02-01` | Last N      |
 | `dt=2024-01-01, dt=2024-02-01` | `dt=2024-01-01`, `dt=2024-02-01` | Multi-term  |
-| _(blank)_                      | all 3                            | No filter   |
+| _(blank)_                      | All 3                            | No filter   |
 
 For `analytics_db.events`:
 
-| Expression                     | Partitions matched  | Type          |
-| ------------------------------ | ------------------- | ------------- |
-| `region=US/*`                  | All 3 US partitions | Wildcard      |
-| `region=EU/year=2024/month=01` | EU partition only   | Exact 3-level |
+| Expression                    | Partitions matched  | Type          |
+| ----------------------------- | ------------------- | ------------- |
+| `region=US/*`                 | All 3 US partitions | Wildcard      |
+| `region=EU/year=2024/month=1` | EU partition only   | Exact 3-level |
 
 ---
 
@@ -476,11 +505,32 @@ Wait 90 seconds, verify both 9083 and 10000 are listening, then re-run setup.
 AM Container for appattempt_XXX exited with exitCode: 1
 ```
 
-This is expected in Docker. Hadoop 2.7.x cannot launch YARN MapReduce containers
-inside a Docker container due to cgroup limitations. `test-distcp.sh` already
-works around this with `-Dmapreduce.framework.name=local`. This flag is only in
-the test script — the DAG itself does not include it, so real MapR clusters are
-unaffected.
+YARN cannot launch MapReduce containers when the NodeManager runs as root
+(Hadoop 2.7.x `DefaultContainerExecutor` hard block in `ContainerLaunch.java`).
+This image sets `mapreduce.framework.name=local` in `conf/mapred-site.xml` so
+DistCp always runs in-process without needing YARN. The DAG's distcp commands
+include `-Dmapreduce.framework.name=local` when targeting this container. Real
+MapR clusters run YARN as a non-root service user and are unaffected.
+
+### `hadoop fs -ls s3a://...` fails with `ClassNotFoundException`
+
+The Hadoop FsShell does not auto-load `share/hadoop/tools/lib/*`. The image
+sets `HADOOP_CLASSPATH` in `profile-additions.sh` (copied to
+`/etc/profile.d/hadoop.sh`) and bakes it into `/root/.profile`, so this should
+not occur after a normal image build. If it appears, run:
+
+```bash
+source /root/.profile
+hadoop fs -Dfs.s3a.access.key=... -Dfs.s3a.secret.key=... -ls s3a://your-bucket/
+```
+
+### Row counts show 0 for partitioned tables
+
+This is caused by a mismatch between HDFS path format and Hive partition specs.
+Hive registers partitions as `month=1` (integer, unpadded). If HDFS directories
+use `month=01`, the partition points to a non-existent path and `COUNT(*)` returns 0.
+Always use unpadded integers in HDFS paths. The `setup-test-data.sh` script
+already does this correctly.
 
 ### PySpark exits with `ClassNotFoundException` or `NoSuchMethodError`
 
