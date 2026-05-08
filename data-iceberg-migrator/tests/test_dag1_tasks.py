@@ -534,6 +534,29 @@ class TestRunDistcpSsh:
         assert result['distcp_results'][0]['status'] == 'SKIPPED'
         client.exec_command.assert_not_called()
 
+    def test_empty_source_skips_distcp_and_sets_empty_source_status(self, mock_ssh_hook, sample_discovery):
+        """If source has 0 files, distcp must be skipped and status set to EMPTY_SOURCE."""
+        hook, client, _, _ = mock_ssh_hook
+
+        empty_source_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'source_file_count': 0,
+                'partition_filter_active': False,
+                'filtered_file_count': 0,
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=empty_source_discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'EMPTY_SOURCE'
+        if client.exec_command.called:
+            cmd = client.exec_command.call_args[0][0]
+            assert 'distcp' not in cmd.lower(), "distcp should not be called for empty source"
+
 
 class TestUpdateDistcpStatus:
 
