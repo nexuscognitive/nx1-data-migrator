@@ -2,6 +2,7 @@
 """Deploy Airflow DAGs to S3 with per-user suffix and owner customization."""
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -267,14 +268,23 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
             sys.exit(1)
 
         content = local_path.read_text()
-        content = content.replace(
-            f"dag_id='{dag_info['dag_id']}'",
-            f"dag_id='{dag_info['dag_id']}_{args.suffix}'",
+        content, dag_id_subs = re.subn(
+            rf"""dag_id=["']{re.escape(dag_info['dag_id'])}["']""",
+            f'dag_id="{dag_info["dag_id"]}_{args.suffix}"',
+            content,
         )
-        content = content.replace(
-            dag_info["owner_marker"],
-            f"'owner': '{args.owner}'",
+        if dag_id_subs == 0:
+            print(f"Error: dag_id='{dag_info['dag_id']}' not found in {local_path}")
+            sys.exit(1)
+        owner_pattern = re.escape(dag_info["owner_marker"]).replace("'", """["']""")
+        content, owner_subs = re.subn(
+            owner_pattern,
+            f'"owner": "{args.owner}"',
+            content,
         )
+        if owner_subs == 0:
+            print(f"Error: owner marker not found in {local_path}: {dag_info['owner_marker']}")
+            sys.exit(1)
 
         dag_stem = local_path.stem
         s3_key = f"{args.dags_prefix}{dag_stem}_{args.suffix}.py"
