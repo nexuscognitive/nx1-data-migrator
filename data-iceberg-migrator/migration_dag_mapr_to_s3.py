@@ -607,6 +607,7 @@ import json
 import sys
 import fnmatch
 from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
 sys.path.insert(0, "{temp_dir}")
 from partition_utils import apply_partition_filter, partitions_to_where_clause
 
@@ -621,38 +622,94 @@ dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
 
 tokens = json.loads('{tokens_json_escaped}')
+filter_expr = "{filter_expr_escaped}"
+
+def _s3_location_for(tbl):
+    if {include_db_in_path}:
+        return dest_bucket + "/" + dest_db + "/" + tbl
+    return dest_bucket + "/" + tbl
+
+def _default_metadata_record(tbl):
+    return {{
+        "source_database": src_db,
+        "source_table": tbl,
+        "dest_database": dest_db,
+        "dest_bucket": dest_bucket,
+        "source_location": "",
+        "s3_location": _s3_location_for(tbl),
+        "file_format": "UNKNOWN",
+        "schema": [],
+        "partitions": [],
+        "partition_columns": "",
+        "partition_count": 0,
+        "row_count": 0,
+        "is_partitioned": False,
+        "unregistered_partitions": False,
+        "table_type": "UNKNOWN",
+        "source_total_size_bytes": 0,
+        "source_file_count": 0,
+        "serde_properties": {{}},
+        "partition_filter": filter_expr or None,
+        "filtered_partitions": [],
+        "partition_filter_active": False,
+        "filtered_row_count": 0,
+        "filtered_source_size_bytes": 0,
+        "filtered_file_count": 0,
+        "full_table_row_count": 0,
+        "full_table_partition_count": 0,
+        "partition_file_counts": {{}},
+    }}
 
 def resolve_tokens(spark, db, tokens):
+    try:
+        existing_rows = spark.sql("SHOW TABLES IN {{0}}".format(db)).collect()
+        existing_lower = {{r.tableName.lower(): r.tableName for r in existing_rows}}
+    except AnalysisException as e:
+        print("WARNING: SHOW TABLES IN {{0}} failed with AnalysisException ({{1}}). Treating all explicit tokens as missing.".format(db, str(e)[:200]))
+        existing_lower = {{}}
+
     resolved = []
+    missing = []
     seen = set()
 
     for tok in tokens:
         if tok == '*':
-            rows = spark.sql("SHOW TABLES IN {{0}}".format(db)).collect()
-            for r in rows:
-                t = r.tableName
-                if t not in seen:
-                    seen.add(t)
-                    resolved.append(t)
+            for low, canonical in existing_lower.items():
+                if low not in seen:
+                    seen.add(low)
+                    resolved.append(canonical)
         elif '*' in tok:
-            rows = spark.sql(
-                "SHOW TABLES IN {{0}} LIKE '{{1}}'".format(db, tok)
-            ).collect()
-            for r in rows:
-                t = r.tableName
-                if t not in seen:
-                    seen.add(t)
-                    resolved.append(t)
+            tok_lower = tok.lower()
+            matched = 0
+            for low, canonical in existing_lower.items():
+                if fnmatch.fnmatch(low, tok_lower):
+                    if low not in seen:
+                        seen.add(low)
+                        resolved.append(canonical)
+                        matched += 1
+            if matched == 0:
+                print("WARNING: wildcard token '{{0}}' matched no existing tables in {{1}}".format(tok, db))
         else:
-            if tok not in seen:
-                seen.add(tok)
-                resolved.append(tok)
+            tok_lower = tok.lower()
+            if tok_lower in seen:
+                continue
+            seen.add(tok_lower)
+            if tok_lower in existing_lower:
+                resolved.append(existing_lower[tok_lower])
+            else:
+                missing.append(tok)
 
-    return resolved
+    return resolved, missing
 
-table_list = resolve_tokens(spark, src_db, tokens)
+table_list, missing_tables = resolve_tokens(spark, src_db, tokens)
 
 metadata = []
+
+for tbl in missing_tables:
+    record = _default_metadata_record(tbl)
+    record["error"] = "Table '{{0}}' not found in source database '{{1}}'".format(tbl, src_db)
+    record["error_type"] = "TABLE_NOT_FOUND"
+    metadata.append(record)
 
 for tbl in table_list:
     loc = None
@@ -660,7 +717,6 @@ for tbl in table_list:
     input_format = None
     serde_properties = {{}}
     in_serde_section = False
-    filter_expr = "{filter_expr_escaped}"
     partition_filter_active = False
     filtered_partitions = []
     filtered_source_size = 0
@@ -668,6 +724,8 @@ for tbl in table_list:
     row_count = 0
     full_row_count = 0
     full_partition_count = 0
+    # Race window: a table dropped between SHOW TABLES and DESCRIBE here is
+    # classified FAILED (not TABLE_NOT_FOUND). Tolerable; retry resolves it.
     try:
         desc_df = spark.sql(
             "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
@@ -775,7 +833,6 @@ for tbl in table_list:
             pass
 
         # Apply partition filter
-        filter_expr = "{filter_expr_escaped}"
         full_partition_count = len(metastore_partitions)
         full_row_count = row_count
 
@@ -869,18 +926,9 @@ for tbl in table_list:
 
             schema.append({{"name": col_name, "type": data_type}})
 
-        if {include_db_in_path}:
-            s3_location = "{{0}}/{{1}}/{{2}}".format(dest_bucket, dest_db, tbl)
-        else:
-            s3_location = "{{0}}/{{1}}".format(dest_bucket, tbl)
-
-        metadata.append({{
-            "source_database": src_db,
-            "source_table": tbl,
-            "dest_database": dest_db,
-            "dest_bucket": dest_bucket,
+        record = _default_metadata_record(tbl)
+        record.update({{
             "source_location": loc or "",
-            "s3_location": s3_location,
             "file_format": file_format,
             "schema": schema,
             "partitions": filtered_partitions,
@@ -893,7 +941,6 @@ for tbl in table_list:
             "source_total_size_bytes": source_total_size,
             "serde_properties": serde_properties,
             "source_file_count": source_file_count,
-            "partition_filter": filter_expr or None,
             "filtered_partitions": filtered_partitions,
             "partition_filter_active": partition_filter_active,
             "filtered_row_count": row_count,
@@ -903,38 +950,12 @@ for tbl in table_list:
             "full_table_partition_count": full_partition_count,
             "partition_file_counts": partition_file_counts,
         }})
+        metadata.append(record)
 
     except Exception as e:
-        err_str = str(e)
-        missing_markers = (
-            "table or view not found",
-            "table_or_view_not_found",
-            "nosuchtableexception",
-            "nosuchobjectexception",
-        )
-        err_lower = err_str.lower()
-        is_missing = any(m in err_lower for m in missing_markers)
-        error_type = "TABLE_NOT_FOUND" if is_missing else "FAILED"
-        metadata.append({{
-            "source_database": src_db,
-            "source_table": tbl,
-            "dest_database": dest_db,
-            "dest_bucket": dest_bucket,
-            "source_location": "",
-            "s3_location": (dest_bucket + "/" + dest_db + "/" + tbl) if {include_db_in_path} else (dest_bucket + "/" + tbl),
-            "file_format": "UNKNOWN",
-            "schema": [],
-            "partitions": [],
-            "partition_columns": "",
-            "partition_count": 0,
-            "row_count": 0,
-            "is_partitioned": False,
-            "unregistered_partitions": False,
-            "table_type": "UNKNOWN",
-            "source_total_size_bytes": 0,
-            "source_file_count": 0,
+        record = _default_metadata_record(tbl)
+        record.update({{
             "serde_properties": serde_properties,
-            "partition_filter": filter_expr or None,
             "filtered_partitions": filtered_partitions,
             "partition_filter_active": partition_filter_active,
             "filtered_row_count": row_count,
@@ -942,10 +963,10 @@ for tbl in table_list:
             "filtered_file_count": filtered_file_count,
             "full_table_row_count": full_row_count,
             "full_table_partition_count": full_partition_count,
-            "partition_file_counts": {{}},
-            "error": err_str[:500],
-            "error_type": error_type,
+            "error": str(e)[:500],
+            "error_type": "FAILED",
         }})
+        metadata.append(record)
 
 print ("===JSON_START===")
 sys.stdout.flush()
