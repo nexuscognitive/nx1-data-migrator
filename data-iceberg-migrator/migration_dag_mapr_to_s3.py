@@ -33,6 +33,7 @@ from utils.migrations.shared import (
     cluster_login,
     execute_with_iceberg_retry,
     get_config,
+    hive_type_to_spark_ddl,
     normalize_s3,
     track_duration,
     validate_bucket_endpoint_pairs,
@@ -2140,7 +2141,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
 
                 if schema_list:
                     cols = [
-                        f"`{c['name']}` {c['type']}"
+                        f"`{c['name']}` {hive_type_to_spark_ddl(c['type'])}"
                         for c in schema_list
                         if c.get("name") and c["name"] not in part_col_list
                     ]
@@ -2178,7 +2179,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                         ptype = "STRING"
                         for c in schema_list:
                             if c.get("name") == pc:
-                                ptype = c.get("type", "STRING")
+                                ptype = hive_type_to_spark_ddl(c.get("type", "STRING"))
                                 break
                         pdefs.append(f"`{pc}` {ptype}")
                     part_clause = f"PARTITIONED BY ({', '.join(pdefs)})"
