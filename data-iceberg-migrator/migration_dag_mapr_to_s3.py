@@ -660,6 +660,20 @@ def _default_metadata_record(tbl):
         "partition_file_counts": {{}},
     }}
 
+def database_exists(spark, db):
+    try:
+        rows = spark.sql("SHOW DATABASES LIKE '{{0}}'".format(db)).collect()
+    except AnalysisException as e:
+        print("WARNING: SHOW DATABASES LIKE '{{0}}' failed with AnalysisException ({{1}}). Assuming database exists.".format(db, str(e)[:200]))
+        return True
+    db_lower = db.lower()
+    # SHOW DATABASES LIKE returns a single column; field name varies across Spark versions
+    # (databaseName in Spark 2.x, namespace in Spark 3.x), so read positionally.
+    for r in rows:
+        if r[0] and r[0].lower() == db_lower:
+            return True
+    return False
+
 def resolve_tokens(spark, db, tokens):
     try:
         existing_rows = spark.sql("SHOW TABLES IN {{0}}".format(db)).collect()
@@ -701,9 +715,19 @@ def resolve_tokens(spark, db, tokens):
 
     return resolved, missing
 
-table_list, missing_tables = resolve_tokens(spark, src_db, tokens)
-
 metadata = []
+
+if not database_exists(spark, src_db):
+    print("WARNING: source database '{{0}}' does not exist on the cluster. Emitting DATABASE_NOT_FOUND records for all tokens.".format(src_db))
+    for tok in tokens:
+        record = _default_metadata_record(tok)
+        record["error"] = "Source database '{{0}}' does not exist on the cluster".format(src_db)
+        record["error_type"] = "DATABASE_NOT_FOUND"
+        metadata.append(record)
+    table_list = []
+    missing_tables = []
+else:
+    table_list, missing_tables = resolve_tokens(spark, src_db, tokens)
 
 for tbl in missing_tables:
     record = _default_metadata_record(tbl)
@@ -1052,6 +1076,10 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
             logger.warning(
                 f"  Table not found on source: {src_db}.{t['source_table']} — will be skipped in downstream phases"
             )
+        elif t.get("error_type") == "DATABASE_NOT_FOUND":
+            logger.warning(
+                f"  Source database not found: {src_db} (token='{t['source_table']}') — will be skipped in downstream phases"
+            )
         else:
             logger.error(
                 f"  Discovery FAILED: {src_db}.{t['source_table']} | error={t.get('error','')[:200]}"
@@ -1059,7 +1087,7 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
 
     real_failures = [
         t for t in metadata
-        if "error" in t and t.get("error_type") != "TABLE_NOT_FOUND"
+        if "error" in t and t.get("error_type") not in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND")
     ]
     if real_failures:
         failed_count = len(real_failures)
@@ -1097,16 +1125,22 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
     discovery_duration = discovery.get("_task_duration", 0.0)
 
     for t in discovery["tables"]:
-        is_not_found = t.get("error_type") == "TABLE_NOT_FOUND"
-        disc_status = "TABLE_NOT_FOUND" if is_not_found else "COMPLETED"
-        if is_not_found:
+        error_type = t.get("error_type")
+        is_missing = error_type in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND")
+        disc_status = error_type if is_missing else "COMPLETED"
+        if is_missing:
+            default_msg = (
+                "Source database does not exist on the cluster"
+                if error_type == "DATABASE_NOT_FOUND"
+                else "Table not found on source"
+            )
             err_msg_escaped = (
-                (t.get("error") or "Table not found on source")
+                (t.get("error") or default_msg)
                 .replace("'", "''")[:2000]
             )
-            overall_status_insert = "'TABLE_NOT_FOUND'"
+            overall_status_insert = f"'{error_type}'"
             error_msg_insert = f"'{err_msg_escaped}'"
-            overall_status_update = "'TABLE_NOT_FOUND'"
+            overall_status_update = f"'{error_type}'"
             error_msg_update = f"'{err_msg_escaped}'"
         else:
             overall_status_insert = "NULL"
@@ -1278,13 +1312,13 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
     results = []
     for t in tables:
-        if t.get("error_type") == "TABLE_NOT_FOUND":
+        if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             results.append(
                 {
                     "source_database": t["source_database"],
                     "source_table": t["source_table"],
                     "dest_database": t["dest_database"],
-                    "status": "TABLE_NOT_FOUND",
+                    "status": t["error_type"],
                 }
             )
             continue
@@ -1968,7 +2002,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
     src_db = distcp_result["source_database"]
 
     for r in distcp_result.get("distcp_results", []):
-        if r.get("status") in ("SKIPPED", "EMPTY_SOURCE", "TABLE_NOT_FOUND"):
+        if r.get("status") in ("SKIPPED", "EMPTY_SOURCE", "TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             continue
         overall = "COPIED" if r["status"] == "COMPLETED" else "FAILED"
         error_msg = r.get("error", "").replace("'", "''") if r.get("error") else ""
@@ -2136,12 +2170,12 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
         tbl = t["source_table"]
         dest_db = t.get("dest_database") or distcp_result["dest_database"]
 
-        if t.get("error_type") == "TABLE_NOT_FOUND":
+        if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             results.append(
                 {
                     "source_table": tbl,
                     "dest_database": dest_db,
-                    "status": "TABLE_NOT_FOUND",
+                    "status": t["error_type"],
                     "action": "skipped_not_found",
                     "existed": False,
                     "error": None,
@@ -2420,7 +2454,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
     table_duration = table_result.get("_task_duration", 0.0)
 
     for r in table_result.get("table_results", []):
-        if r.get("status") == "TABLE_NOT_FOUND":
+        if r.get("status") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             continue
         per_table_dest_db = r.get("dest_database", table_result["dest_database"])
         overall = (
@@ -2442,6 +2476,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                     WHEN overall_status = 'FAILED' THEN overall_status
                     WHEN overall_status = 'EMPTY_SOURCE' THEN overall_status
                     WHEN overall_status = 'TABLE_NOT_FOUND' THEN overall_status
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN overall_status
                     ELSE '{overall}'
                 END,
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
@@ -2544,13 +2579,17 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
         per_table_dest_db = t.get("dest_database", dest_db)
         dest_tbl = f"{per_table_dest_db}.{tbl}"
 
-        if t.get("error_type") == "TABLE_NOT_FOUND":
+        if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             validation_results.append(
                 {
                     "source_table": tbl,
                     "dest_database": per_table_dest_db,
-                    "status": "TABLE_NOT_FOUND",
-                    "error": "Table not found on source",
+                    "status": t["error_type"],
+                    "error": (
+                        "Source database does not exist on the cluster"
+                        if t["error_type"] == "DATABASE_NOT_FOUND"
+                        else "Table not found on source"
+                    ),
                 }
             )
             continue
@@ -2905,11 +2944,13 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                     WHEN overall_status = 'FAILED' THEN overall_status
                     WHEN overall_status = 'EMPTY_SOURCE' THEN overall_status
                     WHEN overall_status = 'TABLE_NOT_FOUND' THEN overall_status
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN overall_status
                     ELSE '{final_overall_status}'
                 END,
                 error_message = CASE
                     WHEN overall_status = 'FAILED' THEN error_message
                     WHEN overall_status = 'TABLE_NOT_FOUND' THEN error_message
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN error_message
                     ELSE {error_message_sql}
                 END,
                 updated_at = current_timestamp()
@@ -2972,6 +3013,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                     WHEN overall_status = 'FAILED' THEN 'FAILED'
                     WHEN overall_status = 'EMPTY_SOURCE' THEN 'EMPTY_SOURCE'
                     WHEN overall_status = 'TABLE_NOT_FOUND' THEN 'TABLE_NOT_FOUND'
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
                     ELSE 'VALIDATION_FAILED'
                 END,
                 error_message = COALESCE(error_message, 'Validation task did not process this table'),
@@ -3022,6 +3064,7 @@ def generate_html_report(run_id: str, spark) -> str:
     )
     failed_tables = sum(1 for t in table_status if "FAILED" in (t.overall_status or ""))
     not_found_tables = sum(1 for t in table_status if t.overall_status == "TABLE_NOT_FOUND")
+    db_not_found_tables = sum(1 for t in table_status if t.overall_status == "DATABASE_NOT_FOUND")
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (
         1024**3
     )
@@ -3145,6 +3188,10 @@ def generate_html_report(run_id: str, spark) -> str:
             background-color: #e2e3e5;
             color: #6c757d;
         }}
+        .status-db-not-found {{
+            background-color: #ffe0b2;
+            color: #8a4b00;
+        }}
         .status-warning {{
             background-color: #fff3cd;
             color: #856404;
@@ -3220,6 +3267,10 @@ def generate_html_report(run_id: str, spark) -> str:
             <div class="summary-card">
                 <h3>NOT FOUND ON SOURCE</h3>
                 <p class="value">{not_found_tables}</p>
+            </div>
+            <div class="summary-card">
+                <h3>DATABASE NOT FOUND</h3>
+                <p class="value">{db_not_found_tables}</p>
             </div>
             <div class="summary-card info">
                 <h3>TOTAL DATA</h3>
@@ -3370,6 +3421,9 @@ def generate_html_report(run_id: str, spark) -> str:
         if status == "TABLE_NOT_FOUND":
             status_class = "status-not-found"
             status_label = status
+        elif status == "DATABASE_NOT_FOUND":
+            status_class = "status-db-not-found"
+            status_label = status
         elif "VALIDATED_WITH_WARNINGS" in status:
             status_class = "status-warning"
             status_label = status
@@ -3479,19 +3533,25 @@ def generate_html_report(run_id: str, spark) -> str:
 
     def _not_found_row(t, colspan):
         pf = t.partition_filter or '<span style="color:#bdc3c7;font-size:11px;">—</span>'
+        if t.overall_status == "DATABASE_NOT_FOUND":
+            badge_class = "status-db-not-found"
+            badge_label = "DATABASE_NOT_FOUND"
+        else:
+            badge_class = "status-not-found"
+            badge_label = "TABLE_NOT_FOUND"
         return f"""
                     <tr>
                         <td>{t.source_database}</td>
                         <td><strong>{t.source_table}</strong></td>
                         <td>{pf}</td>
                         <td colspan="{colspan}">
-                            <span class="status-badge status-not-found">TABLE_NOT_FOUND</span>
+                            <span class="status-badge {badge_class}">{badge_label}</span>
                         </td>
                     </tr>
     """
 
     for t in table_status:
-        if t.overall_status == "TABLE_NOT_FOUND":
+        if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             html += _not_found_row(t, 7)
             continue
         if not t.validation_status:
@@ -3573,7 +3633,7 @@ def generate_html_report(run_id: str, spark) -> str:
 """
 
     for t in table_status:
-        if t.overall_status == "TABLE_NOT_FOUND":
+        if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             html += _not_found_row(t, 10)
             continue
         if not t.distcp_status:
@@ -3654,7 +3714,7 @@ def generate_html_report(run_id: str, spark) -> str:
 """
 
     for t in table_status:
-        if t.overall_status == "TABLE_NOT_FOUND":
+        if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             continue
         data_gb = (t.s3_total_size_bytes_after or 0) / (1024**3)
         distcp_speed = (
@@ -3726,9 +3786,9 @@ def finalize_run(run_id: str, spark) -> dict:
         stats_result = spark.sql(f"""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED', 'EMPTY_SOURCE', 'TABLE_NOT_FOUND') THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED', 'EMPTY_SOURCE', 'TABLE_NOT_FOUND', 'DATABASE_NOT_FOUND') THEN 1 ELSE 0 END) as successful,
                 SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN overall_status = 'TABLE_NOT_FOUND' THEN 1 ELSE 0 END) as not_found
+                SUM(CASE WHEN overall_status IN ('TABLE_NOT_FOUND', 'DATABASE_NOT_FOUND') THEN 1 ELSE 0 END) as not_found
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'
         """).collect()
