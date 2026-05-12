@@ -3369,7 +3369,7 @@ def generate_html_report(run_id: str, spark) -> str:
         status = t.overall_status or ""
         if status == "TABLE_NOT_FOUND":
             status_class = "status-not-found"
-            status_label = "Table not found on source"
+            status_label = status
         elif "VALIDATED_WITH_WARNINGS" in status:
             status_class = "status-warning"
             status_label = status
@@ -3484,8 +3484,8 @@ def generate_html_report(run_id: str, spark) -> str:
                         <td>{t.source_database}</td>
                         <td><strong>{t.source_table}</strong></td>
                         <td>{pf}</td>
-                        <td colspan="{colspan}" style="color:#6c757d;font-style:italic;font-size:12px;">
-                            Table not found on source
+                        <td colspan="{colspan}">
+                            <span class="status-badge status-not-found">TABLE_NOT_FOUND</span>
                         </td>
                     </tr>
     """
