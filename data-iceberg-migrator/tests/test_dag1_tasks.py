@@ -534,6 +534,69 @@ class TestRunDistcpSsh:
         assert result['distcp_results'][0]['status'] == 'SKIPPED'
         client.exec_command.assert_not_called()
 
+    def _run_with_partition_filter(self, mock_ssh_hook, sample_discovery, preserve_delete):
+        """Helper: invoke run_distcp_ssh with a partition filter and return the SSH command."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+        )
+        filtered_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'partition_filter': 'dt>=2024-01-01',
+                'filtered_partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+                'partition_filter_active': True,
+                'filtered_row_count': 500,
+                'filtered_source_size_bytes': 5 * 1024 * 1024,
+                'filtered_file_count': 2,
+                'full_table_row_count': 1000,
+                'full_table_partition_count': 2,
+                'serde_properties': {},
+            }],
+        }
+        cfg = {**m.get_config(), 'distcp_preserve_delete': preserve_delete}
+        with patch.object(m, 'get_config', return_value=cfg):
+            m.run_distcp_ssh.function.__wrapped__(
+                discovery=filtered_discovery,
+                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+                ti=MagicMock(),
+            )
+        return client.exec_command.call_args[0][0]
+
+    def _assert_metrics_scoped_to_partitions(self, ssh_cmd, s3_loc, partitions):
+        """Regression check (WF-201): BEFORE/AFTER S3 metrics must be summed only over the
+        filtered partition paths, not the whole table location."""
+        assert 'DEST_PART_PATHS=(' in ssh_cmd
+        for part in partitions:
+            assert f"{s3_loc}/{part}" in ssh_cmd
+        assert 'sum_s3_metrics_over_paths()' in ssh_cmd
+        assert 'S3_BEFORE=$(sum_s3_metrics_over_paths "${DEST_PART_PATHS[@]}")' in ssh_cmd
+        assert 'S3_AFTER=$(sum_s3_metrics_over_paths "${DEST_PART_PATHS[@]}")' in ssh_cmd
+        assert f'S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")' not in ssh_cmd
+        assert f'S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")' not in ssh_cmd
+
+    def test_partition_filter_per_partition_scopes_s3_metrics(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_with_partition_filter(
+            mock_ssh_hook, sample_discovery, preserve_delete=True,
+        )
+        s3_loc = sample_discovery['tables'][0]['s3_location']
+        self._assert_metrics_scoped_to_partitions(
+            ssh_cmd, s3_loc, ['dt=2024-01-01', 'dt=2024-01-02'],
+        )
+
+    def test_partition_filter_pathlist_scopes_s3_metrics(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_with_partition_filter(
+            mock_ssh_hook, sample_discovery, preserve_delete=False,
+        )
+        s3_loc = sample_discovery['tables'][0]['s3_location']
+        assert 'PATHLIST=' in ssh_cmd
+        self._assert_metrics_scoped_to_partitions(
+            ssh_cmd, s3_loc, ['dt=2024-01-01', 'dt=2024-01-02'],
+        )
+
     def test_empty_source_skips_distcp_and_sets_empty_source_status(self, mock_ssh_hook, sample_discovery):
         """If source has 0 files, distcp must be skipped and status set to EMPTY_SOURCE."""
         hook, client, _, _ = mock_ssh_hook
