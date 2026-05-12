@@ -354,6 +354,41 @@ class TestDiscoverTablesViaSshSpark:
         with pytest.raises(Exception, match="Discovery failed for"):
             m.discover_tables_via_spark_ssh.function.__wrapped__(db_config=db_config)
 
+    def test_table_not_found_does_not_raise(self, mock_ssh_hook, sample_run_id):
+        hook, client, _, _ = mock_ssh_hook
+        import json
+        metadata = [{
+            'source_database': 'sales', 'source_table': 'ghost',
+            'dest_database': 'sales_s3', 'dest_bucket': 's3a://bucket',
+            'source_location': '', 's3_location': 's3a://bucket/sales_s3/ghost',
+            'file_format': 'UNKNOWN', 'schema': [], 'partitions': [],
+            'partition_columns': '', 'partition_count': 0, 'row_count': 0,
+            'is_partitioned': False, 'unregistered_partitions': False,
+            'table_type': 'UNKNOWN', 'source_total_size_bytes': 0,
+            'source_file_count': 0, 'serde_properties': {},
+            'partition_filter': None, 'filtered_partitions': [],
+            'partition_filter_active': False, 'filtered_row_count': 0,
+            'filtered_source_size_bytes': 0, 'filtered_file_count': 0,
+            'full_table_row_count': 0, 'full_table_partition_count': 0,
+            'error': 'Table or view not found: sales.ghost',
+            'error_type': 'TABLE_NOT_FOUND',
+        }]
+        mkdir_stdout = mock_ssh_stdout(0, b'')
+        pyspark_stdout = mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata)))
+        client.exec_command.side_effect = [
+            (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), pyspark_stdout, MagicMock()),
+        ]
+
+        db_config = {
+            'run_id': sample_run_id, 'source_database': 'sales',
+            'table_tokens': ['ghost'], 'dest_database': 'sales_s3',
+            'dest_bucket': 's3a://bucket',
+        }
+        result = m.discover_tables_via_spark_ssh.function.__wrapped__(db_config=db_config)
+        assert len(result['tables']) == 1
+        assert result['tables'][0]['error_type'] == 'TABLE_NOT_FOUND'
+
 
 class TestRecordDiscoveredTables:
 
@@ -374,6 +409,21 @@ class TestRecordDiscoveredTables:
         self._setup_count(mock_spark, 1)
         m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
         assert any('UPDATE' in str(c) for c in mock_iceberg_retry.call_args_list)
+
+    def test_writes_table_not_found_status(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        self._setup_count(mock_spark, 0)
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': 'Table or view not found: sales_data.transactions',
+                'error_type': 'TABLE_NOT_FOUND',
+            }],
+        }
+        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
+        assert "'TABLE_NOT_FOUND'" in all_sql
+        assert 'Table or view not found' in all_sql
 
 
 class TestRunDistcpSsh:
@@ -403,6 +453,24 @@ class TestRunDistcpSsh:
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
         assert result['distcp_results'][0]['bytes_copied'] == 10485760
         assert result['distcp_results'][0]['is_incremental'] is True
+
+    def test_skips_table_not_found_without_ssh(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': 'Table or view not found: sales_data.transactions',
+                'error_type': 'TABLE_NOT_FOUND',
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'TABLE_NOT_FOUND'
+        client.exec_command.assert_not_called()
 
     def test_distcp_failure_raises(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
