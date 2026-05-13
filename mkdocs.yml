@@ -1,0 +1,5 @@
+site_name: nx1-data-migrator
+plugins:
+  - techdocs-core
+nav:
+  - Overview: README.md
