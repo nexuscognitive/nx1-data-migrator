@@ -1,4 +1,5 @@
 site_name: nx1-data-migrator
+docs_dir: .
 plugins:
   - techdocs-core
 nav:
