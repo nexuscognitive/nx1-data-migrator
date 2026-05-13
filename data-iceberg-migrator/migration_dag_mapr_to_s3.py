@@ -603,7 +603,7 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
 
-        pyspark_script = """
+        pyspark_script = """# -*- coding: utf-8 -*-
 import json
 import sys
 import fnmatch
@@ -857,18 +857,23 @@ for tbl in table_list:
         is_partitioned = partition_definition
         unregistered_partitions = partition_definition and registered_partition_count == 0
 
-        schema_df = spark.sql(
-            "DESCRIBE {{0}}.{{1}}".format(src_db, tbl)
-        )
-        schema = []
-        for row in schema_df.collect():
-            col_name = row.col_name.strip() if row.col_name else ""
-            data_type = row.data_type.strip() if row.data_type else ""
-
-            if col_name.startswith("#") or col_name == "" or col_name == "col_name":
-                break
-
-            schema.append({{"name": col_name, "type": data_type}})
+        # Use spark.table().schema instead of DESCRIBE to avoid Spark's
+        # simpleString() truncation (default maxToStringFields=25) which
+        # renders wide structs as "struct<f1:t1,...N more fields>" — a
+        # literal string that is not valid DDL and causes PARSE_SYNTAX_ERROR
+        # downstream in create_hive_tables.
+        # simpleString() returns the full colon-separated Hive catalog
+        # notation (e.g. struct<a:int,b:string>) and is available on all
+        # PySpark versions. catalogString() is equivalent but was added to
+        # the Python DataType API only in newer PySpark releases.
+        # hive_type_to_spark_ddl() in create_hive_tables converts the
+        # colon-separated notation to space-separated Spark SQL DDL.
+        tbl_schema = spark.table("{{0}}.{{1}}".format(src_db, tbl)).schema
+        schema = [
+            {{"name": f.name, "type": f.dataType.simpleString()}}
+            for f in tbl_schema.fields
+            if f.name not in partition_cols_from_describe
+        ]
 
         if {include_db_in_path}:
             s3_location = "{{0}}/{{1}}/{{2}}".format(dest_bucket, dest_db, tbl)
@@ -2594,13 +2599,18 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 f"[Validation] {per_table_dest_db}.{tbl} | source_rows={source_row_count} | dest_rows={dest_row_count} | source_parts={source_partition_count} | dest_parts={dest_partition_count}"
             )
 
-            # Schema comparison
+            # Schema comparison — use spark.table().schema to avoid DESCRIBE truncation,
+            # and exclude partition columns (DESCRIBE includes them; source schema does not)
             src_schema = t.get("schema", [])
-            dest_schema_df = spark.sql(f"DESCRIBE {dest_tbl}")
+            partition_cols = set(
+                c.strip()
+                for c in (t.get("partition_columns") or "").split(",")
+                if c.strip()
+            )
             dest_schema = [
-                {"name": row.col_name, "type": row.data_type}
-                for row in dest_schema_df.collect()
-                if row.col_name and not row.col_name.startswith("#")
+                {"name": f.name, "type": f.dataType.simpleString()}
+                for f in spark.table(dest_tbl).schema.fields
+                if f.name not in partition_cols
             ]
 
             # Compare schemas
