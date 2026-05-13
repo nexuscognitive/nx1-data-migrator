@@ -1,4 +1,6 @@
-# DAG 5: Iceberg Rewrite Table Path Migration
+# DAG 5: Iceberg Catalog Migration (Hadoop → Hive)
+
+Iceberg-to-Iceberg catalog migration from a **Hadoop catalog** to a **Hive (HMS) catalog**, implemented via the Iceberg `rewrite_table_path` stored procedure. DAG ID: `iceberg_catalog_migration`.
 
 ## Prerequisite Conditions
 
@@ -25,12 +27,7 @@ Register-only rows are visually marked with a `register-only` pill in the HTML r
 
 This DAG supports both full snapshot and incremental migrations. For incremental loads, you must manually re-copy any new or changed data files and the corresponding updated metadata files to the destination S3 before each run. The DAG will then rewrite all metadata paths for the current state at the destination. Automatic detection or syncing of incremental changes is not handled by this DAG; it operates on whatever data and metadata are present at the destination when triggered.
 
-
-Iceberg-to-Iceberg migration using the `rewrite_table_path` stored procedure. Use this DAG when data **and** metadata have already been copied to the destination S3 bucket and snapshot history / partition transform fidelity must be preserved.
-
 ---
-
-
 
 ## Strategy: `iceberg_rewrite_table_path`
 
@@ -69,25 +66,7 @@ The procedure reads the existing Iceberg metadata at the destination — which s
 
 ### S3 Credentials
 
-DAG 5 only accesses the **destination** S3 bucket at runtime. The `source_s3_prefix` is used purely as a text prefix to construct the source metadata file path — Spark never opens a connection to source S3. Source S3 credentials are not required.
-
-**Destination credentials** — set the dest-specific variables; the global variables are used as fallback if they are not set:
-
-| Airflow Variable key | Env var fallback | Description |
-|---|---|---|
-| `s3_dest_endpoint` | `S3_DEST_ENDPOINT` | Destination S3 endpoint URL |
-| `s3_dest_access_key` | `S3_DEST_ACCESS_KEY` | Destination S3 access key |
-| `s3_dest_secret_key` | `S3_DEST_SECRET_KEY` | Destination S3 secret key |
-
-**Global S3 fallback** (used when dest-specific variables are not set):
-
-| Airflow Variable key | Env var fallback | Description |
-|---|---|---|
-| `s3_endpoint` | `S3_ENDPOINT` | Global S3 endpoint URL |
-| `s3_access_key` | `S3_ACCESS_KEY` | Global S3 access key |
-| `s3_secret_key` | `S3_SECRET_KEY` | Global S3 secret key |
-
-Credentials are applied at the per-bucket level internally via Hadoop's `fs.s3a.bucket.<name>.*` properties — no additional configuration is needed beyond setting the variables above.
+This DAG does **not** configure S3 credentials itself. Both the **source** and **destination** S3 buckets are assumed to be reachable by Spark using the endpoints and credentials already registered through the **nx1 portal's object store** configuration (surfaced to the Spark cluster's Hadoop config). Source-side access is required — `rewrite_table_path` reads the source metadata and manifest files to determine what paths to rewrite — so both buckets must be accessible from the Spark workers.
 
 ### DAG Parameter
 
@@ -274,8 +253,10 @@ The task raises after all tables are processed if any failed.
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done`
 
-- Updates `table_create_status`, `table_create_duration_seconds`, `table_already_existed`, and `overall_status` for each table.
-- Applies a catch-all update to mark any unprocessed `CONFIRMED` tables as `FAILED`.
+- Updates `table_create_status`, `table_create_completed_at`, `table_create_duration_seconds`, `table_already_existed`, `error_message`, and `overall_status` for each table.
+- For tables that registered successfully, **overwrites** `source_row_count` and `source_partition_count` with the post-register counts queried by `rewrite_and_register_tables` (`SELECT COUNT(*)` and `.partitions` on the now-registered Hive table). These replace the values discovery wrote from `metadata.json`, so downstream validation compares the freshly-registered Hive view against itself for these two metrics rather than against the on-disk metadata.
+- `overall_status` is sticky: rows already at `FAILED` or `DATA_MISSING` are not overwritten; otherwise it advances to `TABLE_CREATED` (success), `DATA_MISSING` (skipped), or `FAILED`.
+- Applies a catch-all update scoped to `(run_id, source_database, source_s3_prefix, dest_s3_prefix)` so parallel mapped tasks don't race: any `CONFIRMED` row with `table_create_status IS NULL` is marked `FAILED`.
 
 ---
 
@@ -288,8 +269,8 @@ For each table that was successfully created:
 - Compares against source row count and partition count stored in the tracking table.
 - Performs schema comparison between source `metadata.json` schema and `DESCRIBE` output.
 - Reads the destination snapshots view and verifies that no snapshot's `manifest_list` field still references `source_s3_prefix` (`path_rewrite_verified`). **Skipped for register-only tables** — when `source_prefix == dest_prefix` no rewrite was needed and manifests legitimately live under the shared prefix; `path_rewrite_verified` stays `true` and the report renders this cell as "— N/A".
-- Partition count mismatches are treated as warnings.
-- Schema, row count, and path rewrite mismatches are failures.
+- Compares the destination snapshot count (rows in `{dest_tbl}.snapshots`) against `source_snapshot_count` captured during discovery (`snapshot_count_match`). When the source snapshot count is `0` (e.g. discovery didn't read it), the check is treated as a pass to avoid spurious failures.
+- A table reaches `VALIDATED` only when **all five** checks pass: row count, partition count, schema, path rewrite, and snapshot count. Any mismatch sets `overall_status = VALIDATION_FAILED`. The HTML report renders a partition-count mismatch with a yellow "⚠ WARN" badge for visual emphasis, but the underlying status is still failed.
 
 ---
 
@@ -297,8 +278,9 @@ For each table that was successfully created:
 
 **Type:** PySpark (mapped per database config) · trigger: `all_done`
 
-- Updates `validation_status`, `row_count_match`, `partition_count_match`, `schema_match`, `path_rewrite_verified`, `schema_differences`, and `overall_status` (`VALIDATED` or `VALIDATION_FAILED`).
-- Applies catch-all updates for tables that were not processed by the validation task.
+- Updates per-table validation fields: `validation_status`, `validation_completed_at`, `validation_duration_seconds`, `dest_hive_row_count`, `dest_partition_count`, `source_partition_count`, `row_count_match`, `partition_count_match`, `schema_match`, `path_rewrite_verified`, `snapshot_count_match`, `source_snapshot_count`, `dest_snapshot_count`, `schema_differences`, and `overall_status` (`VALIDATED` or `VALIDATION_FAILED`).
+- For tables whose validation task itself errored (`status == 'FAILED'`), patches `validation_status = 'FAILED'`, `overall_status = 'VALIDATION_FAILED'`, `path_rewrite_verified = false`, and writes the error message — but only when no other validator instance has already set `validation_status` for that row.
+- Applies a catch-all update scoped to `(run_id, source_database, source_s3_prefix, dest_s3_prefix)` so parallel mapped tasks don't race: any `CONFIRMED` + `table_create_status = 'COMPLETED'` row with `validation_status IS NULL` is marked `SKIPPED` / `VALIDATION_FAILED`.
 
 ---
 
@@ -323,7 +305,7 @@ Register-only tables are marked with a `register-only` pill next to the table na
 **Type:** PySpark · trigger: `all_done`
 
 - Reads the HTML report from S3 and sends it as an email attachment.
-- Subject: `Iceberg Rewrite Migration Report — {run_id}`.
+- Subject: `Iceberg Catalog Migration Report — {run_id}`.
 - Skips silently if `email_recipients` is not configured.
 - Uses the `smtp_conn_id` Airflow connection (default: `smtp_default`).
 

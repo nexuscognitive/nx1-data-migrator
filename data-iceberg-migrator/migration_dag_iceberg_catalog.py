@@ -282,8 +282,6 @@ def validate_data_presence(db_config: dict, spark, **context) -> dict:
         logger.warning(f"[validate_data_presence] Skipping invalid input: {type(db_config)}")
         return {}
 
-    config = get_config()
-
     dest_prefix = db_config['dest_s3_prefix'].rstrip('/')
     source_prefix = db_config['source_s3_prefix'].rstrip('/')
     tokens = db_config.get('table_tokens', ['*'])
@@ -509,12 +507,9 @@ def discover_tables(presence_result: dict, spark, **context) -> dict:
         _read_iceberg_metadata,
     )
 
-    config = get_config()
-
     database = presence_result['dest_database']
     dest_prefix = presence_result['dest_s3_prefix']
     source_prefix = presence_result['source_s3_prefix']
-    run_id = presence_result['run_id']
 
     # Initialise early so the except block can always push partial results to xcom.
     metadata_list = []
@@ -642,7 +637,6 @@ def update_discovered_tables_in_tracking(discovery: dict, spark) -> dict:
         parts_json = json.dumps(t.get('partitions', [])).replace("'", "''")
         has_error = 'error' in t
         disc_status = 'FAILED' if has_error else 'COMPLETED'
-        overall_status = 'FAILED' if has_error else 'DISCOVERED'
         disc_error_sql = f"'{t['error'][:2000].replace(chr(39), chr(39)*2)}'" if has_error else 'NULL'
 
         execute_with_iceberg_retry(spark, f"""
@@ -712,7 +706,6 @@ def rewrite_and_register_tables(presence_result: dict, spark, **context) -> dict
         logger.warning("[rewrite_and_register_tables] Skipping invalid input")
         return {}
 
-    config = get_config()
     dest_db = presence_result['dest_database']
     dest_prefix = presence_result.get('dest_s3_prefix', '').rstrip('/')
     source_prefix = presence_result.get('source_s3_prefix', '').rstrip('/')
