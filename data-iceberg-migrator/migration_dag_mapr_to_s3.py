@@ -1219,8 +1219,21 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
     )
 
     results = []
-    for t in tables:
+    total_tables = len(tables)
+    logger.info("=" * 60)
+    logger.info(f"[DistCp] STARTING — {total_tables} table(s) to copy")
+    logger.info(f"[DistCp]   Source DB : {discovery['source_database']}")
+    logger.info(f"[DistCp]   Dest DB   : {discovery['dest_database']}")
+    logger.info(f"[DistCp]   Dest bucket: {discovery['dest_bucket']}")
+    logger.info(f"[DistCp]   Mappers={mappers} | Bandwidth={bandwidth} MB/s | preserve_delete={preserve_delete}")
+    logger.info("=" * 60)
+    for table_idx, t in enumerate(tables, start=1):
+        logger.info(f"[DistCp] [{table_idx}/{total_tables}] Processing {t['source_database']}.{t['source_table']}")
         if t.get("error"):
+            logger.warning(
+                f"[DistCp] [{table_idx}/{total_tables}] SKIPPING {t['source_database']}.{t['source_table']} "
+                f"— discovery error: {t.get('error', '')[:200]}"
+            )
             results.append(
                 {
                     "source_database": t["source_database"],
@@ -1336,15 +1349,20 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
         partition_filter_active = t.get("partition_filter_active", False)
         filtered_partitions = t.get("filtered_partitions", [])
 
-        logger.info(f"[DistCp] Starting copy for {src_db}.{tbl}")
+        logger.info(f"[DistCp] [{table_idx}/{total_tables}] Starting copy for {src_db}.{tbl}")
         logger.info(f"[DistCp]   Source : {source_loc}")
         logger.info(f"[DistCp]   Dest   : {s3_loc}")
-        logger.info(f"[DistCp]   Mappers: {mappers} | Bandwidth: {bandwidth} MB/s")
+        logger.info(
+            f"[DistCp]   Source size: {t.get('source_total_size_bytes', 0) / (1024**2):.1f} MB"
+            f" | files: {t.get('source_file_count', 0)}"
+            f" | rows: {t.get('row_count', 0)}"
+        )
 
         if partition_filter_active:
             logger.info(
-                f"[DistCp]   Partition mode: "
-                f"{'per-partition with delete preservation' if preserve_delete else 'path-list additive copy (delete disabled)'}"
+                f"[DistCp]   Partition filter: '{t.get('partition_filter')}'"
+                f" | filtered partitions: {len(filtered_partitions)}"
+                f" | mode: {'per-partition with delete preservation' if preserve_delete else 'path-list additive copy (delete disabled)'}"
             )
 
         if partition_filter_active and filtered_partitions:
@@ -1854,7 +1872,22 @@ exit 0
             logger.error(f"ERROR: {error_msg}")
 
     failed_tables = [r for r in results if r["status"] == "FAILED"]
+    completed_tables = [r for r in results if r["status"] == "COMPLETED"]
+    skipped_tables = [r for r in results if r["status"] in ("SKIPPED", "EMPTY_SOURCE")]
     has_failures = len(failed_tables) > 0
+
+    logger.info("=" * 60)
+    logger.info(
+        f"[DistCp] SUMMARY — completed={len(completed_tables)}/{len(results)}"
+        f" | skipped={len(skipped_tables)} | failed={len(failed_tables)}"
+    )
+    if failed_tables:
+        for r in failed_tables:
+            logger.error(
+                f"[DistCp]   FAILED: {r['source_database']}.{r['source_table']}"
+                f" | error: {str(r.get('error', ''))[:300]}"
+            )
+    logger.info("=" * 60)
 
     result_dict = {
         **discovery,
@@ -2063,12 +2096,20 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
 
     results = []
     created_dbs = set()
+    total_tables = len(tables)
 
-    for t in tables:
+    logger.info("=" * 60)
+    logger.info(f"[HiveTable] STARTING — {total_tables} table(s) to create/repair")
+    logger.info(f"[HiveTable]   Source DB: {distcp_result.get('source_database')}")
+    logger.info(f"[HiveTable]   Dest DB  : {distcp_result.get('dest_database')}")
+    logger.info("=" * 60)
+
+    for table_idx, t in enumerate(tables, start=1):
         tbl = t["source_table"]
         dest_db = t.get("dest_database") or distcp_result["dest_database"]
 
         if dest_db not in created_dbs:
+            logger.info(f"[HiveTable] Creating database if not exists: {dest_db}")
             spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
             created_dbs.add(dest_db)
 
@@ -2094,7 +2135,16 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
             )
 
         distcp_status = distcp_entry["status"] if distcp_entry else "UNKNOWN"
+        if distcp_entry is None:
+            logger.warning(
+                f"[HiveTable] [{table_idx}/{total_tables}] No distcp_result entry found for "
+                f"{dest_db}.{tbl} (partition_filter={table_partition_filter!r}) — treating as UNKNOWN"
+            )
         if distcp_status in ("FAILED", "SKIPPED", "UNKNOWN"):
+            logger.warning(
+                f"[HiveTable] [{table_idx}/{total_tables}] SKIPPING {dest_db}.{tbl} "
+                f"— DistCp status was {distcp_status}"
+            )
             results.append(
                 {
                     "source_table": t["source_table"],
@@ -2116,7 +2166,9 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
         full_name = f"{dest_db}.{tbl}"
 
         logger.info(
-            f"[HiveTable] Processing {full_name} | format={fmt} | partitioned={is_part}"
+            f"[HiveTable] [{table_idx}/{total_tables}] Processing {full_name}"
+            f" | format={fmt} | partitioned={is_part}"
+            f" | distcp_status={distcp_status} | s3_location={s3_loc}"
         )
 
         try:
@@ -2127,12 +2179,20 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
             except Exception:
                 pass
 
+            logger.info(f"[HiveTable] {full_name} — already exists: {exists}")
+
             if exists:
                 if is_part:
                     if t.get("partition_filter_active") and t.get(
                         "filtered_partitions"
                     ):
-                        for part_str in t["filtered_partitions"]:
+                        filtered_parts = t["filtered_partitions"]
+                        logger.info(
+                            f"[HiveTable] {full_name} — adding {len(filtered_parts)} filtered partition(s) via ALTER TABLE ADD"
+                        )
+                        add_ok = 0
+                        add_fail = 0
+                        for part_str in filtered_parts:
                             part_kv = {}
                             for segment in part_str.split("/"):
                                 if "=" in segment:
@@ -2147,12 +2207,18 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                     f"ALTER TABLE {full_name} ADD IF NOT EXISTS "
                                     f"PARTITION ({partition_spec}) LOCATION '{part_location}'"
                                 )
+                                add_ok += 1
                             except Exception as add_e:
+                                add_fail += 1
                                 logger.warning(
                                     f"[HiveTable] Could not add partition {partition_spec} "
                                     f"to {full_name}: {str(add_e)[:200]}"
                                 )
+                        logger.info(
+                            f"[HiveTable] {full_name} — partition ADD complete: {add_ok} succeeded, {add_fail} failed"
+                        )
                     else:
+                        logger.info(f"[HiveTable] {full_name} — running MSCK REPAIR TABLE")
                         spark.sql(f"MSCK REPAIR TABLE {full_name}")
                 spark.sql(f"REFRESH TABLE {full_name}")
                 logger.info(f"[HiveTable] REPAIRED (already existed): {full_name}")
@@ -2242,13 +2308,26 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                     LOCATION '{s3_loc}'
                     {tbl_properties_clause}
                 """
+                logger.info(
+                    f"[HiveTable] Executing CREATE for {full_name}"
+                    f" | columns={len(schema_list)} | partition_columns={part_cols_str!r}"
+                    f" | format={fmt} | row_format={repr(row_format_clause.strip()) if row_format_clause.strip() else 'default'}"
+                )
+                logger.debug(f"[HiveTable] DDL for {full_name}:\n{ddl.strip()}")
                 spark.sql(ddl)
+                logger.info(f"[HiveTable] CREATE succeeded for {full_name}")
 
                 if is_part:
                     if t.get("partition_filter_active") and t.get(
                         "filtered_partitions"
                     ):
-                        for part_str in t["filtered_partitions"]:
+                        filtered_parts = t["filtered_partitions"]
+                        logger.info(
+                            f"[HiveTable] {full_name} — adding {len(filtered_parts)} filtered partition(s) via ALTER TABLE ADD"
+                        )
+                        add_ok = 0
+                        add_fail = 0
+                        for part_str in filtered_parts:
                             part_kv = {}
                             for segment in part_str.split("/"):
                                 if "=" in segment:
@@ -2263,12 +2342,18 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                     f"ALTER TABLE {full_name} ADD IF NOT EXISTS "
                                     f"PARTITION ({partition_spec}) LOCATION '{part_location}'"
                                 )
+                                add_ok += 1
                             except Exception as add_e:
+                                add_fail += 1
                                 logger.warning(
                                     f"[HiveTable] Could not add partition {partition_spec} "
                                     f"to {full_name}: {str(add_e)[:200]}"
                                 )
+                        logger.info(
+                            f"[HiveTable] {full_name} — partition ADD complete: {add_ok} succeeded, {add_fail} failed"
+                        )
                     else:
+                        logger.info(f"[HiveTable] {full_name} — running MSCK REPAIR TABLE")
                         spark.sql(f"MSCK REPAIR TABLE {full_name}")
                 spark.sql(f"REFRESH TABLE {full_name}")
 
@@ -2298,7 +2383,23 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
             logger.error(f"ERROR: {error_msg}")
 
     failed_tables = [r for r in results if r["status"] == "FAILED"]
+    created_count = sum(1 for r in results if r.get("action") == "created")
+    repaired_count = sum(1 for r in results if r.get("action") == "repaired")
+    skipped_count = sum(1 for r in results if r["status"] == "SKIPPED")
     has_failures = len(failed_tables) > 0
+
+    logger.info("=" * 60)
+    logger.info(
+        f"[HiveTable] SUMMARY — created={created_count} | repaired={repaired_count}"
+        f" | skipped={skipped_count} | failed={len(failed_tables)} / {len(results)} total"
+    )
+    if failed_tables:
+        for r in failed_tables:
+            logger.error(
+                f"[HiveTable]   FAILED: {r['dest_database']}.{r['source_table']}"
+                f" | error: {str(r.get('error', ''))[:300]}"
+            )
+    logger.info("=" * 60)
 
     result_dict = {
         **distcp_result,
@@ -2454,8 +2555,14 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
     tables = source_validation["tables"]
 
     validation_results = []
+    total_tables = len(tables)
 
-    for t in tables:
+    logger.info("=" * 60)
+    logger.info(f"[Validation] STARTING — {total_tables} table(s) to validate")
+    logger.info(f"[Validation]   Source DB: {src_db} | Dest DB: {dest_db}")
+    logger.info("=" * 60)
+
+    for table_idx, t in enumerate(tables, start=1):
         tbl = t["source_table"]
         per_table_dest_db = t.get("dest_database", dest_db)
         dest_tbl = f"{per_table_dest_db}.{tbl}"
@@ -2484,6 +2591,13 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 or row["table_create_status"] in ("FAILED", "SKIPPED")
                 or row["overall_status"] == "FAILED"
             ):
+                logger.warning(
+                    f"[Validation] [{table_idx}/{total_tables}] SKIPPING {per_table_dest_db}.{tbl}"
+                    f" — upstream failure: distcp={row['distcp_status']}"
+                    f" | table_create={row['table_create_status']}"
+                    f" | overall={row['overall_status']}"
+                    f" | error: {str(row['error_message'])[:200] if row['error_message'] else 'none'}"
+                )
                 validation_results.append(
                     {
                         "source_table": tbl,
@@ -2496,7 +2610,8 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
 
             if row["distcp_status"] == "EMPTY_SOURCE":
                 logger.info(
-                    f"[Validation] SKIPPING row-count query for {per_table_dest_db}.{tbl} "
+                    f"[Validation] [{table_idx}/{total_tables}] SKIPPING row-count query for {per_table_dest_db}.{tbl}"
+                    f" — EMPTY_SOURCE (0 rows expected, marking as validated)"
                 )
                 validation_results.append(
                     {
@@ -2516,7 +2631,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 )
                 continue
 
-        logger.info(f"[Validation] Starting validation for {per_table_dest_db}.{tbl}")
+        logger.info(f"[Validation] [{table_idx}/{total_tables}] Starting validation for {per_table_dest_db}.{tbl}")
 
         try:
             pf_val = (t.get("partition_filter") or "").replace("'", "''")
@@ -2554,14 +2669,19 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             partition_filter = (
                 source_metrics[0]["partition_filter"] if source_metrics else None
             )
-            if partition_filter:
-                logger.info(
-                    f"[Validation] {per_table_dest_db}.{tbl} — partition filter active: '{partition_filter}'. "
-                    f"Comparing against filtered baseline: {source_row_count} rows, "
-                    f"{source_partition_count} partitions."
-                )
+            logger.info(
+                f"[Validation] {per_table_dest_db}.{tbl} — source baseline:"
+                f" rows={source_row_count} | partitions={source_partition_count}"
+                + (f" | partition_filter='{partition_filter}'" if partition_filter else "")
+            )
 
             # Get destination row count — scope to filtered partitions if a filter was active
+            if partition_filter:
+                filtered_parts = t.get("filtered_partitions", [])
+                logger.info(
+                    f"[Validation] {per_table_dest_db}.{tbl} — querying dest with partition filter"
+                    f" ({len(filtered_parts)} partition(s) in scope)"
+                )
             if partition_filter:
                 filtered_parts = t.get("filtered_partitions", [])
                 if filtered_parts:
@@ -2685,6 +2805,13 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             logger.error(f"ERROR: {error_msg}")
 
     failed_validations = [v for v in validation_results if v["status"] == "FAILED"]
+    validated_clean = [
+        v for v in validation_results
+        if v.get("status") == "COMPLETED"
+        and v.get("row_count_match", True)
+        and v.get("partition_count_match", True)
+        and v.get("schema_match", True)
+    ]
     warned_count_checks = [
         v
         for v in validation_results
@@ -2694,6 +2821,23 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             or not v.get("partition_count_match", True)
         )
     ]
+    skipped_validations = [v for v in validation_results if v["status"] == "SKIPPED"]
+
+    logger.info("=" * 60)
+    logger.info(
+        f"[Validation] SUMMARY — validated={len(validated_clean)}"
+        f" | warnings={len(warned_count_checks)}"
+        f" | skipped={len(skipped_validations)}"
+        f" | failed={len(failed_validations)}"
+        f" / {len(validation_results)} total"
+    )
+    if failed_validations:
+        for v in failed_validations:
+            logger.error(
+                f"[Validation]   FAILED: {v['dest_database']}.{v['source_table']}"
+                f" | error: {str(v.get('error', ''))[:300]}"
+            )
+    logger.info("=" * 60)
 
     if warned_count_checks:
         for v in warned_count_checks:
