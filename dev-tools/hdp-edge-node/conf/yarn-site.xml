@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+  <property>
+    <n>yarn.nodemanager.aux-services</n>
+    <value>mapreduce_shuffle</value>
+  </property>
+  <property>
+    <n>yarn.nodemanager.aux-services.mapreduce.shuffle.class</n>
+    <value>org.apache.hadoop.mapred.ShuffleHandler</value>
+  </property>
+  <property>
+    <n>yarn.resourcemanager.hostname</n>
+    <value>localhost</value>
+  </property>
+  <!-- Required in Hadoop 3.x to pass env vars into YARN containers -->
+  <property>
+    <n>yarn.nodemanager.env-whitelist</n>
+    <value>JAVA_HOME,HADOOP_COMMON_HOME,HADOOP_HDFS_HOME,HADOOP_CONF_DIR,CLASSPATH_PREPEND_DISTCACHE,HADOOP_YARN_HOME,HADOOP_HOME,PATH,LANG,TZ,HADOOP_MAPRED_HOME</value>
+  </property>
+</configuration>

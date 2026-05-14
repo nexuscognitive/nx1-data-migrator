@@ -1,0 +1,19 @@
+services:
+  hadoop-edge:
+    build: .
+    container_name: hadoop-edge-node
+    hostname: hadoop-edge-node
+    ports:
+      - "2222:22"
+      - "8088:8088"
+      - "9870:9870"
+      - "10000:10000"
+    volumes:
+      - hadoop_data:/hadoop/data
+    environment:
+      - JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+    stdin_open: true
+    tty: true
+
+volumes:
+  hadoop_data:
