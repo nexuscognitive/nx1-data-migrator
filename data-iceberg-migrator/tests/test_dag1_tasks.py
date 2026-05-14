@@ -820,6 +820,94 @@ class TestCreateHiveTables:
         assert 'ADD IF NOT EXISTS' in all_sql or 'ADD PARTITION' in all_sql
         assert 'MSCK REPAIR' not in all_sql
 
+    def test_struct_types_use_space_notation_in_ddl(
+        self, mock_spark, sample_run_id, sample_table_metadata_with_structs
+    ):
+        """Colon-separated struct types from Hive catalogString() must be converted
+        to space-separated notation before embedding in CREATE EXTERNAL TABLE DDL.
+        Regression test for Bug #2: PARSE_SYNTAX_ERROR on struct<field:type>."""
+        distcp_result = {
+            'run_id': sample_run_id,
+            'source_database': 'sales_data',
+            'dest_database': 'sales_data_s3',
+            'dest_bucket': 's3a://test-bucket',
+            'tables': sample_table_metadata_with_structs,
+            'distcp_results': [{
+                'source_database': 'sales_data',
+                'source_table': 'flex_rules_result',
+                'dest_database': 'sales_data_s3',
+                'status': 'COMPLETED',
+                'partition_filter': None,
+                'error': None,
+            }],
+        }
+
+        sql_calls = []
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            if sql.strip().upper().startswith('DESCRIBE') and 'FORMATTED' not in sql.upper():
+                raise Exception("Table not found")
+            df = MagicMock()
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        result = m.create_hive_tables.function.__wrapped__(
+            distcp_result=distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+
+        assert result['table_results'][0]['status'] == 'COMPLETED'
+        create_ddl = next(s for s in sql_calls if 'CREATE EXTERNAL TABLE' in s.upper())
+        # Space-separated notation must be present
+        assert 'FIELD_0 string' in create_ddl
+        assert 'category string' in create_ddl
+        # Colon-separated notation must NOT appear inside type bodies
+        assert 'FIELD_0:string' not in create_ddl
+        assert 'category:string' not in create_ddl
+
+    def test_wide_struct_all_fields_present_in_ddl(
+        self, mock_spark, sample_run_id, sample_table_metadata_with_structs
+    ):
+        """All 30 struct fields must appear in the DDL — no truncation to
+        '... N more fields'. Regression test for Bug #1: DESCRIBE truncation."""
+        distcp_result = {
+            'run_id': sample_run_id,
+            'source_database': 'sales_data',
+            'dest_database': 'sales_data_s3',
+            'dest_bucket': 's3a://test-bucket',
+            'tables': sample_table_metadata_with_structs,
+            'distcp_results': [{
+                'source_database': 'sales_data',
+                'source_table': 'flex_rules_result',
+                'dest_database': 'sales_data_s3',
+                'status': 'COMPLETED',
+                'partition_filter': None,
+                'error': None,
+            }],
+        }
+
+        sql_calls = []
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            if sql.strip().upper().startswith('DESCRIBE') and 'FORMATTED' not in sql.upper():
+                raise Exception("Table not found")
+            df = MagicMock()
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        m.create_hive_tables.function.__wrapped__(
+            distcp_result=distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+
+        create_ddl = next(s for s in sql_calls if 'CREATE EXTERNAL TABLE' in s.upper())
+        # All 30 fields must be present — none truncated
+        for i in range(30):
+            assert f'FIELD_{i} string' in create_ddl
+        assert 'more fields' not in create_ddl
+
 
 class TestUpdateTableCreateStatus:
 
@@ -837,6 +925,24 @@ class TestValidateDestinationTables:
             'overall_status': 'TABLE_CREATED', 'error_message': None,
         }[k]
         return row
+
+    def _make_dest_field(self, name, dtype):
+        f = MagicMock()
+        f.name = name
+        f.dataType.simpleString.return_value = dtype
+        return f
+
+    def _setup_dest_schema(self, mock_spark):
+        # Validation reads dest schema via spark.table(dest_tbl).schema.fields.
+        # Source schema (from fixture) excludes the 'dt' partition col; dest mock
+        # includes it so the validation code's partition-col filter is exercised.
+        table_mock = MagicMock()
+        table_mock.schema.fields = [
+            self._make_dest_field('id', 'bigint'),
+            self._make_dest_field('amount', 'double'),
+            self._make_dest_field('dt', 'string'),
+        ]
+        mock_spark.table.return_value = table_mock
 
     def _make_router(self, dest_count, partition_filter=None):
         _pf = partition_filter
@@ -862,12 +968,6 @@ class TestValidateDestinationTables:
             elif 'show partitions' in sql_lower:
                 df.count.return_value = 2
                 df.collect.return_value = [MagicMock(), MagicMock()]
-            elif 'describe' in sql_lower:
-                df.collect.return_value = [
-                    MagicMock(col_name='id', data_type='bigint'),
-                    MagicMock(col_name='amount', data_type='double'),
-                    MagicMock(col_name='dt', data_type='string'),
-                ]
             else:
                 df.collect.return_value = []
             return df
@@ -875,6 +975,7 @@ class TestValidateDestinationTables:
 
     def test_passes_with_matching_counts(self, mock_spark, sample_table_result):
         mock_spark.sql.side_effect = self._make_router(1000)
+        self._setup_dest_schema(mock_spark)
         result = m.validate_destination_tables.function.__wrapped__(
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )
@@ -883,6 +984,7 @@ class TestValidateDestinationTables:
 
     def test_detects_row_count_mismatch(self, mock_spark, sample_table_result):
         mock_spark.sql.side_effect = self._make_router(500)
+        self._setup_dest_schema(mock_spark)
         result = m.validate_destination_tables.function.__wrapped__(
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )
@@ -902,6 +1004,7 @@ class TestValidateDestinationTables:
             'serde_properties': {},
         })
         mock_spark.sql.side_effect = self._make_router(1000, partition_filter='dt>=2024-01-01')
+        self._setup_dest_schema(mock_spark)
         result = m.validate_destination_tables.function.__wrapped__(
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )

@@ -419,3 +419,73 @@ class TestValidateBucketEndpointPairs:
              patch('airflow.models.Variable.get', return_value=''), \
              pytest.raises(Exception, match='validation failed'):
             m.validate_bucket_endpoint_pairs(self._make_grouped(), {})
+
+
+# ---------------------------------------------------------------------------
+# hive_type_to_spark_ddl
+# ---------------------------------------------------------------------------
+class TestHiveTypeToSparkDdl:
+
+    def _conv(self, t):
+        return m.hive_type_to_spark_ddl(t)
+
+    # Primitives — no colons present, must be returned unchanged
+    def test_primitives_are_no_ops(self):
+        for t in ("string", "bigint", "timestamp", "boolean", "double"):
+            assert self._conv(t) == t
+
+    def test_decimal_and_varchar_unchanged(self):
+        assert self._conv("decimal(18,4)") == "decimal(18,4)"
+        assert self._conv("varchar(255)") == "varchar(255)"
+
+    # Simple structs
+    def test_single_field_struct(self):
+        assert self._conv("struct<a:int>") == "struct<a int>"
+
+    def test_multi_field_struct(self):
+        assert self._conv("struct<a:int,b:string>") == "struct<a int,b string>"
+
+    # Arrays and maps
+    def test_array_of_primitives_unchanged(self):
+        assert self._conv("array<string>") == "array<string>"
+
+    def test_array_of_struct(self):
+        assert self._conv("array<struct<a:int>>") == "array<struct<a int>>"
+
+    def test_map_of_primitives_unchanged(self):
+        assert self._conv("map<string,int>") == "map<string,int>"
+
+    def test_map_with_struct_value(self):
+        assert self._conv("map<string,struct<a:int>>") == "map<string,struct<a int>>"
+
+    # Deep nesting
+    def test_deeply_nested(self):
+        assert self._conv("struct<a:array<struct<b:map<string,int>>>>") == \
+            "struct<a array<struct<b map<string,int>>>>"
+
+    def test_array_of_array_of_struct(self):
+        assert self._conv("array<array<struct<x:int>>>") == "array<array<struct<x int>>>"
+
+    # Parameterised types inside structs (decimal/varchar — no colons → no-op on the type part)
+    def test_decimal_inside_struct(self):
+        assert self._conv("struct<amount:decimal(18,4),qty:int>") == \
+            "struct<amount decimal(18,4),qty int>"
+
+    def test_varchar_inside_struct(self):
+        assert self._conv("struct<name:varchar(255),code:char(10)>") == \
+            "struct<name varchar(255),code char(10)>"
+
+    # Edge cases
+    def test_idempotent_already_converted(self):
+        already = "struct<a int,b string>"
+        assert self._conv(already) == already
+
+    def test_empty_string(self):
+        assert self._conv("") == ""
+
+    def test_mixed_case(self):
+        assert self._conv("STRUCT<A:INT>") == "STRUCT<A INT>"
+
+    def test_no_colon_struct_field_returned_unchanged(self):
+        # Malformed but must not crash
+        assert self._conv("struct<malformed>") == "struct<malformed>"

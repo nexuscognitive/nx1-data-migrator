@@ -27,10 +27,34 @@ __all__ = [
     "configure_spark_s3",
     "execute_with_iceberg_retry",
     "get_config",
+    "hive_type_to_spark_ddl",
     "normalize_s3",
     "track_duration",
     "validate_bucket_endpoint_pairs",
 ]
+
+# =============================================================================
+# Hive → Spark SQL DDL type converter
+# =============================================================================
+def hive_type_to_spark_ddl(hive_type: str) -> str:
+    """
+    Convert a Hive metastore type string to the Spark SQL DDL notation.
+
+    Hive's DESCRIBE returns struct fields in colon-separated format:
+        struct<field_name:type,...>
+    Spark SQL DDL requires space-separated format:
+        struct<field_name type,...>
+
+    The regex replaces every colon that is surrounded by word characters
+    (i.e., inside struct field definitions at any nesting depth) with a
+    space.  Primitives and map<k,v>/array<t> contain no colons, so they
+    are returned unchanged.  Parameterised types such as decimal(18,4)
+    and varchar(255) contain no colons either, so they pass through
+    correctly without any parenthesis-depth tracking.
+    """
+    import re
+    return re.sub(r"(?<=\w):(?=\w)", " ", hive_type)
+
 
 # =============================================================================
 # Duration tracking decorator using XCom
