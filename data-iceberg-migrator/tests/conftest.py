@@ -319,7 +319,6 @@ def sample_table_metadata():
         'schema': [
             {'name': 'id', 'type': 'bigint'},
             {'name': 'amount', 'type': 'double'},
-            {'name': 'dt', 'type': 'string'},
         ],
         'partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
         'partition_columns': 'dt',

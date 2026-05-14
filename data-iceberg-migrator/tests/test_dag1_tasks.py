@@ -790,6 +790,24 @@ class TestValidateDestinationTables:
         }[k]
         return row
 
+    def _make_dest_field(self, name, dtype):
+        f = MagicMock()
+        f.name = name
+        f.dataType.simpleString.return_value = dtype
+        return f
+
+    def _setup_dest_schema(self, mock_spark):
+        # Validation reads dest schema via spark.table(dest_tbl).schema.fields.
+        # Source schema (from fixture) excludes the 'dt' partition col; dest mock
+        # includes it so the validation code's partition-col filter is exercised.
+        table_mock = MagicMock()
+        table_mock.schema.fields = [
+            self._make_dest_field('id', 'bigint'),
+            self._make_dest_field('amount', 'double'),
+            self._make_dest_field('dt', 'string'),
+        ]
+        mock_spark.table.return_value = table_mock
+
     def _make_router(self, dest_count, partition_filter=None):
         _pf = partition_filter
         _filtered_parts = ['dt=2024-01-01', 'dt=2024-01-02']
@@ -814,12 +832,6 @@ class TestValidateDestinationTables:
             elif 'show partitions' in sql_lower:
                 df.count.return_value = 2
                 df.collect.return_value = [MagicMock(), MagicMock()]
-            elif 'describe' in sql_lower:
-                df.collect.return_value = [
-                    MagicMock(col_name='id', data_type='bigint'),
-                    MagicMock(col_name='amount', data_type='double'),
-                    MagicMock(col_name='dt', data_type='string'),
-                ]
             else:
                 df.collect.return_value = []
             return df
@@ -827,6 +839,7 @@ class TestValidateDestinationTables:
 
     def test_passes_with_matching_counts(self, mock_spark, sample_table_result):
         mock_spark.sql.side_effect = self._make_router(1000)
+        self._setup_dest_schema(mock_spark)
         result = m.validate_destination_tables.function.__wrapped__(
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )
@@ -835,6 +848,7 @@ class TestValidateDestinationTables:
 
     def test_detects_row_count_mismatch(self, mock_spark, sample_table_result):
         mock_spark.sql.side_effect = self._make_router(500)
+        self._setup_dest_schema(mock_spark)
         result = m.validate_destination_tables.function.__wrapped__(
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )
@@ -854,6 +868,7 @@ class TestValidateDestinationTables:
             'serde_properties': {},
         })
         mock_spark.sql.side_effect = self._make_router(1000, partition_filter='dt>=2024-01-01')
+        self._setup_dest_schema(mock_spark)
         result = m.validate_destination_tables.function.__wrapped__(
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )
