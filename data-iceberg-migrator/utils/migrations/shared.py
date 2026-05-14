@@ -52,8 +52,23 @@ def track_duration(func):
 
     return wrapper
 
+# Substrings that identify a transient Iceberg commit conflict in the wrapped
+# PySpark exception message. Other errors (schema mismatches, INSERT arity bugs,
+# parse errors, permission denials, etc.) are permanent — retrying them just
+# wastes minutes and obscures the real failure.
+_ICEBERG_COMMIT_CONFLICT_MARKERS = (
+    "CommitFailedException",
+    "Cannot commit:",
+)
+
+
+def _is_iceberg_commit_conflict(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(marker in msg for marker in _ICEBERG_COMMIT_CONFLICT_MARKERS)
+
+
 def execute_with_iceberg_retry(spark, sql: str, max_retries: int = 6, task_label: str = ""):
-    """Execute Spark SQL with retry logic for Iceberg commit conflicts."""
+    """Execute Spark SQL with retry logic, scoped to Iceberg commit conflicts only."""
     status = False
     counter = 0
     last_exception = None
@@ -63,6 +78,12 @@ def execute_with_iceberg_retry(spark, sql: str, max_retries: int = 6, task_label
             spark.sql(sql)
             status = True
         except Exception as e:
+            # Permanent errors fail immediately — retrying won't help.
+            if not _is_iceberg_commit_conflict(e):
+                logger.error(
+                    f"[IcebergRetry] {task_label} non-retryable error (no commit conflict marker): {str(e)[:300]}"
+                )
+                raise
             last_exception = e
             counter += 1
             if counter < max_retries:
