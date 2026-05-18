@@ -3510,6 +3510,9 @@ def generate_html_report(run_id: str, spark) -> str:
         elif "VALIDATED" in status or "TABLE_CREATED" in status:
             status_class = "status-completed"
             status_label = status
+        elif status == "SKIPPED":
+            status_class = "status-skipped"
+            status_label = status
         else:
             status_class = "status-failed"
             status_label = status
