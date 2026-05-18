@@ -363,6 +363,7 @@ def sample_distcp_result(sample_discovery):
             's3_total_size_bytes_after': 10 * 1024 * 1024, 's3_file_count_after': 5,
             's3_bytes_transferred': 10 * 1024 * 1024, 's3_files_transferred': 5,
             'partition_filter_active': False, 'partitions_requested': None,
+            'partition_filter': None,
             'error': None,
         }],
         '_task_duration': 305.0,

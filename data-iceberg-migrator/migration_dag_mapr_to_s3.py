@@ -2007,6 +2007,43 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
     run_id = distcp_result["run_id"]
     src_db = distcp_result["source_database"]
 
+    # Normalize: a COMPLETED distcp against a source with zero rows is
+    # functionally an EMPTY_SOURCE. Keyed on row_count rather than
+    # source_file_count because getContentSummary().getFileCount() includes
+    # _SUCCESS/.crc markers — using files-count makes the normalization flip
+    # with marker presence, which is the original flake source.
+    # partition_filter is part of the row identity (multi-slice runs emit
+    # several discovery entries differing only by filter), so key on it too.
+    _tables_by_key = {}
+    for t in distcp_result.get("tables", []):
+        key = (
+            t.get("source_database"),
+            t.get("source_table"),
+            t.get("dest_database"),
+            t.get("partition_filter"),
+        )
+        if None in (key[0], key[1], key[2]):
+            continue
+        _tables_by_key[key] = t
+    for r in distcp_result.get("distcp_results", []):
+        if r.get("status") != "COMPLETED":
+            continue
+        key = (
+            r.get("source_database"),
+            r.get("source_table"),
+            r.get("dest_database"),
+            r.get("partition_filter"),
+        )
+        src_t = _tables_by_key.get(key)
+        if src_t is None:
+            continue
+        if (
+            src_t.get("row_count", 0) == 0
+            and r.get("bytes_copied", 0) == 0
+            and r.get("files_copied", 0) == 0
+        ):
+            r["status"] = "EMPTY_SOURCE"
+
     for r in distcp_result.get("distcp_results", []):
         if r.get("status") in ("SKIPPED", "EMPTY_SOURCE", "TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             continue
@@ -2066,7 +2103,12 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 f"""
                 UPDATE {tracking_db}.migration_table_status
                 SET distcp_status = 'FAILED',
-                    overall_status = 'FAILED',
+                    overall_status = CASE
+                        WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
+                        WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
+                        WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                        ELSE 'FAILED'
+                    END,
                     error_message = '{per_table_error}',
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
@@ -2141,7 +2183,13 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
             spark,
             f"""
             UPDATE {tracking_db}.migration_table_status
-            SET distcp_status='FAILED', overall_status='FAILED',
+            SET distcp_status='FAILED',
+                overall_status = CASE
+                    WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
+                    WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                    ELSE 'FAILED'
+                END,
                 error_message=COALESCE(error_message,'S3 copy task did not process this table'),
                 updated_at=current_timestamp()
             WHERE run_id='{run_id}' AND source_database='{src_db}'
@@ -2504,7 +2552,12 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                 f"""
                 UPDATE {tracking_db}.migration_table_status
                 SET table_create_status = 'FAILED',
-                    overall_status = 'FAILED',
+                    overall_status = CASE
+                        WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
+                        WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
+                        WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                        ELSE 'FAILED'
+                    END,
                     error_message = '{per_table_error}',
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
@@ -2542,7 +2595,12 @@ def update_table_create_status(table_result: dict, spark) -> dict:
             f"""
             UPDATE {tracking_db}.migration_table_status
             SET table_create_status = 'FAILED',
-                overall_status = 'FAILED',
+                overall_status = CASE
+                    WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
+                    WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                    ELSE 'FAILED'
+                END,
                 error_message = COALESCE(error_message, 'Table creation task did not process this table'),
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
@@ -2619,22 +2677,15 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
 
         if upstream:
             row = upstream[0]
-            if (
-                row["distcp_status"] == "FAILED"
-                or row["table_create_status"] in ("FAILED", "SKIPPED")
-                or row["overall_status"] == "FAILED"
-            ):
-                validation_results.append(
-                    {
-                        "source_table": tbl,
-                        "dest_database": per_table_dest_db,
-                        "status": "SKIPPED",
-                        "error": f"Skipped validation — upstream failure: {row['error_message']}",
-                    }
-                )
-                continue
-
-            if row["distcp_status"] == "EMPTY_SOURCE":
+            # EMPTY_SOURCE is a successful terminal state; check it before the
+            # upstream-failure branch so a stray overall_status='FAILED' set by
+            # a catchall UPDATE doesn't drown out a valid empty-source result.
+            # But only take the shortcut if create_hive_tables actually ran —
+            # otherwise the destination shell wasn't created and reporting
+            # schema_match=True would be a lie.
+            if row["distcp_status"] == "EMPTY_SOURCE" and row[
+                "table_create_status"
+            ] not in ("FAILED", "SKIPPED"):
                 logger.info(
                     f"[Validation] SKIPPING row-count query for {per_table_dest_db}.{tbl} "
                 )
@@ -2652,6 +2703,21 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                         "schema_match": True,
                         "schema_differences": "",
                         "error": None,
+                    }
+                )
+                continue
+
+            if (
+                row["distcp_status"] == "FAILED"
+                or row["table_create_status"] in ("FAILED", "SKIPPED")
+                or row["overall_status"] == "FAILED"
+            ):
+                validation_results.append(
+                    {
+                        "source_table": tbl,
+                        "dest_database": per_table_dest_db,
+                        "status": "SKIPPED",
+                        "error": f"Skipped validation — upstream failure: {row['error_message']}",
                     }
                 )
                 continue
