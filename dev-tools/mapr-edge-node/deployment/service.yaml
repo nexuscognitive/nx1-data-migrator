@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: hadoop-edge-ssh
+  # namespace: <your-namespace>
+spec:
+  type: ClusterIP           # only reachable inside the cluster — correct for this use case
+  selector:
+    app: hadoop-edge
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: 22

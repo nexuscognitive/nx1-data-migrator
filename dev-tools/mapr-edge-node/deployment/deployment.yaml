@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hadoop-edge
+  labels:
+    app: hadoop-edge
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # single-node as Hadoop can't run as 2 concurrent pods
+  selector:
+    matchLabels:
+      app: hadoop-edge
+  template:
+    metadata:
+      labels:
+        app: hadoop-edge
+    spec:
+      containers:
+        - name: hadoop-edge
+          image: nx1registry-hgb9hgbwd8baguad.azurecr.io/hadoop-edge:2.7.7
+          ports:
+            - name: ssh
+              containerPort: 22
+            - name: yarn-ui
+              containerPort: 8088
+            - name: hdfs-ui
+              containerPort: 9870
+            - name: hiveserver2
+              containerPort: 10000
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+
+          # SSH must be up before K8s marks the pod Ready and the Service routes to it
+          readinessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 20   # time for sshd + Hadoop to start
+            periodSeconds: 10
+            failureThreshold: 6
+
+          livenessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 60
+            periodSeconds: 30
+
+          volumeMounts:
+            # Airflow's public key injected here; entrypoint appends it to authorized_keys
+            # - name: airflow-ssh-pubkey
+            #   mountPath: /etc/ssh/external-keys
+            #   readOnly: true
+            # Persistent HDFS data so bootstrap only runs once
+            - name: hdfs-data
+              mountPath: /hadoop/data
+
+      volumes:
+        # - name: airflow-ssh-pubkey
+        #   secret:
+        #     secretName: hadoop-airflow-pubkey   # created below
+        - name: hdfs-data
+          emptyDir: {}
+          # persistentVolumeClaim:
+          #   claimName: hadoop-hdfs-data         # or emptyDir for ephemeral testing
