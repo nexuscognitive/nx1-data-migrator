@@ -359,19 +359,19 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
 
         # Text-format INPLACE is unsupported: Iceberg's migrate procedure rejects
         # LazySimpleSerDe (see TableMigrationUtil.listPartition), and we can't
-        # safely overwrite the source Hive table in place. Fail fast.
+        # safely overwrite the source Hive table in place. Record as SKIPPED
+        # (not FAILED) so the run continues and the report distinguishes a
+        # known limitation from an actual failure.
         if source_format == 'TEXT' and inplace:
             error_msg = (
                 f"Inplace Iceberg migration is not supported for text-format Hive tables "
-                f"(LazySimpleSerDe). Set inplace_migration=False for {src_db}.{tbl} to use "
-                f"the snapshot+CTAS path."
             ).replace("'", "''")
             tbl_fail_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
             results.append({
                 'source_table': f"{src_db}.{tbl}",
                 'destination_table': f"{src_db}.{tbl}",
                 'migration_type': 'INPLACE',
-                'status': 'FAILED',
+                'status': 'SKIPPED',
                 'error': error_msg,
             })
             execute_with_iceberg_retry(spark, f"""
@@ -386,13 +386,13 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     '{run_id}', '{dag_run_id}', '{src_db}', '{tbl}', 'INPLACE',
                     '{dest_db}', '{tbl}', '{location or ""}',
                     current_timestamp(), current_timestamp(),
-                    {tbl_fail_duration}, 'FAILED',
+                    {tbl_fail_duration}, 'SKIPPED',
                     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
                     '{error_msg}',
                     current_timestamp()
                 )
             """, task_label=f"migrate:text_inplace_skip:insert:{tbl}")
-            logger.error(f"[IcebergMigrate] SKIPPED text-format inplace: {src_db}.{tbl}")
+            logger.warning(f"[IcebergMigrate] SKIPPED text-format inplace: {src_db}.{tbl}")
             continue
 
         try:
@@ -543,7 +543,68 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             """, task_label=f"migrate:completed:insert:{tbl}")
 
         except Exception as e:
-            error_msg = f"Migration to Iceberg failed for {dest_db}.{tbl}: {str(e)[:2000]}".replace("'", "''")
+            err_text = str(e)
+            # Spark's migrate() only accepts V1 source tables. If a table is already
+            # DataSource V2 (for example already Iceberg), treat this as a known
+            # skip condition for INPLACE mode instead of failing the whole task.
+            if inplace and 'non-v1 table' in err_text.lower():
+                skip_msg = (
+                    f"Inplace Iceberg migration skipped for {src_db}.{tbl}: source table is non-v1 "
+                    f"(likely already Iceberg/DataSource V2). Use snapshot mode or point to the original Hive V1 table."
+                )
+                skip_msg_sql = skip_msg[:2000].replace("'", "''")
+                tbl_skip_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
+
+                results.append({
+                    'source_table': f"{src_db}.{tbl}",
+                    'destination_table': f"{src_db}.{tbl}",
+                    'migration_type': 'INPLACE',
+                    'status': 'SKIPPED',
+                    'error': skip_msg,
+                })
+
+                execute_with_iceberg_retry(spark, f"""
+                    DELETE FROM {tracking_db}.iceberg_migration_table_status
+                    WHERE run_id = '{run_id}'
+                      AND source_database = '{src_db}'
+                      AND source_table = '{tbl}'
+                """, task_label=f"migrate:non_v1_inplace_skip:delete:{tbl}")
+
+                execute_with_iceberg_retry(spark, f"""
+                    INSERT INTO {tracking_db}.iceberg_migration_table_status
+                    VALUES (
+                        '{run_id}',
+                        '{dag_run_id}',
+                        '{src_db}',
+                        '{tbl}',
+                        'INPLACE',
+                        '{dest_db}',
+                        '{tbl}',
+                        '{location or ""}',
+                        current_timestamp(),
+                        current_timestamp(),
+                        {tbl_skip_duration},
+                        'SKIPPED',
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        '{skip_msg_sql}',
+                        current_timestamp()
+                    )
+                """, task_label=f"migrate:non_v1_inplace_skip:insert:{tbl}")
+
+                logger.warning(f"[IcebergMigrate] SKIPPED non-v1 inplace source: {src_db}.{tbl} | reason={err_text[:300]}")
+                continue
+
+            error_msg = f"Migration to Iceberg failed for {dest_db}.{tbl}: {err_text[:2000]}".replace("'", "''")
             tbl_fail_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
 
             results.append({
@@ -923,6 +984,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
     total_tables = len(migration_status)
     successful_tables = sum(1 for t in migration_status if t.status in ['VALIDATED', 'COMPLETED'])
     failed_tables = sum(1 for t in migration_status if 'FAILED' in (t.status or ''))
+    skipped_tables = sum(1 for t in migration_status if (t.status or '') == 'SKIPPED')
     total_rows = sum(t.source_hive_row_count or 0 for t in migration_status)
     count_mismatches = sum(1 for t in migration_status if not t.row_count_match and t.row_count_match is not None)
 
@@ -939,6 +1001,13 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
         WHERE run_id = '{run_id}'
           AND validation_status = 'COMPLETED'
     """).collect()
+
+    def _row_value(row, field_name, default=None):
+        """Safely read a Spark Row field even when the schema varies."""
+
+        if hasattr(row, 'asDict'):
+            return row.asDict(recursive=True).get(field_name, default)
+        return default
 
     # Generate HTML
     html = f"""
@@ -1046,6 +1115,10 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
             background-color: #f8d7da;
             color: #721c24;
         }}
+        .status-skipped {{
+            background-color: #fff3cd;
+            color: #856404;
+        }}
         .metric {{
             font-weight: bold;
             color: #2980b9;
@@ -1094,6 +1167,10 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
             <div class="summary-card warning">
                 <h3>FAILED</h3>
                 <p class="value">{failed_tables}</p>
+            </div>
+            <div class="summary-card warning">
+                <h3>SKIPPED</h3>
+                <p class="value">{skipped_tables}</p>
             </div>
             <div class="summary-card info">
                 <h3>TOTAL ROWS</h3>
@@ -1170,11 +1247,16 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
             status_class = 'status-validated'
         elif t.status == 'COMPLETED':
             status_class = 'status-completed'
+        elif t.status == 'SKIPPED':
+            status_class = 'status-skipped'
         else:
             status_class = 'status-failed'
 
         migration_dur = f"{t.migration_duration_seconds:.1f}s" if t.migration_duration_seconds else "N/A"
         validation_dur = f"{t.validation_duration_seconds:.1f}s" if t.validation_duration_seconds else "N/A"
+        row_error = _row_value(t, 'error', '') or _row_value(t, 'error_message', '') or ''
+        reason_tooltip = str(row_error).replace('"', '&quot;') if t.status in ('SKIPPED', 'FAILED') else ''
+        badge_title_attr = f' title="{reason_tooltip}"' if reason_tooltip else ''
 
         html += f"""
                 <tr>
@@ -1182,7 +1264,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
                     <td><strong>{t.source_table}</strong></td>
                     <td>{t.migration_type}</td>
                     <td>{t.destination_table}</td>
-                    <td><span class="status-badge {status_class}">{t.status}</span></td>
+                    <td><span class="status-badge {status_class}"{badge_title_attr}>{t.status}</span></td>
                     <td class="duration">{migration_dur}</td>
                     <td class="duration">{validation_dur}</td>
                 </tr>

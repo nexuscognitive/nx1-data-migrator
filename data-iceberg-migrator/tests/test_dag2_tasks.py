@@ -170,6 +170,40 @@ class TestMigrateTablesToIceberg:
                 spark=mock_spark, ti=MagicMock(),
             )
 
+    def test_inplace_non_v1_source_skips(self, mock_spark, sample_iceberg_discovery):
+        sample_iceberg_discovery['inplace_migration'] = True
+        sample_iceberg_discovery['destination_iceberg_database'] = 'sales_data_s3'
+
+        def router(sql):
+            sl = sql.lower()
+            df = MagicMock()
+            if 'count(*)' in sl:
+                row = MagicMock()
+                row.__getitem__ = lambda self, k: 1000
+                df.collect.return_value = [row]
+            elif 'show partitions' in sl:
+                df.collect.return_value = []
+            elif 'system.migrate' in sl:
+                raise Exception("Cannot use non-v1 table 'sales_data_s3.transactions' as a source")
+            elif 'describe formatted' in sl:
+                loc = MagicMock()
+                loc.col_name = 'Location'
+                loc.data_type = 's3a://bucket/t'
+                df.collect.return_value = [loc]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=sample_iceberg_discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+
+        assert result['_has_failures'] is False
+        assert result['results'][0]['status'] == 'SKIPPED'
+        assert result['results'][0]['migration_type'] == 'INPLACE'
+
 
 class TestUpdateMigrationDurations:
 
@@ -281,6 +315,39 @@ class TestGenerateIcebergHtmlReport:
         result = m.generate_iceberg_html_report.function(run_id=sample_iceberg_run_id, spark=mock_spark)
         assert result['report_path'].endswith('.html')
         assert sample_iceberg_run_id in result['report_path']
+
+    def test_generates_report_when_row_has_no_error_field(self, mock_spark, sample_iceberg_run_id):
+        tbl_row = SimpleNamespace(
+            source_database='sales_s3', source_table='transactions',
+            migration_type='INPLACE', destination_table='sales_s3.transactions',
+            status='SKIPPED', migration_duration_seconds=12.0,
+            validation_duration_seconds=None, validation_status=None,
+            row_count_match=None, partition_count_match=None, schema_match=None,
+            source_hive_row_count=None, destination_iceberg_row_count=None,
+            source_hive_partition_count=None, dest_iceberg_partition_count=None,
+        )
+        ivs_row = MagicMock()
+        ivs_row.__getitem__ = lambda self, k: 0
+        ivs_row.total_tables_validated = 0
+        ivs_row.tables_passed_validation = 0
+        ivs_row.tables_failed_validation = 0
+        ivs_row.total_row_count_mismatches = 0
+        ivs_row.total_partition_count_mismatches = 0
+        ivs_row.total_schema_mismatches = 0
+
+        def router(sql):
+            df = MagicMock()
+            if 'order by' in sql.lower():
+                df.collect.return_value = [tbl_row]
+            elif 'sum(case when' in sql.lower():
+                df.collect.return_value = [ivs_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+        result = m.generate_iceberg_html_report.function(run_id=sample_iceberg_run_id, spark=mock_spark)
+        assert result['report_path'].endswith('.html')
 
 
 class TestSendIcebergReportEmail:
