@@ -1188,6 +1188,22 @@ class TestValidateDestinationTables:
     ):
         """distcp_status='EMPTY_SOURCE' + table_create_status='COMPLETED' →
         validation takes the all-zeros / all-matches shortcut."""
+        import copy
+        empty_source_input = copy.deepcopy(sample_table_result)
+        for t in empty_source_input['tables']:
+            t['partition_count'] = 0
+            t['partitions'] = []
+            t['is_partitioned'] = False
+            t['full_table_partition_count'] = 0
+        src_schema = empty_source_input['tables'][0]['schema']
+        mock_fields = []
+        for col in src_schema:
+            f = MagicMock()
+            f.name = col['name']
+            f.dataType.simpleString.return_value = col['type']
+            mock_fields.append(f)
+        mock_spark.table.return_value.schema.fields = mock_fields
+
         mock_spark.sql.side_effect = self._make_upstream_only_router({
             'distcp_status': 'EMPTY_SOURCE',
             'table_create_status': 'COMPLETED',
@@ -1195,7 +1211,7 @@ class TestValidateDestinationTables:
             'error_message': None,
         })
         result = m.validate_destination_tables.function.__wrapped__(
-            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+            source_validation=empty_source_input, spark=mock_spark, ti=MagicMock(),
         )
         v = result['validation_results'][0]
         assert v['status'] == 'COMPLETED'

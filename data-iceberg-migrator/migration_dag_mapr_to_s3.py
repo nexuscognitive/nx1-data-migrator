@@ -1377,16 +1377,17 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
             distcp_started_at = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-            filtered_partitions_for_mkdir = (
+            (
                 t.get("filtered_partitions", [])
                 if t.get("partition_filter_active")
                 else []
             )
 
-            if filtered_partitions_for_mkdir:
+            all_partitions = t.get("filtered_partitions", [])
+            if all_partitions:
                 mkdir_cmds = " && ".join(
                     f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}/{p}' 2>/dev/null || true"
-                    for p in filtered_partitions_for_mkdir
+                    for p in all_partitions
                 )
             else:
                 mkdir_cmds = f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}' 2>/dev/null || true"
@@ -2321,6 +2322,29 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                     f"[HiveTable] Could not add partition {partition_spec} "
                                     f"to {full_name}: {str(add_e)[:200]}"
                                 )
+                    elif distcp_status == "EMPTY_SOURCE" and t.get("partitions"):
+                        for part_str in t["partitions"]:
+                            part_kv = {}
+                            for segment in part_str.split("/"):
+                                if "=" in segment:
+                                    k, _, v = segment.partition("=")
+                                    part_kv[k.strip()] = v.strip()
+                            if not part_kv:
+                                continue
+                            partition_spec = ", ".join(
+                                f"{k}='{v}'" for k, v in part_kv.items()
+                            )
+                            part_location = f"{s3_loc}/{part_str}"
+                            try:
+                                spark.sql(
+                                    f"ALTER TABLE {full_name} ADD IF NOT EXISTS "
+                                    f"PARTITION ({partition_spec}) LOCATION '{part_location}'"
+                                )
+                            except Exception as add_e:
+                                logger.warning(
+                                    f"[HiveTable] Could not add partition {partition_spec} "
+                                    f"to {full_name}: {str(add_e)[:200]}"
+                                )
                     else:
                         spark.sql(f"MSCK REPAIR TABLE {full_name}")
                 spark.sql(f"REFRESH TABLE {full_name}")
@@ -2423,6 +2447,29 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                 if "=" in segment:
                                     k, _, v = segment.partition("=")
                                     part_kv[k.strip()] = v.strip()
+                            partition_spec = ", ".join(
+                                f"{k}='{v}'" for k, v in part_kv.items()
+                            )
+                            part_location = f"{s3_loc}/{part_str}"
+                            try:
+                                spark.sql(
+                                    f"ALTER TABLE {full_name} ADD IF NOT EXISTS "
+                                    f"PARTITION ({partition_spec}) LOCATION '{part_location}'"
+                                )
+                            except Exception as add_e:
+                                logger.warning(
+                                    f"[HiveTable] Could not add partition {partition_spec} "
+                                    f"to {full_name}: {str(add_e)[:200]}"
+                                )
+                    elif distcp_status == "EMPTY_SOURCE" and t.get("partitions"):
+                        for part_str in t["partitions"]:
+                            part_kv = {}
+                            for segment in part_str.split("/"):
+                                if "=" in segment:
+                                    k, _, v = segment.partition("=")
+                                    part_kv[k.strip()] = v.strip()
+                            if not part_kv:
+                                continue
                             partition_spec = ", ".join(
                                 f"{k}='{v}'" for k, v in part_kv.items()
                             )
@@ -2683,28 +2730,65 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             # But only take the shortcut if create_hive_tables actually ran —
             # otherwise the destination shell wasn't created and reporting
             # schema_match=True would be a lie.
-            if row["distcp_status"] == "EMPTY_SOURCE" and row[
-                "table_create_status"
-            ] not in ("FAILED", "SKIPPED"):
-                logger.info(
-                    f"[Validation] SKIPPING row-count query for {per_table_dest_db}.{tbl} "
+            if row["distcp_status"] == "EMPTY_SOURCE" and row["table_create_status"] not in ("FAILED", "SKIPPED"):
+                source_partition_count = t.get("partition_count", 0)
+                dest_partition_count = 0
+                try:
+                    dest_parts = spark.sql(f"SHOW PARTITIONS {dest_tbl}").collect()
+                    dest_partition_count = len(dest_parts)
+                except Exception:
+                    pass
+
+                partition_count_match = source_partition_count == dest_partition_count
+
+                src_schema = t.get("schema", [])
+                partition_cols = set(
+                    c.strip() for c in (t.get("partition_columns") or "").split(",") if c.strip()
                 )
-                validation_results.append(
-                    {
-                        "source_table": tbl,
-                        "dest_database": per_table_dest_db,
-                        "status": "COMPLETED",
-                        "source_row_count": 0,
-                        "dest_hive_row_count": 0,
-                        "source_partition_count": 0,
-                        "dest_partition_count": 0,
-                        "row_count_match": True,
-                        "partition_count_match": True,
-                        "schema_match": True,
-                        "schema_differences": "",
-                        "error": None,
-                    }
-                )
+                schema_match = True
+                schema_diffs = []
+                try:
+                    dest_schema = [
+                        {"name": f.name, "type": f.dataType.simpleString()}
+                        for f in spark.table(dest_tbl).schema.fields
+                        if f.name not in partition_cols
+                    ]
+                    src_cols = {c["name"]: c["type"] for c in src_schema}
+                    dest_cols = {c["name"]: c["type"] for c in dest_schema}
+                    for col_name, col_type in src_cols.items():
+                        if col_name not in dest_cols:
+                            schema_match = False
+                            schema_diffs.append(f"Missing column: {col_name}")
+                        elif dest_cols[col_name] != col_type:
+                            schema_match = False
+                            schema_diffs.append(f"Type mismatch for {col_name}: {col_type} vs {dest_cols[col_name]}")
+                    for col_name in dest_cols:
+                        if col_name not in src_cols:
+                            schema_match = False
+                            schema_diffs.append(f"Extra column in dest: {col_name}")
+                except Exception as e:
+                    schema_match = False
+                    schema_diffs.append(f"Schema check failed: {str(e)[:200]}")
+
+                validation_results.append({
+                    "source_table": tbl,
+                    "dest_database": per_table_dest_db,
+                    "status": "COMPLETED",
+                    "source_row_count": 0,
+                    "dest_hive_row_count": 0,
+                    "source_partition_count": source_partition_count,
+                    "dest_partition_count": dest_partition_count,
+                    "row_count_match": True,
+                    "partition_count_match": partition_count_match,
+                    "schema_match": schema_match,
+                    "schema_differences": "; ".join(schema_diffs) if schema_diffs else "",
+                    "error": None if (partition_count_match and schema_match) else
+                             "; ".join([
+                                 f"Partition count mismatch: source={source_partition_count}, dest={dest_partition_count}"
+                                 if not partition_count_match else "",
+                                 "; ".join(schema_diffs[:3]) if not schema_match else ""
+                             ]).strip("; "),
+                })
                 continue
 
             if (
