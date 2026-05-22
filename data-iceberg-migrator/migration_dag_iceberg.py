@@ -400,37 +400,12 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             src_hive_partition_count = 0
             if is_partitioned:
                 try:
-                    src_partitions_df = spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}")
-                    all_partitions = src_partitions_df.collect()
-
-                    if all_partitions:
-                        non_empty_count = 0
-                        table_location = tbl_meta.get('location') or ''
-                        for part_row in all_partitions:
-                            part_spec = part_row[0]
-                            part_path = f"{table_location}/{part_spec.replace('=', '=').rstrip('/')}"
-                            try:
-                                from py4j.java_gateway import java_import
-                                java_import(spark._jvm, "org.apache.hadoop.fs.*")
-                                fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-                                    spark._jvm.java.net.URI(part_path),
-                                    spark._jsc.hadoopConfiguration()
-                                )
-                                path_obj = spark._jvm.org.apache.hadoop.fs.Path(part_path)
-                                if fs.exists(path_obj):
-                                    summary = fs.getContentSummary(path_obj)
-                                    if int(summary.getLength()) > 0:
-                                        non_empty_count += 1
-                            except Exception:
-                                non_empty_count += 1
-                        src_hive_partition_count = non_empty_count
-                        logger.info(
-                            f"[IcebergMigrate] {src_db}.{tbl} | "
-                            f"strategy={'INPLACE' if inplace else 'SNAPSHOT'} | "
-                            f"total_hive_partitions={len(all_partitions)} | "
-                            f"non_empty_partitions={non_empty_count} "
-                            f"(0-byte partitions excluded from comparison)"
-                        )
+                    src_hive_partition_count = spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}").count()
+                    logger.info(
+                        f"[IcebergMigrate] {src_db}.{tbl} | "
+                        f"strategy={'INPLACE' if inplace else 'SNAPSHOT'} | "
+                        f"hive_partitions={src_hive_partition_count}"
+                    )
                 except Exception:
                     pass
 
@@ -447,13 +422,25 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     spark.sql(f"DROP TABLE IF EXISTS {dest_table}")
                 except Exception:
                     pass
-                if source_format == 'TEXT':
-                    # Iceberg's snapshot procedure rejects LazySimpleSerDe — rewrite via CTAS
-                    # into a new Parquet-backed Iceberg table, preserving partition columns.
+                # Determine migration path for SNAPSHOT strategy:
+                # - TEXT (LazySimpleSerDe): system.snapshot rejects it outright — must use CTAS.
+                # - AVRO, empty table (hive_count == 0): system.snapshot has no data files to
+                #   anchor the new Iceberg table to a distinct destination path, so Iceberg falls
+                #   back to writing its metadata/ directory inside the SOURCE table's location.
+                #   On a subsequent Airflow retry the AVRO SerDe reader then encounters metadata/
+                #   as a subdirectory and raises IOException (not a directory-recursive reader).
+                #   CTAS is safe because it writes the new Iceberg table to a fresh location in
+                #   the destination warehouse and never touches the source directory.
+                # - AVRO, non-empty table: system.snapshot works correctly — it anchors the new
+                #   Iceberg table at the destination warehouse path (separate from the source
+                #   external location) and metadata/ is written there, not in the source dir.
+                # - PARQUET / ORC: system.snapshot is the preferred zero-copy path.
+                use_ctas = source_format == 'TEXT' or (source_format == 'AVRO' and hive_count == 0)
+                if use_ctas:
                     partition_clause = f"PARTITIONED BY ({', '.join(partition_columns)})" if partition_columns else ""
                     logger.info(
-                        f"[IcebergMigrate] TEXT source for {src_db}.{tbl}: using CTAS into "
-                        f"{dest_table} {partition_clause or '(unpartitioned)'}"
+                        f"[IcebergMigrate] {source_format} source (rows={hive_count}) for {src_db}.{tbl}: "
+                        f"using CTAS into {dest_table} {partition_clause or '(unpartitioned)'}"
                     )
                     spark.sql(f"""
                         CREATE TABLE {dest_table}
@@ -465,15 +452,14 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     spark.sql(f"CALL spark_catalog.system.snapshot('{src_db}.{tbl}', '{dest_db}.{tbl}')")
 
             iceberg_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_table}").collect()[0]['c']
-            # For unpartitioned tables, Iceberg's .partitions metadata always reports a single
-            # empty-spec partition. Normalize to 0 to match SHOW PARTITIONS on the Hive source.
+            # For unpartitioned tables, normalize to 0.
             dest_iceberg_partition_count = 0
             if is_partitioned:
                 try:
                     spark.catalog.refreshTable(dest_table)
                     dest_iceberg_partition_count = spark.sql(
-                        f"SELECT COUNT(*) as cnt FROM {dest_table}.partitions"
-                    ).collect()[0]['cnt']
+                        f"SHOW PARTITIONS {dest_table}"
+                    ).count()
                 except Exception:
                     pass
 
@@ -783,6 +769,19 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
             schema_match = True
             schema_diffs = []
 
+            def _normalize_type_for_iceberg(hive_type: str) -> str:
+                """Normalize a Hive column type to its Iceberg-equivalent representation.
+
+                Iceberg's type system does not have TINYINT (8-bit) or SMALLINT (16-bit).
+                Both are promoted to Iceberg IntegerType, which DESCRIBE shows as 'int'.
+                This normalization prevents false-positive schema-mismatch failures when
+                validating Hive tables that use these narrow integer types as partition cols.
+                """
+                t = hive_type.strip().lower()
+                if t in ('tinyint', 'smallint'):
+                    return 'int'
+                return t
+
             src_cols = {c['name']: c['type'] for c in src_hive_schema}
             dest_cols = {c['name']: c['type'] for c in dest_iceberg_schema}
 
@@ -790,9 +789,15 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
                 if col_name not in dest_cols:
                     schema_match = False
                     schema_diffs.append(f"Missing column in Iceberg: {col_name}")
-                elif dest_cols[col_name] != col_type:
+                elif _normalize_type_for_iceberg(dest_cols[col_name]) != _normalize_type_for_iceberg(col_type):
                     schema_match = False
                     schema_diffs.append(f"Type mismatch for {col_name}: Hive {col_type} vs Iceberg {dest_cols[col_name]}")
+                elif dest_cols[col_name] != col_type:
+                    # Types are Iceberg-compatible (e.g. smallint promoted to int) — log but do not flag as failure
+                    logger.info(
+                        f"[IcebergValidation] Type promoted (expected): {col_name} Hive={col_type} -> Iceberg={dest_cols[col_name]} "
+                        f"in {src_db}.{tbl}"
+                    )
 
             for col_name in dest_cols:
                 if col_name not in src_cols:
