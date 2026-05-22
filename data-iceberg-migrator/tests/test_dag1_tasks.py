@@ -769,6 +769,125 @@ class TestUpdateDistcpStatus:
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
         assert any('FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_normalizes_zero_row_completed_to_empty_source(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """A COMPLETED distcp that moved zero bytes/files against a source with
+        zero rows must be flipped to EMPTY_SOURCE so the report converges on a
+        single tracking state regardless of stray marker files."""
+        sample_distcp_result['tables'][0]['row_count'] = 0
+        sample_distcp_result['distcp_results'][0].update({
+            'status': 'COMPLETED', 'bytes_copied': 0, 'files_copied': 0,
+            's3_file_count_after': 0, 's3_total_size_bytes_after': 0,
+        })
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert "distcp_status = 'EMPTY_SOURCE'" in sql_calls
+        assert "overall_status = 'EMPTY_SOURCE'" in sql_calls
+
+    def test_does_not_normalize_when_source_has_rows(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """A COMPLETED distcp with zero bytes/files but non-zero source row
+        count is NOT EMPTY_SOURCE — it's an incremental no-op against a real
+        table. Reporting it as EMPTY_SOURCE would lose information."""
+        sample_distcp_result['tables'][0]['row_count'] = 1000
+        sample_distcp_result['distcp_results'][0].update({
+            'status': 'COMPLETED', 'bytes_copied': 0, 'files_copied': 0,
+        })
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert "distcp_status = 'EMPTY_SOURCE'" not in sql_calls
+        # The main per-row UPDATE must still have fired with the original status.
+        assert "distcp_status = 'COMPLETED'" in sql_calls
+
+    def test_normalization_keys_match_per_partition_filter_slice(
+        self, mock_spark, sample_discovery, mock_iceberg_retry
+    ):
+        """Two discovery slices for the same (src,table,dest) differing only by
+        partition_filter must each be matched to their own distcp result —
+        the key includes partition_filter."""
+        base_t = sample_discovery['tables'][0]
+        empty_slice = dict(base_t)
+        empty_slice.update({
+            'partition_filter': "dt='2025-01-02'",
+            'partition_filter_active': True,
+            'filtered_partitions': ['dt=2025-01-02'],
+            'filtered_row_count': 0,
+            'row_count': 0,
+        })
+        nonempty_slice = dict(base_t)
+        nonempty_slice.update({
+            'partition_filter': "dt='2025-01-01'",
+            'partition_filter_active': True,
+            'filtered_partitions': ['dt=2025-01-01'],
+            'filtered_row_count': 1000,
+            'row_count': 1000,
+        })
+        distcp_result = {
+            **sample_discovery,
+            'tables': [empty_slice, nonempty_slice],
+            'distcp_results': [
+                {
+                    'source_database': 'sales_data', 'source_table': 'transactions',
+                    'dest_database': 'sales_data_s3',
+                    'partition_filter': "dt='2025-01-02'",
+                    'status': 'COMPLETED',
+                    'distcp_started_at': '2025-01-01 12:00:00',
+                    'distcp_completed_at': '2025-01-01 12:00:10',
+                    'distcp_duration_secs': 10.0, 'is_incremental': True,
+                    'bytes_copied': 0, 'files_copied': 0,
+                    's3_total_size_bytes_before': 0, 's3_file_count_before': 0,
+                    's3_total_size_bytes_after': 0, 's3_file_count_after': 0,
+                    's3_bytes_transferred': 0, 's3_files_transferred': 0,
+                    'partition_filter_active': True, 'partitions_requested': 1,
+                    'error': None,
+                },
+                {
+                    'source_database': 'sales_data', 'source_table': 'transactions',
+                    'dest_database': 'sales_data_s3',
+                    'partition_filter': "dt='2025-01-01'",
+                    'status': 'COMPLETED',
+                    'distcp_started_at': '2025-01-01 12:00:00',
+                    'distcp_completed_at': '2025-01-01 12:05:00',
+                    'distcp_duration_secs': 300.0, 'is_incremental': False,
+                    'bytes_copied': 10 * 1024 * 1024, 'files_copied': 5,
+                    's3_total_size_bytes_before': 0, 's3_file_count_before': 0,
+                    's3_total_size_bytes_after': 10 * 1024 * 1024, 's3_file_count_after': 5,
+                    's3_bytes_transferred': 10 * 1024 * 1024, 's3_files_transferred': 5,
+                    'partition_filter_active': True, 'partitions_requested': 1,
+                    'error': None,
+                },
+            ],
+            '_task_duration': 310.0,
+        }
+        m.update_distcp_status.function(distcp_result=distcp_result, spark=mock_spark)
+        # Only the empty slice should be flipped to EMPTY_SOURCE; the
+        # non-empty slice's UPDATE must still write distcp_status='COMPLETED'.
+        # Without partition_filter in the key, the dict comprehension would
+        # collapse both slices onto whichever entry came last, and both
+        # distcp_results would see the same row_count.
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert "distcp_status = 'EMPTY_SOURCE'" in sql_calls
+        assert "distcp_status = 'COMPLETED'" in sql_calls
+
+    def test_catchall_preserves_empty_source_overall_status(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """The catchall UPDATE that fires for tables not processed by distcp
+        must NOT overwrite overall_status='EMPTY_SOURCE' with 'FAILED'."""
+        # Empty distcp_results so the catchall fires for every table in the slot.
+        sample_distcp_result['distcp_results'] = []
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        catchall_sqls = [
+            str(c) for c in mock_iceberg_retry.call_args_list
+            if "S3 copy task did not process this table" in str(c)
+        ]
+        assert catchall_sqls, "catchall UPDATE should have fired"
+        joined = ' '.join(catchall_sqls)
+        assert "overall_status='FAILED'" not in joined
+        assert "WHEN overall_status = 'EMPTY_SOURCE'" in joined
+
 
 class TestCreateHiveTables:
 
@@ -915,6 +1034,38 @@ class TestUpdateTableCreateStatus:
         m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
         assert any('TABLE_CREATED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_catchall_preserves_empty_source_overall_status(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        """The catchall UPDATE for tables not processed by create_hive_tables
+        must NOT overwrite overall_status='EMPTY_SOURCE' with 'FAILED'."""
+        sample_table_result['table_results'] = []
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        catchall_sqls = [
+            str(c) for c in mock_iceberg_retry.call_args_list
+            if "Table creation task did not process this table" in str(c)
+        ]
+        assert catchall_sqls, "catchall UPDATE should have fired"
+        joined = ' '.join(catchall_sqls)
+        assert "overall_status = 'FAILED'," not in joined
+        assert "WHEN overall_status = 'EMPTY_SOURCE'" in joined
+
+    def test_failure_patch_preserves_empty_source_overall_status(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        """The per-table failure-patch UPDATE must also preserve EMPTY_SOURCE."""
+        sample_table_result['table_results'][0].update({
+            'status': 'FAILED', 'error': 'forced failure for test',
+        })
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        patch_sqls = [
+            str(c) for c in mock_iceberg_retry.call_args_list
+            if 'failure_patch' in str(c)
+        ]
+        assert patch_sqls, "failure-patch UPDATE should have fired"
+        joined = ' '.join(patch_sqls)
+        assert "WHEN overall_status = 'EMPTY_SOURCE'" in joined
+
 
 class TestValidateDestinationTables:
 
@@ -1015,6 +1166,108 @@ class TestValidateDestinationTables:
             "Expected a scoped COUNT(*) with WHERE clause for filtered partitions"
         )
         assert result['validation_results'][0]['row_count_match'] is True
+
+    def _make_upstream_only_router(self, upstream_values):
+        """spark.sql router that returns just one upstream-tracking row.
+        Used by EMPTY_SOURCE-shortcut tests where validation should never
+        reach the COUNT(*) / SHOW PARTITIONS queries."""
+        row = MagicMock()
+        row.__getitem__ = lambda self, k: upstream_values[k]
+
+        def sql_router(sql):
+            df = MagicMock()
+            if 'distcp_status' in sql.lower():
+                df.collect.return_value = [row]
+            else:
+                df.collect.return_value = []
+            return df
+        return sql_router
+
+    def test_empty_source_shortcut_taken_when_table_create_succeeded(
+        self, mock_spark, sample_table_result
+    ):
+        """distcp_status='EMPTY_SOURCE' + table_create_status='COMPLETED' →
+        validation takes the all-zeros / all-matches shortcut."""
+        import copy
+        empty_source_input = copy.deepcopy(sample_table_result)
+        for t in empty_source_input['tables']:
+            t['partition_count'] = 0
+            t['partitions'] = []
+            t['is_partitioned'] = False
+            t['full_table_partition_count'] = 0
+        src_schema = empty_source_input['tables'][0]['schema']
+        mock_fields = []
+        for col in src_schema:
+            f = MagicMock()
+            f.name = col['name']
+            f.dataType.simpleString.return_value = col['type']
+            mock_fields.append(f)
+        mock_spark.table.return_value.schema.fields = mock_fields
+
+        mock_spark.sql.side_effect = self._make_upstream_only_router({
+            'distcp_status': 'EMPTY_SOURCE',
+            'table_create_status': 'COMPLETED',
+            'overall_status': 'EMPTY_SOURCE',
+            'error_message': None,
+        })
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=empty_source_input, spark=mock_spark, ti=MagicMock(),
+        )
+        v = result['validation_results'][0]
+        assert v['status'] == 'COMPLETED'
+        assert v['row_count_match'] is True
+        assert v['partition_count_match'] is True
+        assert v['schema_match'] is True
+
+    def test_empty_source_shortcut_wins_over_stale_failed_overall_status(
+        self, mock_spark, sample_table_result
+    ):
+        """If a catchall left overall_status='FAILED' but distcp_status is
+        still 'EMPTY_SOURCE' and the dest table got created, the shortcut
+        must still fire — that's the run-2-style flake we're fixing."""
+        mock_spark.sql.side_effect = self._make_upstream_only_router({
+            'distcp_status': 'EMPTY_SOURCE',
+            'table_create_status': 'COMPLETED',
+            'overall_status': 'FAILED',
+            'error_message': 'stale catchall message',
+        })
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['status'] == 'COMPLETED'
+
+    def test_empty_source_skipped_when_table_create_failed(
+        self, mock_spark, sample_table_result
+    ):
+        """distcp_status='EMPTY_SOURCE' but table_create_status='FAILED' means
+        the destination shell was never built — validation must SKIP rather
+        than falsely report schema_match=True."""
+        mock_spark.sql.side_effect = self._make_upstream_only_router({
+            'distcp_status': 'EMPTY_SOURCE',
+            'table_create_status': 'FAILED',
+            'overall_status': 'FAILED',
+            'error_message': 'table create crashed',
+        })
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['status'] == 'SKIPPED'
+
+    def test_empty_source_skipped_when_table_create_skipped(
+        self, mock_spark, sample_table_result
+    ):
+        """Same as above for table_create_status='SKIPPED' (e.g.
+        skipped_no_schema branch in create_hive_tables)."""
+        mock_spark.sql.side_effect = self._make_upstream_only_router({
+            'distcp_status': 'EMPTY_SOURCE',
+            'table_create_status': 'SKIPPED',
+            'overall_status': 'EMPTY_SOURCE',
+            'error_message': None,
+        })
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['status'] == 'SKIPPED'
 
 
 class TestUpdateValidationStatus:
