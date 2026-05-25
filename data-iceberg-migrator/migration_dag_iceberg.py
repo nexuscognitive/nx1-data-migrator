@@ -365,7 +365,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
         # known limitation from an actual failure.
         if source_format == 'TEXT' and inplace:
             error_msg = (
-                f"Inplace Iceberg migration is not supported for text-format Hive tables "
+                "Inplace Iceberg migration is not supported for text-format Hive tables "
             ).replace("'", "''")
             tbl_fail_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
             results.append({

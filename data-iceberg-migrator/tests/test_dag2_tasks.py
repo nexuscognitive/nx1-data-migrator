@@ -204,6 +204,199 @@ class TestMigrateTablesToIceberg:
         assert result['results'][0]['status'] == 'SKIPPED'
         assert result['results'][0]['migration_type'] == 'INPLACE'
 
+    # ------------------------------------------------------------------
+    # Partition counting and AVRO CTAS tests (new behaviour)
+    # ------------------------------------------------------------------
+
+    def _make_partitioned_discovery(self, source_format='PARQUET'):
+        return {
+            'source_database': 'sales_data_s3',
+            'destination_iceberg_database': 'sales_data_s3_iceberg',
+            'inplace_migration': False,
+            'run_id': 'iceberg_run_20250101_120000_abcd1234',
+            'discovered_tables': [{
+                'table': 'transactions',
+                'location': 's3a://bucket/transactions',
+                'source_format': source_format,
+                'partition_columns': ['dt'],
+            }],
+        }
+
+    def _partition_router(self, *, hive_rows=5, non_empty=1, registered=2, iceberg=1):
+        """SQL router that distinguishes SELECT DISTINCT, .partitions, row-count, SHOW PARTITIONS."""
+        def router(sql):
+            sl = sql.lower()
+            df = MagicMock()
+            row = MagicMock()
+            if 'select distinct' in sl:
+                row.__getitem__ = lambda self, k: non_empty
+                df.collect.return_value = [row]
+            elif '.partitions' in sl:
+                row.__getitem__ = lambda self, k: iceberg
+                df.collect.return_value = [row]
+            elif 'count(*)' in sl:
+                row.__getitem__ = lambda self, k: hive_rows
+                df.collect.return_value = [row]
+            elif 'show partitions' in sl:
+                df.count.return_value = registered
+                df.collect.return_value = [MagicMock() for _ in range(registered)]
+            elif 'describe formatted' in sl:
+                loc = MagicMock()
+                loc.col_name = 'Location'
+                loc.data_type = 's3a://bucket/t'
+                df.collect.return_value = [loc]
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        return router
+
+    def test_source_partition_count_uses_select_distinct(self, mock_spark):
+        """SELECT DISTINCT is used to count non-empty source partitions."""
+        discovery = self._make_partitioned_discovery()
+        mock_spark.sql.side_effect = self._partition_router(non_empty=2, iceberg=2)
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'select distinct' in all_sql
+        assert result['results'][0]['hive_partition_count'] == 2
+
+    def test_all_empty_partitions_pass_validation(self, mock_spark):
+        """Tables with all Hive partitions empty: non-empty=0, Iceberg=0 → partition_match=True."""
+        discovery = self._make_partitioned_discovery()
+        # 3 partitions registered but all empty; Iceberg also sees 0
+        mock_spark.sql.side_effect = self._partition_router(
+            hive_rows=0, non_empty=0, registered=3, iceberg=0,
+        )
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        r = result['results'][0]
+        assert r['hive_partition_count'] == 0
+        assert r['iceberg_partition_count'] == 0
+        assert r['partition_match'] is True
+
+    def test_total_registered_written_to_tracking_insert(self, mock_spark):
+        """SHOW PARTITIONS count (total_registered=7) is stored in the tracking INSERT SQL."""
+        discovery = self._make_partitioned_discovery()
+        mock_spark.sql.side_effect = self._partition_router(non_empty=1, registered=7, iceberg=1)
+        m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        insert_calls = [
+            str(c) for c in mock_spark.sql.call_args_list
+            if 'insert into' in str(c).lower()
+        ]
+        assert any('7' in c for c in insert_calls), "total_registered=7 must appear in INSERT SQL"
+
+    def test_avro_empty_table_uses_ctas(self, mock_spark):
+        """Empty AVRO table uses CTAS (not system.snapshot) to avoid metadata dir collision."""
+        discovery = self._make_partitioned_discovery(source_format='AVRO')
+        mock_spark.sql.side_effect = self._partition_router(hive_rows=0, non_empty=0, registered=0, iceberg=0)
+        m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'system.snapshot' not in all_sql
+        assert 'create table' in all_sql and 'as select' in all_sql
+
+    def test_avro_nonempty_table_uses_system_snapshot(self, mock_spark):
+        """Non-empty AVRO table uses system.snapshot (CTAS only applies to empty AVRO)."""
+        discovery = self._make_partitioned_discovery(source_format='AVRO')
+        mock_spark.sql.side_effect = self._partition_router(hive_rows=5, non_empty=1, registered=1, iceberg=1)
+        m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'system.snapshot' in all_sql
+
+    # ------------------------------------------------------------------
+    # TEXT-format and unpartitioned partition-count guard (from PR)
+    # ------------------------------------------------------------------
+
+    def test_text_format_snapshot_uses_ctas(self, mock_spark):
+        """TEXT-format (LazySimpleSerDe) snapshot must use CTAS — system.snapshot rejects it."""
+        discovery = {
+            'source_database': 'sales_data_s3',
+            'destination_iceberg_database': 'sales_data_s3_iceberg',
+            'inplace_migration': False,
+            'run_id': 'iceberg_run_20250101_120000_abcd1234',
+            'discovered_tables': [{'table': 'logs', 'location': 's3a://bucket/logs',
+                                    'source_format': 'TEXT', 'partition_columns': []}],
+        }
+        mock_spark.sql.side_effect = self._partition_router(hive_rows=10)
+        m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'system.snapshot' not in all_sql
+        assert 'create table' in all_sql and 'as select' in all_sql
+
+    def test_text_format_partitioned_snapshot_includes_partitioned_by(self, mock_spark):
+        """TEXT-format partitioned CTAS must include PARTITIONED BY with the source partition columns."""
+        discovery = {
+            'source_database': 'sales_data_s3',
+            'destination_iceberg_database': 'sales_data_s3_iceberg',
+            'inplace_migration': False,
+            'run_id': 'iceberg_run_20250101_120000_abcd1234',
+            'discovered_tables': [{'table': 'logs', 'location': 's3a://bucket/logs',
+                                    'source_format': 'TEXT', 'partition_columns': ['dt', 'region']}],
+        }
+        mock_spark.sql.side_effect = self._partition_router(hive_rows=10, non_empty=2, registered=2, iceberg=2)
+        m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'partitioned by' in all_sql
+        assert 'dt' in all_sql and 'region' in all_sql
+        assert 'system.snapshot' not in all_sql
+
+    def test_text_format_inplace_is_skipped_not_failed(self, mock_spark):
+        """TEXT+inplace is unsupported: must record SKIPPED (not FAILED) and leave _has_failures=False."""
+        discovery = {
+            'source_database': 'sales_data_s3',
+            'destination_iceberg_database': 'sales_data_s3',
+            'inplace_migration': True,
+            'run_id': 'iceberg_run_20250101_120000_abcd1234',
+            'discovered_tables': [{'table': 'logs', 'location': 's3a://bucket/logs',
+                                    'source_format': 'TEXT', 'partition_columns': []}],
+        }
+        mock_spark.sql.side_effect = self._partition_router()
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['_has_failures'] is False
+        assert result['results'][0]['status'] == 'SKIPPED'
+        assert result['results'][0]['migration_type'] == 'INPLACE'
+
+    def test_unpartitioned_table_skips_iceberg_partitions_query(self, mock_spark):
+        """Unpartitioned tables must NOT query .partitions — Iceberg returns 1 spurious row there."""
+        discovery = {
+            'source_database': 'sales_data_s3',
+            'destination_iceberg_database': 'sales_data_s3_iceberg',
+            'inplace_migration': False,
+            'run_id': 'iceberg_run_20250101_120000_abcd1234',
+            'discovered_tables': [{'table': 'events', 'location': 's3a://bucket/events',
+                                    'source_format': 'PARQUET', 'partition_columns': []}],
+        }
+        mock_spark.sql.side_effect = self._partition_router(hive_rows=500)
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert '.partitions' not in all_sql
+        assert result['results'][0]['partition_match'] is True
+
 
 class TestUpdateMigrationDurations:
 
@@ -249,6 +442,46 @@ class TestValidateIcebergTables:
             migration_result=sample_iceberg_migration_result, spark=mock_spark, ti=MagicMock(),
         )
         assert result['validation_results'][0]['schema_match'] is False
+
+    def test_smallint_normalized_to_int_schema_match(self, mock_spark, sample_iceberg_migration_result):
+        """SMALLINT in Hive source must match INT in Iceberg dest (Iceberg promotes it)."""
+        call_n = [0]
+
+        def router(sql):
+            df = MagicMock()
+            if 'describe' in sql.lower():
+                call_n[0] += 1
+                dtype = 'smallint' if call_n[0] % 2 == 1 else 'int'
+                df.collect.return_value = [MagicMock(col_name='region_code', data_type=dtype)]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+        result = m.validate_iceberg_tables.function.__wrapped__(
+            migration_result=sample_iceberg_migration_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['schema_match'] is True
+
+    def test_tinyint_normalized_to_int_schema_match(self, mock_spark, sample_iceberg_migration_result):
+        """TINYINT in Hive source must match INT in Iceberg dest (Iceberg promotes it)."""
+        call_n = [0]
+
+        def router(sql):
+            df = MagicMock()
+            if 'describe' in sql.lower():
+                call_n[0] += 1
+                dtype = 'tinyint' if call_n[0] % 2 == 1 else 'int'
+                df.collect.return_value = [MagicMock(col_name='flag', data_type=dtype)]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+        result = m.validate_iceberg_tables.function.__wrapped__(
+            migration_result=sample_iceberg_migration_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['schema_match'] is True
 
 
 class TestUpdateIcebergValidationStatus:
@@ -348,6 +581,45 @@ class TestGenerateIcebergHtmlReport:
         mock_spark.sql.side_effect = router
         result = m.generate_iceberg_html_report.function(run_id=sample_iceberg_run_id, spark=mock_spark)
         assert result['report_path'].endswith('.html')
+
+    def test_html_report_includes_hive_total_partitions_column(self, mock_spark, sample_iceberg_run_id):
+        """HTML report must contain 'Source Partitions (non-empty)' and 'Hive Total Partitions' headers."""
+        tbl_row = SimpleNamespace(
+            source_database='sales_s3', source_table='transactions',
+            migration_type='SNAPSHOT', destination_table='sales_s3_iceberg.transactions',
+            status='VALIDATED', migration_duration_seconds=10.0,
+            validation_duration_seconds=1.0, validation_status='COMPLETED',
+            row_count_match=True, partition_count_match=True, schema_match=True,
+            source_hive_row_count=5, destination_iceberg_row_count=5,
+            source_hive_partition_count=1, dest_iceberg_partition_count=1,
+        )
+        ivs_row = MagicMock()
+        ivs_row.__getitem__ = lambda self, k: 1 if k == 'total_tables_validated' else 0
+        ivs_row.total_tables_validated = 1
+        ivs_row.tables_passed_validation = 1
+        ivs_row.tables_failed_validation = 0
+        ivs_row.total_row_count_mismatches = 0
+        ivs_row.total_partition_count_mismatches = 0
+        ivs_row.total_schema_mismatches = 0
+
+        def router(sql):
+            df = MagicMock()
+            if 'order by' in sql.lower():
+                df.collect.return_value = [tbl_row]
+            elif 'sum(case when' in sql.lower():
+                df.collect.return_value = [ivs_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+        m.generate_iceberg_html_report.function(run_id=sample_iceberg_run_id, spark=mock_spark)
+
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        written_bytes = fs_mock.create.return_value.write.call_args[0][0]
+        html = written_bytes.decode('utf-8')
+        assert 'Hive Total Partitions' in html
+        assert 'Source Partitions (non-empty)' in html
 
 
 class TestSendIcebergReportEmail:
