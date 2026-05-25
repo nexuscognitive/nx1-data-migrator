@@ -92,6 +92,7 @@ def init_iceberg_tracking_tables(spark) -> dict:
             destination_iceberg_row_count BIGINT,
             row_count_match BOOLEAN,
             source_hive_partition_count INT,
+            source_hive_total_partition_count INT,
             dest_iceberg_partition_count INT,
             partition_count_match BOOLEAN,
             schema_match BOOLEAN,
@@ -387,7 +388,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     '{dest_db}', '{tbl}', '{location or ""}',
                     current_timestamp(), current_timestamp(),
                     {tbl_fail_duration}, 'SKIPPED',
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
                     '{error_msg}',
                     current_timestamp()
                 )
@@ -398,13 +399,26 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
         try:
             hive_count = spark.sql(f"SELECT COUNT(*) as c FROM {src_db}.{tbl}").collect()[0]['c']
             src_hive_partition_count = 0
+            total_registered = 0
             if is_partitioned:
                 try:
-                    src_hive_partition_count = spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}").count()
+                    # Count only partitions that have actual data files — these are the only
+                    # ones system.snapshot can register in Iceberg (empty Hive partition dirs
+                    # have no data files and are not visible to Iceberg after snapshot).
+                    # Using DISTINCT on partition columns avoids a separate S3 scan; it piggy-
+                    # backs on the data already read for hive_count.
+                    part_cols_expr = ', '.join(partition_columns)
+                    src_hive_partition_count = spark.sql(f"""
+                        SELECT COUNT(*) as cnt FROM (
+                            SELECT DISTINCT {part_cols_expr} FROM {src_db}.{tbl}
+                        )
+                    """).collect()[0]['cnt']
+                    total_registered = spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}").count()
                     logger.info(
                         f"[IcebergMigrate] {src_db}.{tbl} | "
                         f"strategy={'INPLACE' if inplace else 'SNAPSHOT'} | "
-                        f"hive_partitions={src_hive_partition_count}"
+                        f"hive_registered_partitions={total_registered} | "
+                        f"hive_nonempty_partitions={src_hive_partition_count}"
                     )
                 except Exception:
                     pass
@@ -453,13 +467,15 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
 
             iceberg_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_table}").collect()[0]['c']
             # For unpartitioned tables, normalize to 0.
+            # Iceberg's .partitions metadata table counts partitions that have data files.
+            # SHOW PARTITIONS is a Hive-metastore command and returns 0 on Iceberg tables.
             dest_iceberg_partition_count = 0
             if is_partitioned:
                 try:
                     spark.catalog.refreshTable(dest_table)
                     dest_iceberg_partition_count = spark.sql(
-                        f"SHOW PARTITIONS {dest_table}"
-                    ).count()
+                        f"SELECT COUNT(*) as cnt FROM {dest_table}.partitions"
+                    ).collect()[0]['cnt']
                 except Exception:
                     pass
 
@@ -516,6 +532,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     {iceberg_count},
                     {str(counts_match).lower()},
                     {src_hive_partition_count},
+                    {total_registered},
                     {dest_iceberg_partition_count},
                     {str(partition_match).lower()},
                     NULL,
@@ -582,6 +599,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                         NULL,
                         NULL,
                         NULL,
+                        NULL,
                         '{skip_msg_sql}',
                         current_timestamp()
                     )
@@ -623,6 +641,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     current_timestamp(),
                     {tbl_fail_duration},
                     'FAILED',
+                    NULL,
                     NULL,
                     NULL,
                     NULL,
@@ -1290,7 +1309,8 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
                     <th>Source Hive Rows</th>
                     <th>Dest Iceberg Rows</th>
                     <th>Row Count Match</th>
-                    <th>Source Partitions</th>
+                    <th>Source Partitions (non-empty)</th>
+                    <th>Hive Total Partitions</th>
                     <th>Dest Partitions</th>
                     <th>Partition Match</th>
                     <th>Schema Match</th>
@@ -1319,6 +1339,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
                     <td class="metric">{(t.destination_iceberg_row_count or 0):,}</td>
                     <td class="{row_match_class}">{row_match_icon}</td>
                     <td class="metric">{t.source_hive_partition_count or 0}</td>
+                    <td class="metric">{_row_value(t, 'source_hive_total_partition_count', 0) or 0}</td>
                     <td class="metric">{t.dest_iceberg_partition_count or 0}</td>
                     <td class="{part_match_class}">{part_match_icon}</td>
                     <td class="{schema_match_class}">{schema_match_icon}</td>
