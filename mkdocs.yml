@@ -1,0 +1,6 @@
+site_name: nx1-data-migrator
+plugins:
+  - include-markdown
+  - techdocs-core
+nav:
+  - Overview: index.md

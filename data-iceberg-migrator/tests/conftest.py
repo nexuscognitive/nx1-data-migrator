@@ -264,6 +264,50 @@ def mock_iceberg_retry():
 def sample_run_id():
     return 'run_20250101_120000_abcd1234'
 
+# 30-field struct that mirrors the customerAttributes / response columns from
+# the flex_rules_result failure — used to verify hive_type_to_spark_ddl and
+# the spark.table().schema schema path (Bug #1 + Bug #2 fixes).
+_WIDE_STRUCT_TYPE = (
+    "struct<"
+    + ",".join(f"FIELD_{i}:string" for i in range(30))
+    + ">"
+)
+_NESTED_STRUCT_TYPE = "array<struct<category:string,result:string,status:string>>"
+
+@pytest.fixture
+def sample_table_metadata_with_structs():
+    """Table metadata with wide/nested struct columns (mirrors flex_rules_result)."""
+    return [{
+        'source_database': 'sales_data', 'source_table': 'flex_rules_result',
+        'dest_database': 'sales_data_s3', 'dest_bucket': 's3a://test-bucket',
+        'source_location': 'maprfs:///data/sales_data/flex_rules_result',
+        's3_location': 's3a://test-bucket/sales_data_s3/flex_rules_result',
+        'file_format': 'PARQUET',
+        'schema': [
+            {'name': 'id', 'type': 'string'},
+            {'name': 'customerAttributes', 'type': _WIDE_STRUCT_TYPE},
+            {'name': 'response', 'type': _NESTED_STRUCT_TYPE},
+        ],
+        'partitions': [],
+        'partition_columns': '',
+        'partition_count': 0,
+        'row_count': 500,
+        'is_partitioned': False,
+        'unregistered_partitions': False,
+        'table_type': 'EXTERNAL',
+        'source_total_size_bytes': 5 * 1024 * 1024,
+        'source_file_count': 2,
+        'serde_properties': {},
+        'partition_filter': None,
+        'filtered_partitions': [],
+        'partition_filter_active': False,
+        'filtered_row_count': 500,
+        'filtered_source_size_bytes': 5 * 1024 * 1024,
+        'filtered_file_count': 2,
+        'full_table_row_count': 500,
+        'full_table_partition_count': 0,
+    }]
+
 @pytest.fixture
 def sample_table_metadata():
     return [{
@@ -275,7 +319,6 @@ def sample_table_metadata():
         'schema': [
             {'name': 'id', 'type': 'bigint'},
             {'name': 'amount', 'type': 'double'},
-            {'name': 'dt', 'type': 'string'},
         ],
         'partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
         'partition_columns': 'dt',
@@ -320,6 +363,7 @@ def sample_distcp_result(sample_discovery):
             's3_total_size_bytes_after': 10 * 1024 * 1024, 's3_file_count_after': 5,
             's3_bytes_transferred': 10 * 1024 * 1024, 's3_files_transferred': 5,
             'partition_filter_active': False, 'partitions_requested': None,
+            'partition_filter': None,
             'error': None,
         }],
         '_task_duration': 305.0,

@@ -34,6 +34,7 @@ from utils.migrations.shared import (
     cluster_login,
     execute_with_iceberg_retry,
     get_config,
+    hive_type_to_spark_ddl,
     normalize_s3,
     track_duration,
     validate_bucket_endpoint_pairs,
@@ -602,11 +603,12 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
 
-        pyspark_script = """
+        pyspark_script = """# -*- coding: utf-8 -*-
 import json
 import sys
 import fnmatch
 from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
 sys.path.insert(0, "{temp_dir}")
 from partition_utils import apply_partition_filter, partitions_to_where_clause
 
@@ -621,38 +623,118 @@ dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
 
 tokens = json.loads('{tokens_json_escaped}')
+filter_expr = "{filter_expr_escaped}"
+
+def _s3_location_for(tbl):
+    if {include_db_in_path}:
+        return dest_bucket + "/" + dest_db + "/" + tbl
+    return dest_bucket + "/" + tbl
+
+def _default_metadata_record(tbl):
+    return {{
+        "source_database": src_db,
+        "source_table": tbl,
+        "dest_database": dest_db,
+        "dest_bucket": dest_bucket,
+        "source_location": "",
+        "s3_location": _s3_location_for(tbl),
+        "file_format": "UNKNOWN",
+        "schema": [],
+        "partitions": [],
+        "partition_columns": "",
+        "partition_count": 0,
+        "row_count": 0,
+        "is_partitioned": False,
+        "unregistered_partitions": False,
+        "table_type": "UNKNOWN",
+        "source_total_size_bytes": 0,
+        "source_file_count": 0,
+        "serde_properties": {{}},
+        "partition_filter": filter_expr or None,
+        "filtered_partitions": [],
+        "partition_filter_active": False,
+        "filtered_row_count": 0,
+        "filtered_source_size_bytes": 0,
+        "filtered_file_count": 0,
+        "full_table_row_count": 0,
+        "full_table_partition_count": 0,
+        "partition_file_counts": {{}},
+    }}
+
+def database_exists(spark, db):
+    try:
+        rows = spark.sql("SHOW DATABASES LIKE '{{0}}'".format(db)).collect()
+    except AnalysisException as e:
+        print("WARNING: SHOW DATABASES LIKE '{{0}}' failed with AnalysisException ({{1}}). Assuming database exists.".format(db, str(e)[:200]))
+        return True
+    db_lower = db.lower()
+    # SHOW DATABASES LIKE returns a single column; field name varies across Spark versions
+    # (databaseName in Spark 2.x, namespace in Spark 3.x), so read positionally.
+    for r in rows:
+        if r[0] and r[0].lower() == db_lower:
+            return True
+    return False
 
 def resolve_tokens(spark, db, tokens):
+    try:
+        existing_rows = spark.sql("SHOW TABLES IN {{0}}".format(db)).collect()
+        existing_lower = {{r.tableName.lower(): r.tableName for r in existing_rows}}
+    except AnalysisException as e:
+        print("WARNING: SHOW TABLES IN {{0}} failed with AnalysisException ({{1}}). Treating all explicit tokens as missing.".format(db, str(e)[:200]))
+        existing_lower = {{}}
+
     resolved = []
+    missing = []
     seen = set()
 
     for tok in tokens:
         if tok == '*':
-            rows = spark.sql("SHOW TABLES IN {{0}}".format(db)).collect()
-            for r in rows:
-                t = r.tableName
-                if t not in seen:
-                    seen.add(t)
-                    resolved.append(t)
+            for low, canonical in existing_lower.items():
+                if low not in seen:
+                    seen.add(low)
+                    resolved.append(canonical)
         elif '*' in tok:
-            rows = spark.sql(
-                "SHOW TABLES IN {{0}} LIKE '{{1}}'".format(db, tok)
-            ).collect()
-            for r in rows:
-                t = r.tableName
-                if t not in seen:
-                    seen.add(t)
-                    resolved.append(t)
+            tok_lower = tok.lower()
+            matched = 0
+            for low, canonical in existing_lower.items():
+                if fnmatch.fnmatch(low, tok_lower):
+                    if low not in seen:
+                        seen.add(low)
+                        resolved.append(canonical)
+                        matched += 1
+            if matched == 0:
+                print("WARNING: wildcard token '{{0}}' matched no existing tables in {{1}}".format(tok, db))
         else:
-            if tok not in seen:
-                seen.add(tok)
-                resolved.append(tok)
+            tok_lower = tok.lower()
+            if tok_lower in seen:
+                continue
+            seen.add(tok_lower)
+            if tok_lower in existing_lower:
+                resolved.append(existing_lower[tok_lower])
+            else:
+                missing.append(tok)
 
-    return resolved
-
-table_list = resolve_tokens(spark, src_db, tokens)
+    return resolved, missing
 
 metadata = []
+
+if not database_exists(spark, src_db):
+    print("WARNING: source database '{{0}}' does not exist on the cluster. Emitting DATABASE_NOT_FOUND records for all tokens.".format(src_db))
+    for tok in tokens:
+        record = _default_metadata_record(tok)
+        record["error"] = "Source database '{{0}}' does not exist on the cluster".format(src_db)
+        record["error_type"] = "DATABASE_NOT_FOUND"
+        metadata.append(record)
+    table_list = []
+    missing_tables = []
+else:
+    table_list, missing_tables = resolve_tokens(spark, src_db, tokens)
+
+for tbl in missing_tables:
+    record = _default_metadata_record(tbl)
+    record["error"] = "Table '{{0}}' not found in source database '{{1}}'".format(tbl, src_db)
+    record["error_type"] = "TABLE_NOT_FOUND"
+    metadata.append(record)
 
 for tbl in table_list:
     loc = None
@@ -660,7 +742,6 @@ for tbl in table_list:
     input_format = None
     serde_properties = {{}}
     in_serde_section = False
-    filter_expr = "{filter_expr_escaped}"
     partition_filter_active = False
     filtered_partitions = []
     filtered_source_size = 0
@@ -668,6 +749,8 @@ for tbl in table_list:
     row_count = 0
     full_row_count = 0
     full_partition_count = 0
+    # Race window: a table dropped between SHOW TABLES and DESCRIBE here is
+    # classified FAILED (not TABLE_NOT_FOUND). Tolerable; retry resolves it.
     try:
         desc_df = spark.sql(
             "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
@@ -775,7 +858,6 @@ for tbl in table_list:
             pass
 
         # Apply partition filter
-        filter_expr = "{filter_expr_escaped}"
         full_partition_count = len(metastore_partitions)
         full_row_count = row_count
 
@@ -856,31 +938,27 @@ for tbl in table_list:
         is_partitioned = partition_definition
         unregistered_partitions = partition_definition and registered_partition_count == 0
 
-        schema_df = spark.sql(
-            "DESCRIBE {{0}}.{{1}}".format(src_db, tbl)
-        )
-        schema = []
-        for row in schema_df.collect():
-            col_name = row.col_name.strip() if row.col_name else ""
-            data_type = row.data_type.strip() if row.data_type else ""
+        # Use spark.table().schema instead of DESCRIBE to avoid Spark's
+        # simpleString() truncation (default maxToStringFields=25) which
+        # renders wide structs as "struct<f1:t1,...N more fields>" — a
+        # literal string that is not valid DDL and causes PARSE_SYNTAX_ERROR
+        # downstream in create_hive_tables.
+        # simpleString() returns the full colon-separated Hive catalog
+        # notation (e.g. struct<a:int,b:string>) and is available on all
+        # PySpark versions. catalogString() is equivalent but was added to
+        # the Python DataType API only in newer PySpark releases.
+        # hive_type_to_spark_ddl() in create_hive_tables converts the
+        # colon-separated notation to space-separated Spark SQL DDL.
+        tbl_schema = spark.table("{{0}}.{{1}}".format(src_db, tbl)).schema
+        schema = [
+            {{"name": f.name, "type": f.dataType.simpleString()}}
+            for f in tbl_schema.fields
+            if f.name not in partition_cols_from_describe
+        ]
 
-            if col_name.startswith("#") or col_name == "" or col_name == "col_name":
-                break
-
-            schema.append({{"name": col_name, "type": data_type}})
-
-        if {include_db_in_path}:
-            s3_location = "{{0}}/{{1}}/{{2}}".format(dest_bucket, dest_db, tbl)
-        else:
-            s3_location = "{{0}}/{{1}}".format(dest_bucket, tbl)
-
-        metadata.append({{
-            "source_database": src_db,
-            "source_table": tbl,
-            "dest_database": dest_db,
-            "dest_bucket": dest_bucket,
+        record = _default_metadata_record(tbl)
+        record.update({{
             "source_location": loc or "",
-            "s3_location": s3_location,
             "file_format": file_format,
             "schema": schema,
             "partitions": filtered_partitions,
@@ -893,7 +971,6 @@ for tbl in table_list:
             "source_total_size_bytes": source_total_size,
             "serde_properties": serde_properties,
             "source_file_count": source_file_count,
-            "partition_filter": filter_expr or None,
             "filtered_partitions": filtered_partitions,
             "partition_filter_active": partition_filter_active,
             "filtered_row_count": row_count,
@@ -903,28 +980,12 @@ for tbl in table_list:
             "full_table_partition_count": full_partition_count,
             "partition_file_counts": partition_file_counts,
         }})
+        metadata.append(record)
 
     except Exception as e:
-        metadata.append({{
-            "source_database": src_db,
-            "source_table": tbl,
-            "dest_database": dest_db,
-            "dest_bucket": dest_bucket,
-            "source_location": "",
-            "s3_location": (dest_bucket + "/" + dest_db + "/" + tbl) if {include_db_in_path} else (dest_bucket + "/" + tbl),
-            "file_format": "PARQUET",
-            "schema": [],
-            "partitions": [],
-            "partition_columns": "",
-            "partition_count": 0,
-            "row_count": 0,
-            "is_partitioned": False,
-            "unregistered_partitions": False,
-            "table_type": "UNKNOWN",
-            "source_total_size_bytes": 0,
-            "source_file_count": 0,
+        record = _default_metadata_record(tbl)
+        record.update({{
             "serde_properties": serde_properties,
-            "partition_filter": filter_expr or None,
             "filtered_partitions": filtered_partitions,
             "partition_filter_active": partition_filter_active,
             "filtered_row_count": row_count,
@@ -932,9 +993,10 @@ for tbl in table_list:
             "filtered_file_count": filtered_file_count,
             "full_table_row_count": full_row_count,
             "full_table_partition_count": full_partition_count,
-            "partition_file_counts": {{}},
-            "error": str(e)[:500]
+            "error": str(e)[:500],
+            "error_type": "FAILED",
         }})
+        metadata.append(record)
 
 print ("===JSON_START===")
 sys.stdout.flush()
@@ -1016,16 +1078,27 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
             logger.info(
                 f"  Discovered: {src_db}.{t['source_table']} | format={t['file_format']} | partitions={t['partition_count']} | rows={t['row_count']} | size={t.get('source_total_size_bytes',0)/(1024**2):.1f} MB"
             )
+        elif t.get("error_type") == "TABLE_NOT_FOUND":
+            logger.warning(
+                f"  Table not found on source: {src_db}.{t['source_table']} — will be skipped in downstream phases"
+            )
+        elif t.get("error_type") == "DATABASE_NOT_FOUND":
+            logger.warning(
+                f"  Source database not found: {src_db} (token='{t['source_table']}') — will be skipped in downstream phases"
+            )
         else:
             logger.error(
                 f"  Discovery FAILED: {src_db}.{t['source_table']} | error={t.get('error','')[:200]}"
             )
-    failed_discoveries = [t for t in metadata if "error" in t]
 
-    if failed_discoveries:
-        failed_count = len(failed_discoveries)
+    real_failures = [
+        t for t in metadata
+        if "error" in t and t.get("error_type") not in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND")
+    ]
+    if real_failures:
+        failed_count = len(real_failures)
         total_count = len(metadata)
-        failed_names = ", ".join([t["source_table"] for t in failed_discoveries[:3]])
+        failed_names = ", ".join([t["source_table"] for t in real_failures[:3]])
 
         raise Exception(
             f"Discovery failed for {failed_count}/{total_count} table(s) in {src_db}: {failed_names}. "
@@ -1058,6 +1131,29 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
     discovery_duration = discovery.get("_task_duration", 0.0)
 
     for t in discovery["tables"]:
+        error_type = t.get("error_type")
+        is_missing = error_type in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND")
+        disc_status = error_type if is_missing else "COMPLETED"
+        if is_missing:
+            default_msg = (
+                "Source database does not exist on the cluster"
+                if error_type == "DATABASE_NOT_FOUND"
+                else "Table not found on source"
+            )
+            err_msg_escaped = (
+                (t.get("error") or default_msg)
+                .replace("'", "''")[:2000]
+            )
+            overall_status_insert = f"'{error_type}'"
+            error_msg_insert = f"'{err_msg_escaped}'"
+            overall_status_update = f"'{error_type}'"
+            error_msg_update = f"'{err_msg_escaped}'"
+        else:
+            overall_status_insert = "NULL"
+            error_msg_insert = "NULL"
+            overall_status_update = "NULL"
+            error_msg_update = "NULL"
+
         parts = t.get("partitions", [])
         if isinstance(parts, str):
             parts = [p for p in parts.split(",") if p]
@@ -1113,7 +1209,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                 spark,
                 f"""
                 UPDATE {tracking_db}.migration_table_status
-                SET discovery_status = 'COMPLETED',
+                SET discovery_status = '{disc_status}',
                     discovery_completed_at = current_timestamp(),
                     discovery_duration_seconds = {discovery_duration},
                     source_location = '{t['source_location']}',
@@ -1128,6 +1224,8 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     filtered_partition_count = {filtered_partition_count_sql},
                     full_table_row_count = {full_table_row_count},
                     full_table_partition_count = {full_table_partition_count},
+                    overall_status = {overall_status_update},
+                    error_message = {error_msg_update},
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
                   AND source_database = '{t['source_database']}'
@@ -1175,7 +1273,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     {tracking_partition_count}, {str(t.get('unregistered_partitions', False)).lower()},
                     NULL, NULL, NULL, NULL, NULL, NULL,
                     NULL, NULL,
-                    'COMPLETED', current_timestamp(), {discovery_duration},
+                    '{disc_status}', current_timestamp(), {discovery_duration},
                     NULL, NULL, NULL, NULL,
                     NULL, NULL, NULL,
                     NULL, NULL, NULL,
@@ -1184,7 +1282,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     NULL, NULL,
                     NULL, NULL, NULL,
                     NULL,
-                    NULL, NULL,
+                    {overall_status_insert}, {error_msg_insert},
                     current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count},
                     NULL
                 )
@@ -1220,6 +1318,16 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
     results = []
     for t in tables:
+        if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+            results.append(
+                {
+                    "source_database": t["source_database"],
+                    "source_table": t["source_table"],
+                    "dest_database": t["dest_database"],
+                    "status": t["error_type"],
+                }
+            )
+            continue
         if t.get("error"):
             results.append(
                 {
@@ -1269,16 +1377,17 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
             distcp_started_at = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-            filtered_partitions_for_mkdir = (
+            (
                 t.get("filtered_partitions", [])
                 if t.get("partition_filter_active")
                 else []
             )
 
-            if filtered_partitions_for_mkdir:
+            all_partitions = t.get("filtered_partitions", [])
+            if all_partitions:
                 mkdir_cmds = " && ".join(
                     f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}/{p}' 2>/dev/null || true"
-                    for p in filtered_partitions_for_mkdir
+                    for p in all_partitions
                 )
             else:
                 mkdir_cmds = f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}' 2>/dev/null || true"
@@ -1899,8 +2008,45 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
     run_id = distcp_result["run_id"]
     src_db = distcp_result["source_database"]
 
+    # Normalize: a COMPLETED distcp against a source with zero rows is
+    # functionally an EMPTY_SOURCE. Keyed on row_count rather than
+    # source_file_count because getContentSummary().getFileCount() includes
+    # _SUCCESS/.crc markers — using files-count makes the normalization flip
+    # with marker presence, which is the original flake source.
+    # partition_filter is part of the row identity (multi-slice runs emit
+    # several discovery entries differing only by filter), so key on it too.
+    _tables_by_key = {}
+    for t in distcp_result.get("tables", []):
+        key = (
+            t.get("source_database"),
+            t.get("source_table"),
+            t.get("dest_database"),
+            t.get("partition_filter"),
+        )
+        if None in (key[0], key[1], key[2]):
+            continue
+        _tables_by_key[key] = t
     for r in distcp_result.get("distcp_results", []):
-        if r.get("status") in ("SKIPPED", "EMPTY_SOURCE"):
+        if r.get("status") != "COMPLETED":
+            continue
+        key = (
+            r.get("source_database"),
+            r.get("source_table"),
+            r.get("dest_database"),
+            r.get("partition_filter"),
+        )
+        src_t = _tables_by_key.get(key)
+        if src_t is None:
+            continue
+        if (
+            src_t.get("row_count", 0) == 0
+            and r.get("bytes_copied", 0) == 0
+            and r.get("files_copied", 0) == 0
+        ):
+            r["status"] = "EMPTY_SOURCE"
+
+    for r in distcp_result.get("distcp_results", []):
+        if r.get("status") in ("SKIPPED", "EMPTY_SOURCE", "TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             continue
         overall = "COPIED" if r["status"] == "COMPLETED" else "FAILED"
         error_msg = r.get("error", "").replace("'", "''") if r.get("error") else ""
@@ -1958,7 +2104,12 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 f"""
                 UPDATE {tracking_db}.migration_table_status
                 SET distcp_status = 'FAILED',
-                    overall_status = 'FAILED',
+                    overall_status = CASE
+                        WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
+                        WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
+                        WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                        ELSE 'FAILED'
+                    END,
                     error_message = '{per_table_error}',
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
@@ -2033,7 +2184,13 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
             spark,
             f"""
             UPDATE {tracking_db}.migration_table_status
-            SET distcp_status='FAILED', overall_status='FAILED',
+            SET distcp_status='FAILED',
+                overall_status = CASE
+                    WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
+                    WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                    ELSE 'FAILED'
+                END,
                 error_message=COALESCE(error_message,'S3 copy task did not process this table'),
                 updated_at=current_timestamp()
             WHERE run_id='{run_id}' AND source_database='{src_db}'
@@ -2067,6 +2224,19 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
     for t in tables:
         tbl = t["source_table"]
         dest_db = t.get("dest_database") or distcp_result["dest_database"]
+
+        if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+            results.append(
+                {
+                    "source_table": tbl,
+                    "dest_database": dest_db,
+                    "status": t["error_type"],
+                    "action": "skipped_not_found",
+                    "existed": False,
+                    "error": None,
+                }
+            )
+            continue
 
         if dest_db not in created_dbs:
             spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
@@ -2152,6 +2322,29 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                     f"[HiveTable] Could not add partition {partition_spec} "
                                     f"to {full_name}: {str(add_e)[:200]}"
                                 )
+                    elif distcp_status == "EMPTY_SOURCE" and t.get("partitions"):
+                        for part_str in t["partitions"]:
+                            part_kv = {}
+                            for segment in part_str.split("/"):
+                                if "=" in segment:
+                                    k, _, v = segment.partition("=")
+                                    part_kv[k.strip()] = v.strip()
+                            if not part_kv:
+                                continue
+                            partition_spec = ", ".join(
+                                f"{k}='{v}'" for k, v in part_kv.items()
+                            )
+                            part_location = f"{s3_loc}/{part_str}"
+                            try:
+                                spark.sql(
+                                    f"ALTER TABLE {full_name} ADD IF NOT EXISTS "
+                                    f"PARTITION ({partition_spec}) LOCATION '{part_location}'"
+                                )
+                            except Exception as add_e:
+                                logger.warning(
+                                    f"[HiveTable] Could not add partition {partition_spec} "
+                                    f"to {full_name}: {str(add_e)[:200]}"
+                                )
                     else:
                         spark.sql(f"MSCK REPAIR TABLE {full_name}")
                 spark.sql(f"REFRESH TABLE {full_name}")
@@ -2173,7 +2366,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
 
                 if schema_list:
                     cols = [
-                        f"`{c['name']}` {c['type']}"
+                        f"`{c['name']}` {hive_type_to_spark_ddl(c['type'])}"
                         for c in schema_list
                         if c.get("name") and c["name"] not in part_col_list
                     ]
@@ -2211,7 +2404,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                         ptype = "STRING"
                         for c in schema_list:
                             if c.get("name") == pc:
-                                ptype = c.get("type", "STRING")
+                                ptype = hive_type_to_spark_ddl(c.get("type", "STRING"))
                                 break
                         pdefs.append(f"`{pc}` {ptype}")
                     part_clause = f"PARTITIONED BY ({', '.join(pdefs)})"
@@ -2254,6 +2447,29 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                 if "=" in segment:
                                     k, _, v = segment.partition("=")
                                     part_kv[k.strip()] = v.strip()
+                            partition_spec = ", ".join(
+                                f"{k}='{v}'" for k, v in part_kv.items()
+                            )
+                            part_location = f"{s3_loc}/{part_str}"
+                            try:
+                                spark.sql(
+                                    f"ALTER TABLE {full_name} ADD IF NOT EXISTS "
+                                    f"PARTITION ({partition_spec}) LOCATION '{part_location}'"
+                                )
+                            except Exception as add_e:
+                                logger.warning(
+                                    f"[HiveTable] Could not add partition {partition_spec} "
+                                    f"to {full_name}: {str(add_e)[:200]}"
+                                )
+                    elif distcp_status == "EMPTY_SOURCE" and t.get("partitions"):
+                        for part_str in t["partitions"]:
+                            part_kv = {}
+                            for segment in part_str.split("/"):
+                                if "=" in segment:
+                                    k, _, v = segment.partition("=")
+                                    part_kv[k.strip()] = v.strip()
+                            if not part_kv:
+                                continue
                             partition_spec = ", ".join(
                                 f"{k}='{v}'" for k, v in part_kv.items()
                             )
@@ -2339,6 +2555,8 @@ def update_table_create_status(table_result: dict, spark) -> dict:
     table_duration = table_result.get("_task_duration", 0.0)
 
     for r in table_result.get("table_results", []):
+        if r.get("status") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+            continue
         per_table_dest_db = r.get("dest_database", table_result["dest_database"])
         overall = (
             "TABLE_CREATED"
@@ -2358,6 +2576,8 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
                     WHEN overall_status = 'EMPTY_SOURCE' THEN overall_status
+                    WHEN overall_status = 'TABLE_NOT_FOUND' THEN overall_status
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN overall_status
                     ELSE '{overall}'
                 END,
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
@@ -2379,7 +2599,12 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                 f"""
                 UPDATE {tracking_db}.migration_table_status
                 SET table_create_status = 'FAILED',
-                    overall_status = 'FAILED',
+                    overall_status = CASE
+                        WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
+                        WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
+                        WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                        ELSE 'FAILED'
+                    END,
                     error_message = '{per_table_error}',
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
@@ -2417,7 +2642,12 @@ def update_table_create_status(table_result: dict, spark) -> dict:
             f"""
             UPDATE {tracking_db}.migration_table_status
             SET table_create_status = 'FAILED',
-                overall_status = 'FAILED',
+                overall_status = CASE
+                    WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
+                    WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                    ELSE 'FAILED'
+                END,
                 error_message = COALESCE(error_message, 'Table creation task did not process this table'),
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
@@ -2460,6 +2690,21 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
         per_table_dest_db = t.get("dest_database", dest_db)
         dest_tbl = f"{per_table_dest_db}.{tbl}"
 
+        if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+            validation_results.append(
+                {
+                    "source_table": tbl,
+                    "dest_database": per_table_dest_db,
+                    "status": t["error_type"],
+                    "error": (
+                        "Source database does not exist on the cluster"
+                        if t["error_type"] == "DATABASE_NOT_FOUND"
+                        else "Table not found on source"
+                    ),
+                }
+            )
+            continue
+
         pf_val_upstream = (t.get("partition_filter") or "").replace("'", "''")
         pf_clause_upstream = (
             f"AND partition_filter = '{pf_val_upstream}'"
@@ -2479,6 +2724,73 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
 
         if upstream:
             row = upstream[0]
+            # EMPTY_SOURCE is a successful terminal state; check it before the
+            # upstream-failure branch so a stray overall_status='FAILED' set by
+            # a catchall UPDATE doesn't drown out a valid empty-source result.
+            # But only take the shortcut if create_hive_tables actually ran —
+            # otherwise the destination shell wasn't created and reporting
+            # schema_match=True would be a lie.
+            if row["distcp_status"] == "EMPTY_SOURCE" and row["table_create_status"] not in ("FAILED", "SKIPPED"):
+                source_partition_count = t.get("partition_count", 0)
+                dest_partition_count = 0
+                try:
+                    dest_parts = spark.sql(f"SHOW PARTITIONS {dest_tbl}").collect()
+                    dest_partition_count = len(dest_parts)
+                except Exception:
+                    pass
+
+                partition_count_match = source_partition_count == dest_partition_count
+
+                src_schema = t.get("schema", [])
+                partition_cols = set(
+                    c.strip() for c in (t.get("partition_columns") or "").split(",") if c.strip()
+                )
+                schema_match = True
+                schema_diffs = []
+                try:
+                    dest_schema = [
+                        {"name": f.name, "type": f.dataType.simpleString()}
+                        for f in spark.table(dest_tbl).schema.fields
+                        if f.name not in partition_cols
+                    ]
+                    src_cols = {c["name"]: c["type"] for c in src_schema}
+                    dest_cols = {c["name"]: c["type"] for c in dest_schema}
+                    for col_name, col_type in src_cols.items():
+                        if col_name not in dest_cols:
+                            schema_match = False
+                            schema_diffs.append(f"Missing column: {col_name}")
+                        elif dest_cols[col_name] != col_type:
+                            schema_match = False
+                            schema_diffs.append(f"Type mismatch for {col_name}: {col_type} vs {dest_cols[col_name]}")
+                    for col_name in dest_cols:
+                        if col_name not in src_cols:
+                            schema_match = False
+                            schema_diffs.append(f"Extra column in dest: {col_name}")
+                except Exception as e:
+                    schema_match = False
+                    schema_diffs.append(f"Schema check failed: {str(e)[:200]}")
+
+                validation_results.append({
+                    "source_table": tbl,
+                    "dest_database": per_table_dest_db,
+                    "status": "COMPLETED",
+                    "source_row_count": 0,
+                    "dest_hive_row_count": 0,
+                    "source_partition_count": source_partition_count,
+                    "dest_partition_count": dest_partition_count,
+                    "row_count_match": True,
+                    "partition_count_match": partition_count_match,
+                    "schema_match": schema_match,
+                    "schema_differences": "; ".join(schema_diffs) if schema_diffs else "",
+                    "error": None if (partition_count_match and schema_match) else
+                             "; ".join([
+                                 f"Partition count mismatch: source={source_partition_count}, dest={dest_partition_count}"
+                                 if not partition_count_match else "",
+                                 "; ".join(schema_diffs[:3]) if not schema_match else ""
+                             ]).strip("; "),
+                })
+                continue
+
             if (
                 row["distcp_status"] == "FAILED"
                 or row["table_create_status"] in ("FAILED", "SKIPPED")
@@ -2490,28 +2802,6 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                         "dest_database": per_table_dest_db,
                         "status": "SKIPPED",
                         "error": f"Skipped validation — upstream failure: {row['error_message']}",
-                    }
-                )
-                continue
-
-            if row["distcp_status"] == "EMPTY_SOURCE":
-                logger.info(
-                    f"[Validation] SKIPPING row-count query for {per_table_dest_db}.{tbl} "
-                )
-                validation_results.append(
-                    {
-                        "source_table": tbl,
-                        "dest_database": per_table_dest_db,
-                        "status": "COMPLETED",
-                        "source_row_count": 0,
-                        "dest_hive_row_count": 0,
-                        "source_partition_count": 0,
-                        "dest_partition_count": 0,
-                        "row_count_match": True,
-                        "partition_count_match": True,
-                        "schema_match": True,
-                        "schema_differences": "",
-                        "error": None,
                     }
                 )
                 continue
@@ -2593,13 +2883,18 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 f"[Validation] {per_table_dest_db}.{tbl} | source_rows={source_row_count} | dest_rows={dest_row_count} | source_parts={source_partition_count} | dest_parts={dest_partition_count}"
             )
 
-            # Schema comparison
+            # Schema comparison — use spark.table().schema to avoid DESCRIBE truncation,
+            # and exclude partition columns (DESCRIBE includes them; source schema does not)
             src_schema = t.get("schema", [])
-            dest_schema_df = spark.sql(f"DESCRIBE {dest_tbl}")
+            partition_cols = set(
+                c.strip()
+                for c in (t.get("partition_columns") or "").split(",")
+                if c.strip()
+            )
             dest_schema = [
-                {"name": row.col_name, "type": row.data_type}
-                for row in dest_schema_df.collect()
-                if row.col_name and not row.col_name.startswith("#")
+                {"name": f.name, "type": f.dataType.simpleString()}
+                for f in spark.table(dest_tbl).schema.fields
+                if f.name not in partition_cols
             ]
 
             # Compare schemas
@@ -2809,10 +3104,14 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
                     WHEN overall_status = 'EMPTY_SOURCE' THEN overall_status
+                    WHEN overall_status = 'TABLE_NOT_FOUND' THEN overall_status
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN overall_status
                     ELSE '{final_overall_status}'
                 END,
                 error_message = CASE
                     WHEN overall_status = 'FAILED' THEN error_message
+                    WHEN overall_status = 'TABLE_NOT_FOUND' THEN error_message
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN error_message
                     ELSE {error_message_sql}
                 END,
                 updated_at = current_timestamp()
@@ -2874,6 +3173,8 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN 'FAILED'
                     WHEN overall_status = 'EMPTY_SOURCE' THEN 'EMPTY_SOURCE'
+                    WHEN overall_status = 'TABLE_NOT_FOUND' THEN 'TABLE_NOT_FOUND'
+                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
                     ELSE 'VALIDATION_FAILED'
                 END,
                 error_message = COALESCE(error_message, 'Validation task did not process this table'),
@@ -2923,6 +3224,8 @@ def generate_html_report(run_id: str, spark) -> str:
         in ["VALIDATED", "VALIDATED_WITH_WARNINGS", "TABLE_CREATED", "EMPTY_SOURCE"]
     )
     failed_tables = sum(1 for t in table_status if "FAILED" in (t.overall_status or ""))
+    not_found_tables = sum(1 for t in table_status if t.overall_status == "TABLE_NOT_FOUND")
+    db_not_found_tables = sum(1 for t in table_status if t.overall_status == "DATABASE_NOT_FOUND")
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (
         1024**3
     )
@@ -3042,6 +3345,14 @@ def generate_html_report(run_id: str, spark) -> str:
             background-color: #e8f4fd;
             color: #1a6fa3;
         }}
+        .status-not-found {{
+            background-color: #e2e3e5;
+            color: #6c757d;
+        }}
+        .status-db-not-found {{
+            background-color: #ffe0b2;
+            color: #8a4b00;
+        }}
         .status-warning {{
             background-color: #fff3cd;
             color: #856404;
@@ -3113,6 +3424,14 @@ def generate_html_report(run_id: str, spark) -> str:
             <div class="summary-card warning">
                 <h3>FAILED</h3>
                 <p class="value">{failed_tables}</p>
+            </div>
+            <div class="summary-card">
+                <h3>NOT FOUND ON SOURCE</h3>
+                <p class="value">{not_found_tables}</p>
+            </div>
+            <div class="summary-card">
+                <h3>DATABASE NOT FOUND</h3>
+                <p class="value">{db_not_found_tables}</p>
             </div>
             <div class="summary-card info">
                 <h3>TOTAL DATA</h3>
@@ -3260,14 +3579,27 @@ def generate_html_report(run_id: str, spark) -> str:
 
     for t in table_status:
         status = t.overall_status or ""
-        if "VALIDATED_WITH_WARNINGS" in status:
+        if status == "TABLE_NOT_FOUND":
+            status_class = "status-not-found"
+            status_label = status
+        elif status == "DATABASE_NOT_FOUND":
+            status_class = "status-db-not-found"
+            status_label = status
+        elif "VALIDATED_WITH_WARNINGS" in status:
             status_class = "status-warning"
+            status_label = status
         elif "EMPTY_SOURCE" in status:
             status_class = "status-empty"
+            status_label = status
         elif "VALIDATED" in status or "TABLE_CREATED" in status:
             status_class = "status-completed"
+            status_label = status
+        elif status == "SKIPPED":
+            status_class = "status-skipped"
+            status_label = status
         else:
             status_class = "status-failed"
+            status_label = status
 
         discovery_dur = (
             f"{t.discovery_duration_seconds:.1f}s"
@@ -3327,7 +3659,7 @@ def generate_html_report(run_id: str, spark) -> str:
                 <tr>
                     <td>{t.source_database}</td>
                     <td><strong>{t.source_table}</strong></td>
-                    <td><span class="status-badge {status_class}">{t.overall_status}</span></td>
+                    <td><span class="status-badge {status_class}">{status_label}</span></td>
                     <td>{pf_display}</td>
                     <td class="duration">{discovery_dur}</td>
                     <td class="duration">{distcp_dur}{distcp_detail}{yarn_app_detail}</td>
@@ -3363,7 +3695,29 @@ def generate_html_report(run_id: str, spark) -> str:
             <tbody>
 """
 
+    def _not_found_row(t, colspan):
+        pf = t.partition_filter or '<span style="color:#bdc3c7;font-size:11px;">—</span>'
+        if t.overall_status == "DATABASE_NOT_FOUND":
+            badge_class = "status-db-not-found"
+            badge_label = "DATABASE_NOT_FOUND"
+        else:
+            badge_class = "status-not-found"
+            badge_label = "TABLE_NOT_FOUND"
+        return f"""
+                    <tr>
+                        <td>{t.source_database}</td>
+                        <td><strong>{t.source_table}</strong></td>
+                        <td>{pf}</td>
+                        <td colspan="{colspan}">
+                            <span class="status-badge {badge_class}">{badge_label}</span>
+                        </td>
+                    </tr>
+    """
+
     for t in table_status:
+        if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+            html += _not_found_row(t, 7)
+            continue
         if not t.validation_status:
             html += f"""
                     <tr>
@@ -3443,6 +3797,9 @@ def generate_html_report(run_id: str, spark) -> str:
 """
 
     for t in table_status:
+        if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+            html += _not_found_row(t, 10)
+            continue
         if not t.distcp_status:
             html += f"""
                     <tr>
@@ -3521,6 +3878,8 @@ def generate_html_report(run_id: str, spark) -> str:
 """
 
     for t in table_status:
+        if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+            continue
         data_gb = (t.s3_total_size_bytes_after or 0) / (1024**3)
         distcp_speed = (
             (t.s3_total_size_bytes_after or 0)
@@ -3584,15 +3943,16 @@ def finalize_run(run_id: str, spark) -> dict:
     config = get_config()
     tracking_db = config["tracking_database"]
 
-    stats = {"total": 0, "successful": 0, "failed": 0}
+    stats = {"total": 0, "successful": 0, "failed": 0, "not_found": 0}
     final_status = "FAILED"
 
     try:
         stats_result = spark.sql(f"""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED', 'EMPTY_SOURCE') THEN 1 ELSE 0 END) as successful,
-                SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed
+                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED', 'EMPTY_SOURCE', 'TABLE_NOT_FOUND', 'DATABASE_NOT_FOUND') THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN overall_status IN ('TABLE_NOT_FOUND', 'DATABASE_NOT_FOUND') THEN 1 ELSE 0 END) as not_found
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'
         """).collect()
@@ -3608,10 +3968,14 @@ def finalize_run(run_id: str, spark) -> dict:
                 "total": stats_result[0]["total"] or 0,
                 "successful": stats_result[0]["successful"] or 0,
                 "failed": stats_result[0]["failed"] or 0,
+                "not_found": stats_result[0]["not_found"] or 0,
             }
-            final_status = (
-                "COMPLETED" if stats["failed"] == 0 else "COMPLETED_WITH_FAILURES"
-            )
+            if stats["failed"] > 0:
+                final_status = "COMPLETED_WITH_FAILURES"
+            elif stats["not_found"] > 0:
+                final_status = "COMPLETED_WITH_MISSING"
+            else:
+                final_status = "COMPLETED"
 
     except Exception as e:
         logger.error(f"[finalize_run] Failed to query migration_table_status: {str(e)}")
