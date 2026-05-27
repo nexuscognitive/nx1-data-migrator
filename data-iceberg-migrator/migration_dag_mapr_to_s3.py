@@ -2743,7 +2743,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
 
                 src_schema = t.get("schema", [])
                 partition_cols = set(
-                    c.strip() for c in (t.get("partition_columns") or "").split(",") if c.strip()
+                    c.strip().lower() for c in (t.get("partition_columns") or "").split(",") if c.strip()
                 )
                 schema_match = True
                 schema_diffs = []
@@ -2751,10 +2751,10 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     dest_schema = [
                         {"name": f.name, "type": f.dataType.simpleString()}
                         for f in spark.table(dest_tbl).schema.fields
-                        if f.name not in partition_cols
+                        if f.name.lower() not in partition_cols
                     ]
-                    src_cols = {c["name"]: c["type"] for c in src_schema}
-                    dest_cols = {c["name"]: c["type"] for c in dest_schema}
+                    src_cols = {c["name"].lower(): c["type"] for c in src_schema}
+                    dest_cols = {c["name"].lower(): c["type"] for c in dest_schema}
                     for col_name, col_type in src_cols.items():
                         if col_name not in dest_cols:
                             schema_match = False
@@ -2887,22 +2887,22 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             # and exclude partition columns (DESCRIBE includes them; source schema does not)
             src_schema = t.get("schema", [])
             partition_cols = set(
-                c.strip()
+                c.strip().lower()
                 for c in (t.get("partition_columns") or "").split(",")
                 if c.strip()
             )
             dest_schema = [
                 {"name": f.name, "type": f.dataType.simpleString()}
                 for f in spark.table(dest_tbl).schema.fields
-                if f.name not in partition_cols
+                if f.name.lower() not in partition_cols
             ]
 
             # Compare schemas
             schema_match = True
             schema_diffs = []
 
-            src_cols = {c["name"]: c["type"] for c in src_schema}
-            dest_cols = {c["name"]: c["type"] for c in dest_schema}
+            src_cols = {c["name"].lower(): c["type"] for c in src_schema}
+            dest_cols = {c["name"].lower(): c["type"] for c in dest_schema}
 
             for col_name, col_type in src_cols.items():
                 if col_name not in dest_cols:
