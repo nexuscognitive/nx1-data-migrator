@@ -39,6 +39,7 @@ else:
     logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
 
 def _resolve_dag_owner() -> str:
+    """Read portal username from Airflow Variable at DAG parse/trigger time."""
     try:
         from airflow.models import Variable
         owner = Variable.get('migration_dag_owner', default_var='')
@@ -49,10 +50,10 @@ def _resolve_dag_owner() -> str:
     return 'data-migration'
 
 default_args = {
-    'owner': _resolve_dag_owner(),
-    'depends_on_past': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
+    "owner": _resolve_dag_owner(),
+    "depends_on_past": False,
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5),
 }
 
 @task
@@ -100,7 +101,7 @@ def validate_prerequisites_folder_copy() -> dict:
 
             # 2. Hadoop DistCp
             logger.info("[2/3] Testing hadoop distcp availability...")
-            test_cmd = "hadoop distcp --help > /dev/null 2>&1 && echo DISTCP_OK || echo DISTCP_FAIL"
+            test_cmd = "hadoop distcp 2>&1 | grep -qi 'usage\\|distcp\\|options' && echo DISTCP_OK || echo DISTCP_FAIL"
             _, stdout, stderr = client.exec_command(_login_shell(test_cmd, config.get('cluster_type', 'MapR')), timeout=60)
             output = stdout.read().decode()
             stderr.read()
@@ -936,7 +937,7 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
 """
 
     portal_run_id = context.get('params', {}).get('run_id') or run_id
-    report_filename = f"{portal_run_id}_report.html"
+    report_filename = f"{portal_run_id}_data_copy_report.html"
     report_path = f"{report_location}/{report_filename}"
     hadoop_conf = spark._jsc.hadoopConfiguration()
     fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(

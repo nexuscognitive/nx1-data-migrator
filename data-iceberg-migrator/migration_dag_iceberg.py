@@ -39,6 +39,7 @@ else:
     logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
 
 def _resolve_dag_owner() -> str:
+    """Read portal username from Airflow Variable at DAG parse/trigger time."""
     try:
         from airflow.models import Variable
         owner = Variable.get('migration_dag_owner', default_var='')
@@ -49,10 +50,10 @@ def _resolve_dag_owner() -> str:
     return 'data-migration'
 
 default_args = {
-    'owner': _resolve_dag_owner(),
-    'depends_on_past': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
+    "owner": _resolve_dag_owner(),
+    "depends_on_past": False,
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5),
 }
 
 # =============================================================================

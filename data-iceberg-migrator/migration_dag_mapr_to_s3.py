@@ -53,8 +53,19 @@ else:
         f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults"
     )
 
+def _resolve_dag_owner() -> str:
+    """Read portal username from Airflow Variable at DAG parse/trigger time."""
+    try:
+        from airflow.models import Variable
+        owner = Variable.get('migration_dag_owner', default_var='')
+        if owner:
+            return owner
+    except Exception:
+        pass
+    return 'data-migration'
+
 default_args = {
-    "owner": "data-migration",
+    "owner": _resolve_dag_owner(),
     "depends_on_past": False,
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
@@ -993,24 +1004,6 @@ for tbl in table_list:
     except Exception as e:
         record = _default_metadata_record(tbl)
         record.update({{
-        metadata.append({{
-            "source_database": src_db,
-            "source_table": tbl,
-            "dest_database": dest_db,
-            "dest_bucket": dest_bucket,
-            "source_location": "",
-            "s3_location": dest_bucket.rstrip('/') + "/" + dest_db + "/" + tbl,
-            "file_format": "PARQUET",
-            "schema": [],
-            "partitions": [],
-            "partition_columns": "",
-            "partition_count": 0,
-            "row_count": 0,
-            "is_partitioned": False,
-            "unregistered_partitions": False,
-            "table_type": "UNKNOWN",
-            "source_total_size_bytes": 0,
-            "source_file_count": 0,
             "serde_properties": serde_properties,
             "filtered_partitions": filtered_partitions,
             "partition_filter_active": partition_filter_active,

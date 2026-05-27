@@ -1035,7 +1035,7 @@ def generate_s3_html_report(run_id: str, spark, **context) -> dict:
 </div></div></body></html>"""
 
     portal_run_id = context.get('params', {}).get('run_id') or run_id
-    report_filename = f"{portal_run_id}_report.html"
+    report_filename = f"{portal_run_id}_s3_report.html"
     report_path = f"{report_location}/{report_filename}"
     hadoop_conf = spark._jsc.hadoopConfiguration()
     fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
