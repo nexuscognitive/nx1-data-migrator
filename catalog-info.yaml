@@ -1,0 +1,17 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: nx1-data-migrator
+  description: Data platform migration tools (MapR/HDFS to S3/Iceberg) and access control automation
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+    github.com/project-slug: nexuscognitive/nx1-data-migrator
+  tags:
+    - python
+    - migration
+    - pyspark
+spec:
+  type: service
+  lifecycle: production
+  owner: nx1-platform-team
+  system: nx1-data-ops

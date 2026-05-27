@@ -1,103 +1,174 @@
+# -*- coding: utf-8 -*-
 """
 Pure-Python partition filtering and SQL clause helpers.
 """
-
+import fnmatch
 import re
+
 try:
-    from urllib import unquote as url_unquote      
+    from urllib.parse import unquote
 except ImportError:
-    from urllib.parse import unquote as url_unquote
+    from urllib import unquote
+
+
+def _normalize_filter_expr(filter_expr):
+    """
+    Convert path-style filter 'year=2024/month=1' to SQL-style
+    'year=2024 AND month=1'. If already SQL-style, return as-is.
+    Only triggers when '/' is present but no AND/OR/comparison operators.
+    """
+    if not filter_expr:
+        return filter_expr
+    if '/' in filter_expr and not re.search(r'\b(AND|OR)\b|[><!=]', filter_expr, re.IGNORECASE):
+        segments = filter_expr.split('/')
+        conditions = []
+        for seg in segments:
+            seg = seg.strip()
+            if seg == '*':
+                return filter_expr
+            if '=' in seg:
+                k, _, v = seg.partition('=')
+                v = v.strip()
+                if not (v.startswith("'") and v.endswith("'")):
+                    v = "'" + v + "'"
+                conditions.append(k.strip() + '=' + v)
+        if conditions:
+            return ' AND '.join(conditions)
+    return filter_expr
+
+_LAST_N_RE = re.compile(r'^last_n_partitions\s*=\s*(\d+)$', re.IGNORECASE)
+_GLOB_RE = re.compile(r'[\*\?]')
+_SQL_PRED_RE = re.compile(
+    r"(\w+)\s*(>=|<=|!=|=|>|<)\s*'([^']*)'$"
+    r"|(\w+)\s*(>=|<=|!=|=|>|<)\s*(\S+)$",
+)
+
+
+def _classify_term(term):
+    """
+    Return ('last_n', N) | ('glob', pattern) | ('sql', expr) | ('unknown', term).
+    """
+    term = term.strip()
+    m = _LAST_N_RE.match(term)
+    if m:
+        return ('last_n', int(m.group(1)))
+
+    if _GLOB_RE.search(term):
+        return ('glob', term)
+
+    if _SQL_PRED_RE.search(term) or re.search(r'\b(AND|OR)\b|[><!=]', term, re.IGNORECASE):
+        return ('sql', term)
+
+    return ('unknown', term)
+
+
+def _eval_filter(kv, expr):
+    """
+    Evaluate a simple SQL filter expression against a partition kv dict.
+    Supports: AND, OR, =, !=, >, >=, <, <=
+    Values are compared as strings, with numeric coercion attempted.
+    """
+    expr = expr.strip()
+
+    or_parts = re.split(r'\bOR\b', expr, flags=re.IGNORECASE)
+    if len(or_parts) > 1:
+        return any(_eval_filter(kv, part.strip()) for part in or_parts)
+
+    and_parts = re.split(r'\bAND\b', expr, flags=re.IGNORECASE)
+    if len(and_parts) > 1:
+        return all(_eval_filter(kv, part.strip()) for part in and_parts)
+
+    expr_stripped = expr.strip().strip('()')
+    m = re.match(
+        r"(\w+)\s*(>=|<=|!=|=|>|<)\s*'([^']*)'$"
+        r"|(\w+)\s*(>=|<=|!=|=|>|<)\s*(\S+)$",
+        expr_stripped
+    )
+    if not m:
+        return False
+
+    if m.group(1):
+        col, op, val = m.group(1), m.group(2), m.group(3)
+    else:
+        col, op, val = m.group(4), m.group(5), m.group(6)
+
+    actual = kv.get(col)
+    if actual is None:
+        return False
+
+    try:
+        a, b = float(actual), float(val)
+    except (ValueError, TypeError):
+        a, b = str(actual), str(val)
+
+    if op == '=':
+        return a == b
+    if op == '!=':
+        return a != b
+    if op == '>':
+        return a > b
+    if op == '>=':
+        return a >= b
+    if op == '<':
+        return a < b
+    if op == '<=':
+        return a <= b
+    return False
 
 
 def apply_partition_filter(partitions, filter_expr):
-    """Filter Hive partition strings against a filter expression."""
-
     if not filter_expr:
-        return partitions
+        return list(partitions)
 
-    def parse_partition(part_str):
-        result = {}
-        for segment in part_str.split('/'):
-            if '=' in segment:
-                k, _, v = segment.partition('=')
-                result[k.strip()] = url_unquote(v.strip())
-        return result
+    # Split on commas to get individual terms, then classify each
+    raw_terms = [t.strip() for t in filter_expr.split(',') if t.strip()]
+    if len(raw_terms) == 1:
+        raw_terms = [_normalize_filter_expr(raw_terms[0])]
 
-    def try_numeric(val):
-        try:
-            return int(val)
-        except ValueError:
-            return val
+    classified = [_classify_term(t) for t in raw_terms]
 
-    terms = [t.strip() for t in filter_expr.split(',') if t.strip()]
+    # Collect matched partitions per term, then union preserving order
     matched = set()
 
-    for term in terms:
-        m = re.match(r'^last_n_partitions=(\d+)$', term.strip())
-        if m:
-            for p in sorted(partitions, reverse=True)[:int(m.group(1))]:
+    for kind, value in classified:
+        if kind == 'last_n':
+            n = value
+            tail = partitions[-n:] if n < len(partitions) else list(partitions)
+            for p in tail:
                 matched.add(p)
-            continue
 
-        if not any(op in term for op in ('>=', '<=', '>', '<')):
-            if term.endswith('/*') or term.endswith('*'):
-                prefix = term.rstrip('*').rstrip('/')
-                for p in partitions:
-                    if p.startswith(prefix):
-                        matched.add(p)
-            else:
-                for p in partitions:
-                    if p == term:
-                        matched.add(p)
-            continue
-
-        op_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)(>=|<=|>|<)(.+)$', term.strip())
-        if op_match:
-            key = op_match.group(1)
-            op = op_match.group(2)
-            threshold_raw = op_match.group(3).strip()
-            threshold_is_prefix = threshold_raw.endswith('*')
-            threshold = threshold_raw.rstrip('*')
-            threshold_cmp = try_numeric(threshold)
+        elif kind == 'glob':
             for p in partitions:
-                pdict = parse_partition(p)
-                if key not in pdict:
-                    continue
-                pval = pdict[key]
-                pval_for_cmp = pval[:len(threshold)] if threshold_is_prefix else pval
-                pval_cmp = try_numeric(pval_for_cmp)
-                try:
-                    if (  # noqa: SIM114
-                        (op == '>=' and pval_cmp >= threshold_cmp)
-                        or (op == '<=' and pval_cmp <= threshold_cmp)
-                        or (op == '>'  and pval_cmp >  threshold_cmp)
-                        or (op == '<'  and pval_cmp <  threshold_cmp)
-                    ):
-                        matched.add(p)
-                except TypeError:
-                    if (  # noqa: SIM114
-                        (op == '>=' and pval_for_cmp >= threshold)
-                        or (op == '<=' and pval_for_cmp <= threshold)
-                        or (op == '>'  and pval_for_cmp >  threshold)
-                        or (op == '<'  and pval_for_cmp <  threshold)
-                    ):
-                        matched.add(p)
-            continue
+                if fnmatch.fnmatch(p, value):
+                    matched.add(p)
+
+        elif kind == 'sql':
+            sql_expr = _normalize_filter_expr(value)
+            for p in partitions:
+                kv = {}
+                for segment in p.split('/'):
+                    if '=' in segment:
+                        k, _, v = segment.partition('=')
+                        kv[k.strip()] = unquote(v.strip().strip("'\""))
+                if _eval_filter(kv, sql_expr):
+                    matched.add(p)
 
     return [p for p in partitions if p in matched]
 
 
 def partitions_to_where_clause(partitions):
-    """Convert partition strings to a SQL WHERE clause. Values are single-quote escaped."""
     if not partitions:
         return "1=0"
+
     clauses = []
     for part_str in partitions:
         conditions = []
-        for segment in part_str.split('/'):
+        for segment in part_str.strip().split('/'):
             if '=' in segment:
                 k, _, v = segment.partition('=')
-                conditions.append("`%s`='%s'" % (k.strip(), v.replace("'", "''").strip()))
+                v_clean = unquote(v.strip()).replace("'", "''")
+                conditions.append("`%s`='%s'" % (k.strip(), v_clean))
         if conditions:
             clauses.append("(" + " AND ".join(conditions) + ")")
+
     return " OR ".join(clauses) if clauses else "1=1"

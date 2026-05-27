@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+  <property>
+    <n>javax.jdo.option.ConnectionURL</n>
+    <value>jdbc:derby:;databaseName=/opt/hive/metastore_db;create=true</value>
+  </property>
+  <property>
+    <n>javax.jdo.option.ConnectionDriverName</n>
+    <value>org.apache.derby.jdbc.EmbeddedDriver</value>
+  </property>
+  <property>
+    <n>hive.metastore.warehouse.dir</n>
+    <value>hdfs://localhost:9000/user/hive/warehouse</value>
+  </property>
+  <property>
+    <n>hive.server2.enable.doAs</n>
+    <value>false</value>
+  </property>
+  <property>
+    <n>datanucleus.schema.autoCreateAll</n>
+    <value>true</value>
+  </property>
+  <property>
+    <n>hive.metastore.schema.verification</n>
+    <value>false</value>
+  </property>
+  <!-- Standalone metastore thrift URI. The entrypoint starts the metastore
+       thrift service first (it takes the Derby lock), then starts HiveServer2
+       pointing at this URI. PySpark also reads this from /opt/spark/conf/hive-site.xml
+       (copied at build time) so it connects via thrift instead of opening
+       Derby directly — avoiding the XSDB6 lock conflict. -->
+  <property>
+    <n>hive.metastore.uris</n>
+    <value>thrift://localhost:9083</value>
+  </property>
+</configuration>

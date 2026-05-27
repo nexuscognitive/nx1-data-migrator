@@ -1,0 +1,8 @@
+persona: api-dev
+
+setup:
+  - python -m venv .venv
+  - source .venv/bin/activate && pip install ".[dev]"
+
+start:
+  - source .venv/bin/activate

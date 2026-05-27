@@ -1,0 +1,19 @@
+services:
+  mapr-edge:
+    build: .
+    container_name: mapr-edge-node
+    hostname: mapr-edge-node
+    ports:
+      - "2223:22"       # offset from hadoop-edge-node (2222) to allow both running simultaneously
+      - "8089:8088"
+      - "9871:9870"
+      - "10001:10000"
+    volumes:
+      - mapr_data:/hadoop/data
+    environment:
+      - JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+    stdin_open: true
+    tty: true
+
+volumes:
+  mapr_data:

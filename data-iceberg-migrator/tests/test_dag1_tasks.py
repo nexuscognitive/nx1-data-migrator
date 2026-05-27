@@ -15,9 +15,9 @@ class TestValidatePrerequisites:
         hook, client, stdout_mock, _ = mock_ssh_hook
         responses = [
             (MagicMock(), mock_ssh_stdout(0, b'SSH_TEST_OK'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'PySpark 3.4.0'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'Hive 3.1.0'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'Hadoop 3.3.0\nHADOOP_FS_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b'CLUSTER_AUTH_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b'PYSPARK_HIVE_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b'HADOOP_FS_OK'), MagicMock()),
         ]
         for r in responses:
             r[2].read.return_value = b''
@@ -25,6 +25,7 @@ class TestValidatePrerequisites:
 
         result = m.validate_prerequisites.function(run_id='test_run')
         assert result['ssh_connectivity'] is True
+        assert result['cluster_auth'] is True
         assert result['pyspark_available'] is True
         assert result['hive_available'] is True
         assert result['hadoop_fs_available'] is True
@@ -353,6 +354,76 @@ class TestDiscoverTablesViaSshSpark:
         with pytest.raises(Exception, match="Discovery failed for"):
             m.discover_tables_via_spark_ssh.function.__wrapped__(db_config=db_config)
 
+    def test_table_not_found_does_not_raise(self, mock_ssh_hook, sample_run_id):
+        hook, client, _, _ = mock_ssh_hook
+        import json
+        metadata = [{
+            'source_database': 'sales', 'source_table': 'ghost',
+            'dest_database': 'sales_s3', 'dest_bucket': 's3a://bucket',
+            'source_location': '', 's3_location': 's3a://bucket/sales_s3/ghost',
+            'file_format': 'UNKNOWN', 'schema': [], 'partitions': [],
+            'partition_columns': '', 'partition_count': 0, 'row_count': 0,
+            'is_partitioned': False, 'unregistered_partitions': False,
+            'table_type': 'UNKNOWN', 'source_total_size_bytes': 0,
+            'source_file_count': 0, 'serde_properties': {},
+            'partition_filter': None, 'filtered_partitions': [],
+            'partition_filter_active': False, 'filtered_row_count': 0,
+            'filtered_source_size_bytes': 0, 'filtered_file_count': 0,
+            'full_table_row_count': 0, 'full_table_partition_count': 0,
+            'error': 'Table or view not found: sales.ghost',
+            'error_type': 'TABLE_NOT_FOUND',
+        }]
+        mkdir_stdout = mock_ssh_stdout(0, b'')
+        pyspark_stdout = mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata)))
+        client.exec_command.side_effect = [
+            (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), pyspark_stdout, MagicMock()),
+        ]
+
+        db_config = {
+            'run_id': sample_run_id, 'source_database': 'sales',
+            'table_tokens': ['ghost'], 'dest_database': 'sales_s3',
+            'dest_bucket': 's3a://bucket',
+        }
+        result = m.discover_tables_via_spark_ssh.function.__wrapped__(db_config=db_config)
+        assert len(result['tables']) == 1
+        assert result['tables'][0]['error_type'] == 'TABLE_NOT_FOUND'
+
+    def test_database_not_found_does_not_raise(self, mock_ssh_hook, sample_run_id):
+        hook, client, _, _ = mock_ssh_hook
+        import json
+        metadata = [{
+            'source_database': 'phantom_db', 'source_table': 'orders',
+            'dest_database': 'sales_s3', 'dest_bucket': 's3a://bucket',
+            'source_location': '', 's3_location': 's3a://bucket/sales_s3/orders',
+            'file_format': 'UNKNOWN', 'schema': [], 'partitions': [],
+            'partition_columns': '', 'partition_count': 0, 'row_count': 0,
+            'is_partitioned': False, 'unregistered_partitions': False,
+            'table_type': 'UNKNOWN', 'source_total_size_bytes': 0,
+            'source_file_count': 0, 'serde_properties': {},
+            'partition_filter': None, 'filtered_partitions': [],
+            'partition_filter_active': False, 'filtered_row_count': 0,
+            'filtered_source_size_bytes': 0, 'filtered_file_count': 0,
+            'full_table_row_count': 0, 'full_table_partition_count': 0,
+            'error': "Source database 'phantom_db' does not exist on the cluster",
+            'error_type': 'DATABASE_NOT_FOUND',
+        }]
+        mkdir_stdout = mock_ssh_stdout(0, b'')
+        pyspark_stdout = mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata)))
+        client.exec_command.side_effect = [
+            (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), pyspark_stdout, MagicMock()),
+        ]
+
+        db_config = {
+            'run_id': sample_run_id, 'source_database': 'phantom_db',
+            'table_tokens': ['orders'], 'dest_database': 'sales_s3',
+            'dest_bucket': 's3a://bucket',
+        }
+        result = m.discover_tables_via_spark_ssh.function.__wrapped__(db_config=db_config)
+        assert len(result['tables']) == 1
+        assert result['tables'][0]['error_type'] == 'DATABASE_NOT_FOUND'
+
 
 class TestRecordDiscoveredTables:
 
@@ -374,16 +445,48 @@ class TestRecordDiscoveredTables:
         m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
         assert any('UPDATE' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_writes_table_not_found_status(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        self._setup_count(mock_spark, 0)
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': 'Table or view not found: sales_data.transactions',
+                'error_type': 'TABLE_NOT_FOUND',
+            }],
+        }
+        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
+        assert "'TABLE_NOT_FOUND'" in all_sql
+        assert 'Table or view not found' in all_sql
+
+    def test_writes_database_not_found_status(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        self._setup_count(mock_spark, 0)
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': "Source database 'phantom_db' does not exist on the cluster",
+                'error_type': 'DATABASE_NOT_FOUND',
+            }],
+        }
+        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
+        assert "'DATABASE_NOT_FOUND'" in all_sql
+        assert 'does not exist' in all_sql
+
 
 class TestRunDistcpSsh:
 
     def _make_distcp_stdout(self, incremental=False):
         return mock_ssh_stdout(0, (
+            "===DISTCP_METRICS_START===\n"
             f"INCREMENTAL={'true' if incremental else 'false'}\n"
             "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\nDISTCP_EXIT_CODE=0\n"
             "BYTES_COPIED=10485760\nFILES_COPIED=5\n"
             "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
             "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
+            "===DISTCP_METRICS_END===\n"
         ).encode())
 
     def test_successful_copy_detects_incremental(self, mock_ssh_hook, sample_discovery):
@@ -400,6 +503,42 @@ class TestRunDistcpSsh:
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
         assert result['distcp_results'][0]['bytes_copied'] == 10485760
         assert result['distcp_results'][0]['is_incremental'] is True
+
+    def test_skips_table_not_found_without_ssh(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': 'Table or view not found: sales_data.transactions',
+                'error_type': 'TABLE_NOT_FOUND',
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'TABLE_NOT_FOUND'
+        client.exec_command.assert_not_called()
+
+    def test_skips_database_not_found_without_ssh(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': "Source database 'phantom_db' does not exist on the cluster",
+                'error_type': 'DATABASE_NOT_FOUND',
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'DATABASE_NOT_FOUND'
+        client.exec_command.assert_not_called()
 
     def test_distcp_failure_raises(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
@@ -462,6 +601,47 @@ class TestRunDistcpSsh:
         assert s3_loc in ssh_cmd
         assert 'PARTITIONS_REQUESTED=2' in ssh_cmd
 
+    def test_filtered_partitions_can_use_path_list_when_delete_not_preserved(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+        )
+
+        filtered_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'partition_filter': 'dt>=2024-01-01',
+                'filtered_partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+                'partition_filter_active': True,
+                'filtered_row_count': 500,
+                'filtered_source_size_bytes': 5 * 1024 * 1024,
+                'filtered_file_count': 2,
+                'full_table_row_count': 1000,
+                'full_table_partition_count': 2,
+                'serde_properties': {},
+            }],
+        }
+
+        cfg = {**m.get_config(), 'distcp_preserve_delete': False}
+        with patch.object(m, 'get_config', return_value=cfg):
+            result = m.run_distcp_ssh.function.__wrapped__(
+                discovery=filtered_discovery,
+                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+                ti=MagicMock(),
+            )
+
+        assert result['distcp_results'][0]['status'] == 'COMPLETED'
+
+        ssh_cmd = client.exec_command.call_args[0][0]
+        assert 'PATHLIST=' in ssh_cmd
+        assert '-f "$PATHLIST"' in ssh_cmd
+        assert '-delete' not in ssh_cmd
+        assert 'dt=2024-01-01' in ssh_cmd
+        assert 'dt=2024-01-02' in ssh_cmd
+
     def test_zero_filtered_partitions_skips_table(self, mock_ssh_hook, sample_discovery):
         """If partition_filter_active=True but filtered_partitions=[], table must be SKIPPED
         without calling SSH at all."""
@@ -490,6 +670,92 @@ class TestRunDistcpSsh:
         assert result['distcp_results'][0]['status'] == 'SKIPPED'
         client.exec_command.assert_not_called()
 
+    def _run_with_partition_filter(self, mock_ssh_hook, sample_discovery, preserve_delete):
+        """Helper: invoke run_distcp_ssh with a partition filter and return the SSH command."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+        )
+        filtered_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'partition_filter': 'dt>=2024-01-01',
+                'filtered_partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+                'partition_filter_active': True,
+                'filtered_row_count': 500,
+                'filtered_source_size_bytes': 5 * 1024 * 1024,
+                'filtered_file_count': 2,
+                'full_table_row_count': 1000,
+                'full_table_partition_count': 2,
+                'serde_properties': {},
+            }],
+        }
+        cfg = {**m.get_config(), 'distcp_preserve_delete': preserve_delete}
+        with patch.object(m, 'get_config', return_value=cfg):
+            m.run_distcp_ssh.function.__wrapped__(
+                discovery=filtered_discovery,
+                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+                ti=MagicMock(),
+            )
+        return client.exec_command.call_args[0][0]
+
+    def _assert_metrics_scoped_to_partitions(self, ssh_cmd, s3_loc, partitions):
+        """Regression check (WF-201): BEFORE/AFTER S3 metrics must be summed only over the
+        filtered partition paths, not the whole table location."""
+        assert 'DEST_PART_PATHS=(' in ssh_cmd
+        for part in partitions:
+            assert f"{s3_loc}/{part}" in ssh_cmd
+        assert 'sum_s3_metrics_over_paths()' in ssh_cmd
+        assert 'S3_BEFORE=$(sum_s3_metrics_over_paths "${DEST_PART_PATHS[@]}")' in ssh_cmd
+        assert 'S3_AFTER=$(sum_s3_metrics_over_paths "${DEST_PART_PATHS[@]}")' in ssh_cmd
+        assert f'S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")' not in ssh_cmd
+        assert f'S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")' not in ssh_cmd
+
+    def test_partition_filter_per_partition_scopes_s3_metrics(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_with_partition_filter(
+            mock_ssh_hook, sample_discovery, preserve_delete=True,
+        )
+        s3_loc = sample_discovery['tables'][0]['s3_location']
+        self._assert_metrics_scoped_to_partitions(
+            ssh_cmd, s3_loc, ['dt=2024-01-01', 'dt=2024-01-02'],
+        )
+
+    def test_partition_filter_pathlist_scopes_s3_metrics(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_with_partition_filter(
+            mock_ssh_hook, sample_discovery, preserve_delete=False,
+        )
+        s3_loc = sample_discovery['tables'][0]['s3_location']
+        assert 'PATHLIST=' in ssh_cmd
+        self._assert_metrics_scoped_to_partitions(
+            ssh_cmd, s3_loc, ['dt=2024-01-01', 'dt=2024-01-02'],
+        )
+
+    def test_empty_source_skips_distcp_and_sets_empty_source_status(self, mock_ssh_hook, sample_discovery):
+        """If source has 0 files, distcp must be skipped and status set to EMPTY_SOURCE."""
+        hook, client, _, _ = mock_ssh_hook
+
+        empty_source_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'source_file_count': 0,
+                'partition_filter_active': False,
+                'filtered_file_count': 0,
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=empty_source_discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'EMPTY_SOURCE'
+        if client.exec_command.called:
+            cmd = client.exec_command.call_args[0][0]
+            assert 'distcp' not in cmd.lower(), "distcp should not be called for empty source"
+
 
 class TestUpdateDistcpStatus:
 
@@ -502,6 +768,125 @@ class TestUpdateDistcpStatus:
         sample_distcp_result['distcp_results'][0]['error'] = 'Network error'
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
         assert any('FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
+
+    def test_normalizes_zero_row_completed_to_empty_source(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """A COMPLETED distcp that moved zero bytes/files against a source with
+        zero rows must be flipped to EMPTY_SOURCE so the report converges on a
+        single tracking state regardless of stray marker files."""
+        sample_distcp_result['tables'][0]['row_count'] = 0
+        sample_distcp_result['distcp_results'][0].update({
+            'status': 'COMPLETED', 'bytes_copied': 0, 'files_copied': 0,
+            's3_file_count_after': 0, 's3_total_size_bytes_after': 0,
+        })
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert "distcp_status = 'EMPTY_SOURCE'" in sql_calls
+        assert "overall_status = 'EMPTY_SOURCE'" in sql_calls
+
+    def test_does_not_normalize_when_source_has_rows(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """A COMPLETED distcp with zero bytes/files but non-zero source row
+        count is NOT EMPTY_SOURCE — it's an incremental no-op against a real
+        table. Reporting it as EMPTY_SOURCE would lose information."""
+        sample_distcp_result['tables'][0]['row_count'] = 1000
+        sample_distcp_result['distcp_results'][0].update({
+            'status': 'COMPLETED', 'bytes_copied': 0, 'files_copied': 0,
+        })
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert "distcp_status = 'EMPTY_SOURCE'" not in sql_calls
+        # The main per-row UPDATE must still have fired with the original status.
+        assert "distcp_status = 'COMPLETED'" in sql_calls
+
+    def test_normalization_keys_match_per_partition_filter_slice(
+        self, mock_spark, sample_discovery, mock_iceberg_retry
+    ):
+        """Two discovery slices for the same (src,table,dest) differing only by
+        partition_filter must each be matched to their own distcp result —
+        the key includes partition_filter."""
+        base_t = sample_discovery['tables'][0]
+        empty_slice = dict(base_t)
+        empty_slice.update({
+            'partition_filter': "dt='2025-01-02'",
+            'partition_filter_active': True,
+            'filtered_partitions': ['dt=2025-01-02'],
+            'filtered_row_count': 0,
+            'row_count': 0,
+        })
+        nonempty_slice = dict(base_t)
+        nonempty_slice.update({
+            'partition_filter': "dt='2025-01-01'",
+            'partition_filter_active': True,
+            'filtered_partitions': ['dt=2025-01-01'],
+            'filtered_row_count': 1000,
+            'row_count': 1000,
+        })
+        distcp_result = {
+            **sample_discovery,
+            'tables': [empty_slice, nonempty_slice],
+            'distcp_results': [
+                {
+                    'source_database': 'sales_data', 'source_table': 'transactions',
+                    'dest_database': 'sales_data_s3',
+                    'partition_filter': "dt='2025-01-02'",
+                    'status': 'COMPLETED',
+                    'distcp_started_at': '2025-01-01 12:00:00',
+                    'distcp_completed_at': '2025-01-01 12:00:10',
+                    'distcp_duration_secs': 10.0, 'is_incremental': True,
+                    'bytes_copied': 0, 'files_copied': 0,
+                    's3_total_size_bytes_before': 0, 's3_file_count_before': 0,
+                    's3_total_size_bytes_after': 0, 's3_file_count_after': 0,
+                    's3_bytes_transferred': 0, 's3_files_transferred': 0,
+                    'partition_filter_active': True, 'partitions_requested': 1,
+                    'error': None,
+                },
+                {
+                    'source_database': 'sales_data', 'source_table': 'transactions',
+                    'dest_database': 'sales_data_s3',
+                    'partition_filter': "dt='2025-01-01'",
+                    'status': 'COMPLETED',
+                    'distcp_started_at': '2025-01-01 12:00:00',
+                    'distcp_completed_at': '2025-01-01 12:05:00',
+                    'distcp_duration_secs': 300.0, 'is_incremental': False,
+                    'bytes_copied': 10 * 1024 * 1024, 'files_copied': 5,
+                    's3_total_size_bytes_before': 0, 's3_file_count_before': 0,
+                    's3_total_size_bytes_after': 10 * 1024 * 1024, 's3_file_count_after': 5,
+                    's3_bytes_transferred': 10 * 1024 * 1024, 's3_files_transferred': 5,
+                    'partition_filter_active': True, 'partitions_requested': 1,
+                    'error': None,
+                },
+            ],
+            '_task_duration': 310.0,
+        }
+        m.update_distcp_status.function(distcp_result=distcp_result, spark=mock_spark)
+        # Only the empty slice should be flipped to EMPTY_SOURCE; the
+        # non-empty slice's UPDATE must still write distcp_status='COMPLETED'.
+        # Without partition_filter in the key, the dict comprehension would
+        # collapse both slices onto whichever entry came last, and both
+        # distcp_results would see the same row_count.
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert "distcp_status = 'EMPTY_SOURCE'" in sql_calls
+        assert "distcp_status = 'COMPLETED'" in sql_calls
+
+    def test_catchall_preserves_empty_source_overall_status(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """The catchall UPDATE that fires for tables not processed by distcp
+        must NOT overwrite overall_status='EMPTY_SOURCE' with 'FAILED'."""
+        # Empty distcp_results so the catchall fires for every table in the slot.
+        sample_distcp_result['distcp_results'] = []
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        catchall_sqls = [
+            str(c) for c in mock_iceberg_retry.call_args_list
+            if "S3 copy task did not process this table" in str(c)
+        ]
+        assert catchall_sqls, "catchall UPDATE should have fired"
+        joined = ' '.join(catchall_sqls)
+        assert "overall_status='FAILED'" not in joined
+        assert "WHEN overall_status = 'EMPTY_SOURCE'" in joined
 
 
 class TestCreateHiveTables:
@@ -554,12 +939,132 @@ class TestCreateHiveTables:
         assert 'ADD IF NOT EXISTS' in all_sql or 'ADD PARTITION' in all_sql
         assert 'MSCK REPAIR' not in all_sql
 
+    def test_struct_types_use_space_notation_in_ddl(
+        self, mock_spark, sample_run_id, sample_table_metadata_with_structs
+    ):
+        """Colon-separated struct types from Hive catalogString() must be converted
+        to space-separated notation before embedding in CREATE EXTERNAL TABLE DDL.
+        Regression test for Bug #2: PARSE_SYNTAX_ERROR on struct<field:type>."""
+        distcp_result = {
+            'run_id': sample_run_id,
+            'source_database': 'sales_data',
+            'dest_database': 'sales_data_s3',
+            'dest_bucket': 's3a://test-bucket',
+            'tables': sample_table_metadata_with_structs,
+            'distcp_results': [{
+                'source_database': 'sales_data',
+                'source_table': 'flex_rules_result',
+                'dest_database': 'sales_data_s3',
+                'status': 'COMPLETED',
+                'partition_filter': None,
+                'error': None,
+            }],
+        }
+
+        sql_calls = []
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            if sql.strip().upper().startswith('DESCRIBE') and 'FORMATTED' not in sql.upper():
+                raise Exception("Table not found")
+            df = MagicMock()
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        result = m.create_hive_tables.function.__wrapped__(
+            distcp_result=distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+
+        assert result['table_results'][0]['status'] == 'COMPLETED'
+        create_ddl = next(s for s in sql_calls if 'CREATE EXTERNAL TABLE' in s.upper())
+        # Space-separated notation must be present
+        assert 'FIELD_0 string' in create_ddl
+        assert 'category string' in create_ddl
+        # Colon-separated notation must NOT appear inside type bodies
+        assert 'FIELD_0:string' not in create_ddl
+        assert 'category:string' not in create_ddl
+
+    def test_wide_struct_all_fields_present_in_ddl(
+        self, mock_spark, sample_run_id, sample_table_metadata_with_structs
+    ):
+        """All 30 struct fields must appear in the DDL — no truncation to
+        '... N more fields'. Regression test for Bug #1: DESCRIBE truncation."""
+        distcp_result = {
+            'run_id': sample_run_id,
+            'source_database': 'sales_data',
+            'dest_database': 'sales_data_s3',
+            'dest_bucket': 's3a://test-bucket',
+            'tables': sample_table_metadata_with_structs,
+            'distcp_results': [{
+                'source_database': 'sales_data',
+                'source_table': 'flex_rules_result',
+                'dest_database': 'sales_data_s3',
+                'status': 'COMPLETED',
+                'partition_filter': None,
+                'error': None,
+            }],
+        }
+
+        sql_calls = []
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            if sql.strip().upper().startswith('DESCRIBE') and 'FORMATTED' not in sql.upper():
+                raise Exception("Table not found")
+            df = MagicMock()
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        m.create_hive_tables.function.__wrapped__(
+            distcp_result=distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+
+        create_ddl = next(s for s in sql_calls if 'CREATE EXTERNAL TABLE' in s.upper())
+        # All 30 fields must be present — none truncated
+        for i in range(30):
+            assert f'FIELD_{i} string' in create_ddl
+        assert 'more fields' not in create_ddl
+
 
 class TestUpdateTableCreateStatus:
 
     def test_sets_table_created_status(self, mock_spark, sample_table_result, mock_iceberg_retry):
         m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
         assert any('TABLE_CREATED' in str(c) for c in mock_iceberg_retry.call_args_list)
+
+    def test_catchall_preserves_empty_source_overall_status(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        """The catchall UPDATE for tables not processed by create_hive_tables
+        must NOT overwrite overall_status='EMPTY_SOURCE' with 'FAILED'."""
+        sample_table_result['table_results'] = []
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        catchall_sqls = [
+            str(c) for c in mock_iceberg_retry.call_args_list
+            if "Table creation task did not process this table" in str(c)
+        ]
+        assert catchall_sqls, "catchall UPDATE should have fired"
+        joined = ' '.join(catchall_sqls)
+        assert "overall_status = 'FAILED'," not in joined
+        assert "WHEN overall_status = 'EMPTY_SOURCE'" in joined
+
+    def test_failure_patch_preserves_empty_source_overall_status(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        """The per-table failure-patch UPDATE must also preserve EMPTY_SOURCE."""
+        sample_table_result['table_results'][0].update({
+            'status': 'FAILED', 'error': 'forced failure for test',
+        })
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        patch_sqls = [
+            str(c) for c in mock_iceberg_retry.call_args_list
+            if 'failure_patch' in str(c)
+        ]
+        assert patch_sqls, "failure-patch UPDATE should have fired"
+        joined = ' '.join(patch_sqls)
+        assert "WHEN overall_status = 'EMPTY_SOURCE'" in joined
 
 
 class TestValidateDestinationTables:
@@ -571,6 +1076,24 @@ class TestValidateDestinationTables:
             'overall_status': 'TABLE_CREATED', 'error_message': None,
         }[k]
         return row
+
+    def _make_dest_field(self, name, dtype):
+        f = MagicMock()
+        f.name = name
+        f.dataType.simpleString.return_value = dtype
+        return f
+
+    def _setup_dest_schema(self, mock_spark):
+        # Validation reads dest schema via spark.table(dest_tbl).schema.fields.
+        # Source schema (from fixture) excludes the 'dt' partition col; dest mock
+        # includes it so the validation code's partition-col filter is exercised.
+        table_mock = MagicMock()
+        table_mock.schema.fields = [
+            self._make_dest_field('id', 'bigint'),
+            self._make_dest_field('amount', 'double'),
+            self._make_dest_field('dt', 'string'),
+        ]
+        mock_spark.table.return_value = table_mock
 
     def _make_router(self, dest_count, partition_filter=None):
         _pf = partition_filter
@@ -596,12 +1119,6 @@ class TestValidateDestinationTables:
             elif 'show partitions' in sql_lower:
                 df.count.return_value = 2
                 df.collect.return_value = [MagicMock(), MagicMock()]
-            elif 'describe' in sql_lower:
-                df.collect.return_value = [
-                    MagicMock(col_name='id', data_type='bigint'),
-                    MagicMock(col_name='amount', data_type='double'),
-                    MagicMock(col_name='dt', data_type='string'),
-                ]
             else:
                 df.collect.return_value = []
             return df
@@ -609,6 +1126,7 @@ class TestValidateDestinationTables:
 
     def test_passes_with_matching_counts(self, mock_spark, sample_table_result):
         mock_spark.sql.side_effect = self._make_router(1000)
+        self._setup_dest_schema(mock_spark)
         result = m.validate_destination_tables.function.__wrapped__(
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )
@@ -617,6 +1135,7 @@ class TestValidateDestinationTables:
 
     def test_detects_row_count_mismatch(self, mock_spark, sample_table_result):
         mock_spark.sql.side_effect = self._make_router(500)
+        self._setup_dest_schema(mock_spark)
         result = m.validate_destination_tables.function.__wrapped__(
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )
@@ -636,6 +1155,7 @@ class TestValidateDestinationTables:
             'serde_properties': {},
         })
         mock_spark.sql.side_effect = self._make_router(1000, partition_filter='dt>=2024-01-01')
+        self._setup_dest_schema(mock_spark)
         result = m.validate_destination_tables.function.__wrapped__(
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )
@@ -646,6 +1166,108 @@ class TestValidateDestinationTables:
             "Expected a scoped COUNT(*) with WHERE clause for filtered partitions"
         )
         assert result['validation_results'][0]['row_count_match'] is True
+
+    def _make_upstream_only_router(self, upstream_values):
+        """spark.sql router that returns just one upstream-tracking row.
+        Used by EMPTY_SOURCE-shortcut tests where validation should never
+        reach the COUNT(*) / SHOW PARTITIONS queries."""
+        row = MagicMock()
+        row.__getitem__ = lambda self, k: upstream_values[k]
+
+        def sql_router(sql):
+            df = MagicMock()
+            if 'distcp_status' in sql.lower():
+                df.collect.return_value = [row]
+            else:
+                df.collect.return_value = []
+            return df
+        return sql_router
+
+    def test_empty_source_shortcut_taken_when_table_create_succeeded(
+        self, mock_spark, sample_table_result
+    ):
+        """distcp_status='EMPTY_SOURCE' + table_create_status='COMPLETED' →
+        validation takes the all-zeros / all-matches shortcut."""
+        import copy
+        empty_source_input = copy.deepcopy(sample_table_result)
+        for t in empty_source_input['tables']:
+            t['partition_count'] = 0
+            t['partitions'] = []
+            t['is_partitioned'] = False
+            t['full_table_partition_count'] = 0
+        src_schema = empty_source_input['tables'][0]['schema']
+        mock_fields = []
+        for col in src_schema:
+            f = MagicMock()
+            f.name = col['name']
+            f.dataType.simpleString.return_value = col['type']
+            mock_fields.append(f)
+        mock_spark.table.return_value.schema.fields = mock_fields
+
+        mock_spark.sql.side_effect = self._make_upstream_only_router({
+            'distcp_status': 'EMPTY_SOURCE',
+            'table_create_status': 'COMPLETED',
+            'overall_status': 'EMPTY_SOURCE',
+            'error_message': None,
+        })
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=empty_source_input, spark=mock_spark, ti=MagicMock(),
+        )
+        v = result['validation_results'][0]
+        assert v['status'] == 'COMPLETED'
+        assert v['row_count_match'] is True
+        assert v['partition_count_match'] is True
+        assert v['schema_match'] is True
+
+    def test_empty_source_shortcut_wins_over_stale_failed_overall_status(
+        self, mock_spark, sample_table_result
+    ):
+        """If a catchall left overall_status='FAILED' but distcp_status is
+        still 'EMPTY_SOURCE' and the dest table got created, the shortcut
+        must still fire — that's the run-2-style flake we're fixing."""
+        mock_spark.sql.side_effect = self._make_upstream_only_router({
+            'distcp_status': 'EMPTY_SOURCE',
+            'table_create_status': 'COMPLETED',
+            'overall_status': 'FAILED',
+            'error_message': 'stale catchall message',
+        })
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['status'] == 'COMPLETED'
+
+    def test_empty_source_skipped_when_table_create_failed(
+        self, mock_spark, sample_table_result
+    ):
+        """distcp_status='EMPTY_SOURCE' but table_create_status='FAILED' means
+        the destination shell was never built — validation must SKIP rather
+        than falsely report schema_match=True."""
+        mock_spark.sql.side_effect = self._make_upstream_only_router({
+            'distcp_status': 'EMPTY_SOURCE',
+            'table_create_status': 'FAILED',
+            'overall_status': 'FAILED',
+            'error_message': 'table create crashed',
+        })
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['status'] == 'SKIPPED'
+
+    def test_empty_source_skipped_when_table_create_skipped(
+        self, mock_spark, sample_table_result
+    ):
+        """Same as above for table_create_status='SKIPPED' (e.g.
+        skipped_no_schema branch in create_hive_tables)."""
+        mock_spark.sql.side_effect = self._make_upstream_only_router({
+            'distcp_status': 'EMPTY_SOURCE',
+            'table_create_status': 'SKIPPED',
+            'overall_status': 'EMPTY_SOURCE',
+            'error_message': None,
+        })
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['status'] == 'SKIPPED'
 
 
 class TestUpdateValidationStatus:
