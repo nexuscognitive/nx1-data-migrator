@@ -165,12 +165,12 @@ def normalize_s3(path: str) -> str:
     if not path:
         return path
     if path.startswith('s3n://'):
-        path = 's3a://' + path[6:]
-    elif path.startswith('s3://'):
-        path = 's3a://' + path[5:]
-    elif not path.startswith('s3a://'):
-        path = 's3a://' + path
-    return path.rstrip('/')
+        return 's3a://' + path[6:]
+    if path.startswith('s3://'):
+        return 's3a://' + path[5:]
+    if not path.startswith('s3a://'):
+        return 's3a://' + path
+    return path
 
 # =============================================================================
 # SHARED CONFIGURATION
@@ -182,21 +182,32 @@ def get_config() -> dict:
         from airflow.operators.python import get_current_context
         _ctx = get_current_context()
         _run_id = _ctx["run_id"]
+        _dag_run = _ctx.get("dag_run")
+        _dag_run_conf = (_dag_run.conf if _dag_run and hasattr(_dag_run, 'conf') else {}) or {}
     except Exception:
         _run_id = None
+        _dag_run_conf = {}
 
     def _var(base_key: str, env_var: str, default: str) -> str:
         if _run_id:
-            scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
-            if scoped is not None:
-                return scoped
+            try:
+                scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
+                if scoped is not None:
+                    return scoped
+            except Exception:
+                pass
         return Variable.get(base_key, default_var=os.getenv(env_var, default))
 
 
-    return {
+    dag_owner = _var('migration_dag_owner', 'MIGRATION_DAG_OWNER', '') \
+                or _dag_run_conf.get('dag_owner', '') \
+                or _dag_run_conf.get('spark_user', '') \
+                or 'data-migration'
+
+    config = {
         # SSH Configuration (for MapR migration)
-        'ssh_conn_id': Variable.get('cluster_ssh_conn_id', default_var=os.getenv('CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh')),
-        'edge_temp_path': Variable.get('cluster_edge_temp_path', default_var=os.getenv('CLUSTER_EDGE_TEMP_PATH', '/tmp/migration')),
+        'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh'),
+        'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration'),
 
         # S3 Configuration
         'default_s3_bucket': _var('migration_default_s3_bucket', 'MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake'),
@@ -205,17 +216,17 @@ def get_config() -> dict:
         's3_secret_key': _var('s3_secret_key', 'S3_SECRET_KEY', ''),
 
         # DistCp Configuration
-        'distcp_mappers': Variable.get('migration_distcp_mappers', default_var=os.getenv('MIGRATION_DISTCP_MAPPERS', '50')),
-        'distcp_bandwidth': Variable.get('migration_distcp_bandwidth', default_var=os.getenv('MIGRATION_DISTCP_BANDWIDTH', '100')),
+        'distcp_mappers': _var('migration_distcp_mappers', 'MIGRATION_DISTCP_MAPPERS', '50'),
+        'distcp_bandwidth': _var('migration_distcp_bandwidth', 'MIGRATION_DISTCP_BANDWIDTH', '100'),
         'distcp_preserve_delete': str(
-            Variable.get(
+            _var(
                 'migration_distcp_preserve_delete',
-                default_var=os.getenv('MIGRATION_DISTCP_PRESERVE_DELETE', 'true')
+                'MIGRATION_DISTCP_PRESERVE_DELETE', 'true'
             )
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
         # Spark Configuration
-        'spark_conn_id': Variable.get('migration_spark_conn_id', default_var=os.getenv('MIGRATION_SPARK_CONN_ID', 'spark_default')),
+        'spark_conn_id': _var('migration_spark_conn_id', 'MIGRATION_SPARK_CONN_ID', 'spark_default'),
 
         # Tracking Configuration
         'tracking_database': _var('migration_tracking_database', 'MIGRATION_TRACKING_DATABASE', 'migration_tracking'),
@@ -223,40 +234,52 @@ def get_config() -> dict:
         'report_output_location': _var('migration_report_location', 'MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports'),
 
         # Cluster type for display/reporting purposes ('MapR' or 'HDP')
-        'cluster_type': Variable.get('cluster_type', default_var=os.getenv('CLUSTER_TYPE', 'MapR')),
+        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
-        'auth_method': Variable.get('auth_method', default_var=os.getenv('AUTH_METHOD', 'mapr')),  # 'mapr' or 'kinit'
-        'mapr_user': Variable.get('mapr_user', default_var=os.getenv('MAPR_USER', '')),
-        'mapr_ticketfile_location': Variable.get('mapr_ticketfile_location', default_var=os.getenv('MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}')),
+        'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr'),  # 'mapr' or 'kinit'
+        'mapr_user': _var('mapr_user', 'MAPR_USER', ''),
+        'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}'),
         # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
-        'hdfs_nameservice': Variable.get('hdfs_nameservice', default_var=os.getenv('HDFS_NAMESERVICE', '')),
+        'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', ''),
 
         # Listing tool
         's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
 
         # S3 source credentials
-        's3_source_endpoint': Variable.get('s3_source_endpoint', default_var=os.getenv('S3_SOURCE_ENDPOINT', '')),
-        's3_source_access_key': Variable.get('s3_source_access_key', default_var=os.getenv('S3_SOURCE_ACCESS_KEY', '')),
-        's3_source_secret_key': Variable.get('s3_source_secret_key', default_var=os.getenv('S3_SOURCE_SECRET_KEY', '')),
+        's3_source_endpoint': _var('s3_source_endpoint', 'S3_SOURCE_ENDPOINT', ''),
+        's3_source_access_key': _var('s3_source_access_key', 'S3_SOURCE_ACCESS_KEY', ''),
+        's3_source_secret_key': _var('s3_source_secret_key', 'S3_SOURCE_SECRET_KEY', ''),
 
         # S3 destination credentials
-        's3_dest_endpoint': Variable.get('s3_dest_endpoint', default_var=os.getenv('S3_DEST_ENDPOINT', '')),
-        's3_dest_access_key': Variable.get('s3_dest_access_key', default_var=os.getenv('S3_DEST_ACCESS_KEY', '')),
-        's3_dest_secret_key': Variable.get('s3_dest_secret_key', default_var=os.getenv('S3_DEST_SECRET_KEY', '')),
+        's3_dest_endpoint': _var('s3_dest_endpoint','S3_DEST_ENDPOINT', ''),
+        's3_dest_access_key': _var('s3_dest_access_key', 'S3_DEST_ACCESS_KEY', ''),
+        's3_dest_secret_key': _var('s3_dest_secret_key', 'S3_DEST_SECRET_KEY', ''),
 
         # Email / SMTP Configuration
-        'smtp_conn_id': Variable.get('migration_smtp_conn_id', default_var=os.getenv('MIGRATION_SMTP_CONN_ID', 'smtp_default')),
-        'email_recipients': Variable.get('migration_email_recipients', default_var=os.getenv('MIGRATION_EMAIL_RECIPIENTS', '')),
+        'smtp_conn_id': _var('migration_smtp_conn_id', 'MIGRATION_SMTP_CONN_ID', 'smtp_default'),
+        'email_recipients': _var('migration_email_recipients', 'MIGRATION_EMAIL_RECIPIENTS', ''),
 
         # Path structure: when True (default), dest path is {bucket}/{database}/{table}.
         # When False, dest path is {bucket}/{table} (database folder omitted).
         'include_db_in_path': str(
-            Variable.get(
-                'migration_include_db_in_path',
-                default_var=os.getenv('MIGRATION_INCLUDE_DB_IN_PATH', 'true'),
-            )
+            _var('migration_include_db_in_path', 'MIGRATION_INCLUDE_DB_IN_PATH', 'true')
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+
+        'owner': dag_owner,
     }
+
+    if dag_owner and dag_owner != 'data-migration':
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if spark:
+                spark.conf.set('spark.sql.kyuubi.session.user', dag_owner)
+                logger.debug(f"[get_config] Set spark.sql.kyuubi.session.user={dag_owner}")
+        except Exception:
+            pass
+
+    logger.debug(f"[get_config] dag_owner={dag_owner!r} run_id={_run_id!r}")
+    return config
 
 # SSH timeout: 24 hours
 SSH_COMMAND_TIMEOUT = 86400
