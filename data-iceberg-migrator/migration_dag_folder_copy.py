@@ -101,7 +101,7 @@ def validate_prerequisites_folder_copy() -> dict:
 
             # 2. Hadoop DistCp
             logger.info("[2/3] Testing hadoop distcp availability...")
-            test_cmd = "hadoop distcp 2>&1 | grep -qi 'usage\\|distcp\\|options' && echo DISTCP_OK || echo DISTCP_FAIL"
+            test_cmd = "hadoop distcp --help > /dev/null 2>&1 && echo DISTCP_OK || echo DISTCP_FAIL"
             _, stdout, stderr = client.exec_command(_login_shell(test_cmd, config.get('cluster_type', 'MapR')), timeout=60)
             output = stdout.read().decode()
             stderr.read()
