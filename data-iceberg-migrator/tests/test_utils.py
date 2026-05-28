@@ -54,16 +54,28 @@ class TestExecuteWithIcebergRetry:
         m.execute_with_iceberg_retry(mock_spark, "SELECT 1")
         mock_spark.sql.assert_called_once_with("SELECT 1")
 
-        # Success after retries
+        # Success after retries — requires an actual commit-conflict marker
         mock_spark.sql.reset_mock()
-        mock_spark.sql.side_effect = [Exception("conflict"), Exception("conflict"), None]
+        mock_spark.sql.side_effect = [
+            Exception("CommitFailedException"),
+            Exception("CommitFailedException"),
+            None,
+        ]
         with patch('time.sleep'):
             m.execute_with_iceberg_retry(mock_spark, "MERGE INTO t USING s", max_retries=3)
         assert mock_spark.sql.call_count == 3
 
-    def test_raises_after_exhausting_default_six_retries(self, mock_spark):
+    def test_raises_immediately_on_non_retryable_error(self, mock_spark):
+        """Errors without a commit-conflict marker raise immediately without retrying."""
         mock_spark.sql.side_effect = Exception("persistent error")
-        with patch('time.sleep'), pytest.raises(Exception, match="persistent error"):
+        with pytest.raises(Exception, match="persistent error"):
+            m.execute_with_iceberg_retry(mock_spark, "BAD SQL")
+        assert mock_spark.sql.call_count == 1
+
+    def test_raises_after_exhausting_default_six_retries(self, mock_spark):
+        """CommitFailedException is retried up to max_retries (default 6) times."""
+        mock_spark.sql.side_effect = Exception("CommitFailedException")
+        with patch('time.sleep'), pytest.raises(Exception, match="CommitFailedException"):
             m.execute_with_iceberg_retry(mock_spark, "BAD SQL")
         assert mock_spark.sql.call_count == 6
 
