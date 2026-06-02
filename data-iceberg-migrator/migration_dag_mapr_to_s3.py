@@ -53,8 +53,19 @@ else:
         f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults"
     )
 
+def _resolve_dag_owner() -> str:
+    """Read portal username from Airflow Variable at DAG parse/trigger time."""
+    try:
+        from airflow.models import Variable
+        owner = Variable.get('migration_dag_owner', default_var='')
+        if owner:
+            return owner
+    except Exception:
+        pass
+    return 'data-migration'
+
 default_args = {
-    "owner": "data-migration",
+    "owner": _resolve_dag_owner(),
     "depends_on_past": False,
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
@@ -742,6 +753,14 @@ for tbl in table_list:
     input_format = None
     serde_properties = {{}}
     in_serde_section = False
+    filter_expr = "{filter_expr_escaped}"
+    row_count = 0
+    filtered_partitions = []
+    partition_filter_active = False
+    filtered_source_size = 0
+    filtered_file_count = 0
+    full_row_count = 0
+    full_partition_count = 0
     partition_filter_active = False
     filtered_partitions = []
     filtered_source_size = 0
@@ -3194,7 +3213,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 
 
 @task.pyspark(conn_id="spark_default")
-def generate_html_report(run_id: str, spark) -> str:
+def generate_html_report(run_id: str, spark, **context) -> str:
     """Generate comprehensive HTML migration report."""
     from datetime import datetime
 
@@ -3920,7 +3939,8 @@ def generate_html_report(run_id: str, spark) -> str:
 """
 
     # Write HTML to S3
-    report_filename = f"{run_id}_report.html"
+    portal_run_id = context.get('params', {}).get('run_id') or run_id
+    report_filename = f"{portal_run_id}_report.html"
     report_path = f"{report_location}/{report_filename}"
 
     # Use Spark to write HTML
@@ -4158,7 +4178,7 @@ with DAG(
     t_val_status.operator.trigger_rule = "all_done"
 
     # Report generation
-    t_report = generate_html_report(run_id=t_run_id)
+    t_report = generate_html_report(run_id=t_run_id, params="{{ params }}")
     t_report.operator.trigger_rule = "all_done"
 
     # Email report

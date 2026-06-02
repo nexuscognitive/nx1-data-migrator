@@ -199,70 +199,108 @@ def normalize_s3(path: str) -> str:
 
 def get_config() -> dict:
     """Shared configuration for all migration DAGs."""
-    return {
+    try:
+        from airflow.operators.python import get_current_context
+        _ctx = get_current_context()
+        _run_id = _ctx["run_id"]
+        _dag_run = _ctx.get("dag_run")
+        _dag_run_conf = (_dag_run.conf if _dag_run and hasattr(_dag_run, 'conf') else {}) or {}
+    except Exception:
+        _run_id = None
+        _dag_run_conf = {}
+
+    def _var(base_key: str, env_var: str, default: str) -> str:
+        if _run_id:
+            try:
+                scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
+                if scoped is not None:
+                    return scoped
+            except Exception:
+                pass
+        return Variable.get(base_key, default_var=os.getenv(env_var, default))
+
+
+    dag_owner = _var('migration_dag_owner', 'MIGRATION_DAG_OWNER', '') \
+                or _dag_run_conf.get('dag_owner', '') \
+                or _dag_run_conf.get('spark_user', '') \
+                or 'data-migration'
+
+    config = {
         # SSH Configuration (for MapR migration)
-        'ssh_conn_id': Variable.get('cluster_ssh_conn_id', default_var=os.getenv('CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh')),
-        'edge_temp_path': Variable.get('cluster_edge_temp_path', default_var=os.getenv('CLUSTER_EDGE_TEMP_PATH', '/tmp/migration')),
+        'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh'),
+        'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration'),
 
         # S3 Configuration
-        'default_s3_bucket': Variable.get('migration_default_s3_bucket', default_var=os.getenv('MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake')),
-        's3_endpoint': Variable.get('s3_endpoint', default_var=os.getenv('S3_ENDPOINT', '')),
-        's3_access_key': Variable.get('s3_access_key', default_var=os.getenv('S3_ACCESS_KEY', '')),
-        's3_secret_key': Variable.get('s3_secret_key', default_var=os.getenv('S3_SECRET_KEY', '')),
+        'default_s3_bucket': _var('migration_default_s3_bucket', 'MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake'),
+        's3_endpoint': _var('s3_endpoint', 'S3_ENDPOINT', ''),
+        's3_access_key': _var('s3_access_key', 'S3_ACCESS_KEY', ''),
+        's3_secret_key': _var('s3_secret_key', 'S3_SECRET_KEY', ''),
 
         # DistCp Configuration
-        'distcp_mappers': Variable.get('migration_distcp_mappers', default_var=os.getenv('MIGRATION_DISTCP_MAPPERS', '50')),
-        'distcp_bandwidth': Variable.get('migration_distcp_bandwidth', default_var=os.getenv('MIGRATION_DISTCP_BANDWIDTH', '100')),
+        'distcp_mappers': _var('migration_distcp_mappers', 'MIGRATION_DISTCP_MAPPERS', '50'),
+        'distcp_bandwidth': _var('migration_distcp_bandwidth', 'MIGRATION_DISTCP_BANDWIDTH', '100'),
         'distcp_preserve_delete': str(
-            Variable.get(
+            _var(
                 'migration_distcp_preserve_delete',
-                default_var=os.getenv('MIGRATION_DISTCP_PRESERVE_DELETE', 'true')
+                'MIGRATION_DISTCP_PRESERVE_DELETE', 'true'
             )
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
         # Spark Configuration
-        'spark_conn_id': Variable.get('migration_spark_conn_id', default_var=os.getenv('MIGRATION_SPARK_CONN_ID', 'spark_default')),
+        'spark_conn_id': _var('migration_spark_conn_id', 'MIGRATION_SPARK_CONN_ID', 'spark_default'),
 
         # Tracking Configuration
-        'tracking_database': Variable.get('migration_tracking_database', default_var=os.getenv('MIGRATION_TRACKING_DATABASE', 'migration_tracking')),
-        'tracking_location': Variable.get('migration_tracking_location', default_var=os.getenv('MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking')),
-        'report_output_location': Variable.get('migration_report_location', default_var=os.getenv('MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports')),
+        'tracking_database': _var('migration_tracking_database', 'MIGRATION_TRACKING_DATABASE', 'migration_tracking'),
+        'tracking_location': _var('migration_tracking_location', 'MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking'),
+        'report_output_location': _var('migration_report_location', 'MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports'),
 
         # Cluster type for display/reporting purposes ('MapR' or 'HDP')
-        'cluster_type': Variable.get('cluster_type', default_var=os.getenv('CLUSTER_TYPE', 'MapR')),
+        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
-        'auth_method': Variable.get('auth_method', default_var=os.getenv('AUTH_METHOD', 'mapr')),  # 'mapr' or 'kinit'
-        'mapr_user': Variable.get('mapr_user', default_var=os.getenv('MAPR_USER', '')),
-        'mapr_ticketfile_location': Variable.get('mapr_ticketfile_location', default_var=os.getenv('MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}')),
+        'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr'),  # 'mapr' or 'kinit'
+        'mapr_user': _var('mapr_user', 'MAPR_USER', ''),
+        'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}'),
         # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
-        'hdfs_nameservice': Variable.get('hdfs_nameservice', default_var=os.getenv('HDFS_NAMESERVICE', '')),
+        'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', ''),
 
         # Listing tool
         's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
 
         # S3 source credentials
-        's3_source_endpoint': Variable.get('s3_source_endpoint', default_var=os.getenv('S3_SOURCE_ENDPOINT', '')),
-        's3_source_access_key': Variable.get('s3_source_access_key', default_var=os.getenv('S3_SOURCE_ACCESS_KEY', '')),
-        's3_source_secret_key': Variable.get('s3_source_secret_key', default_var=os.getenv('S3_SOURCE_SECRET_KEY', '')),
+        's3_source_endpoint': _var('s3_source_endpoint', 'S3_SOURCE_ENDPOINT', ''),
+        's3_source_access_key': _var('s3_source_access_key', 'S3_SOURCE_ACCESS_KEY', ''),
+        's3_source_secret_key': _var('s3_source_secret_key', 'S3_SOURCE_SECRET_KEY', ''),
 
         # S3 destination credentials
-        's3_dest_endpoint': Variable.get('s3_dest_endpoint', default_var=os.getenv('S3_DEST_ENDPOINT', '')),
-        's3_dest_access_key': Variable.get('s3_dest_access_key', default_var=os.getenv('S3_DEST_ACCESS_KEY', '')),
-        's3_dest_secret_key': Variable.get('s3_dest_secret_key', default_var=os.getenv('S3_DEST_SECRET_KEY', '')),
+        's3_dest_endpoint': _var('s3_dest_endpoint','S3_DEST_ENDPOINT', ''),
+        's3_dest_access_key': _var('s3_dest_access_key', 'S3_DEST_ACCESS_KEY', ''),
+        's3_dest_secret_key': _var('s3_dest_secret_key', 'S3_DEST_SECRET_KEY', ''),
 
         # Email / SMTP Configuration
-        'smtp_conn_id': Variable.get('migration_smtp_conn_id', default_var=os.getenv('MIGRATION_SMTP_CONN_ID', 'smtp_default')),
-        'email_recipients': Variable.get('migration_email_recipients', default_var=os.getenv('MIGRATION_EMAIL_RECIPIENTS', '')),
+        'smtp_conn_id': _var('migration_smtp_conn_id', 'MIGRATION_SMTP_CONN_ID', 'smtp_default'),
+        'email_recipients': _var('migration_email_recipients', 'MIGRATION_EMAIL_RECIPIENTS', ''),
 
         # Path structure: when True (default), dest path is {bucket}/{database}/{table}.
         # When False, dest path is {bucket}/{table} (database folder omitted).
         'include_db_in_path': str(
-            Variable.get(
-                'migration_include_db_in_path',
-                default_var=os.getenv('MIGRATION_INCLUDE_DB_IN_PATH', 'true'),
-            )
+            _var('migration_include_db_in_path', 'MIGRATION_INCLUDE_DB_IN_PATH', 'true')
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+
+        'owner': dag_owner,
     }
+
+    if dag_owner and dag_owner != 'data-migration':
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if spark:
+                spark.conf.set('spark.sql.kyuubi.session.user', dag_owner)
+                logger.debug(f"[get_config] Set spark.sql.kyuubi.session.user={dag_owner}")
+        except Exception:
+            pass
+
+    logger.debug(f"[get_config] dag_owner={dag_owner!r} run_id={_run_id!r}")
+    return config
 
 # SSH timeout: 24 hours
 SSH_COMMAND_TIMEOUT = 86400
@@ -557,3 +595,293 @@ def validate_bucket_endpoint_pairs(grouped: dict, config: dict) -> None:
             f"pair(s). Fix the Excel config and re-trigger the DAG:\n"
             + "\n".join(errors)
         )
+
+
+
+def _list_iceberg_tables(spark, base_path):
+    """List subdirectories under base_path that contain a metadata/ folder."""
+    try:
+        from py4j.java_gateway import java_import
+
+        java_import(spark._jvm, 'org.apache.hadoop.fs.*')
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jvm.java.net.URI(base_path),
+            spark._jsc.hadoopConfiguration()
+        )
+        base = spark._jvm.org.apache.hadoop.fs.Path(base_path)
+        if not fs.exists(base):
+            return []
+
+        status_list = fs.listStatus(base)
+        tables = []
+        for i in range(len(status_list)):
+            if not status_list[i].isDirectory():
+                continue
+            name = status_list[i].getPath().getName()
+            metadata_dir = spark._jvm.org.apache.hadoop.fs.Path(
+                f"{base_path}/{name}/metadata"
+            )
+            if fs.exists(metadata_dir):
+                tables.append(name)
+        return sorted(tables)
+    except Exception as e:
+        logger.warning(f"[iceberg_helpers] Could not list tables at {base_path}: {e}")
+        return []
+
+
+def _match_tokens(table_names, tokens):
+    """Match table names against token patterns using fnmatch."""
+    import fnmatch as _fnmatch
+
+    if '*' in tokens:
+        return table_names
+    seen = set()
+    matched = []
+    for tok in tokens:
+        for t in table_names:
+            if t not in seen and _fnmatch.fnmatch(t, tok):
+                seen.add(t)
+                matched.append(t)
+    return matched
+
+def _parse_transform(transform_str):
+    """Parse an Iceberg partition transform string into (transform, param)."""
+    if '[' in transform_str:
+        name, rest = transform_str.split('[', 1)
+        param = int(rest.rstrip(']'))
+        return name, param
+    return transform_str, None
+
+
+def _extract_partition_spec(metadata):
+    """Extract partition spec from Iceberg metadata.
+
+    Returns (spec_fields, is_partitioned) where spec_fields is a list of dicts:
+        {'source_column': str, 'transform': str, 'name': str, 'param': int | None}
+    """
+    default_spec_id = metadata.get('default-spec-id', 0)
+    specs = metadata.get('partition-specs', [])
+
+    spec = None
+    for s in specs:
+        if s.get('spec-id') == default_spec_id:
+            spec = s
+            break
+    if spec is None and specs:
+        spec = specs[-1]
+
+    if not spec or not spec.get('fields'):
+        return [], False
+
+    current_schema_id = metadata.get('current-schema-id', 0)
+    schemas = metadata.get('schemas', [])
+    schema = None
+    for s in schemas:
+        if s.get('schema-id') == current_schema_id:
+            schema = s
+            break
+    if schema is None and schemas:
+        schema = schemas[-1]
+
+    field_id_to_name = {}
+    if schema:
+        for f in schema.get('fields', []):
+            field_id_to_name[f['id']] = f['name']
+
+    spec_fields = []
+    for pf in spec.get('fields', []):
+        source_id = pf.get('source-id')
+        source_column = field_id_to_name.get(source_id, f'field_{source_id}')
+        transform, param = _parse_transform(pf.get('transform', 'identity'))
+        spec_fields.append({
+            'source_column': source_column,
+            'transform': transform,
+            'name': pf.get('name', source_column),
+            'param': param,
+        })
+
+    return spec_fields, len(spec_fields) > 0
+
+
+def _extract_row_count(metadata):
+    """Extract total row count from the current snapshot summary."""
+    current_snapshot_id = metadata.get('current-snapshot-id')
+    if current_snapshot_id is None:
+        return 0
+
+    for snap in metadata.get('snapshots', []):
+        if snap.get('snapshot-id') == current_snapshot_id:
+            summary = snap.get('summary', {})
+            return int(summary.get('total-records', 0))
+
+    return 0
+
+
+def _read_iceberg_metadata(spark, table_path):
+    """Read and parse the latest Iceberg metadata.json from S3."""
+    import json as _json
+
+    from py4j.java_gateway import java_import
+
+    java_import(spark._jvm, 'org.apache.hadoop.fs.*')
+
+    metadata_file = _resolve_metadata_file(spark, table_path)
+    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+        spark._jvm.java.net.URI(table_path),
+        spark._jsc.hadoopConfiguration()
+    )
+
+    reader = spark._jvm.java.io.BufferedReader(
+        spark._jvm.java.io.InputStreamReader(
+            fs.open(spark._jvm.org.apache.hadoop.fs.Path(metadata_file)), "UTF-8"
+        )
+    )
+    try:
+        lines = []
+        line = reader.readLine()
+        while line is not None:
+            lines.append(line)
+            line = reader.readLine()
+    finally:
+        reader.close()
+
+    return _json.loads('\n'.join(lines))
+
+
+def _extract_schema(metadata):
+    """Extract schema from Iceberg metadata as list of {name, type} dicts."""
+    current_schema_id = metadata.get('current-schema-id', 0)
+    schemas = metadata.get('schemas', [])
+
+    schema = None
+    for s in schemas:
+        if s.get('schema-id') == current_schema_id:
+            schema = s
+            break
+    if schema is None and schemas:
+        schema = schemas[-1]
+    if schema is None:
+        return []
+
+    return [
+        {'name': field['name'], 'type': _map_iceberg_type(field['type'])}
+        for field in schema.get('fields', [])
+    ]
+
+def _rebase_table_path(table_path: str, from_prefix: str, to_prefix: str) -> str:
+    """Return table_path with its leading from_prefix replaced by to_prefix.
+
+    Raises ValueError if table_path does not start with from_prefix, which
+    would indicate a misconfigured Excel row (dest path outside dest_prefix).
+    """
+    base = from_prefix.rstrip('/')
+    if not table_path.startswith(base):
+        raise ValueError(
+            f"table_path {table_path!r} does not start with prefix {base!r} — "
+            "check that source_s3_prefix / dest_s3_prefix in the Excel config "
+            "match the actual table locations"
+        )
+    return to_prefix.rstrip('/') + table_path[len(base):]
+
+
+def _resolve_metadata_file(spark, table_path):
+    """Resolve the path to the latest Iceberg metadata.json file for a table."""
+    from py4j.java_gateway import java_import
+
+    java_import(spark._jvm, 'org.apache.hadoop.fs.*')
+
+    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+        spark._jvm.java.net.URI(table_path),
+        spark._jsc.hadoopConfiguration()
+    )
+
+    metadata_dir = f"{table_path}/metadata"
+    hint_path = spark._jvm.org.apache.hadoop.fs.Path(
+        f"{metadata_dir}/version-hint.text"
+    )
+
+    if fs.exists(hint_path):
+        reader = spark._jvm.java.io.BufferedReader(
+            spark._jvm.java.io.InputStreamReader(fs.open(hint_path))
+        )
+        version = reader.readLine().strip()
+        reader.close()
+        return f"{metadata_dir}/v{version}.metadata.json"
+
+    status_list = fs.listStatus(
+        spark._jvm.org.apache.hadoop.fs.Path(metadata_dir)
+    )
+    metadata_files = []
+    for i in range(len(status_list)):
+        name = status_list[i].getPath().getName()
+        if name.endswith('.metadata.json'):
+            metadata_files.append(name)
+    if not metadata_files:
+        raise FileNotFoundError(f"No metadata.json files found in {metadata_dir}")
+    import re as _re
+
+    def _version_key(name):
+        # handles v{N}.metadata.json and {N:05d}-{uuid}.metadata.json
+        m = _re.match(r'(?:v)?(\d+)', name)
+        return int(m.group(1)) if m else -1
+
+    latest = sorted(metadata_files, key=_version_key)[-1]
+    return f"{metadata_dir}/{latest}"
+
+# =============================================================================
+# Iceberg metadata helpers
+# =============================================================================
+
+ICEBERG_TYPE_MAP = {
+    'boolean': 'BOOLEAN',
+    'int': 'INT',
+    'long': 'BIGINT',
+    'float': 'FLOAT',
+    'double': 'DOUBLE',
+    'date': 'DATE',
+    'time': 'STRING',
+    'timestamp': 'TIMESTAMP',
+    'timestamptz': 'TIMESTAMP',
+    'string': 'STRING',
+    'binary': 'BINARY',
+    'uuid': 'STRING',
+}
+
+
+def _map_iceberg_type(iceberg_type):
+    """Map an Iceberg type to a Spark SQL type string.
+
+    Handles primitives plus nested struct / list / map recursively, emitting
+    the same forms Spark's DESCRIBE returns for an Iceberg-backed table:
+      STRUCT<a:INT,b:STRING>   ←  iceberg struct<a:int,b:string>
+      ARRAY<INT>               ←  iceberg list<int>
+      MAP<STRING,INT>          ←  iceberg map<string,int>
+
+    Casing doesn't matter because validate_dest_tables lowercases both sides
+    before comparison; the structural form must match exactly or every
+    complex-typed column flags a false schema mismatch.
+    """
+    if isinstance(iceberg_type, dict):
+        kind = str(iceberg_type.get('type', '')).lower()
+        if kind == 'struct':
+            inner = ','.join(
+                f"{f['name']}:{_map_iceberg_type(f['type'])}"
+                for f in iceberg_type.get('fields', [])
+            )
+            return f"STRUCT<{inner}>"
+        if kind == 'list':
+            return f"ARRAY<{_map_iceberg_type(iceberg_type.get('element', 'string'))}>"
+        if kind == 'map':
+            key_t = _map_iceberg_type(iceberg_type.get('key', 'string'))
+            val_t = _map_iceberg_type(iceberg_type.get('value', 'string'))
+            return f"MAP<{key_t},{val_t}>"
+        return 'STRING'
+
+    t = str(iceberg_type).lower()
+    if t in ICEBERG_TYPE_MAP:
+        return ICEBERG_TYPE_MAP[t]
+    if t.startswith('decimal'):
+        return t.upper()
+    if t.startswith('fixed'):
+        return 'BINARY'
+    return 'STRING'
