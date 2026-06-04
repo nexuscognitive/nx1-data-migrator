@@ -354,6 +354,7 @@ def init_tracking_tables(spark) -> dict:
                 distcp_bytes_copied BIGINT,
                 distcp_files_copied BIGINT,
                 yarn_application_id STRING,
+                source_timezone STRING,
                 table_create_status STRING,
                 table_create_completed_at TIMESTAMP,
                 table_create_duration_seconds DOUBLE,
@@ -628,6 +629,11 @@ spark = SparkSession.builder \\
     .enableHiveSupport() \\
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
+
+_source_tz = spark.conf.get("spark.sql.session.timeZone", "UTC")
+print("===SOURCE_TIMEZONE===")
+print(_source_tz)
+print("===SOURCE_TIMEZONE_END===")
 
 src_db = "{src_db}"
 dest_db = "{dest_db}"
@@ -1089,6 +1095,16 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
         json_str = output[json_start + len("===JSON_START===") : json_end].strip()
         metadata = json.loads(json_str)
 
+        tz_start = output.find("===SOURCE_TIMEZONE===")
+        tz_end = output.find("===SOURCE_TIMEZONE_END===")
+        if tz_start != -1 and tz_end != -1:
+            source_timezone = output[tz_start + len("===SOURCE_TIMEZONE==="):tz_end].strip()
+        else:
+            source_timezone = "UTC"
+            logger.warning(f"[Discovery] Could not detect source timezone for {src_db}, defaulting to UTC")
+
+        logger.info(f"[Discovery] Source cluster timezone for {src_db}: {source_timezone}")
+
     logger.info(
         f"Discovery complete for database '{src_db}': {len(metadata)} table(s) found"
     )
@@ -1129,6 +1145,7 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
         "dest_database": dest_db,
         "dest_bucket": dest_bucket,
         "dest_endpoint": dest_endpoint,
+        "source_timezone": source_timezone,
         "tables": metadata,
     }
 
@@ -1197,6 +1214,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
             "full_table_partition_count", t.get("partition_count", 0)
         )
         partition_filter_val = (t.get("partition_filter") or "").replace("'", "''")
+        source_tz = (discovery.get("source_timezone") or "UTC").replace("'", "''")
         filtered_partition_count = (
             len(t.get("filtered_partitions", [])) if partition_filter_active else None
         )
@@ -1245,7 +1263,8 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     full_table_partition_count = {full_table_partition_count},
                     overall_status = {overall_status_update},
                     error_message = {error_msg_update},
-                    updated_at = current_timestamp()
+                    updated_at = current_timestamp(),
+                    source_timezone = '{source_tz}'
                 WHERE run_id = '{run_id}'
                   AND source_database = '{t['source_database']}'
                   AND source_table = '{t['source_table']}'
@@ -1280,7 +1299,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     schema_differences,
                     overall_status, error_message,
                     updated_at, partition_filter, filtered_partition_count, full_table_row_count, full_table_partition_count,
-                    yarn_application_id
+                    yarn_application_id, source_timezone
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
                     '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
@@ -1303,7 +1322,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     NULL,
                     {overall_status_insert}, {error_msg_insert},
                     current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count},
-                    NULL
+                    NULL, '{source_tz}'
                 )
             """,
                 task_label=f"record_discovered_tables:{t['source_table']}",
@@ -2244,6 +2263,10 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
         tbl = t["source_table"]
         dest_db = t.get("dest_database") or distcp_result["dest_database"]
 
+        source_tz = distcp_result.get("source_timezone", "UTC")
+        spark.conf.set("spark.sql.session.timeZone", source_tz)
+        logger.info(f"[HiveTable] Set session timezone to '{source_tz}' for {dest_db}.{tbl}")
+
         if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
             results.append(
                 {
@@ -2826,6 +2849,17 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 continue
 
         logger.info(f"[Validation] Starting validation for {per_table_dest_db}.{tbl}")
+
+        source_tz_row = spark.sql(f"""
+            SELECT source_timezone FROM {tracking_db}.migration_table_status
+            WHERE run_id = '{run_id}'
+              AND source_database = '{src_db}'
+              AND source_table = '{tbl}'
+            LIMIT 1
+        """).collect()
+        source_tz = (source_tz_row[0]["source_timezone"] if source_tz_row and source_tz_row[0]["source_timezone"] else "UTC")
+        spark.conf.set("spark.sql.session.timeZone", source_tz)
+        logger.info(f"[Validation] Set session timezone to '{source_tz}' for {dest_tbl}")
 
         try:
             pf_val = (t.get("partition_filter") or "").replace("'", "''")
@@ -3590,6 +3624,7 @@ def generate_html_report(run_id: str, spark, **context) -> str:
                     <th>Table Create</th>
                     <th>Validation</th>
                     <th>Format</th>
+                    <th>Source TZ</th>
                     <th>Total Duration</th>
                 </tr>
             </thead>
@@ -3685,6 +3720,7 @@ def generate_html_report(run_id: str, spark, **context) -> str:
                     <td class="duration">{table_dur}</td>
                     <td class="duration">{val_dur}</td>
                     <td>{t.file_format or 'N/A'}</td>
+                    <td>{getattr(t, 'source_timezone', None) or 'UTC'}</td>
                     <td class="metric">{total_dur:.1f}s</td>
                 </tr>
 """

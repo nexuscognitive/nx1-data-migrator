@@ -47,7 +47,7 @@ def _resolve_dag_owner() -> str:
             return owner
     except Exception:
         pass
-    return 'data-migration'
+    return 'gsomisetty'
 
 default_args = {
     "owner": _resolve_dag_owner(),
@@ -227,7 +227,7 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
         pattern_str = db_config.get('table_pattern', '*')
         raw_tokens = [t.strip() for t in pattern_str.split(',') if t.strip()] or ['*']
 
-        source_timezone = "UTC"
+    source_timezone = "UTC"
     try:
         tz_rows = spark.sql(f"""
             SELECT source_timezone
@@ -1611,7 +1611,7 @@ def send_iceberg_report_email(report_result: dict, run_id: str, spark) -> dict:
 # =============================================================================
 
 with DAG(
-    dag_id='iceberg_migration',
+    dag_id='es_iceberg_migration_tz_diff_v2',
     default_args=default_args,
     description='Migrate existing Hive tables in S3 to Iceberg format',
     schedule=None,
@@ -1621,7 +1621,7 @@ with DAG(
     tags=['migration', 'iceberg', 'hive'],
     params={
         'excel_file_path': Param(
-            default='s3a://config-bucket/iceberg_migration.xlsx',
+            default='s3a://nx1poc-pdc-default-ygglold/es-tenant-2/es-test/es_inputs_tz_diff_v2/iceberg_migration_tz_diff_v2.xlsx',
             type='string',
             description='S3 path to Excel config file for Iceberg migration'
         )
