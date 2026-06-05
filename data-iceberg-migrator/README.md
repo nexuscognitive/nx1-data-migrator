@@ -11,7 +11,6 @@ This implementation provides three independent but complementary migration DAGs:
 1. **`source_to_s3_migration`** - Migrates Hive tables from source (MapR-FS/HDP-HDFS) to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
 3. **`folder_only_data_copy`** - Copies raw folders from source cluster (MapR-FS/HDP-HDFS) to S3 via DistCp — no Hive metadata
-4. **`s3_to_s3_metadata_migration`** - Metadata-only migration with pluggable strategies: recreate Hive external tables (`hive_to_hive`) or register file-based Iceberg tables into HMS (`iceberg_to_iceberg`)
 
 ---
 
@@ -24,7 +23,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | Variable                      | Description                                     | Example                              | Applies To                                            |
 | ----------------------------- | ----------------------------------------------- | ------------------------------------ | ----------------------------------------------------- |
 | `cluster_ssh_conn_id`         | Airflow SSH connection ID for cluster edge node | `cluster_edge_ssh`                   | `source_to_s3_migration`, `folder_only_data_copy`       |
-| `migration_default_s3_bucket` | Default S3 bucket for migrations                | `s3a://data-lake`                    | `source_to_s3_migration`, `s3_to_s3_metadata_migration` |
+| `migration_default_s3_bucket` | Default S3 bucket for migrations                | `s3a://data-lake`                    | `source_to_s3_migration`                                |
 | `migration_tracking_database` | Database name for tracking tables               | `migration_tracking`                 | All DAGs                                              |
 | `migration_tracking_location` | S3 location for tracking tables                 | `s3a://data-lake/migration_tracking` | All DAGs                                              |
 | `migration_report_location`   | S3 location for HTML reports                    | `s3a://data-lake/migration_reports`  | All DAGs                                              |
@@ -44,9 +43,9 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | Variable                     | Default          | Description                                  | Applies To                                                                            |
 | ---------------------------- | ---------------- | -------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node             | `source_to_s3_migration`, `folder_only_data_copy`                                       |
-| `s3_endpoint`                | _(empty)_        | Default S3 endpoint URL (all buckets)        | `source_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
-| `s3_access_key`              | _(empty)_        | Default S3 access key (all buckets)          | `source_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
-| `s3_secret_key`              | _(empty)_        | Default S3 secret key (all buckets)          | `source_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
+| `s3_endpoint`                | _(empty)_        | Default S3 endpoint URL (all buckets)        | `source_to_s3_migration`, `folder_only_data_copy`        |
+| `s3_access_key`              | _(empty)_        | Default S3 access key (all buckets)          | `source_to_s3_migration`, `folder_only_data_copy`        |
+| `s3_secret_key`              | _(empty)_        | Default S3 secret key (all buckets)          | `source_to_s3_migration`, `folder_only_data_copy`        |
 | `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     | `source_to_s3_migration`, `folder_only_data_copy`                                       |
 | `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            | `source_to_s3_migration`, `folder_only_data_copy`                                       |
 | `migration_distcp_preserve_delete` | `true`     | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes)) | `source_to_s3_migration` |
@@ -116,8 +115,6 @@ single-tenant setups.
 | DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config                 | `s3a://config-bucket/migration.xlsx`             |
 | DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config               | `s3a://config-bucket/iceberg_migration.xlsx`     |
 | DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config           | `s3a://config-bucket/folder_copy.xlsx`           |
-| DAG 4 | `excel_file_path` | Yes      | S3 path to S3 metadata migration config | `s3a://config-bucket/s3_metadata_migration.xlsx` |
-| DAG 4 | `migration_type`  | Yes      | Strategy: `hive_to_hive` or `iceberg_to_iceberg` | `hive_to_hive` |
 
 ---
 
@@ -177,26 +174,6 @@ single-tenant setups.
 │ ▼                                                           │
 │ Validated & Tracked                                         │
 └─────────────────────────────────────────────────────────────┘
-│
-│ (Independent — use when data is already in destination S3)
-▼
-┌─────────────────────────────────────────────────────────────┐
-│ DAG 4: S3-to-S3 Metadata Migration                          │
-│                                                             │
-│ Strategy: hive_to_hive          │ iceberg_to_iceberg        │
-│ ────────────────────────────────┼───────────────────────────│
-│ Source: Hive metastore          │ Source: metadata.json      │
-│   (SHOW TABLES, DESCRIBE)      │   (read directly from S3)  │
-│ │                               │ │                         │
-│ │ [Data Presence Validation]    │ │ [Data Presence Valid.]   │
-│ ▼                               │ ▼                         │
-│ CREATE EXTERNAL TABLE           │ register_table (HMS)       │
-│ + MSCK REPAIR TABLE             │                            │
-│ │                               │ │                         │
-│ │ [Validation: Row counts, partitions, schema]              │
-│ ▼                                                           │
-│ Validated & Tracked                                         │
-└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -218,18 +195,8 @@ Do you need to migrate from source cluster (MapR-FS/HDFS) to S3?
 │       └─ Both Hive and Iceberg → Snapshot migration
 │
 └─ NO → Already in S3, need Iceberg?
-│  │
-│  └─ YES → Run DAG 2 (iceberg_migration) only
-│
-└─ NO → Data already in destination S3?
    │
-   ├─ YES, Hive tables → Run DAG 4 (migration_type=hive_to_hive)
-   │   │
-   │   └─ Need Iceberg format too? → Run DAG 2 after DAG 4
-   │
-   ├─ YES, Iceberg files (no metastore) → Run DAG 4 (migration_type=iceberg_to_iceberg)
-   │
-   └─ Need Iceberg only (metadata already exists) → Run DAG 2 (iceberg_migration) only
+   └─ YES → Run DAG 2 (iceberg_migration) only
 ```
 
 ---
@@ -1294,289 +1261,6 @@ COMPLETED_WITH_ERRORS
 
 ---
 
-## DAG 4: S3-to-S3 Metadata Migration
-
-### Purpose
-
-Metadata-only migration: discovers source table schemas and recreates them at a destination. No data is copied — only metadata (DDL) is migrated. Supports multiple migration types via the strategy pattern:
-
-- **`hive_to_hive`** — Discovers Hive tables via metastore (`SHOW TABLES` / `DESCRIBE FORMATTED`), creates Hive external tables at destination S3 paths
-- **`iceberg_to_iceberg`** — Reads Iceberg `metadata.json` directly from S3 (file-based catalog, no metastore), registers tables in HMS via `register_table`
-
----
-
-### Key Features
-
-- **Strategy Pattern** - Pluggable migration types (`hive_to_hive`, `iceberg_to_iceberg`) with a shared pipeline
-- **No Data Movement** - Assumes data already exists at destination S3 paths
-- **Data Presence Validation** - Verifies destination S3 paths contain files before creating tables
-- **Path Remapping** - Supports prefix-based path translation (`source_s3_prefix` → `dest_s3_prefix`) or simple bucket-based destination
-- **Partition Support** - Automatic partition discovery and repair (Hive) or partition-aware registration (Iceberg)
-- **Format Preservation** - Supports Parquet, ORC, Avro, and TextFile
-- **Comprehensive Validation** - Row counts, partition counts, schema comparison
-- **Incremental Support** - Detects existing tables and runs repair/refresh instead of recreating
-
----
-
-### Excel Configuration Format
-
-**Required Columns:**
-
-| Column             | Required | Description                                             | Example                 |
-| ------------------ | -------- | ------------------------------------------------------- | ----------------------- |
-| `database`         | **Yes**  | Source database name                                    | `sales_data`            |
-| `table`            | Varies   | Table name or pattern. `hive_to_hive`: supports `*` wildcards, comma-separated. `iceberg_to_iceberg`: exact table name (required) | `transactions_*` or `*` |
-| `dest_database`    | No       | Destination database (defaults to source)               | `sales_data_dest`       |
-| `dest_bucket`      | No\*     | Destination S3 bucket                                   | `s3a://dest-lake`       |
-| `source_s3_prefix` | No\*     | Source S3 prefix for path remapping                     | `s3a://source-lake`     |
-| `dest_s3_prefix`   | No\*     | Destination S3 prefix for path remapping                | `s3a://dest-lake`       |
-| `source_table_path`| No\*\*  | S3 path to Iceberg table root (containing `metadata/`)  | `s3a://bucket/db/table` |
-
-\* Either `dest_bucket` or both `source_s3_prefix` + `dest_s3_prefix` must be provided per row.
-
-\*\* Required for `iceberg_to_iceberg` strategy. Ignored by `hive_to_hive`.
-
-**Path Remapping Behavior:**
-
-- If `source_s3_prefix` and `dest_s3_prefix` are provided, destination path is computed by replacing the source prefix with the destination prefix, preserving the relative path.
-- If only `dest_bucket` is provided:
-  - `hive_to_hive`: destination path defaults to `{dest_bucket}/{dest_database}/{table_name}`
-  - `iceberg_to_iceberg`: destination path equals `source_table_path` (in-place registration)
-
----
-
-### Task Flow
-
-```
-init_s3_tracking_tables
-    ↓
-create_s3_migration_run
-    ↓
-parse_s3_excel
-    ↓
-┌───────────────────────────────────────────────┐
-│  Dynamic Task Mapping (per database config)   │
-│                                               │
-│  discover_source_tables (PySpark)             │
-│    ↓  (dispatches to active strategy)         │
-│  record_s3_discovered_tables                  │
-│    ↓                                          │
-│  validate_data_presence (PySpark)             │
-│    ↓                                          │
-│  update_data_presence_status                  │
-│    ↓                                          │
-│  create_dest_tables (PySpark)                 │
-│    ↓  (dispatches to active strategy)         │
-│  update_s3_table_create_status                │
-│    ↓                                          │
-│  validate_s3_destination_tables (PySpark)     │
-│    ↓                                          │
-│  update_s3_validation_status                  │
-└───────────────────────────────────────────────┘
-    ↓
-generate_s3_html_report
-    ↓
-send_s3_report_email
-    ↓
-finalize_s3_run
-```
-
----
-
-### Task Summaries
-
-#### Step 0 - `init_s3_tracking_tables`
-
-**Type:** PySpark  
-**Purpose:** Initialize tracking infrastructure for S3 metadata migration
-
-- Creates the `migration_tracking` database if it doesn't exist
-- Creates two Iceberg tables for tracking:
-  - `s3_migration_runs` - Run-level metadata including a `missing_tables` count
-  - `s3_migration_table_status` - Table-level tracking including data presence checks and path information
-- Ensures tracking tables persist across all migration runs
-
----
-
-#### Step 1 - `create_s3_migration_run`
-
-**Type:** PySpark  
-**Purpose:** Generate unique run identifier and initialize run record
-
-- Creates a unique run ID prefixed with `s3_run_`
-- Inserts initial record into `s3_migration_runs` with status `RUNNING`
-- Stores DAG configuration snapshot for audit trail
-
----
-
-#### Step 2 - `parse_s3_excel`
-
-**Type:** PySpark  
-**Purpose:** Read and parse the Excel configuration file, delegating row parsing to the active strategy
-
-- Reads Excel file from S3 using `pyspark.pandas.read_excel`
-- Normalizes column names and delegates to the strategy's `parse_excel_rows` function
-- `hive_to_hive`: groups rows by `(source_database, dest_database, dest_bucket, prefixes)`, supports wildcard table patterns
-- `iceberg_to_iceberg`: groups rows similarly, but requires `table` and `source_table_path` per row
-- Skips rows that provide neither a `dest_bucket` nor a `source_s3_prefix`+`dest_s3_prefix` pair (hive) or missing `source_table_path` (iceberg)
-
----
-
-#### Step 3 - `discover_source_tables`
-
-**Type:** PySpark (mapped per database)
-**Purpose:** Discover source table metadata — dispatches to the active strategy
-
-- **`hive_to_hive`**: lists tables via `SHOW TABLES`, filters by token patterns (wildcards/comma-separated), extracts schema, location, format, partitions, row count, and file metrics from the Hive metastore
-- **`iceberg_to_iceberg`**: reads `metadata.json` directly from S3 at each `source_table_path`, extracts schema, partitions, row count, and format from the Iceberg metadata
-- Computes destination S3 path using prefix remapping or bucket-based/in-place logic
-
----
-
-#### Step 4 - `record_s3_discovered_tables`
-
-**Type:** PySpark (mapped per database)
-**Purpose:** Persist discovered table metadata in tracking table
-
-- Inserts or updates records in `s3_migration_table_status`
-- Sets initial `overall_status` to `DISCOVERED`
-
----
-
-#### Step 5 - `validate_data_presence`
-
-**Type:** PySpark (mapped per database)
-
-**Purpose:** Verify that data files exist at the computed destination S3 paths before creating any Hive tables
-
-- For each discovered table, checks that the destination S3 path exists and contains at least one file using Hadoop FileSystem API
-- Records `file_count` and `size_bytes` for each confirmed path
-- Marks tables with no files or non-existent paths as `MISSING` — these are tracked but do not block the run
-- Raises an exception only if S3 API/connectivity errors occur (`FAILED` status)
-
----
-
-#### Step 6 - `update_data_presence_status`
-
-**Type:** PySpark (mapped per database)
-
-**Purpose:** Update tracking table with data presence results
-
-- Updates `data_presence_status` to `CONFIRMED`, `MISSING`, or `FAILED`
-- Sets `overall_status` to `DATA_CONFIRMED`, `DATA_MISSING`, or `FAILED` accordingly
-- Tables with `DATA_MISSING` are skipped in all downstream steps but remain visible in the report
-
----
-
-#### Step 7 - `create_dest_tables`
-
-**Type:** PySpark (mapped per database)
-
-**Purpose:** Create destination tables — dispatches per-table creation to the active strategy
-
-- Skips tables whose data presence status is not `CONFIRMED`
-- **`hive_to_hive`**: for each confirmed table:
-  - **If table exists:** Runs `MSCK REPAIR TABLE` and `REFRESH TABLE`
-  - **If table does not exist:** Generates and executes `CREATE EXTERNAL TABLE` DDL using schema from discovery, then runs `MSCK REPAIR TABLE` if partitioned
-- **`iceberg_to_iceberg`**: for each confirmed table:
-  - **If table exists:** Runs `REFRESH TABLE`
-  - **If table does not exist:** Resolves the latest `metadata.json` file and calls `register_table` to register in HMS
-- Applies per-bucket S3 credentials for destination paths
-
----
-
-#### Step 8 - `update_s3_table_create_status`
-
-**Type:** PySpark (mapped per database)
-
-**Purpose:** Update tracking table with table creation results
-
-- Sets `table_create_status` to `COMPLETED`, `SKIPPED`, or `FAILED`
-- Preserves `DATA_MISSING` overall status for skipped tables
-
----
-
-#### Step 9 - `validate_s3_destination_tables`
-
-**Type:** PySpark (mapped per database)
-
-**Purpose:** Validate destination Hive tables — row counts, partition counts, schema comparison
-
-- Skips tables where table creation was skipped or data was missing
-- Compares source row count, partition count, and schema against the newly created destination table
-- Partition count mismatches are treated as warnings (stale source partitions), not failures
-
----
-
-#### Step 10 - `update_s3_validation_status`
-
-**Type:** PySpark (mapped per database)
-
-**Purpose:** Update tracking table with validation results and determine final status
-
-- Sets `overall_status` to `VALIDATED` or `VALIDATION_FAILED`
-
-**Final status meanings:**
-
-- `DISCOVERED`: Metadata extracted, data presence not yet checked
-- `DATA_CONFIRMED`: Data found at destination S3, table not yet created
-- `DATA_MISSING`: No files found at destination S3 path — skipped
-- `TABLE_CREATED`: Hive table created/repaired, not yet validated
-- `VALIDATED`: All validations passed — MIGRATION SUCCESS
-- `VALIDATION_FAILED`: One or more validations failed
-- `FAILED`: S3 API error or table creation error
-
----
-
-### Step 11 - `generate_s3_html_report`
-
-**Type:** PySpark
-
-**Purpose:** Generate comprehensive HTML report covering data presence, table creation, validation, and performance
-
-- Writes report to `{report_location}/{run_id}_s3_report.html`
-- Report sections: Migration Summary, Data Presence Summary, Table Migration Details, Validation Results, Performance Metrics
-
----
-
-### Step 12 - `send_s3_report_email`
-
-**Type:** PySpark
-
-**Purpose:** Send HTML report via email
-
-- Subject: `S3 Metadata Migration Report — {run_id}`
-- Skips if `migration_email_recipients` variable is empty
-
----
-
-### Step 13 - `finalize_s3_run`
-
-**Type:** PySpark
-
-**Purpose:** Aggregate statistics and mark run complete
-
-- Updates `s3_migration_runs` with final counts including a dedicated `missing_tables` field
-- Final run statuses: `COMPLETED`, `COMPLETED_WITH_MISSING`, `COMPLETED_WITH_FAILURES`, or `FAILED`
-
----
-
-### Status Progression
-
-```
-DISCOVERED
-    ↓
-DATA_CONFIRMED (files found at destination S3)
-    ↓
-TABLE_CREATED (Hive table created/repaired)
-    ↓
-VALIDATED (all validations passed)
-
-DATA_MISSING → skipped in all downstream steps, visible in report
-```
-
----
-
 ## Tracking Tables
 
 ### MapR-to-S3 Migration Tracking
@@ -1595,11 +1279,6 @@ DATA_MISSING → skipped in all downstream steps, visible in report
 
 1. **migration_tracking.data_copy_runs**: Run-level metadata for folder-only data copy runs.
 2. **migration_tracking.data_copy_status**: Folder-level tracking — one row per source/destination pair per run.
-
-### S3-to-S3 Metadata Migration Tracking
-
-1. **migration_tracking.s3_migration_runs**: Run-level metadata for S3 metadata migrations, including a `missing_tables` count separate from `failed_tables`.
-2. **migration_tracking.s3_migration_table_status**: Table-level tracking including data presence check results (`data_presence_status`, `data_presence_file_count`, `data_presence_size_bytes`) alongside the standard discovery, table creation, and validation fields.
 
 ---
 

@@ -29,29 +29,12 @@ PROJECTS = {
                 "dag_id": "folder_only_data_copy",
                 "owner_marker": "'owner': 'data-migration'",
             },
-            "metadata": {
-                "file": "migration_dag_metadata.py",
-                "dag_id": "s3_to_s3_metadata_migration",
-                "owner_marker": "'owner': 'data-migration'",
-            },
         },
         "shared_utils": [
             ("utils/__init__.py", "utils/__init__.py"),
             ("utils/migrations/__init__.py", "utils/migrations/__init__.py"),
             ("utils/migrations/shared.py", "utils/migrations/shared.py"),
             ("utils/migrations/partition_utils.py", "utils/migrations/partition_utils.py"),
-            (
-                "utils/migrations/metadata_strategies/__init__.py",
-                "utils/migrations/metadata_strategies/__init__.py",
-            ),
-            (
-                "utils/migrations/metadata_strategies/hive_to_hive.py",
-                "utils/migrations/metadata_strategies/hive_to_hive.py",
-            ),
-            (
-                "utils/migrations/metadata_strategies/iceberg_to_iceberg.py",
-                "utils/migrations/metadata_strategies/iceberg_to_iceberg.py",
-            ),
         ],
     },
     "ranger": {

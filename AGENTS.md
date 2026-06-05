@@ -18,14 +18,12 @@ Data platform migration tools (MapR/HDFS to S3/Iceberg) and Apache Ranger/Keyclo
 
 ```
 .
-├── data-iceberg-migrator/       # Airflow DAGs: MapR/HDFS -> S3, Hive -> Iceberg conversion, S3-to-S3 metadata
+├── data-iceberg-migrator/       # Airflow DAGs: MapR/HDFS -> S3, Hive -> Iceberg conversion
 │   ├── migration_dag_mapr_to_s3.py      # DAG 1: MapR-FS/HDFS to S3 via DistCp
 │   ├── migration_dag_iceberg.py         # DAG 2: Hive tables to Iceberg (in-place or snapshot)
 │   ├── migration_dag_folder_copy.py     # DAG 3: folder-only data copy
-│   ├── migration_dag_metadata.py        # DAG 4: S3-to-S3 metadata migration (Hive and Iceberg)
 │   ├── utils/migrations/shared.py       # Shared config, S3 helpers, retry logic
 │   ├── utils/migrations/partition_utils.py
-│   ├── utils/migrations/metadata_strategies/  # Strategy pattern for metadata migration
 │   └── tests/
 ├── ranger-policies-generator/   # Airflow DAG: Ranger policies + Keycloak roles from Excel
 │   ├── ranger_policies_generator_airflow3.py
@@ -83,7 +81,7 @@ cd code-scanner && pytest tests/ --cov
 ### Deploy
 
 ```bash
-python deploy.py --project migrator --dag metadata --owner my-name --suffix dev1
+python deploy.py --project migrator --dag iceberg --owner my-name --suffix dev1
 python deploy.py --project ranger --dag ranger --owner my-name --suffix dev1 --dry-run
 ```
 
