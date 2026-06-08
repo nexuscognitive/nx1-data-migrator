@@ -24,6 +24,8 @@ from dotenv import load_dotenv
 from utils.migrations.shared import (
     execute_with_iceberg_retry,
     get_config,
+    is_permanent_error,
+    permanent_fail,
     track_duration,
 )
 
@@ -156,10 +158,14 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
 
     import pandas as ps
 
-    binary_df = spark.read.format("binaryFile").load(excel_file_path)
-    row = binary_df.select("content").first()
-    excel_bytes = bytes(row.content)
-    df = ps.read_excel(BytesIO(excel_bytes), engine='openpyxl')
+    df = None
+    try:
+        binary_df = spark.read.format("binaryFile").load(excel_file_path)
+        row = binary_df.select("content").first()
+        excel_bytes = bytes(row.content)
+        df = ps.read_excel(BytesIO(excel_bytes), engine='openpyxl')
+    except Exception as _e:
+        permanent_fail("parse_iceberg_excel", _e)
 
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
@@ -212,6 +218,10 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
         })
 
     logger.info(f"[ParseIcebergExcel] Total database configs emitted: {len(configs)}")
+    if not configs:
+        permanent_fail("parse_iceberg_excel", ValueError(
+            "No valid rows found in Excel — check the 'database' column is populated."
+        ))
     return configs
 
 
@@ -669,6 +679,17 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 )
             """, task_label=f"migrate:failed:insert:{tbl}")
             logger.error(f"ERROR: {error_msg}")
+            if is_permanent_error("iceberg_migrate", e):
+                context['ti'].xcom_push(key='return_value', value={
+                    'run_id': run_id,
+                    'source_database': src_db,
+                    'destination_database': dest_db,
+                    'migration_type': 'INPLACE' if inplace else 'SNAPSHOT',
+                    'results': results,
+                    '_has_failures': True,
+                    '_failure_summary': error_msg,
+                })
+                permanent_fail(f"migrate_tables_to_iceberg:{src_db}.{tbl}", e)
 
     failed_migrations = [r for r in results if r['status'] == 'FAILED']
     has_failures = len(failed_migrations) > 0
@@ -1571,6 +1592,8 @@ def send_iceberg_report_email(report_result: dict, run_id: str, spark) -> dict:
         return {'sent': True, 'recipients': recipients, 'report_path': report_path}
     except Exception as e:
         logger.error(f"[Email] Failed to send Iceberg report: {str(e)}")
+        if is_permanent_error("send_email", e):
+            permanent_fail("send_iceberg_report_email", e)
         raise Exception(f"Failed to send Iceberg report email: {str(e)}") from e
 
 # =============================================================================

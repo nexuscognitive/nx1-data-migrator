@@ -136,6 +136,7 @@ def _make_airflow_stubs():
         "airflow.utils":                        MagicMock(),
         "airflow.utils.email":                  MagicMock(),
         "airflow.utils.trigger_rule":           MagicMock(TriggerRule=MagicMock(ALL_DONE="all_done")),
+        "airflow.exceptions":                   MagicMock(AirflowFailException=type("AirflowFailException", (Exception,), {})),
         "dotenv":                               MagicMock(),
         "pyspark":                              MagicMock(),
         "pyspark.sql":                          MagicMock(),
