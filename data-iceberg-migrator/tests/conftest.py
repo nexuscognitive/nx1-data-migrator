@@ -172,10 +172,6 @@ def _install_airflow_stubs():
     sys.modules.pop("migration_dag_mapr_to_s3", None)
     sys.modules.pop("migration_dag_iceberg", None)
     sys.modules.pop("migration_dag_folder_copy", None)
-    sys.modules.pop("migration_dag_metadata", None)
-    sys.modules.pop("utils.migrations.metadata_strategies.iceberg_to_iceberg", None)
-    sys.modules.pop("utils.migrations.metadata_strategies.hive_to_hive", None)
-    sys.modules.pop("utils.migrations.metadata_strategies", None)
     sys.modules.pop("utils.migrations.partition_utils", None)
     sys.modules.pop("utils.migrations.shared", None)
     sys.modules.pop("utils.migrations", None)
@@ -253,8 +249,7 @@ def mock_iceberg_retry():
     """Patch execute_with_iceberg_retry across all DAG modules."""
     with patch('migration_dag_mapr_to_s3.execute_with_iceberg_retry') as retry, \
          patch('migration_dag_iceberg.execute_with_iceberg_retry', retry), \
-         patch('migration_dag_folder_copy.execute_with_iceberg_retry', retry), \
-         patch('migration_dag_metadata.execute_with_iceberg_retry', retry):
+         patch('migration_dag_folder_copy.execute_with_iceberg_retry', retry):
         yield retry
 
 
@@ -488,114 +483,4 @@ def sample_folder_finalize_result(sample_folder_run_id):
     return {
         'run_id': sample_folder_run_id, 'status': 'COMPLETED',
         'total_folders': 2, 'successful_folders': 2, 'failed_folders': 0,
-    }
-
-# ---------------------------------------------------------------------------
-# DAG 4 sample data
-# ---------------------------------------------------------------------------
-@pytest.fixture
-def sample_s3_run_id():
-    return 's3_run_20250101_120000_abcd1234'
-
-
-@pytest.fixture
-def sample_s3_db_config(sample_s3_run_id):
-    return {
-        'source_database':  'sales_data',
-        'dest_database':    'sales_data_dest',
-        'dest_bucket':      's3a://dest-bucket',
-        'source_s3_prefix': 's3a://src-bucket/data',
-        'dest_s3_prefix':   's3a://dest-bucket/data',
-        'table_tokens':     ['transactions'],
-        'run_id':           sample_s3_run_id,
-        'migration_type':   'hive_to_hive',
-    }
-
-
-@pytest.fixture
-def sample_s3_table_metadata():
-    return [{
-        'source_database':        'sales_data',
-        'source_table':           'transactions',
-        'dest_database':          'sales_data_dest',
-        'dest_bucket':            's3a://dest-bucket',
-        'source_location':        's3a://src-bucket/data/sales_data/transactions',
-        'dest_location':          's3a://dest-bucket/data/sales_data/transactions',
-        'file_format':            'PARQUET',
-        'table_type':             'EXTERNAL_TABLE',
-        'schema':                 [{'name': 'id', 'type': 'bigint'}, {'name': 'amount', 'type': 'double'}],
-        'partition_columns':      'dt',
-        'partitions':             ['dt=2024-01-01', 'dt=2024-01-02'],
-        'partition_count':        2,
-        'is_partitioned':         True,
-        'source_row_count':       1000,
-        'source_file_count':      5,
-        'source_total_size_bytes': 10 * 1024 * 1024,
-    }]
-
-
-@pytest.fixture
-def sample_s3_discovery(sample_s3_run_id, sample_s3_table_metadata):
-    return {
-        'run_id':           sample_s3_run_id,
-        'source_database':  'sales_data',
-        'dest_database':    'sales_data_dest',
-        'dest_bucket':      's3a://dest-bucket',
-        'source_s3_prefix': 's3a://src-bucket/data',
-        'dest_s3_prefix':   's3a://dest-bucket/data',
-        'migration_type':   'hive_to_hive',
-        'tables':           sample_s3_table_metadata,
-        '_task_duration':   4.2,
-    }
-
-
-@pytest.fixture
-def sample_s3_presence_result(sample_s3_discovery):
-    return {
-        **sample_s3_discovery,
-        'presence_results': [{
-            'source_database': 'sales_data',
-            'source_table':    'transactions',
-            'status':          'CONFIRMED',
-            'file_count':      5,
-            'size_bytes':      10 * 1024 * 1024,
-            'error':           None,
-        }],
-    }
-
-
-@pytest.fixture
-def sample_s3_table_result(sample_s3_presence_result):
-    return {
-        **sample_s3_presence_result,
-        'table_results': [{
-            'source_table': 'transactions',
-            'status':       'COMPLETED',
-            'existed':      False,
-            'error':        None,
-        }],
-        '_task_duration': 3.1,
-        '_has_failures':  False,
-    }
-
-
-@pytest.fixture
-def sample_s3_validation_result(sample_s3_table_result):
-    return {
-        **sample_s3_table_result,
-        'validation_results': [{
-            'source_table':          'transactions',
-            'status':                'COMPLETED',
-            'source_row_count':      1000,
-            'dest_hive_row_count':   1000,
-            'source_partition_count': 2,
-            'dest_partition_count':  2,
-            'row_count_match':       True,
-            'partition_count_match': True,
-            'schema_match':          True,
-            'schema_differences':    '',
-            'error':                 None,
-        }],
-        '_task_duration': 2.8,
-        '_has_failures':  False,
     }
