@@ -148,6 +148,10 @@ class TestMigrateTablesToIceberg:
         assert any(r['migration_type'] == 'INPLACE' for r in result['results'])
 
     def test_failure_raises(self, mock_spark, sample_iceberg_discovery):
+        # source_format must be PARQUET so system.snapshot is called (UNKNOWN/TEXT triggers CTAS)
+        for tbl in sample_iceberg_discovery['discovered_tables']:
+            tbl['source_format'] = 'PARQUET'
+
         def router(sql):
             sl = sql.lower()
             df = MagicMock()
