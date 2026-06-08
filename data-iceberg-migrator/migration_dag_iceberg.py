@@ -273,10 +273,11 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
         for row in desc_rows:
             col = (row.col_name or '').strip()
             val = (row.data_type.strip() if row.data_type else '')
-            if col.startswith('# Partition Information'):
+            col_lower = col.lower()
+            if col_lower.startswith('# partition information'):
                 section = 'partitions'
                 continue
-            if col.startswith('# Detailed Table Information') or col.startswith('# Storage Information'):
+            if col_lower.startswith('# detailed table information') or col_lower.startswith('# storage information'):
                 section = 'details'
                 continue
             if not col:
@@ -290,7 +291,7 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                     input_format = val
                 elif col == 'Provider':
                     provider = val
-                elif col == 'Serde Library':
+                elif col.lower() == 'serde library':
                     serde = val
         sig = ' '.join(s for s in (input_format, provider, serde) if s).lower()
         if 'parquet' in sig:
@@ -354,6 +355,14 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
     config = get_config()
     tracking_db = config['tracking_database']
 
+    # Ensure Spark reads Hive tables recursively (handles nested subdirectories
+    # under partition paths that are common after MapR-to-S3 copies).
+    # system.snapshot does NOT use these settings for its own file listing, but
+    # these are needed for the pre-migration hive_count query and any CTAS path.
+    spark.conf.set("spark.sql.hive.convertMetastoreParquet", "false")
+    spark.conf.set("mapreduce.input.fileinputformat.input.dir.recursive", "true")
+    spark.conf.set("mapred.input.dir.recursive", "true")
+
     src_db = discovery['source_database']
     dest_db = discovery['destination_iceberg_database']
     inplace = discovery['inplace_migration']
@@ -384,10 +393,17 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
         # safely overwrite the source Hive table in place. Record as SKIPPED
         # (not FAILED) so the run continues and the report distinguishes a
         # known limitation from an actual failure.
-        if source_format == 'TEXT' and inplace:
-            error_msg = (
-                "Inplace Iceberg migration is not supported for text-format Hive tables "
-            ).replace("'", "''")
+        if source_format in ('TEXT', 'UNKNOWN') and inplace:
+            if source_format == 'UNKNOWN':
+                error_msg = (
+                    "Inplace Iceberg migration skipped: format detection returned UNKNOWN "
+                    "(likely a text-format table whose SerDe was not parsed from DESCRIBE FORMATTED)"
+                ).replace("'", "''")
+                logger.warning(f"[IcebergMigrate] SKIPPED unknown-format inplace: {src_db}.{tbl}")
+            else:
+                error_msg = (
+                    "Inplace Iceberg migration is not supported for text-format Hive tables "
+                ).replace("'", "''")
             tbl_fail_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
             results.append({
                 'source_table': f"{src_db}.{tbl}",
@@ -414,13 +430,15 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     current_timestamp()
                 )
             """, task_label=f"migrate:text_inplace_skip:insert:{tbl}")
-            logger.warning(f"[IcebergMigrate] SKIPPED text-format inplace: {src_db}.{tbl}")
+            if source_format != 'UNKNOWN':  # UNKNOWN already warned above
+                logger.warning(f"[IcebergMigrate] SKIPPED text-format inplace: {src_db}.{tbl}")
             continue
 
         try:
             hive_count = spark.sql(f"SELECT COUNT(*) as c FROM {src_db}.{tbl}").collect()[0]['c']
             src_hive_partition_count = 0
             total_registered = 0
+            partition_count_ok = False
             if is_partitioned:
                 try:
                     # Count only partitions that have actual data files — these are the only
@@ -435,14 +453,19 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                         )
                     """).collect()[0]['cnt']
                     total_registered = spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}").count()
+                    partition_count_ok = True
                     logger.info(
                         f"[IcebergMigrate] {src_db}.{tbl} | "
                         f"strategy={'INPLACE' if inplace else 'SNAPSHOT'} | "
                         f"hive_registered_partitions={total_registered} | "
                         f"hive_nonempty_partitions={src_hive_partition_count}"
                     )
-                except Exception:
-                    pass
+                except Exception as _pcount_err:
+                    logger.warning(
+                        f"[IcebergMigrate] {src_db}.{tbl}: could not count Hive partitions "
+                        f"(partition_columns={partition_columns}): {_pcount_err!r}. "
+                        f"Skipping dest .partitions query to avoid spurious mismatch."
+                    )
 
             if inplace:
                 migration_type = "INPLACE"
@@ -470,7 +493,13 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 #   Iceberg table at the destination warehouse path (separate from the source
                 #   external location) and metadata/ is written there, not in the source dir.
                 # - PARQUET / ORC: system.snapshot is the preferred zero-copy path.
-                use_ctas = source_format == 'TEXT' or (source_format == 'AVRO' and hive_count == 0)
+                if source_format == 'UNKNOWN':
+                    logger.warning(
+                        f"[IcebergMigrate] {src_db}.{tbl}: source_format=UNKNOWN — "
+                        f"system.snapshot rejects text-format SerDes; falling back to CTAS. "
+                        f"Check DESCRIBE FORMATTED output (InputFormat/Serde Library may not have been parsed)."
+                    )
+                use_ctas = source_format in ('TEXT', 'UNKNOWN') or (source_format == 'AVRO' and hive_count == 0)
                 if use_ctas:
                     partition_clause = f"PARTITIONED BY ({', '.join(partition_columns)})" if partition_columns else ""
                     logger.info(
@@ -485,13 +514,41 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     """)
                 else:
                     spark.sql(f"CALL spark_catalog.system.snapshot('{src_db}.{tbl}', '{dest_db}.{tbl}')")
+                    # system.snapshot uses fs.listStatus() (non-recursive) to register files,
+                    # so it misses data files that live in subdirectories under a partition
+                    # path (common when the source was copied from MapR with the original
+                    # sub-folder layout preserved). Detect the shortfall by comparing the
+                    # snapshot row count with the pre-migration Hive row count (which Spark
+                    # read recursively above). If rows are missing, drop the incomplete
+                    # snapshot and fall back to CTAS, which uses Spark's full recursive reader.
+                    spark.catalog.refreshTable(dest_table)
+                    snapshot_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_table}").collect()[0]['c']
+                    if snapshot_count < hive_count:
+                        logger.warning(
+                            f"[IcebergMigrate] {src_db}.{tbl}: system.snapshot registered only "
+                            f"{snapshot_count}/{hive_count} rows — partition subdirectories not "
+                            f"picked up by non-recursive file listing. Dropping snapshot and "
+                            f"falling back to CTAS."
+                        )
+                        spark.sql(f"DROP TABLE IF EXISTS {dest_table}")
+                        partition_clause = f"PARTITIONED BY ({', '.join(partition_columns)})" if partition_columns else ""
+                        spark.sql(f"""
+                            CREATE TABLE {dest_table}
+                            USING iceberg
+                            {partition_clause}
+                            AS SELECT * FROM {src_db}.{tbl}
+                        """)
+                        use_ctas = True
 
             iceberg_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_table}").collect()[0]['c']
             # For unpartitioned tables, normalize to 0.
             # Iceberg's .partitions metadata table counts partitions that have data files.
             # SHOW PARTITIONS is a Hive-metastore command and returns 0 on Iceberg tables.
+            # Guard: only query .partitions when src partition-counting succeeded; if it
+            # failed (e.g. DESCRIBE FORMATTED returned false-positive partition_columns for
+            # a non-partitioned table), both counts remain 0 → partition_match stays True.
             dest_iceberg_partition_count = 0
-            if is_partitioned:
+            if is_partitioned and partition_count_ok:
                 try:
                     spark.catalog.refreshTable(dest_table)
                     dest_iceberg_partition_count = spark.sql(
