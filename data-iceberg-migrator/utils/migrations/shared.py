@@ -939,7 +939,8 @@ _PERMANENT_ERROR_MARKERS: dict[str, tuple[str, ...]] = {
         "no such file or directory",
         "source path not found",
         "source location not found",
-        "does not exist",
+        "input path does not exist",
+        "file does not exist:",
         "permission denied",
         "accesscontrolexception",
         "accessdenied",
@@ -965,6 +966,8 @@ _PERMANENT_ERROR_MARKERS: dict[str, tuple[str, ...]] = {
         "invalid parquet file",
         "not a parquet file",
         "could not read footer",
+        "table_or_view_not_found",
+        "cannot be found. verify the spelling",
     ),
 
     # ── rewrite_and_register_tables ──────────────────────────────────────

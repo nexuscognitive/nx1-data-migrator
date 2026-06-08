@@ -372,6 +372,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
 
     results = []
+    _permanent_failure = None
 
     for tbl_meta in discovery.get('discovered_tables', []):
         tbl = tbl_meta['table']
@@ -737,18 +738,21 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             """, task_label=f"migrate:failed:insert:{tbl}")
             logger.error(f"ERROR: {error_msg}")
             if is_permanent_error("iceberg_migrate", e):
-                context['ti'].xcom_push(key='return_value', value={
-                    'run_id': run_id,
-                    'source_database': src_db,
-                    'destination_database': dest_db,
-                    'migration_type': 'INPLACE' if inplace else 'SNAPSHOT',
-                    'results': results,
-                    '_has_failures': True,
-                    '_failure_summary': error_msg,
-                })
-                permanent_fail(f"migrate_tables_to_iceberg:{src_db}.{tbl}", e)
+                _permanent_failure = (f"migrate_tables_to_iceberg:{src_db}.{tbl}", e)
 
     failed_migrations = [r for r in results if r['status'] == 'FAILED']
+    if _permanent_failure is not None:
+        _label, _exc = _permanent_failure
+        context['ti'].xcom_push(key='return_value', value={
+            'run_id': run_id,
+            'source_database': src_db,
+            'destination_database': dest_db,
+            'migration_type': 'INPLACE' if inplace else 'SNAPSHOT',
+            'results': results,
+            '_has_failures': True,
+            '_failure_summary': str(_exc)[:400],
+        })
+        permanent_fail(_label, _exc)
     has_failures = len(failed_migrations) > 0
 
     result_dict = {
