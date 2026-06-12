@@ -243,6 +243,32 @@ def _discover_partition_columns(spark, location: str) -> list:
     return columns
 
 
+def _count_leaf_partition_dirs(spark, location: str, depth: int) -> int:
+    """Count leaf key=value directories `depth` levels below location.
+
+    Mirrors what MSCK REPAIR registers: every key=value directory chain is a
+    partition, whether or not it contains data files — so empty partition
+    directories are counted on both sides of the validation comparison.
+    """
+    jvm = spark._jvm
+    hadoop_conf = spark._jsc.hadoopConfiguration()
+    fs = jvm.org.apache.hadoop.fs.FileSystem.get(jvm.java.net.URI(location), hadoop_conf)
+
+    current = [location]
+    for _ in range(depth):
+        next_level = []
+        for path in current:
+            for st in fs.listStatus(jvm.org.apache.hadoop.fs.Path(path)):
+                if not st.isDirectory():
+                    continue
+                name = st.getPath().getName()
+                if name.startswith((".", "_")) or "=" not in name:
+                    continue
+                next_level.append(st.getPath().toString())
+        current = next_level
+    return len(current)
+
+
 def _table_location(spark, database: str, table: str) -> str | None:
     """Return the storage location of an existing HMS table, or None if not found."""
     for row in spark.sql(f"DESCRIBE FORMATTED {database}.{table}").collect():
@@ -339,9 +365,16 @@ def register_parquet_tables(table_config: dict, dag_run_id: str, spark, **contex
             _record("SKIPPED", [], msg)
             return result
 
-        # Spark partition discovery infers partition columns (from key=value dirs)
-        # into the schema alongside the data columns read from the parquet footers.
-        df = spark.read.parquet(s3_location)
+        # Partition columns are registered as STRING: typed inference would
+        # collapse month=01/month=1 into one value, lose leading zeros, and
+        # make the registered type depend on the values present today. Keeping
+        # partition keys string-typed also matches Athena/Glue guidance.
+        spark.conf.set("spark.sql.sources.partitionColumnTypeInference.enabled", "false")
+        # mergeSchema unions the footers of ALL files, so columns added or
+        # removed by schema evolution are not silently dropped from the table
+        # (the default samples a single footer). Incompatible type evolution
+        # across files fails loudly here instead of corrupting reads later.
+        df = spark.read.option("mergeSchema", "true").parquet(s3_location)
         partition_columns = _discover_partition_columns(spark, s3_location)
         result["partition_columns"] = partition_columns
 
@@ -437,9 +470,10 @@ def validate_registered_tables(registration_result: dict, spark, **context) -> d
         partition_count_match = True
         if partition_columns:
             hms_partition_count = spark.sql(f"SHOW PARTITIONS {database}.{table}").count()
-            # DISTINCT over the partition columns counts non-empty partitions and
-            # piggybacks on the data already read for parquet_count (no S3 walk).
-            s3_partition_count = parquet_df.select(*partition_columns).distinct().count()
+            # Count leaf key=value directories rather than DISTINCT over the
+            # data, so empty partition dirs (registered by MSCK but holding no
+            # rows) don't produce a false mismatch.
+            s3_partition_count = _count_leaf_partition_dirs(spark, s3_location, len(partition_columns))
             partition_count_match = hms_partition_count == s3_partition_count
 
         mismatches = []

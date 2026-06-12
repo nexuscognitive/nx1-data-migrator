@@ -183,11 +183,44 @@ class TestDiscoverPartitionColumns:
         assert m._discover_partition_columns(mock_spark, "s3a://b/t") == []
 
 
+class TestCountLeafPartitionDirs:
+    def test_counts_nested_leaves_including_empty(self, mock_spark):
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        # depth 2: root has two dt dirs; first has two region dirs, second has
+        # one region dir that is empty — empty leaves still count
+        fs_mock.listStatus.side_effect = [
+            [
+                _make_status("dt=2024-01-01", True, "s3a://b/t/dt=2024-01-01"),
+                _make_status("dt=2024-01-02", True, "s3a://b/t/dt=2024-01-02"),
+                _make_status("_SUCCESS", False),
+            ],
+            [
+                _make_status("region=eu", True, "s3a://b/t/dt=2024-01-01/region=eu"),
+                _make_status("region=us", True, "s3a://b/t/dt=2024-01-01/region=us"),
+            ],
+            [
+                _make_status("region=eu", True, "s3a://b/t/dt=2024-01-02/region=eu"),
+            ],
+        ]
+        assert m._count_leaf_partition_dirs(mock_spark, "s3a://b/t", 2) == 3
+
+    def test_ignores_hidden_and_non_kv_directories(self, mock_spark):
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        fs_mock.listStatus.side_effect = [
+            [
+                _make_status("dt=2024-01-01", True, "s3a://b/t/dt=2024-01-01"),
+                _make_status(".spark-staging", True),
+                _make_status("not_a_partition", True),
+            ],
+        ]
+        assert m._count_leaf_partition_dirs(mock_spark, "s3a://b/t", 1) == 1
+
+
 class TestRegisterParquetTables:
     def _setup_parquet_read(self, mock_spark, fields):
         df = MagicMock()
         df.schema.fields = fields
-        mock_spark.read.parquet.return_value = df
+        mock_spark.read.option.return_value.parquet.return_value = df
         return df
 
     def _setup_fs_listing(self, mock_spark, listings):
@@ -284,7 +317,7 @@ class TestRegisterParquetTables:
             ti=MagicMock(),
         )
         assert result["status"] == "SKIPPED"
-        mock_spark.read.parquet.assert_not_called()
+        mock_spark.read.option.assert_not_called()
         all_sql = " ".join(str(c) for c in mock_spark.sql.call_args_list).lower()
         assert "msck" not in all_sql
         assert any("SKIPPED" in str(c) for c in mock_iceberg_retry.call_args_list)
@@ -338,7 +371,7 @@ class TestRegisterParquetTables:
         self, mock_spark, sample_hms_table_config, mock_iceberg_retry
     ):
         mock_spark.catalog.tableExists.return_value = False
-        mock_spark.read.parquet.side_effect = Exception("Path does not exist")
+        mock_spark.read.option.return_value.parquet.side_effect = Exception("Path does not exist")
         with pytest.raises(Exception, match="HMS registration failed"):
             m.register_parquet_tables.function.__wrapped__(
                 table_config=sample_hms_table_config,
@@ -387,6 +420,27 @@ class TestRegisterParquetTables:
         assert "hms_registration_status" in retry_sql
         assert "REGISTERED" in retry_sql
 
+    def test_disables_type_inference_and_merges_schema(self, mock_spark, sample_hms_table_config, mock_iceberg_retry):
+        """Partition columns must register as STRING (inference off) and the schema
+        must be merged across all footers so evolved columns are not dropped."""
+        mock_spark.catalog.tableExists.return_value = False
+        self._setup_parquet_read(mock_spark, [_make_field("id", "bigint"), _make_field("dt", "string")])
+        self._setup_fs_listing(
+            mock_spark,
+            [
+                [_make_status("dt=2024-01-01", True, "s3a://b/t/dt=2024-01-01")],
+                [_make_status("part-00000.parquet", False)],
+            ],
+        )
+        m.register_parquet_tables.function.__wrapped__(
+            table_config=sample_hms_table_config,
+            dag_run_id="dag_test",
+            spark=mock_spark,
+            ti=MagicMock(),
+        )
+        mock_spark.conf.set.assert_any_call("spark.sql.sources.partitionColumnTypeInference.enabled", "false")
+        mock_spark.read.option.assert_called_once_with("mergeSchema", "true")
+
 
 class TestValidateRegisteredTables:
     def _setup_counts(self, mock_spark, hms_rows=1000, parquet_rows=1000, hms_partitions=2, s3_partitions=2):
@@ -407,8 +461,15 @@ class TestValidateRegisteredTables:
 
         parquet_df = MagicMock()
         parquet_df.count.return_value = parquet_rows
-        parquet_df.select.return_value.distinct.return_value.count.return_value = s3_partitions
         mock_spark.read.parquet.return_value = parquet_df
+
+        # the fixture's partition_columns is ['dt'] (depth 1), so the S3-side
+        # count is one listStatus call on the table root
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        fs_mock.listStatus.return_value = [
+            _make_status(f"dt=2024-01-{i:02d}", True, f"s3a://b/t/dt=2024-01-{i:02d}")
+            for i in range(1, s3_partitions + 1)
+        ]
 
     def test_counts_match_validated(self, mock_spark, sample_hms_registration_result):
         self._setup_counts(mock_spark)
@@ -438,6 +499,21 @@ class TestValidateRegisteredTables:
                 spark=mock_spark,
                 ti=MagicMock(),
             )
+
+    def test_empty_partition_dirs_count_on_both_sides(self, mock_spark, sample_hms_registration_result):
+        """MSCK registers empty key=value dirs; the S3-side directory count must
+        include them too, so an empty partition is not a false mismatch."""
+        # 3 partition dirs on S3 (one empty), MSCK registered all 3 — rows live
+        # in only 2 of them but row counts still agree overall
+        self._setup_counts(mock_spark, hms_partitions=3, s3_partitions=3)
+        result = m.validate_registered_tables.function.__wrapped__(
+            registration_result=sample_hms_registration_result,
+            spark=mock_spark,
+            ti=MagicMock(),
+        )
+        assert result["validation_status"] == "COMPLETED"
+        assert result["partition_count_match"] is True
+        assert result["s3_partition_count"] == 3
 
     def test_unpartitioned_skips_partition_check(self, mock_spark, sample_hms_registration_result):
         sample_hms_registration_result["partition_columns"] = []
