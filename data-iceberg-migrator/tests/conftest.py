@@ -171,6 +171,7 @@ def _install_airflow_stubs():
     sys.modules.pop("migration_dag_mapr_to_s3", None)
     sys.modules.pop("migration_dag_iceberg", None)
     sys.modules.pop("migration_dag_folder_copy", None)
+    sys.modules.pop("migration_dag_parquet_hms", None)
     sys.modules.pop("utils.migrations.partition_utils", None)
     sys.modules.pop("utils.migrations.shared", None)
     sys.modules.pop("utils.migrations", None)
@@ -248,7 +249,8 @@ def mock_iceberg_retry():
     """Patch execute_with_iceberg_retry across all DAG modules."""
     with patch('migration_dag_mapr_to_s3.execute_with_iceberg_retry') as retry, \
          patch('migration_dag_iceberg.execute_with_iceberg_retry', retry), \
-         patch('migration_dag_folder_copy.execute_with_iceberg_retry', retry):
+         patch('migration_dag_folder_copy.execute_with_iceberg_retry', retry), \
+         patch('migration_dag_parquet_hms.execute_with_iceberg_retry', retry):
         yield retry
 
 
@@ -482,4 +484,31 @@ def sample_folder_finalize_result(sample_folder_run_id):
     return {
         'run_id': sample_folder_run_id, 'status': 'COMPLETED',
         'total_folders': 2, 'successful_folders': 2, 'failed_folders': 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# DAG 4 (Parquet HMS registration) sample data
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def sample_hms_run_id():
+    return 'hms_reg_20250101_120000_abcd1234'
+
+@pytest.fixture
+def sample_hms_table_config(sample_hms_run_id):
+    return {
+        'run_id': sample_hms_run_id,
+        'database': 'sales_data',
+        'table': 'transactions',
+        's3_location': 's3a://test-bucket/sales_data/transactions',
+    }
+
+@pytest.fixture
+def sample_hms_registration_result(sample_hms_table_config):
+    return {
+        **sample_hms_table_config,
+        'partition_columns': ['dt'],
+        'status': 'REGISTERED',
+        'error': None,
+        '_task_duration': 12.5,
     }
