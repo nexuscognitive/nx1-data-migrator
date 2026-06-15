@@ -1,16 +1,17 @@
 # Source (MapR-FS/HDP-HDFS) to S3 Migration DAG
 
-An automated **Airflow TaskFlow-based migration pipeline** consisting of two independent DAGs for orchestrating large-scale Hive table migrations from source (MapR-FS or HDP-HDFS) to S3 and converting existing tables to Iceberg format.
+An automated **Airflow TaskFlow-based migration pipeline** consisting of four independent DAGs for orchestrating large-scale Hive table migrations from source (MapR-FS or HDP-HDFS) to S3 and converting existing tables to Iceberg format.
 
 ---
 
 ## Overview
 
-This implementation provides three independent but complementary migration DAGs:
+This implementation provides four independent but complementary migration DAGs:
 
 1. **`source_to_s3_migration`** - Migrates Hive tables from source (MapR-FS/HDP-HDFS) to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
 3. **`folder_only_data_copy`** - Copies raw folders from source cluster (MapR-FS/HDP-HDFS) to S3 via DistCp — no Hive metadata
+4. **`parquet_hms_registration`** - Registers plain parquet files on S3 as external Hive Metastore tables — schema inferred, partitions auto-discovered
 
 ---
 
@@ -115,6 +116,7 @@ single-tenant setups.
 | DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config                 | `s3a://config-bucket/migration.xlsx`             |
 | DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config               | `s3a://config-bucket/iceberg_migration.xlsx`     |
 | DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config           | `s3a://config-bucket/folder_copy.xlsx`           |
+| DAG 4 | `excel_file_path` | Yes      | S3 path to parquet HMS config           | `s3a://config-bucket/parquet_hms.xlsx`           |
 
 ---
 
@@ -1258,6 +1260,119 @@ COMPLETED_WITH_ERRORS
 | `VALIDATION_FAILED`  | Destination exists but file count or size mismatch |
 | `VALIDATION_SKIPPED` | Copy step failed — validation not attempted        |
 | `FAILED`             | DistCp failed                                      |
+
+---
+
+## DAG 4: Parquet HMS Registration (`parquet_hms_registration`)
+
+### Purpose
+
+Registers plain parquet files already sitting on S3 (e.g. copied by DAG 3 or an
+external migration) as **external Hive Metastore tables**, so they become
+queryable without moving or rewriting any data.
+
+### Key Features
+
+- **Schema inference** - column names and types are inferred directly from the
+  parquet files via Spark with `mergeSchema=true`, so the footers of **all**
+  files are unioned — columns added or removed by schema evolution are not
+  silently dropped; no schema input required
+- **Automatic partition discovery** - Hive-style `key=value` directory layouts
+  are detected, the table is created with the matching `PARTITIONED BY` clause,
+  and partitions are registered with `MSCK REPAIR TABLE`. Partition columns are
+  always registered as **STRING** (`partitionColumnTypeInference` is disabled):
+  values keep their exact directory form (`month=01` stays `01`), and string
+  partition keys are what Athena/Glue recommend for metastore interop
+- **Safe by default** - tables that already exist in HMS at a *different*
+  location are recorded as `SKIPPED`, never dropped or replaced; an existing
+  table at the *same* location (an Airflow retry) is MSCK-repaired and
+  recorded `REGISTERED`
+- **Validation** - row counts (HMS table vs direct parquet read) and partition
+  counts (`SHOW PARTITIONS` vs leaf `key=value` directories on S3) are
+  compared after registration
+- **Tracking & reporting** - run-level and per-table status in Iceberg tracking
+  tables, HTML report written to S3 and emailed
+
+### Excel Configuration
+
+One row per table to register:
+
+| database   | table        | s3_location                              |
+| ---------- | ------------ | ---------------------------------------- |
+| sales_data | transactions | s3a://data-lake/sales_data/transactions  |
+| sales_data | orders       | s3://data-lake/sales_data/orders         |
+
+- All three columns are required; rows with missing cells are skipped with a warning
+- `s3_location` accepts `s3://`, `s3n://`, or `s3a://` (normalized to `s3a://`)
+- The target database is created with `CREATE DATABASE IF NOT EXISTS` when missing
+- Duplicate `(database, table)` rows: the first row wins
+- Partition columns are **not** configured — they are discovered from the
+  directory layout. Locations without `key=value` directories are registered as
+  unpartitioned tables.
+
+### Task Flow
+
+```
+init_hms_tracking_tables
+        |
+create_hms_registration_run
+        |
+parse_parquet_hms_excel
+        |
+register_parquet_tables          (mapped: one task per Excel row)
+        |
+validate_registered_tables       (mapped, max 3 concurrent)
+        |
+update_hms_validation_status     (mapped)
+        |
+generate_hms_html_report
+        |
+send_hms_report_email
+        |
+finalize_hms_run
+```
+
+### Task Summaries
+
+| Task                           | Description                                                                                          |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `init_hms_tracking_tables`     | Creates `hms_registration_runs` and `hms_registration_status` Iceberg tracking tables if missing      |
+| `create_hms_registration_run`  | Inserts a `RUNNING` run record; generates the `hms_reg_...` run ID                                    |
+| `parse_parquet_hms_excel`      | Reads the Excel file from S3; emits one config per valid row                                          |
+| `register_parquet_tables`      | Infers schema (merged across all footers), detects partition columns from `key=value` dirs (typed STRING), `CREATE EXTERNAL TABLE` + `MSCK REPAIR TABLE`; existing table at same location → repair + `REGISTERED`, at different location → `SKIPPED` |
+| `validate_registered_tables`   | Compares HMS row count vs direct parquet count, and `SHOW PARTITIONS` count vs leaf `key=value` directories on S3 |
+| `update_hms_validation_status` | Writes validation results back to the tracking table (`VALIDATED` / `VALIDATION_FAILED`)              |
+| `generate_hms_html_report`     | Builds the HTML report and writes it to `migration_report_location`                                   |
+| `send_hms_report_email`        | Emails the report via SMTP (skips gracefully when no recipients configured)                           |
+| `finalize_hms_run`             | Aggregates per-table statuses into the run record (`COMPLETED` / `COMPLETED_WITH_FAILURES` / `FAILED`) |
+
+### Status Progression
+
+Per table: `REGISTERED` → `VALIDATED` (or `VALIDATION_FAILED`), with terminal
+`SKIPPED` (table already in HMS at a different location) and `FAILED`
+(registration error) states.
+Per run: `RUNNING` → `COMPLETED` / `COMPLETED_WITH_FAILURES` / `FAILED`.
+
+### Notes & Limitations
+
+- **Partition columns are always STRING.** Spark's partition type inference is
+  explicitly disabled (`spark.sql.sources.partitionColumnTypeInference.enabled=false`),
+  so directory values are never coerced (`month=01` and `month=1` stay distinct,
+  leading zeros survive, `dt=2024-01-01` is not turned into a DATE). Query with
+  string predicates (`WHERE year='2024'`) or cast in the query. See the
+  [Athena guidance on string partition keys](https://docs.aws.amazon.com/athena/latest/ug/performance-tuning-data-optimization-techniques.html)
+  and the [Spark partition discovery docs](https://spark.apache.org/docs/latest/sql-data-sources-parquet.html)
+- **Schema evolution is handled at registration** via `mergeSchema=true`: the
+  registered schema is the union of all file footers; files missing
+  later-added columns read those columns as NULL (standard parquet behavior).
+  Genuinely incompatible type changes across files fail the registration loudly
+- Empty partition directories are registered by MSCK and return zero rows when
+  queried; validation counts directories on both sides, so empty partitions do
+  not flag a mismatch
+- Non-Hive-style layouts (no `key=value` directories) are registered as
+  unpartitioned tables
+- No drop/replace support — re-running against a table registered elsewhere
+  records `SKIPPED`
 
 ---
 

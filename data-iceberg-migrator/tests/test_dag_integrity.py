@@ -3,6 +3,7 @@
 import migration_dag_folder_copy as m3
 import migration_dag_iceberg as m2
 import migration_dag_mapr_to_s3 as m1
+import migration_dag_parquet_hms as m4
 
 
 class TestMaprToS3DagIntegrity:
@@ -30,3 +31,12 @@ class TestFolderCopyDagIntegrity:
 
     def test_excel_param_defined(self):
         assert 'excel_file_path' in m3.dag_folder_copy.params
+
+
+class TestParquetHmsDagIntegrity:
+
+    def test_dag_loads_with_correct_id(self):
+        assert m4.dag_parquet_hms.dag_id == 'parquet_hms_registration'
+
+    def test_excel_param_defined(self):
+        assert 'excel_file_path' in m4.dag_parquet_hms.params

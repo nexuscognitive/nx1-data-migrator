@@ -135,7 +135,7 @@ These are standalone CLI tools (not Airflow DAGs). They use argparse for CLI, da
 - **Monorepo with independent test suites**: each component has its own `pytest.ini`, `.coveragerc`, and test directory. Running `pytest` from the repo root will not work correctly.
 - **code-scanner uses `requirements-test.txt`**, not `pyproject.toml` dev deps. Install separately.
 - **Env files are gitignored**: `env.*` except `*.example` are in `.gitignore`. Never commit actual env files.
-- **deploy.py rewrites DAG content in memory**: it string-replaces `dag_id` and `owner` before uploading, so DAG files must contain the exact markers defined in `PROJECTS` dict (e.g. `dag_id='iceberg_migration'`, `'owner': 'data-migration'`).
+- **deploy.py rewrites DAG content in memory**: it string-replaces `dag_id` and `owner` before uploading, so DAG files must contain the exact markers defined in `PROJECTS` dict (e.g. `dag_id='iceberg_migration'`; for migrator DAGs the owner marker is the `return 'data-migration'` fallback inside `_resolve_dag_owner()` — the `migration_dag_owner` Airflow Variable still wins at runtime).
 - **S3 paths use `s3a://` prefix**: the codebase normalizes `s3://` and `s3n://` to `s3a://` via `normalize_s3()`. Always use `s3a://` in config.
 - **Iceberg commit conflicts are expected**: concurrent Spark tasks writing to the same Iceberg table will conflict. This is handled by `execute_with_iceberg_retry()` — do not remove or bypass it.
 - **CI only runs `ruff check`, not `ruff format --check`**: format violations will not fail CI. Run `ruff format --check .` locally before pushing.
