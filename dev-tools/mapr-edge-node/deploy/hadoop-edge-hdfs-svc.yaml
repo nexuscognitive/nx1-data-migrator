@@ -1,0 +1,16 @@
+# Headless Service so hadoop-edge.hadoop-ssh.svc.cluster.local resolves directly
+# to the edge pod IP (no kube-proxy hairpin), exposing HDFS NameNode RPC + DataNode
+# + NameNode HTTP for cross-namespace clients (e.g. the NX1 S3 Gateway hdfs backend).
+apiVersion: v1
+kind: Service
+metadata:
+  name: hadoop-edge
+  namespace: hadoop-ssh
+spec:
+  clusterIP: None
+  selector:
+    app: hadoop-edge
+  ports:
+    - { name: namenode-rpc, port: 9000, targetPort: 9000 }
+    - { name: datanode, port: 50010, targetPort: 50010 }
+    - { name: namenode-http, port: 9870, targetPort: 9870 }

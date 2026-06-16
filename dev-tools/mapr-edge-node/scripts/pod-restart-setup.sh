@@ -39,7 +39,7 @@ cat > /opt/hadoop/etc/hadoop/core-site.xml << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
 <configuration>
-  <property><name>fs.defaultFS</name><value>hdfs://localhost:9000</value></property>
+  <property><name>fs.defaultFS</name><value>hdfs://hadoop-edge.hadoop-ssh.svc.cluster.local:9000</value></property>
   <property><name>hadoop.tmp.dir</name><value>/hadoop/data/tmp</value></property>
   <property><name>fs.maprfs.impl</name><value>org.apache.hadoop.hdfs.DistributedFileSystem</value></property>
   <property><name>fs.s3a.impl</name><value>org.apache.hadoop.fs.s3a.S3AFileSystem</value></property>
