@@ -35,7 +35,9 @@ from utils.migrations.shared import (
     execute_with_iceberg_retry,
     get_config,
     hive_type_to_spark_ddl,
+    is_permanent_error,
     normalize_s3,
+    permanent_fail,
     track_duration,
     validate_bucket_endpoint_pairs,
 )
@@ -276,11 +278,14 @@ fi
             logger.warning(f"  - {error}")
         logger.info("=" * 60)
 
-        raise Exception(
+        _exc = Exception(
             f"Pre-DAG validation failed. "
             f"{len(validation_results['errors'])} check(s) failed:\n"
             + "\n".join(f"  - {e}" for e in validation_results["errors"])
         )
+        if is_permanent_error("validate_prerequisites", _exc):
+            permanent_fail("validate_prerequisites", _exc)
+        raise _exc
 
 
 @task.pyspark(conn_id="spark_default")
@@ -417,11 +422,15 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
 
     import pandas as ps
 
-    config = get_config()
-    binary_df = spark.read.format("binaryFile").load(excel_file_path)
-    row = binary_df.select("content").first()
-    excel_bytes = bytes(row.content)
-    df = ps.read_excel(BytesIO(excel_bytes), engine="openpyxl")
+    df = None
+    try:
+        config = get_config()
+        binary_df = spark.read.format("binaryFile").load(excel_file_path)
+        row = binary_df.select("content").first()
+        excel_bytes = bytes(row.content)
+        df = ps.read_excel(BytesIO(excel_bytes), engine="openpyxl")
+    except Exception as _e:
+        permanent_fail("parse_excel", _e)
 
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
@@ -568,13 +577,22 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         )
 
     logger.info(f"[ParseExcel] Total database configs emitted: {len(configs)}")
+    if not configs:
+        permanent_fail("parse_excel", ValueError(
+            "No valid rows found in Excel — check the 'database' column is populated."
+        ))
     return configs
 
 
 @task
 def cluster_login_setup(run_id: str) -> dict:
     """SSH to edge, perform cluster login (MapR or Kerberos), create temp dir."""
-    return cluster_login(run_id)
+    try:
+        return cluster_login(run_id)
+    except Exception as _e:
+        if is_permanent_error("cluster_login", _e):
+            permanent_fail("cluster_login_setup", _e)
+        raise
 
 
 @task
@@ -1980,6 +1998,15 @@ exit 0
                 }
             )
             logger.error(f"ERROR: {error_msg}")
+            if is_permanent_error("distcp", e):
+                context["ti"].xcom_push(key="return_value", value={
+                    **discovery,
+                    "distcp_results": results,
+                    "yarn_application_ids": [],
+                    "_has_failures": True,
+                    "_failure_summary": error_msg,
+                })
+                permanent_fail(f"run_distcp_ssh:{src_db}.{tbl}", e)
 
     failed_tables = [r for r in results if r["status"] == "FAILED"]
     has_failures = len(failed_tables) > 0
@@ -2531,6 +2558,14 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 }
             )
             logger.error(f"ERROR: {error_msg}")
+            if is_permanent_error("create_hive_tables", e):
+                context["ti"].xcom_push(key="return_value", value={
+                    **distcp_result,
+                    "table_results": results,
+                    "_has_failures": True,
+                    "_failure_summary": error_msg,
+                })
+                permanent_fail(f"create_hive_tables:{dest_db}.{tbl}", e)
 
     failed_tables = [r for r in results if r["status"] == "FAILED"]
     has_failures = len(failed_tables) > 0
@@ -4116,6 +4151,8 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
         return {"sent": True, "recipients": recipients, "report_path": report_path}
     except Exception as e:
         logger.error(f"[Email] Failed to send report: {str(e)}")
+        if is_permanent_error("send_email", e):
+            permanent_fail("send_migration_report_email", e)
         raise Exception(f"Failed to send migration report email: {str(e)}") from e
 
 

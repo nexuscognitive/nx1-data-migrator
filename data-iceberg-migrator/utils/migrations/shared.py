@@ -28,7 +28,9 @@ __all__ = [
     "execute_with_iceberg_retry",
     "get_config",
     "hive_type_to_spark_ddl",
+    "is_permanent_error",
     "normalize_s3",
+    "permanent_fail",
     "track_duration",
     "validate_bucket_endpoint_pairs",
 ]
@@ -885,3 +887,137 @@ def _map_iceberg_type(iceberg_type):
     if t.startswith('fixed'):
         return 'BINARY'
     return 'STRING'
+
+# =============================================================================
+# ERROR CLASSIFICATION — permanent vs transient
+# =============================================================================
+
+_PERMANENT_ERROR_MARKERS: dict[str, tuple[str, ...]] = {
+
+    # ── validate_prerequisites / validate_prerequisites_folder_copy ──────
+    # Expired tickets and missing binaries will not self-heal across retries.
+    "validate_prerequisites": (
+        "no valid mapr ticket",
+        "no valid kerberos tgt",
+        "run maprlogin on the edge node",
+        "hadoop distcp not found",
+        "hadoop distcp not executable",
+    ),
+
+    # ── cluster_login_setup ──────────────────────────────────────────────
+    "cluster_login": (
+        "no valid mapr ticket",
+        "run maprlogin on the edge node",
+        "unknown auth_method",
+        "no valid kerberos",
+    ),
+
+    # ── parse_*_excel / parse_folder_copy_excel ──────────────────────────
+    # Every parse failure is a data-quality / config problem.
+    "parse_excel": (
+        "no valid rows",
+        "missing required column",
+        "valueerror",
+        "zipfile.badzipfile",
+        "not a zip file",
+        "xlrd",
+        "source_path",
+        "target_bucket",
+    ),
+
+    # ── discover_tables_via_spark_ssh / discover_hive_tables ─────────────
+    "discover_tables": (
+        "source database does not exist",
+        "database_not_found",
+        "could not find json markers",
+    ),
+
+    # ── run_distcp_ssh / run_folder_distcp_ssh ───────────────────────────
+    # YARN OOM / resource unavailable → transient (not listed here → retried).
+    # Source path missing / permission denied → permanent.
+    "distcp": (
+        "no such file or directory",
+        "source path not found",
+        "source location not found",
+        "input path does not exist",
+        "file does not exist:",
+        "permission denied",
+        "accesscontrolexception",
+        "accessdenied",
+        "authorizationerror",
+    ),
+
+    # ── create_hive_tables / create_dest_tables ──────────────────────────
+    "create_hive_tables": (
+        "empty_source table has no schema",
+        "cannot infer schema from empty s3 prefix",
+        "serde class not found",
+        "classnotfoundexception",
+    ),
+
+    # ── migrate_tables_to_iceberg ─────────────────────────────────────────
+    # Iceberg CommitFailedException → transient (handled inside execute_with_iceberg_retry).
+    # Corrupt data / unreadable files → permanent.
+    "iceberg_migrate": (
+        "corrupt parquet",
+        "corruptrecordexception",
+        "parquet.io.parquetdecodingexception",
+        "footer is missing",
+        "invalid parquet file",
+        "not a parquet file",
+        "could not read footer",
+        "table_or_view_not_found",
+        "cannot be found. verify the spelling",
+    ),
+
+    # ── rewrite_and_register_tables ──────────────────────────────────────
+    "rewrite_register": (
+        "metadata.json not found",
+        "no metadata file",
+        "version-hint.text",
+        "source_prefix does not match",
+    ),
+
+    # ── validate_data_presence ───────────────────────────────────────────
+    # MISSING path is handled per-table (does not raise at task level).
+    # Only S3 API errors bubble up — bad credentials are the permanent case.
+    "validate_presence": (
+        "invalid access key",
+        "the aws access key id you provided does not exist",
+        "authorizationfailed",
+        "403 forbidden",
+        "access denied",
+    ),
+
+    # ── send_*_report_email ──────────────────────────────────────────────
+    # SMTP transient timeout → retried (not listed). Bad creds / missing
+    # report file → permanent.
+    "send_email": (
+        "no recipients configured",
+        "no such key",
+        "smtpauthenticationerror",
+        "authentication failed",
+    ),
+}
+
+
+def is_permanent_error(task_category: str, exc: Exception) -> bool:
+    """ Return True if *exc* matches a known permanent-failure pattern. """
+    markers = _PERMANENT_ERROR_MARKERS.get(task_category, ())
+    if not markers:
+        return False
+    msg = str(exc).lower()
+    return any(m.lower() in msg for m in markers)
+
+
+def permanent_fail(task_label: str, exc: Exception) -> None:
+    """ Raise AirflowFailException so Airflow marks the task FAILED immediately without consuming remaining retries. """
+    from airflow.exceptions import AirflowFailException
+
+    logger.error(
+        "[PermanentFail] %s — permanent error, retries suppressed: %s: %s",
+        task_label, type(exc).__name__, str(exc)[:400],
+    )
+    raise AirflowFailException(
+        f"{task_label} failed permanently ({type(exc).__name__}): {str(exc)[:400]}"
+    ) from exc
