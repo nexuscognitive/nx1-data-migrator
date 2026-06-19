@@ -894,19 +894,6 @@ def _map_iceberg_type(iceberg_type):
 
 _PERMANENT_ERROR_MARKERS: dict[str, tuple[str, ...]] = {
 
-    # ── parse_*_excel ──────────────────────────
-    # Every parse failure is a data-quality / config problem.
-    "parse_excel": (
-        "no valid rows",
-        "missing required column",
-        "valueerror",
-        "zipfile.badzipfile",
-        "not a zip file",
-        "xlrd",
-        "source_path",
-        "target_bucket",
-    ),
-
     # ── migrate_tables_to_iceberg ─────────────────────────────────────────
     # Iceberg CommitFailedException → transient (handled inside execute_with_iceberg_retry).
     # Corrupt data / unreadable files → permanent.

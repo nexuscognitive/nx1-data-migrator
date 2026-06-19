@@ -30,6 +30,24 @@ class TestCreateIcebergMigrationRun:
         assert run_id.startswith('iceberg_run_')
         assert 'RUNNING' in ' '.join(str(c) for c in mock_spark.sql.call_args_list)
 
+class TestIsPermanentError:
+    def test_matches_known_marker(self):
+        assert m.is_permanent_error("iceberg_migrate", Exception("Corrupt Parquet file")) is True
+
+    def test_no_match_returns_false(self):
+        assert m.is_permanent_error("iceberg_migrate", Exception("connection timed out")) is False
+
+    def test_unknown_category_returns_false(self):
+        assert m.is_permanent_error("nonexistent_category", Exception("anything")) is False
+
+    def test_case_insensitive_match(self):
+        assert m.is_permanent_error("send_email", Exception("SMTPAuthenticationError: bad creds")) is True
+
+class TestPermanentFail:
+    def test_raises_airflow_fail_exception(self):
+        from airflow.exceptions import AirflowFailException
+        with pytest.raises(AirflowFailException, match="failed permanently"):
+            m.permanent_fail("my_task", ValueError("bad input"))
 
 class TestParseIcebergExcel:
 
@@ -207,6 +225,54 @@ class TestMigrateTablesToIceberg:
         assert result['_has_failures'] is False
         assert result['results'][0]['status'] == 'SKIPPED'
         assert result['results'][0]['migration_type'] == 'INPLACE'
+
+    def test_permanent_error_lets_other_tables_finish_then_fails(self, mock_spark):
+        from airflow.exceptions import AirflowFailException
+
+        discovery = {
+            'source_database': 'sales_data_s3',
+            'destination_iceberg_database': 'sales_data_s3_iceberg',
+            'inplace_migration': False,
+            'run_id': 'iceberg_run_20250101_120000_abcd1234',
+            'discovered_tables': [
+                {'table': 'bad_tbl', 'location': 's3a://bucket/bad_tbl',
+                'source_format': 'PARQUET', 'partition_columns': []},
+                {'table': 'good_tbl', 'location': 's3a://bucket/good_tbl',
+                'source_format': 'PARQUET', 'partition_columns': []},
+            ],
+        }
+
+        def router(sql):
+            sl = sql.lower()
+            df = MagicMock()
+            if 'count(*)' in sl:
+                row = MagicMock()
+                row.__getitem__ = lambda self, k: 1000
+                df.collect.return_value = [row]
+            elif 'show partitions' in sl:
+                df.collect.return_value = []
+            elif 'system.snapshot' in sl and 'bad_tbl' in sl:
+                raise Exception("Corrupt Parquet file at footer")
+            elif 'describe formatted' in sl:
+                loc = MagicMock()
+                loc.col_name = 'Location'
+                loc.data_type = 's3a://bucket/t'
+                df.collect.return_value = [loc]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+
+        with pytest.raises(AirflowFailException):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=discovery, dag_run_id='dag_test',
+                spark=mock_spark, ti=MagicMock(),
+            )
+
+        # both tables were attempted before the permanent failure was raised
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'bad_tbl' in all_sql and 'good_tbl' in all_sql
 
     # ------------------------------------------------------------------
     # Partition counting and AVRO CTAS tests (new behaviour)

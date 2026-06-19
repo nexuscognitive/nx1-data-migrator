@@ -70,6 +70,10 @@ class _FakeDAG:
         _FakeDAG._active = None
         return False
 
+class _FakeAirflowFailException(Exception):
+    """Stub for airflow.exceptions.AirflowFailException — behaves like a real exception under test."""
+    pass
+
 
 def _make_airflow_stubs():
     variable_mock = MagicMock()
@@ -142,6 +146,7 @@ def _make_airflow_stubs():
         "pyspark.sql.utils":                    pyspark_sql_utils,
         "py4j":                                 MagicMock(),
         "py4j.java_gateway":                    MagicMock(),
+        "airflow.exceptions":                   MagicMock(AirflowFailException=_FakeAirflowFailException),
     }
     return stubs, variable_mock
 
