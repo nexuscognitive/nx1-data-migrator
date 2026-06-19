@@ -28,7 +28,9 @@ __all__ = [
     "execute_with_iceberg_retry",
     "get_config",
     "hive_type_to_spark_ddl",
+    "is_permanent_error",
     "normalize_s3",
+    "permanent_fail",
     "track_duration",
     "validate_bucket_endpoint_pairs",
 ]
@@ -885,3 +887,57 @@ def _map_iceberg_type(iceberg_type):
     if t.startswith('fixed'):
         return 'BINARY'
     return 'STRING'
+
+# =============================================================================
+# ERROR CLASSIFICATION — permanent vs transient
+# =============================================================================
+
+_PERMANENT_ERROR_MARKERS: dict[str, tuple[str, ...]] = {
+
+    # ── migrate_tables_to_iceberg ─────────────────────────────────────────
+    # Iceberg CommitFailedException → transient (handled inside execute_with_iceberg_retry).
+    # Corrupt data / unreadable files → permanent.
+    "iceberg_migrate": (
+        "corrupt parquet",
+        "corruptrecordexception",
+        "parquet.io.parquetdecodingexception",
+        "footer is missing",
+        "invalid parquet file",
+        "not a parquet file",
+        "could not read footer",
+        "table_or_view_not_found",
+        "cannot be found. verify the spelling",
+    ),
+
+    # ── send_*_report_email ──────────────────────────────────────────────
+    # SMTP transient timeout → retried (not listed). Bad creds / missing
+    # report file → permanent.
+    "send_email": (
+        "no recipients configured",
+        "no such key",
+        "smtpauthenticationerror",
+        "authentication failed",
+    ),
+}
+
+
+def is_permanent_error(task_category: str, exc: Exception) -> bool:
+    """ Return True if *exc* matches a known permanent-failure pattern. """
+    markers = _PERMANENT_ERROR_MARKERS.get(task_category, ())
+    if not markers:
+        return False
+    msg = str(exc).lower()
+    return any(m.lower() in msg for m in markers)
+
+
+def permanent_fail(task_label: str, exc: Exception) -> None:
+    """ Raise AirflowFailException so Airflow marks the task FAILED immediately without consuming remaining retries. """
+    from airflow.exceptions import AirflowFailException
+
+    logger.error(
+        "[PermanentFail] %s — permanent error, retries suppressed: %s: %s",
+        task_label, type(exc).__name__, str(exc)[:400],
+    )
+    raise AirflowFailException(
+        f"{task_label} failed permanently ({type(exc).__name__}): {str(exc)[:400]}"
+    ) from exc
