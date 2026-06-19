@@ -14,20 +14,33 @@ PROJECTS = {
     "migrator": {
         "dir": "data-iceberg-migrator",
         "dags": {
+            # Migrator DAGs resolve their owner at parse time via the
+            # migration_dag_owner Airflow Variable; --owner replaces the
+            # fallback literal inside _resolve_dag_owner(), so the Variable
+            # (when set) still takes precedence over the deployed value.
             "mapr": {
                 "file": "migration_dag_mapr_to_s3.py",
                 "dag_id": "source_to_s3_migration",
-                "owner_marker": "'owner': 'data-migration'",
+                "owner_marker": "return 'data-migration'",
+                "owner_replacement": "return '{owner}'",
             },
             "iceberg": {
                 "file": "migration_dag_iceberg.py",
                 "dag_id": "iceberg_migration",
-                "owner_marker": "'owner': 'data-migration'",
+                "owner_marker": "return 'data-migration'",
+                "owner_replacement": "return '{owner}'",
             },
             "folder": {
                 "file": "migration_dag_folder_copy.py",
                 "dag_id": "folder_only_data_copy",
-                "owner_marker": "'owner': 'data-migration'",
+                "owner_marker": "return 'data-migration'",
+                "owner_replacement": "return '{owner}'",
+            },
+            "parquet_hms": {
+                "file": "migration_dag_parquet_hms.py",
+                "dag_id": "parquet_hms_registration",
+                "owner_marker": "return 'data-migration'",
+                "owner_replacement": "return '{owner}'",
             },
         },
         "shared_utils": [
@@ -260,9 +273,10 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
             print(f"Error: dag_id='{dag_info['dag_id']}' not found in {local_path}")
             sys.exit(1)
         owner_pattern = re.escape(dag_info["owner_marker"]).replace("'", """["']""")
+        owner_replacement = dag_info.get("owner_replacement", '"owner": "{owner}"').format(owner=args.owner)
         content, owner_subs = re.subn(
             owner_pattern,
-            f'"owner": "{args.owner}"',
+            owner_replacement,
             content,
         )
         if owner_subs == 0:
