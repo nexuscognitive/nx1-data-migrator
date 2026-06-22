@@ -2341,8 +2341,10 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                     f"[HiveTable] Could not add partition {partition_spec} "
                                     f"to {full_name}: {str(add_e)[:200]}"
                                 )
-                    elif distcp_status == "EMPTY_SOURCE" and t.get("partitions"):
-                        for part_str in t["partitions"]:
+                    # EMPTY_SOURCE wrote nothing to S3 — MSCK REPAIR would FileNotFound on
+                    # the missing prefix; register partitions explicitly (empty list = no-op).
+                    elif distcp_status == "EMPTY_SOURCE":
+                        for part_str in (t.get("partitions") or []):
                             part_kv = {}
                             for segment in part_str.split("/"):
                                 if "=" in segment:
@@ -2365,7 +2367,10 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                     f"to {full_name}: {str(add_e)[:200]}"
                                 )
                     else:
-                        spark.sql(f"MSCK REPAIR TABLE {full_name}")
+                        # SYNC (not plain REPAIR): also DROP partitions whose dirs no
+                        # longer exist, so a re-run into an existing dest table doesn't
+                        # leave stale partitions that later break reads (e.g. SELECT COUNT(*)).
+                        spark.sql(f"MSCK REPAIR TABLE {full_name} SYNC PARTITIONS")
                 spark.sql(f"REFRESH TABLE {full_name}")
                 logger.info(f"[HiveTable] REPAIRED (already existed): {full_name}")
                 results.append(
@@ -2480,8 +2485,10 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                     f"[HiveTable] Could not add partition {partition_spec} "
                                     f"to {full_name}: {str(add_e)[:200]}"
                                 )
-                    elif distcp_status == "EMPTY_SOURCE" and t.get("partitions"):
-                        for part_str in t["partitions"]:
+                    # EMPTY_SOURCE wrote nothing to S3 — MSCK REPAIR would FileNotFound on
+                    # the missing prefix; register partitions explicitly (empty list = no-op).
+                    elif distcp_status == "EMPTY_SOURCE":
+                        for part_str in (t.get("partitions") or []):
                             part_kv = {}
                             for segment in part_str.split("/"):
                                 if "=" in segment:
@@ -2504,7 +2511,10 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                     f"to {full_name}: {str(add_e)[:200]}"
                                 )
                     else:
-                        spark.sql(f"MSCK REPAIR TABLE {full_name}")
+                        # SYNC (not plain REPAIR): also DROP partitions whose dirs no
+                        # longer exist, so a re-run into an existing dest table doesn't
+                        # leave stale partitions that later break reads (e.g. SELECT COUNT(*)).
+                        spark.sql(f"MSCK REPAIR TABLE {full_name} SYNC PARTITIONS")
                 spark.sql(f"REFRESH TABLE {full_name}")
 
                 logger.info(f"[HiveTable] CREATED: {full_name} | location={s3_loc}")
