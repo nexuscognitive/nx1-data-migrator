@@ -220,7 +220,7 @@ Use `deploy.py` from the repository root to upload the DAG and shared utilities 
 python deploy.py --project ranger --dag ranger --owner my-name --suffix dev1
 ```
 
-This uploads the DAG file (with suffixed DAG ID and custom owner), shared utils (`utils/migrations/ranger_utils.py`), and env files to the correct S3 paths. See the root README for full deploy.py usage.
+This uploads the DAG file (with suffixed DAG ID and custom owner), shared utils (`ranger_gen_utils/migrations/ranger_utils.py`), and env files to the correct S3 paths. See the root README for full deploy.py usage.
 
 ## Task Flow
 
@@ -314,7 +314,7 @@ Coverage settings (source, 80% threshold) are configured in `.coveragerc`.
 
 ## Notes for Dev
 
-Env files are loaded from `utils/migration_configs/` relative to the DAG file location:
+Env files are loaded from `ranger_gen_utils/migration_configs/` relative to the DAG file location:
 
 - `env.shared` — shared config (S3, SSH, Spark, Ranger, Keycloak credentials, etc.)
 - `env.<dag_stem>` — per-developer overrides (e.g. `env.ranger-policies-generator_airflow3`)

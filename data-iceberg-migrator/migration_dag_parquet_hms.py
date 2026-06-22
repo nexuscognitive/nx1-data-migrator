@@ -20,7 +20,7 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.models.param import Param
 from dotenv import load_dotenv
-from utils.migrations.shared import (
+from migrator_utils.migrations.shared import (
     cell_str,
     execute_with_iceberg_retry,
     get_config,
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 _VALID_IDENTIFIER = re.compile(r"^[A-Za-z0-9_]+$")
 
 _dag_dir = Path(__file__).resolve().parent
-_config_dir = str(_dag_dir / "utils" / "migration_configs")
+_config_dir = str(_dag_dir / "migrator_utils" / "migration_configs")
 if os.path.isdir(_config_dir):
     load_dotenv(os.path.join(_config_dir, "env.shared"))
     load_dotenv(os.path.join(_config_dir, f"env.{_dag_stem}"), override=True)

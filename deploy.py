@@ -13,6 +13,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECTS = {
     "migrator": {
         "dir": "data-iceberg-migrator",
+        "package": "migrator_utils",
         "dags": {
             # Migrator DAGs resolve their owner at parse time via the
             # migration_dag_owner Airflow Variable; --owner replaces the
@@ -44,14 +45,15 @@ PROJECTS = {
             },
         },
         "shared_utils": [
-            ("utils/__init__.py", "utils/__init__.py"),
-            ("utils/migrations/__init__.py", "utils/migrations/__init__.py"),
-            ("utils/migrations/shared.py", "utils/migrations/shared.py"),
-            ("utils/migrations/partition_utils.py", "utils/migrations/partition_utils.py"),
+            ("migrator_utils/__init__.py", "migrator_utils/__init__.py"),
+            ("migrator_utils/migrations/__init__.py", "migrator_utils/migrations/__init__.py"),
+            ("migrator_utils/migrations/shared.py", "migrator_utils/migrations/shared.py"),
+            ("migrator_utils/migrations/partition_utils.py", "migrator_utils/migrations/partition_utils.py"),
         ],
     },
     "ranger": {
         "dir": "ranger-policies-generator",
+        "package": "ranger_gen_utils",
         "dags": {
             "ranger": {
                 "file": "ranger_policies_generator_airflow3.py",
@@ -60,9 +62,9 @@ PROJECTS = {
             },
         },
         "shared_utils": [
-            ("utils/__init__.py", "utils/__init__.py"),
-            ("utils/migrations/__init__.py", "utils/migrations/__init__.py"),
-            ("utils/migrations/ranger_utils.py", "utils/migrations/ranger_utils.py"),
+            ("ranger_gen_utils/__init__.py", "ranger_gen_utils/__init__.py"),
+            ("ranger_gen_utils/migrations/__init__.py", "ranger_gen_utils/migrations/__init__.py"),
+            ("ranger_gen_utils/migrations/ranger_utils.py", "ranger_gen_utils/migrations/ranger_utils.py"),
         ],
     },
 }
@@ -292,7 +294,7 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
             if not env_path.exists():
                 print(f"Error: Env file not found: {env_path}")
                 sys.exit(1)
-            env_s3_key = f"{args.dags_prefix}utils/migration_configs/env.{dag_stem}_{args.suffix}"
+            env_s3_key = f"{args.dags_prefix}{project['package']}/migration_configs/env.{dag_stem}_{args.suffix}"
             uploads.append((str(env_path), env_s3_key, None))
 
     if not args.skip_shared_utils:
@@ -310,7 +312,7 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
             print(f"Error: env.shared not found: {env_shared_path}\n"
                   f"Use --skip-env-shared to skip uploading it.")
             sys.exit(1)
-        s3_key = f"{args.dags_prefix}utils/migration_configs/env.shared"
+        s3_key = f"{args.dags_prefix}{project['package']}/migration_configs/env.shared"
         uploads.append((str(env_shared_path), s3_key, None))
 
     return uploads
