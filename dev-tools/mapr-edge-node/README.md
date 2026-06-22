@@ -127,8 +127,10 @@ Run once after starting the container (or after any full reset):
 docker exec -u root mapr-edge-node bash /setup-test-data.sh
 ```
 
-This creates 4 databases and 16 tables covering all migration DAG test scenarios.
-See [Test Data Reference](#test-data-reference) below for the full table inventory.
+This creates 17 databases and 57 tables covering all migration DAG test scenarios,
+`hive_type_to_spark_ddl` struct/complex-type cases, and the error-based-retry
+regression/transient/permanent test suite. See [Test Data Reference](#test-data-reference)
+below for the full table inventory.
 
 ### Step 5 — SSH into the container (optional)
 
@@ -376,8 +378,12 @@ docker exec -u root `
 
 ## Test Data Reference
 
-`setup-test-data.sh` creates 4 databases with 16 tables. Each table is designed
-to exercise a specific scenario in the migration DAG.
+`setup-test-data.sh` creates 17 databases with 57 tables. Each table is designed
+to exercise a specific scenario in the migration DAG, the `hive_type_to_spark_ddl`
+struct/complex-type converter, or the error-based-retry (transient/permanent
+failure) test suite.
+
+## PART A — Migration DAG scenarios + struct/complex-type tests
 
 ### `sales_db`
 
@@ -385,29 +391,30 @@ to exercise a specific scenario in the migration DAG.
 | -------------- | -------- | ----------- | --------------- | ---- | ---------------------------------------------------------------------------------------- |
 | `orders`       | TEXTFILE | Yes         | `year`, `month` | 10   | Partitioned table, 3 partitions — exact filter, `>=` comparison, all-partition migration |
 | `customers`    | TEXTFILE | No          | —               | 5    | Non-partitioned CSV (`,` delimiter)                                                      |
-| `products`     | TEXTFILE | No          | —               | 5    | Non-partitioned TSV (`\t` delimiter)                                                     |
 | `transactions` | TEXTFILE | No          | —               | 4    | Pipe-delimited (`\|`) — tests `field.delim` serde property                               |
 | `orders_empty` | TEXTFILE | Yes         | `year`, `month` | 0    | EMPTY_SOURCE — zero files, no registered partitions                                      |
 
 ### `hr_db`
 
-| Table               | Format   | Partitioned | Partition Keys | Rows | Tests                                                               |
-| ------------------- | -------- | ----------- | -------------- | ---- | ------------------------------------------------------------------- |
-| `employees`         | TEXTFILE | No          | —              | 5    | `\N` null values — tests `serialization.null.format` serde property |
-| `departments`       | TEXTFILE | No          | —              | 0    | EMPTY_SOURCE — empty non-partitioned table                          |
-| `employees_parquet` | PARQUET  | No          | —              | 5    | PARQUET format — schema inferred from files                         |
-| `employees_avro`    | AVRO     | No          | —              | 3    | AVRO format — tests `STORED AS AVRO` DDL                            |
+| Table                     | Format   | Partitioned | Partition Keys | Rows | Tests                                                                  |
+| ------------------------- | -------- | ----------- | -------------- | ---- | ---------------------------------------------------------------------- |
+| `employees`               | TEXTFILE | No          | —              | 5    | `\N` null values — tests `serialization.null.format` serde property    |
+| `departments`             | TEXTFILE | No          | —              | 0    | EMPTY_SOURCE — empty non-partitioned table                             |
+| `employees_parquet`       | PARQUET  | No          | —              | 5    | PARQUET format — schema inferred from files                            |
+| `employees_avro`          | AVRO     | No          | —              | 3    | AVRO format — tests `STORED AS AVRO` DDL                               |
+| `employees_parquet_empty` | PARQUET  | No          | —              | 0    | EMPTY_SOURCE for PARQUET — schema read from metastore, not file footer |
 
 > `hr_db` is used for the **wildcard `*` test** — discovers all tables in one call.
 
 ### `analytics_db`
 
-| Table                      | Format   | Partitioned | Partition Keys            | Rows | Tests                                                                                                                          |
-| -------------------------- | -------- | ----------- | ------------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `events`                   | TEXTFILE | Yes         | `region`, `year`, `month` | 9    | 3-level partition, 4 partitions (3 US + 1 EU) — wildcard filter `region=US/*` and exact 3-level filter                         |
-| `sessions`                 | TEXTFILE | Yes         | `year`, `month`           | 4    | **Unregistered partitions** — data exists in HDFS but not registered in metastore. DAG must set `unregistered_partitions=True` |
-| `events_orc`               | ORC      | Yes         | `region`, `year`, `month` | 5    | ORC format — tests `STORED AS ORC` DDL                                                                                         |
-| `events_empty_partitioned` | TEXTFILE | Yes         | `region`, `year`, `month` | 0    | EMPTY_SOURCE — 3-level partition key, zero files                                                                               |
+| Table                              | Format   | Partitioned | Partition Keys            | Rows | Tests                                                                                                                          |
+| ---------------------------------- | -------- | ----------- | ------------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `events`                           | TEXTFILE | Yes         | `region`, `year`, `month` | 9    | 3-level partition, 4 partitions (3 US + 1 EU) — wildcard filter `region=US/*` and exact 3-level filter                         |
+| `sessions`                         | TEXTFILE | Yes         | `year`, `month`           | 4    | **Unregistered partitions** — data exists in HDFS but not registered in metastore. DAG must set `unregistered_partitions=True` |
+| `events_orc`                       | ORC      | Yes         | `region`, `year`, `month` | 5    | ORC format — tests `STORED AS ORC` DDL                                                                                         |
+| `events_empty_partitioned`         | TEXTFILE | Yes         | `region`, `year`, `month` | 0    | EMPTY_SOURCE — 3-level partition key, registered partitions, zero files                                                        |
+| `events_parquet_empty_partitioned` | PARQUET  | Yes         | `region`, `year`, `month` | 0    | EMPTY_SOURCE for PARQUET partitioned table — same shape as above, Parquet-specific code path                                   |
 
 ### `logs_db`
 
@@ -416,6 +423,136 @@ to exercise a specific scenario in the migration DAG.
 | `app_logs`                     | TEXTFILE | Yes         | `dt`           | 7    | 3 date partitions — used for all partition filter expression types        |
 | `error_logs_empty`             | TEXTFILE | Yes         | `dt`           | 0    | EMPTY_SOURCE — most common real-world case: log table never received data |
 | `metrics_empty_nonpartitioned` | TEXTFILE | No          | —              | 0    | EMPTY_SOURCE — simplest case: flat table, no partition logic              |
+
+### `struct_db`
+
+Covers the `hive_type_to_spark_ddl` converter (colon-to-space conversion for
+nested Hive type strings) and full-DDL integration tests against a
+production-scale replica table.
+
+| Table                    | Format  | Partitioned                      | Rows | Tests                                                                           |
+| ------------------------ | ------- | -------------------------------- | ---- | ------------------------------------------------------------------------------- |
+| `simple_struct`          | PARQUET | No                               | 3    | `struct<a:int,b:string>` — basic colon removal                                  |
+| `array_of_struct`        | PARQUET | No                               | 3    | `array<struct<x:int,y:string>>`                                                 |
+| `map_of_struct`          | PARQUET | No                               | 3    | `map<string,struct<a:int>>`                                                     |
+| `deep_nested_struct`     | PARQUET | No                               | 3    | `struct<a:array<struct<b:map<string,int>>>>` — multi-level nesting              |
+| `array_of_array_struct`  | PARQUET | No                               | 3    | `array<array<struct<x:int>>>`                                                   |
+| `struct_with_decimal`    | PARQUET | No                               | 3    | `struct<amount:decimal(18,4),qty:int>` — decimal comma must not split fields    |
+| `struct_with_varchar`    | PARQUET | No                               | 3    | `struct<name:varchar(255),code:char(10)>` — parameterised types pass through    |
+| `already_converted`      | PARQUET | No                               | 3    | Idempotency — already-space-separated struct is left unchanged                  |
+| `mixed_case_struct`      | PARQUET | No                               | 3    | `STRUCT<A:INT,B:STRING>` — case-insensitive matching                            |
+| `flex_rules_result_mini` | PARQUET | No                               | 3    | Realistic nested struct + array-of-struct (mini production replica)             |
+| `flex_rules_result_full` | PARQUET | Yes (`capbusinesseffectivedate`) | 4    | Full production-width struct DDL — integration test for `CREATE EXTERNAL TABLE` |
+
+---
+
+## PART B — Error-based-retry regression and retry-policy suite
+
+> **Naming note:** `hr_db`, `sales_db`, `analytics_db`, and `logs_db` already
+> exist in PART A with different, incompatible schemas. PART B's equivalents
+> are suffixed `_tz` (`hr_db_tz`, `sales_db_tz`, `analytics_db_tz`,
+> `logs_db_tz`) so both test suites can coexist in the same metastore without
+> one overwriting the other.
+
+### `migration_db`
+
+| Table          | Format  | Partitioned | Rows | Tests                                   |
+| -------------- | ------- | ----------- | ---- | --------------------------------------- |
+| `customers`    | PARQUET | No          | 10   | Basic non-partitioned regression case   |
+| `products`     | PARQUET | No          | 10   | Basic non-partitioned, no NULLs         |
+| `transactions` | PARQUET | No          | 15   | Non-partitioned with `TIMESTAMP` column |
+
+### `metrics_db`
+
+| Table                | Format  | Partitioned | Rows | Tests                             |
+| -------------------- | ------- | ----------- | ---- | --------------------------------- |
+| `daily_active_users` | PARQUET | No          | 4    | Wildcard `*` migration (3 tables) |
+| `conversion_rates`   | PARQUET | No          | 4    | Wildcard `*` migration            |
+| `revenue_summary`    | PARQUET | No          | 4    | Wildcard `*` migration            |
+
+### `audit_db`
+
+| Table        | Format  | Partitioned | Rows | Tests                           |
+| ------------ | ------- | ----------- | ---- | ------------------------------- |
+| `access_log` | PARQUET | No          | 5    | Comma-separated table list test |
+| `change_log` | PARQUET | No          | 4    | Comma-separated table list test |
+
+### `hr_db_tz`
+
+| Table         | Format  | Partitioned | Rows | Tests                                  |
+| ------------- | ------- | ----------- | ---- | -------------------------------------- |
+| `employees`   | PARQUET | No          | 6    | Explicit `dest_database` override test |
+| `departments` | PARQUET | No          | 4    | Explicit `dest_database` override test |
+
+### `sales_db_tz`
+
+| Table           | Format  | Partitioned | Partition Keys  | Rows | Tests                                         |
+| --------------- | ------- | ----------- | --------------- | ---- | --------------------------------------------- |
+| `orders`        | PARQUET | Yes         | `dt`            | 9    | `dt` STRING partition, 3 partitions           |
+| `returns`       | PARQUET | Yes         | `dt`            | 4    | `dt` STRING partition, range filter test      |
+| `daily_summary` | PARQUET | Yes         | `year`, `month` | 6    | INT `year`/`month` partition, `last_n` filter |
+
+### `analytics_db_tz`
+
+| Table      | Format  | Partitioned | Partition Keys            | Rows | Tests                        |
+| ---------- | ------- | ----------- | ------------------------- | ---- | ---------------------------- |
+| `events`   | PARQUET | Yes         | `region`, `year`, `month` | 9    | 3-level partition key        |
+| `sessions` | PARQUET | Yes         | `year`, `month`           | 6    | INT `year`/`month` partition |
+
+### `logs_db_tz`
+
+| Table      | Format  | Partitioned | Partition Keys | Rows | Tests                  |
+| ---------- | ------- | ----------- | -------------- | ---- | ---------------------- |
+| `app_logs` | PARQUET | Yes         | `dt`           | 10   | `dt` range filter test |
+
+### `edge_cases_db`
+
+| Table           | Format  | Partitioned | Rows | Tests                                    |
+| --------------- | ------- | ----------- | ---- | ---------------------------------------- |
+| `empty_table`   | PARQUET | No          | 0    | EMPTY_SOURCE                             |
+| `nulls_table`   | PARQUET | No          | 5    | NULLs across every supported column type |
+| `complex_types` | PARQUET | No          | 3    | `STRUCT`/`ARRAY`/`MAP` columns           |
+| `wide_table`    | PARQUET | No          | 5    | Wide table — 50 columns                  |
+
+### `formats_db`
+
+| Table           | Format   | Partitioned | Rows | Tests                     |
+| --------------- | -------- | ----------- | ---- | ------------------------- |
+| `parquet_table` | PARQUET  | No          | 5    | PARQUET format (explicit) |
+| `orc_table`     | ORC      | No          | 5    | ORC format                |
+| `text_table`    | TEXTFILE | No          | 5    | TEXTFILE format           |
+
+### `tz_db`
+
+Timezone/`TIMESTAMP` round-trip tests. All source timestamps use a fixed
+`17:00:00` local time to surface UTC-offset bugs in the migration path.
+
+| Table                 | Format  | Partitioned | Partition Keys  | Rows | Tests                                |
+| --------------------- | ------- | ----------- | --------------- | ---- | ------------------------------------ |
+| `events_with_ts_la`   | PARQUET | No          | —               | 8    | `TIMESTAMP` columns, non-partitioned |
+| `orders_with_ts_la`   | PARQUET | Yes         | `dt`            | 8    | `TIMESTAMP` columns + `dt` partition |
+| `sessions_with_ts_la` | PARQUET | Yes         | `year`, `month` | 6    | `TIMESTAMP` columns + `year`/`month` |
+
+### `retry_test_db`
+
+| Table            | Format  | Partitioned | Rows | Tests                                             |
+| ---------------- | ------- | ----------- | ---- | ------------------------------------------------- |
+| `yarn_oom_table` | PARQUET | No          | 20   | Transient retry: simulated YARN OOM during DistCp |
+
+### `corrupt_test_db`
+
+Multi-table batch test: one table is corrupted **after** DAG1 copies it to S3
+(see script comments), the other two must still complete successfully.
+
+| Table           | Format  | Partitioned | Rows | Tests                                                          |
+| --------------- | ------- | ----------- | ---- | -------------------------------------------------------------- |
+| `table_a`       | PARQUET | No          | 3    | Healthy table, processed before the corrupt one                |
+| `corrupt_table` | PARQUET | No          | 2    | Corrupted post-copy — must FAIL permanently, no retries        |
+| `table_c`       | PARQUET | No          | 4    | Healthy table, processed after the corrupt one (key assertion) |
+
+> `migration_db.nonexistent_tbl` and `does_not_exist_db.*` are intentionally
+> **not** created — they test `TABLE_NOT_FOUND` / `DATABASE_NOT_FOUND` error
+> handling. |
 
 ### Partition Keys Note
 
