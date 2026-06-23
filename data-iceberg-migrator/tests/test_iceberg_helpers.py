@@ -1,4 +1,4 @@
-"""Tests for the Iceberg metadata helpers in utils/migrations/shared.py.
+"""Tests for the Iceberg metadata helpers in migrator_utils/migrations/shared.py.
 
 These helpers (_list_iceberg_tables, _read_iceberg_metadata, _extract_schema,
 etc.) are consumed by migration_dag_iceberg_catalog.py to read Iceberg table
@@ -8,7 +8,7 @@ metadata directly off S3 without a metastore.
 from unittest.mock import MagicMock
 
 import pytest
-from utils.migrations import shared as sh
+from migrator_utils.migrations import shared as sh
 
 
 class TestMapIcebergType:

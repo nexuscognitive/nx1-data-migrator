@@ -1,8 +1,8 @@
 """
-Tests for utils/migrations/partition_utils.py
+Tests for migrator_utils/migrations/partition_utils.py
 """
 
-from utils.migrations import partition_utils as pu
+from migrator_utils.migrations import partition_utils as pu
 
 
 # ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ _dag_stem = Path(__file__).stem
 logger = logging.getLogger(__name__)
 
 _dag_dir = Path(__file__).resolve().parent
-_config_dir = str(_dag_dir / 'utils' / 'migration_configs')
+_config_dir = str(_dag_dir / 'ranger_gen_utils' / 'migration_configs')
 if os.path.isdir(_config_dir):
     load_dotenv(os.path.join(_config_dir, 'env.shared'))
     load_dotenv(os.path.join(_config_dir, f'env.{_dag_stem}'), override=True)
@@ -1277,7 +1277,7 @@ with DAG(
         """
         from datetime import datetime as dt
 
-        from utils.migrations.ranger_utils import RangerPolicyManager
+        from ranger_gen_utils.migrations.ranger_utils import RangerPolicyManager
 
         cfg = get_config()
         manager = RangerPolicyManager(
@@ -1443,7 +1443,7 @@ with DAG(
         Health check task that verifies Keycloak connectivity before role creation.
         Returns connection status and diagnostic info.
         """
-        from utils.migrations.ranger_utils import KeycloakRoleManager
+        from ranger_gen_utils.migrations.ranger_utils import KeycloakRoleManager
 
         cfg = get_config()
         try:
@@ -1476,7 +1476,7 @@ with DAG(
         Create Keycloak roles and group mappings.
         Returns both summary (for finalize) and statuses (for tracking).
         """
-        from utils.migrations.ranger_utils import KeycloakRoleManager
+        from ranger_gen_utils.migrations.ranger_utils import KeycloakRoleManager
 
         cfg = get_config()
 

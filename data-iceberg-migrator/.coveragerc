@@ -4,7 +4,7 @@ source =
     migration_dag_iceberg
     migration_dag_folder_copy
     migration_dag_parquet_hms
-    utils
+    migrator_utils
 
 [report]
 fail_under = 80

@@ -8,8 +8,8 @@ Tests for shared utility functions:
 import time
 from unittest.mock import MagicMock, patch
 
+import migrator_utils.migrations.shared as m
 import pytest
-import utils.migrations.shared as m
 
 
 class TestGetConfig:

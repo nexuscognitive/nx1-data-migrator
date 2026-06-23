@@ -22,12 +22,12 @@ Data platform migration tools (MapR/HDFS to S3/Iceberg) and Apache Ranger/Keyclo
 │   ├── migration_dag_mapr_to_s3.py      # DAG 1: MapR-FS/HDFS to S3 via DistCp
 │   ├── migration_dag_iceberg.py         # DAG 2: Hive tables to Iceberg (in-place or snapshot)
 │   ├── migration_dag_folder_copy.py     # DAG 3: folder-only data copy
-│   ├── utils/migrations/shared.py       # Shared config, S3 helpers, retry logic
-│   ├── utils/migrations/partition_utils.py
+│   ├── migrator_utils/migrations/shared.py       # Shared config, S3 helpers, retry logic
+│   ├── migrator_utils/migrations/partition_utils.py
 │   └── tests/
 ├── ranger-policies-generator/   # Airflow DAG: Ranger policies + Keycloak roles from Excel
 │   ├── ranger_policies_generator_airflow3.py
-│   ├── utils/migrations/ranger_utils.py
+│   ├── ranger_gen_utils/migrations/ranger_utils.py
 │   └── tests/
 ├── code-scanner/                # Standalone CLI: static analysis for Spark/HDFS/JDK/Python migration
 │   ├── code-scanner.py
@@ -94,15 +94,15 @@ python deploy.py --project ranger --dag ranger --owner my-name --suffix dev1 --d
 - 80% minimum test coverage enforced per component via `.coveragerc`
 - pytest config per component in `pytest.ini`: `-v --timeout=60`
 - Each DAG file is self-contained with its task definitions and DAG wiring at the bottom
-- Shared utilities live in `utils/migrations/` within each component
+- Shared utilities live in each component's own top-level package: `migrator_utils/migrations/` (data-iceberg-migrator) and `ranger_gen_utils/migrations/` (ranger-policies-generator). The names are deliberately unique (not a generic `utils`) so they don't collide with other packages on Airflow's shared `sys.path` (e.g. a `utils` package in the plugins folder)
 
 ## Patterns
 
 ### Configuration Loading
 
-DAGs load config via a two-layer dotenv pattern:
-1. `utils/migration_configs/env.shared` (base config)
-2. `utils/migration_configs/env.{dag_stem}` (per-DAG overrides)
+DAGs load config via a two-layer dotenv pattern (`<pkg>` is the component's package — `migrator_utils` or `ranger_gen_utils`):
+1. `<pkg>/migration_configs/env.shared` (base config)
+2. `<pkg>/migration_configs/env.{dag_stem}` (per-DAG overrides)
 
 At runtime, `get_config()` in `shared.py` resolves each value from: Airflow Variable -> env var -> hardcoded default. This means env files set the env vars that `get_config()` reads.
 
@@ -120,7 +120,7 @@ All DAG tasks use `@task.pyspark(conn_id='spark_default')` for Spark tasks. The 
 
 ### Deployment
 
-`deploy.py` uploads DAG files to S3, injecting per-user DAG ID suffixes and owner names. It also uploads `env.shared` and per-DAG env files to `utils/migration_configs/` on S3. S3 credentials resolve from env.shared, AWS env vars, `~/.aws/credentials`, or IAM role.
+`deploy.py` uploads DAG files to S3, injecting per-user DAG ID suffixes and owner names. It also uploads `env.shared` and per-DAG env files to the component package's `migration_configs/` on S3 (`migrator_utils/migration_configs/` or `ranger_gen_utils/migration_configs/`, from each project's `package` in the `PROJECTS` dict). S3 credentials resolve from env.shared, AWS env vars, `~/.aws/credentials`, or IAM role.
 
 ### Tracking and Reporting
 

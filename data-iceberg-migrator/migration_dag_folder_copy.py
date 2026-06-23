@@ -17,7 +17,7 @@ from airflow.decorators import task
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
-from utils.migrations.shared import (
+from migrator_utils.migrations.shared import (
     SSH_COMMAND_TIMEOUT,
     _login_shell,
     build_s3_opts,
@@ -31,7 +31,7 @@ _dag_stem = Path(__file__).stem
 logger = logging.getLogger(__name__)
 
 _dag_dir = Path(__file__).resolve().parent
-_config_dir = str(_dag_dir / 'utils' / 'migration_configs')
+_config_dir = str(_dag_dir / 'migrator_utils' / 'migration_configs')
 if os.path.isdir(_config_dir):
     load_dotenv(os.path.join(_config_dir, 'env.shared'))
     load_dotenv(os.path.join(_config_dir, f'env.{_dag_stem}'), override=True)

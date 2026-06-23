@@ -41,7 +41,7 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.models.param import Param
 from dotenv import load_dotenv
-from utils.migrations.shared import (
+from migrator_utils.migrations.shared import (
     execute_with_iceberg_retry,
     get_config,
     track_duration,
@@ -51,7 +51,7 @@ _dag_stem = Path(__file__).stem
 logger = logging.getLogger(__name__)
 
 _dag_dir = Path(__file__).resolve().parent
-_config_dir = str(_dag_dir / 'utils' / 'migration_configs')
+_config_dir = str(_dag_dir / 'migrator_utils' / 'migration_configs')
 if os.path.isdir(_config_dir):
     load_dotenv(os.path.join(_config_dir, 'env.shared'))
     load_dotenv(os.path.join(_config_dir, f'env.{_dag_stem}'), override=True)
@@ -193,7 +193,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     from io import BytesIO
 
     import pandas as ps
-    from utils.migrations.shared import cell_str, normalize_s3
+    from migrator_utils.migrations.shared import cell_str, normalize_s3
 
     binary_df = spark.read.format("binaryFile").load(excel_file_path)
     row = binary_df.select("content").first()
@@ -273,7 +273,7 @@ def validate_data_presence(db_config: dict, spark, **context) -> dict:
     Takes db_config (parse_excel output) and enumerates table dirs under
     dest_s3_prefix using _list_iceberg_tables and _match_tokens.
     """
-    from utils.migrations.shared import (
+    from migrator_utils.migrations.shared import (
         _list_iceberg_tables,
         _match_tokens,
     )
@@ -500,7 +500,7 @@ def discover_tables(presence_result: dict, spark, **context) -> dict:
     metadata read provides the source-side metrics that validate_dest_tables
     later compares against the registered Hive table.
     """
-    from utils.migrations.shared import (
+    from migrator_utils.migrations.shared import (
         _extract_partition_spec,
         _extract_row_count,
         _extract_schema,
@@ -700,7 +700,7 @@ def rewrite_and_register_tables(presence_result: dict, spark, **context) -> dict
       5. Permanently register in HMS via register_table using the rewritten
          metadata now present at dest_path/metadata.
     """
-    from utils.migrations.shared import _rebase_table_path, _resolve_metadata_file
+    from migrator_utils.migrations.shared import _rebase_table_path, _resolve_metadata_file
 
     if not isinstance(presence_result, dict) or 'tables' not in presence_result:
         logger.warning("[rewrite_and_register_tables] Skipping invalid input")

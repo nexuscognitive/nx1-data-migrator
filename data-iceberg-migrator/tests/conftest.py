@@ -177,10 +177,10 @@ def _install_airflow_stubs():
     sys.modules.pop("migration_dag_iceberg", None)
     sys.modules.pop("migration_dag_folder_copy", None)
     sys.modules.pop("migration_dag_parquet_hms", None)
-    sys.modules.pop("utils.migrations.partition_utils", None)
-    sys.modules.pop("utils.migrations.shared", None)
-    sys.modules.pop("utils.migrations", None)
-    sys.modules.pop("utils", None)
+    sys.modules.pop("migrator_utils.migrations.partition_utils", None)
+    sys.modules.pop("migrator_utils.migrations.shared", None)
+    sys.modules.pop("migrator_utils.migrations", None)
+    sys.modules.pop("migrator_utils", None)
     if _str_dir in sys.path:
         sys.path.remove(_str_dir)
 

@@ -73,16 +73,16 @@ def ranger_utils_module():
     saved = {k: sys.modules.get(k) for k in stubs}
 
     # Also save the stubs that dag_module (session fixture) may have placed
-    saved_ranger_utils = sys.modules.get("utils.migrations.ranger_utils")
-    saved_utils_migrations = sys.modules.get("utils.migrations")
-    saved_utils = sys.modules.get("utils")
+    saved_ranger_utils = sys.modules.get("ranger_gen_utils.migrations.ranger_utils")
+    saved_utils_migrations = sys.modules.get("ranger_gen_utils.migrations")
+    saved_utils = sys.modules.get("ranger_gen_utils")
 
     for k, v in stubs.items():
         sys.modules[k] = v
 
     import importlib
-    mod_name = "utils.migrations.ranger_utils"
-    for m in ("utils.migrations.ranger_utils", "utils.migrations", "utils"):
+    mod_name = "ranger_gen_utils.migrations.ranger_utils"
+    for m in ("ranger_gen_utils.migrations.ranger_utils", "ranger_gen_utils.migrations", "ranger_gen_utils"):
         sys.modules.pop(m, None)
 
     import sys as _sys
@@ -101,17 +101,17 @@ def ranger_utils_module():
             else:
                 sys.modules[k] = original
         if saved_ranger_utils is None:
-            sys.modules.pop("utils.migrations.ranger_utils", None)
+            sys.modules.pop("ranger_gen_utils.migrations.ranger_utils", None)
         else:
-            sys.modules["utils.migrations.ranger_utils"] = saved_ranger_utils
+            sys.modules["ranger_gen_utils.migrations.ranger_utils"] = saved_ranger_utils
         if saved_utils_migrations is None:
-            sys.modules.pop("utils.migrations", None)
+            sys.modules.pop("ranger_gen_utils.migrations", None)
         else:
-            sys.modules["utils.migrations"] = saved_utils_migrations
+            sys.modules["ranger_gen_utils.migrations"] = saved_utils_migrations
         if saved_utils is None:
-            sys.modules.pop("utils", None)
+            sys.modules.pop("ranger_gen_utils", None)
         else:
-            sys.modules["utils"] = saved_utils
+            sys.modules["ranger_gen_utils"] = saved_utils
 
 
 def _make_manager(ranger_utils_module):
@@ -1273,7 +1273,7 @@ class TestGetExistingPolicyNoneResponse:
         import logging
         mgr = _make_manager(ranger_utils_module)
         mgr.client.find_policies.return_value = None
-        logger = logging.getLogger("utils.migrations.ranger_utils")
+        logger = logging.getLogger("ranger_gen_utils.migrations.ranger_utils")
         with patch.object(logger, "warning") as mock_warn, \
              patch.object(logger, "error") as mock_err:
             mgr.get_existing_policy("iceberg.db1.t1")
