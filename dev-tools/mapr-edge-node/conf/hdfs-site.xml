@@ -17,4 +17,23 @@
     <name>dfs.permissions.enabled</name>
     <value>false</value>
   </property>
+  <!-- Cross-namespace reachability: bind NameNode on all interfaces while
+       advertising the service DNS from fs.defaultFS, so the DataNode registers
+       a routable address (not 127.0.0.1) and remote clients can read blocks. -->
+  <property>
+    <name>dfs.namenode.rpc-bind-host</name>
+    <value>0.0.0.0</value>
+  </property>
+  <property>
+    <name>dfs.namenode.servicerpc-bind-host</name>
+    <value>0.0.0.0</value>
+  </property>
+  <property>
+    <name>dfs.namenode.http-bind-host</name>
+    <value>0.0.0.0</value>
+  </property>
+  <property>
+    <name>dfs.namenode.datanode.registration.ip-hostname-check</name>
+    <value>false</value>
+  </property>
 </configuration>

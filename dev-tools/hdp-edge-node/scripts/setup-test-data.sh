@@ -20,6 +20,24 @@ hdfs dfs -mkdir -p /user/hive/warehouse/logs_db.db/app_logs/dt=2024-01-15
 hdfs dfs -mkdir -p /user/hive/warehouse/logs_db.db/app_logs/dt=2024-02-01
 
 echo "=== [2/4] Writing sample data files to HDFS ==="
+# Drop any stale TEXTFILE table definitions before (re)writing their CSV: each table
+# below is created with CREATE TABLE IF NOT EXISTS in [3/4], which is a no-op if the
+# table already exists in a different storage format (e.g. left STORED AS PARQUET by
+# an earlier run). That leaves the metastore typed wrong over these CSV files, so
+# table discovery reads a CSV as a Parquet footer and fails. These are managed tables,
+# so the drop must run BEFORE the data is written — a drop afterwards would delete the
+# CSV. Idempotent: a no-op on a fresh node.
+$BEELINE -e "
+CREATE DATABASE IF NOT EXISTS sales_db;
+CREATE DATABASE IF NOT EXISTS hr_db;
+CREATE DATABASE IF NOT EXISTS analytics_db;
+CREATE DATABASE IF NOT EXISTS logs_db;
+DROP TABLE IF EXISTS sales_db.orders;
+DROP TABLE IF EXISTS hr_db.employees;
+DROP TABLE IF EXISTS analytics_db.events;
+DROP TABLE IF EXISTS analytics_db.sessions;
+DROP TABLE IF EXISTS logs_db.app_logs;
+"
 echo -e "1,Alice,100\n2,Bob,200\n3,Carol,150" \
   | hdfs dfs -put -f - /user/hive/warehouse/sales_db.db/orders/year=2024/month=01/data.csv
 echo -e "4,Dave,90\n5,Eve,310" \
