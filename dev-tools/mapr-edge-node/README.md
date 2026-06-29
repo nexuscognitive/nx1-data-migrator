@@ -132,6 +132,12 @@ This creates 17 databases and 57 tables covering all migration DAG test scenario
 regression/transient/permanent test suite. See [Test Data Reference](#test-data-reference)
 below for the full table inventory.
 
+To test out the incremental load scenario, run this after the initial migration run
+
+```powershell
+docker exec -u root mapr-edge-node bash /setup-incremental-test-data.sh
+```
+
 ### Step 5 — SSH into the container (optional)
 
 ```powershell
