@@ -804,7 +804,7 @@ def rewrite_and_register_tables(presence_result: dict, spark, **context) -> dict
                         table            => '{full_name}',
                         source_prefix    => '{source_prefix}',
                         target_prefix    => '{dest_prefix}',
-                        staging_location => '{dest_path}/metadata'
+                        staging_location => '{dest_prefix}'
                     )
                 """)
                 latest_version = rewrite_result.collect()[0]['latest_version']
