@@ -27,6 +27,21 @@ Host *
 SSHEOF
 chmod 600 ~/.ssh/config
 
+# ── Pin the NameNode's advertised hostname to this pod's own IP ──────────────
+# fs.defaultFS points at the headless-service FQDN so the DataNode registers a
+# routable address (not 127.0.0.1) for cross-namespace clients. But start-dfs.sh
+# below runs before this pod is Ready, and a headless service publishes no DNS
+# record for a not-Ready pod — so the FQDN is unresolvable at boot and HDFS
+# never starts (start-dfs.sh can't reach the namenode host). Map the FQDN to our
+# own IP in /etc/hosts first so start-up is self-contained; cluster DNS takes
+# over for external clients once the pod becomes Ready.
+NN_HOST=$(sed -n 's#.*hdfs://\([^:/]*\).*#\1#p' "$HADOOP_CONF_DIR/core-site.xml" | head -1)
+if [ -n "$NN_HOST" ] && [ "$NN_HOST" != "localhost" ] && ! grep -qF "$NN_HOST" /etc/hosts; then
+    POD_IP=$(hostname -i | awk '{print $1}')
+    echo "$POD_IP $NN_HOST" >> /etc/hosts
+    echo "Pinned $NN_HOST -> $POD_IP in /etc/hosts for boot"
+fi
+
 if [ ! -f /hadoop/data/.bootstrapped ]; then
     bash /bootstrap-hdfs.sh
     touch /hadoop/data/.bootstrapped
