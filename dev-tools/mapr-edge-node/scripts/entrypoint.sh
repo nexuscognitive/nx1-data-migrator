@@ -11,7 +11,7 @@ fi
 
 # Wait until sshd is actually listening before proceeding
 for i in $(seq 1 30); do
-    if nc -z localhost 22; then
+    if netstat -ltn 2>/dev/null | grep -q ':22 '; then
         echo "sshd ready on port 22"
         break
     fi
