@@ -83,17 +83,17 @@ RUN mkdir -p /run/sshd /root/.ssh \
 
 # Fake maprlogin binary — allows the DAG's cluster_login task to pass
 # its MapR ticket check without a real MapR installation
-RUN cat > /usr/local/bin/maprlogin << 'MAPREOF' \
-    && echo '#!/bin/bash' > /usr/local/bin/maprlogin \
-    && echo 'if [ "$1" = "print" ]; then' >> /usr/local/bin/maprlogin \
-    && echo '  echo "MapR credentials (UID 0) for user: root"' >> /usr/local/bin/maprlogin \
-    && echo '  echo "  created: $(date)"' >> /usr/local/bin/maprlogin \
-    && echo '  echo "  expires: $(date -d '"'"'+7 days'"'"' 2>/dev/null || date)"' >> /usr/local/bin/maprlogin \
-    && echo '  echo "  cluster: test-cluster"' >> /usr/local/bin/maprlogin \
-    && echo '  exit 0' >> /usr/local/bin/maprlogin \
-    && echo 'fi' >> /usr/local/bin/maprlogin \
-    && echo 'exit 1' >> /usr/local/bin/maprlogin \
-    && chmod +x /usr/local/bin/maprlogin
+RUN cat > /usr/local/bin/maprlogin <<'MAPREOF' && chmod +x /usr/local/bin/maprlogin
+#!/bin/bash
+if [ "$1" = "print" ]; then
+  echo "MapR credentials (UID 0) for user: root"
+  echo "  created: $(date)"
+  echo "  expires: $(date -d '+7 days' 2>/dev/null || date)"
+  echo "  cluster: test-cluster"
+  exit 0
+fi
+exit 1
+MAPREOF
 
 # Bake the MapR ticket file so it survives across SSH sessions
 RUN mkdir -p /tmp \
