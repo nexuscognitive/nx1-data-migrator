@@ -1,0 +1,78 @@
+# Deployment for the shared MapR-equivalent edge node (namespace: hadoop-ssh).
+#
+# Recovered from the live cluster and brought under version control. All Hadoop
+# config, the maprlogin stub, the MapR ticket, and the S3A classpath are baked
+# into the image (see ../Dockerfile) — no post-restart script is required.
+#
+# NOTE: the previous live spec mounted a `hadoop-edge-conf` ConfigMap read-only
+# over core-site.xml and hdfs-site.xml. That overlay is intentionally omitted
+# here — the image now ships identical, cross-namespace-correct copies, so the
+# ConfigMap (and pod-restart-setup.sh) are no longer needed. Delete the
+# ConfigMap after cutover:  kubectl delete cm hadoop-edge-conf -n hadoop-ssh
+#
+# Pin `image` to the immutable tag the build-edge-node pipeline published (not
+# :latest) so the running version is reproducible and roll-backable. The tag
+# equals the git tag you pushed to trigger the build (e.g. mapr-edge-2026-07-16).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hadoop-edge
+  namespace: hadoop-ssh
+  labels:
+    app: hadoop-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hadoop-edge
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: hadoop-edge
+    spec:
+      containers:
+        - name: hadoop-edge
+          image: nx1registry-hgb9hgbwd8baguad.azurecr.io/mapr-edge-node:mapr-edge-2026-07-16
+          imagePullPolicy: Always
+          # Pin the headless-service FQDN to this pod's own IP so start-dfs.sh
+          # can reach the NameNode before the pod is Ready (matches entrypoint.sh).
+          command:
+            - /bin/bash
+            - -c
+            - echo "${POD_IP} hadoop-edge.hadoop-ssh.svc.cluster.local" >> /etc/hosts; exec /entrypoint.sh
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - { name: ssh, containerPort: 22 }
+            - { name: yarn-ui, containerPort: 8088 }
+            - { name: hdfs-ui, containerPort: 9870 }
+            - { name: hiveserver2, containerPort: 10000 }
+          livenessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - mountPath: /hadoop/data
+              name: hdfs-data
+      volumes:
+        - name: hdfs-data
+          emptyDir: {}
