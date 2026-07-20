@@ -243,6 +243,9 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                 rows = spark.sql(f"SHOW TABLES IN {db}").collect()
                 for r in rows:
                     t = r.tableName
+                    if _is_iceberg_backup_table(t):
+                        logger.info(f"[IcebergDiscover] Skipping Iceberg backup table: {db}.{t}")
+                        continue
                     if t not in seen:
                         seen.add(t)
                         resolved.append(t)
@@ -250,6 +253,9 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                 rows = spark.sql(f"SHOW TABLES IN {db} LIKE '{tok}'").collect()
                 for r in rows:
                     t = r.tableName
+                    if _is_iceberg_backup_table(t):
+                        logger.info(f"[IcebergDiscover] Skipping Iceberg backup table: {db}.{t}")
+                        continue
                     if t not in seen:
                         seen.add(t)
                         resolved.append(t)
@@ -347,6 +353,65 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
         'discovered_tables': tables_metadata
     }
 
+# =============================================================================
+# ICEBERG IN-PLACE BACKUP HELPERS
+# =============================================================================
+
+ICEBERG_BACKUP_SUFFIXES = ('_backup_', '__BACKUP__')
+
+
+def _is_iceberg_backup_table(table_name: str) -> bool:
+    """True if table_name looks like a backup produced by system.migrate."""
+    n = (table_name or '').strip()
+    return n.lower().endswith('_backup_') or n.upper().endswith('__BACKUP__')
+
+
+def _table_exists(spark, db: str, tbl: str) -> bool:
+    """True if {db}.{tbl} exists in the metastore."""
+    try:
+        return spark.sql(f"SHOW TABLES IN {db} LIKE '{tbl}'").count() > 0
+    except Exception:
+        return False
+
+
+def _is_iceberg_table(spark, db: str, tbl: str) -> bool:
+    """True if {db}.{tbl} is ALREADY an Iceberg table (i.e. previously migrated)."""
+    try:
+        rows = spark.sql(f"DESCRIBE FORMATTED {db}.{tbl}").collect()
+    except Exception:
+        return False
+    for r in rows:
+        col = (r.col_name or '').strip().lower()
+        val = (r.data_type or '').strip().lower()
+        if col == 'provider' and 'iceberg' in val:
+            return True
+        # Some bundles surface the format only via table properties / storage handler
+        if col.startswith('table properties') and 'iceberg' in val:
+            return True
+    return False
+
+
+def _drop_stale_inplace_backup(spark, db: str, tbl: str):
+    """ Incremental-run cleanup for IN-PLACE migration. """
+    if not _is_iceberg_table(spark, db, tbl):
+        return None
+    for suffix in ICEBERG_BACKUP_SUFFIXES:
+        backup = f"{tbl}{suffix}"
+        if _table_exists(spark, db, backup):
+            try:
+                # metadata-only drop; NO PURGE (shared data files)
+                spark.sql(f"DROP TABLE IF EXISTS {db}.{backup}")
+                logger.warning(
+                    f"[IcebergMigrate] Dropped stale backup from a previous run "
+                    f"(metadata-only, no PURGE): {db}.{backup}"
+                )
+                return f"{db}.{backup}"
+            except Exception as e:
+                logger.warning(
+                    f"[IcebergMigrate] Could not drop stale backup {db}.{backup}: {e!r}"
+                )
+    return None
+
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
@@ -367,6 +432,13 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
     dest_db = discovery['destination_iceberg_database']
     inplace = discovery['inplace_migration']
     run_id = discovery['run_id']
+    drop_backup = config.get('iceberg_drop_backup', False)
+
+    if inplace:
+        logger.info(
+            f"[IcebergMigrate] {src_db} | inplace=True | drop_backup={drop_backup} "
+            f"({'backups dropped by Iceberg after commit' if drop_backup else 'backups retained; stale ones cleaned on next run'})"
+        )
 
     if not inplace:
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
@@ -471,7 +543,16 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             if inplace:
                 migration_type = "INPLACE"
                 dest_table = f"{src_db}.{tbl}"
-                spark.sql(f"CALL spark_catalog.system.migrate('{src_db}.{tbl}')")
+                _drop_stale_inplace_backup(spark, src_db, tbl)
+                if drop_backup:
+                    spark.sql(
+                        f"CALL spark_catalog.system.migrate("
+                        f"table => '{src_db}.{tbl}', drop_backup => true)"
+                    )
+                else:
+                    spark.sql(
+                        f"CALL spark_catalog.system.migrate(table => '{src_db}.{tbl}')"
+                    )
             else:
                 migration_type = "SNAPSHOT"
                 dest_table = f"{dest_db}.{tbl}"
@@ -552,14 +633,32 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             if is_partitioned and partition_count_ok:
                 try:
                     spark.catalog.refreshTable(dest_table)
-                    dest_iceberg_partition_count = spark.sql(
-                        f"SELECT COUNT(*) as cnt FROM {dest_table}.partitions"
-                    ).collect()[0]['cnt']
+                    try:
+                        dest_iceberg_partition_count = spark.sql(
+                            f"SELECT COUNT(*) as cnt FROM {dest_table}.partitions "
+                            f"WHERE record_count > 0"
+                        ).collect()[0]['cnt']
+                    except Exception as _rc_err:
+                        logger.warning(
+                            f"[IcebergMigrate] {dest_table}: record_count filter unavailable "
+                            f"({_rc_err!r}); falling back to raw .partitions count."
+                        )
+                        dest_iceberg_partition_count = spark.sql(
+                            f"SELECT COUNT(*) as cnt FROM {dest_table}.partitions"
+                        ).collect()[0]['cnt']
                 except Exception:
                     pass
 
             counts_match = (hive_count == iceberg_count)
-            partition_match = (src_hive_partition_count == dest_iceberg_partition_count)
+            if hive_count == 0:
+                partition_match = True
+                logger.info(
+                    f"[IcebergMigrate] {src_db}.{tbl}: empty source (0 rows) — "
+                    f"partition validation trivially satisfied "
+                    f"(hive_registered={total_registered}, iceberg_data_partitions={dest_iceberg_partition_count})"
+                )
+            else:
+                partition_match = (src_hive_partition_count == dest_iceberg_partition_count)
 
             logger.info(f"[IcebergMigrate] COMPLETED: {src_db}.{tbl} | hive_rows={hive_count} | iceberg_rows={iceberg_count} | rows_match={counts_match} | partitions_match={partition_match}")
 
@@ -1675,7 +1774,12 @@ with DAG(
             default='s3a://config-bucket/iceberg_migration.xlsx',
             type='string',
             description='S3 path to Excel config file for Iceberg migration'
-        )
+        ),
+        'iceberg_drop_backup': Param(
+            default=False,
+            type='boolean',
+            description='Drop the <table>_backup_ table after successful in-place migration',
+        ),
     },
     render_template_as_native_obj=True,
 ) as dag_iceberg:

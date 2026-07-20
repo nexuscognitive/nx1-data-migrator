@@ -292,8 +292,16 @@ class TestMigrateTablesToIceberg:
             }],
         }
 
-    def _partition_router(self, *, hive_rows=5, non_empty=1, registered=2, iceberg=1):
+    def _make_inplace_discovery(self, source_format='PARQUET'):
+        d = self._make_partitioned_discovery(source_format)
+        d['inplace_migration'] = True
+        d['destination_iceberg_database'] = d['source_database']
+        return d
+
+    def _partition_router(self, *, hive_rows=5, non_empty=1, registered=2, iceberg=1, iceberg_with_data=None):
         """SQL router that distinguishes SELECT DISTINCT, .partitions, row-count, SHOW PARTITIONS."""
+        if iceberg_with_data is None:
+            iceberg_with_data = iceberg
         def router(sql):
             sl = sql.lower()
             df = MagicMock()
@@ -302,7 +310,8 @@ class TestMigrateTablesToIceberg:
                 row.__getitem__ = lambda self, k: non_empty
                 df.collect.return_value = [row]
             elif '.partitions' in sl:
-                row.__getitem__ = lambda self, k: iceberg
+                val = iceberg_with_data if 'record_count' in sl else iceberg
+                row.__getitem__ = lambda self, k, _v=val: _v
                 df.collect.return_value = [row]
             elif 'count(*)' in sl:
                 row.__getitem__ = lambda self, k: hive_rows
@@ -320,6 +329,75 @@ class TestMigrateTablesToIceberg:
                 df.count.return_value = 0
             return df
         return router
+
+    def test_empty_table_with_registered_empty_partitions_passes(self, mock_spark):
+        """0 rows, 3 registered-but-empty partitions: raw .partitions=3 (old bug ->
+        mismatch), data-bearing=0 -> partition_match must be True."""
+        discovery = self._make_partitioned_discovery()
+        mock_spark.sql.side_effect = self._partition_router(
+            hive_rows=0, non_empty=0, registered=3, iceberg=3, iceberg_with_data=0,
+        )
+        r = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )['results'][0]
+        assert r['partition_match'] is True
+        assert r['iceberg_partition_count'] == 0
+
+    def test_partially_empty_partitions_match(self, mock_spark):
+        """5 registered, 3 with data -> source 3 vs dest 3 -> match."""
+        discovery = self._make_partitioned_discovery()
+        mock_spark.sql.side_effect = self._partition_router(
+            hive_rows=10, non_empty=3, registered=5, iceberg=5, iceberg_with_data=3,
+        )
+        r = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )['results'][0]
+        assert r['partition_match'] is True
+
+    def test_drop_backup_defaults_to_false(self, mock_spark):
+        discovery = self._make_inplace_discovery()
+        base = m.get_config()          # capture BEFORE patching -> no recursion
+        mock_spark.sql.side_effect = self._partition_router()
+        with patch.object(m, 'get_config', return_value={**base, 'iceberg_drop_backup': False}):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+            )
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'system.migrate' in all_sql
+        assert 'drop_backup' not in all_sql
+
+    def test_drop_backup_true_passes_parameter(self, mock_spark):
+        discovery = self._make_inplace_discovery()
+        base = m.get_config()
+        mock_spark.sql.side_effect = self._partition_router()
+        with patch.object(m, 'get_config', return_value={**base, 'iceberg_drop_backup': True}):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+            )
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'drop_backup => true' in all_sql
+
+    def test_discovery_skips_backup_tables(self, mock_spark):
+        def show_tables(sql):
+            df = MagicMock()
+            df.collect.return_value = [
+                MagicMock(tableName='sales'),
+                MagicMock(tableName='sales_backup_'),
+                MagicMock(tableName='orders__BACKUP__'),
+            ]
+            return df
+        mock_spark.sql.side_effect = show_tables
+        resolved = m.discover_hive_tables.function.__wrapped__(
+            db_config={'source_database': 'db', 'table_pattern': '*'}, spark=mock_spark,
+        )
+        names = {t['table'] for t in resolved.get('discovered_tables', [])}
+        assert 'sales' in names
+        assert 'sales_backup_' not in names
+        assert 'orders__BACKUP__' not in names
+
+    def test_stale_backup_dropped_only_when_table_is_iceberg(self, mock_spark):
+        # _is_iceberg_table False -> no DROP issued
+        assert m._drop_stale_inplace_backup(mock_spark, 'db', 'tbl') is None
 
     def test_source_partition_count_uses_select_distinct(self, mock_spark):
         """SELECT DISTINCT is used to count non-empty source partitions."""

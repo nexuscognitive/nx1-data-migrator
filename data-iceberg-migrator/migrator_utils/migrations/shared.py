@@ -288,6 +288,13 @@ def get_config() -> dict:
             _var('migration_include_db_in_path', 'MIGRATION_INCLUDE_DB_IN_PATH', 'true')
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
+        'iceberg_drop_backup': str(
+            _dag_run_conf.get(
+                'iceberg_drop_backup',
+                _var('migration_iceberg_drop_backup', 'MIGRATION_ICEBERG_DROP_BACKUP', 'false')
+            )
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+
         'owner': dag_owner,
     }
 
