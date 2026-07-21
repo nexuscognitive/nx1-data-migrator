@@ -899,6 +899,60 @@ class TestCreateHiveTables:
         assert result['table_results'][0]['status'] == 'COMPLETED'
         assert result['table_results'][0]['existed'] is False
 
+    def test_partition_column_type_from_partition_schema(self, mock_spark, sample_distcp_result):
+        """A date partition column must be emitted as `dt` date in PARTITIONED BY,
+        not defaulted to STRING. Regression test: partition-column types were never
+        captured in discovery, so create_hive_tables hardcoded every partition
+        column to STRING (source date -> dest string)."""
+        sample_distcp_result['tables'][0]['partition_schema'] = [
+            {'name': 'dt', 'type': 'date'},
+        ]
+
+        sql_calls = []
+
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            if sql.strip().upper().startswith('DESCRIBE') and 'FORMATTED' not in sql.upper():
+                raise Exception("Table not found")
+            df = MagicMock()
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        result = m.create_hive_tables.function.__wrapped__(
+            distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+
+        assert result['table_results'][0]['status'] == 'COMPLETED'
+        create_ddl = next(s for s in sql_calls if 'CREATE EXTERNAL TABLE' in s.upper())
+        assert '`dt` date' in create_ddl
+        assert '`dt` STRING' not in create_ddl
+
+    def test_partition_column_defaults_to_string_without_type(self, mock_spark, sample_distcp_result):
+        """Fallback safety: if no partition_schema/schema type is available for a
+        partition column, it still defaults to STRING (unchanged behavior)."""
+        sample_distcp_result['tables'][0].pop('partition_schema', None)
+
+        sql_calls = []
+
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            if sql.strip().upper().startswith('DESCRIBE') and 'FORMATTED' not in sql.upper():
+                raise Exception("Table not found")
+            df = MagicMock()
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        m.create_hive_tables.function.__wrapped__(
+            distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+
+        create_ddl = next(s for s in sql_calls if 'CREATE EXTERNAL TABLE' in s.upper())
+        assert '`dt` STRING' in create_ddl
+
     def test_repairs_existing_table(self, mock_spark, sample_distcp_result):
         df = MagicMock()
         df.collect.return_value = []

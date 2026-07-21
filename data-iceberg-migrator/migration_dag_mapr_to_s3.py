@@ -651,6 +651,7 @@ def _default_metadata_record(tbl):
         "s3_location": _s3_location_for(tbl),
         "file_format": "UNKNOWN",
         "schema": [],
+        "partition_schema": [],
         "partitions": [],
         "partition_columns": "",
         "partition_count": 0,
@@ -974,12 +975,26 @@ for tbl in table_list:
             for f in tbl_schema.fields
             if f.name not in partition_cols_from_describe
         ]
+        # Partition columns are excluded from `schema` above, so capture their
+        # types separately (spark.table().schema DOES include partition columns
+        # with their real Hive types). Order follows the DESCRIBE FORMATTED
+        # partition section so the PARTITIONED BY clause is emitted in the
+        # correct column order downstream. Without this, create_hive_tables
+        # defaults every partition column to STRING (e.g. date -> string).
+        schema_type_by_name = {{
+            f.name: f.dataType.simpleString() for f in tbl_schema.fields
+        }}
+        partition_schema = [
+            {{"name": pc, "type": schema_type_by_name.get(pc, "string")}}
+            for pc in partition_cols_from_describe
+        ]
 
         record = _default_metadata_record(tbl)
         record.update({{
             "source_location": loc or "",
             "file_format": file_format,
             "schema": schema,
+            "partition_schema": partition_schema,
             "partitions": filtered_partitions,
             "partition_columns": partition_columns,
             "partition_count": len(metastore_partitions),
@@ -2423,13 +2438,20 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
 
                 part_clause = ""
                 if is_part and part_col_list:
+                    # Partition-column types come from discovery's partition_schema
+                    # (captured from spark.table().schema, which preserves the real
+                    # Hive types). schema_list never contains partition columns, so
+                    # relying on it would silently default every partition column to
+                    # STRING (e.g. a date partition key becomes string on the dest).
+                    part_type_by_name = {
+                        c["name"]: c["type"]
+                        for c in (schema_list + t.get("partition_schema", []))
+                        if c.get("name")
+                    }
                     pdefs = []
                     for pc in part_col_list:
-                        ptype = "STRING"
-                        for c in schema_list:
-                            if c.get("name") == pc:
-                                ptype = hive_type_to_spark_ddl(c.get("type", "STRING"))
-                                break
+                        raw_ptype = part_type_by_name.get(pc, "STRING")
+                        ptype = hive_type_to_spark_ddl(raw_ptype)
                         pdefs.append(f"`{pc}` {ptype}")
                     part_clause = f"PARTITIONED BY ({', '.join(pdefs)})"
 
