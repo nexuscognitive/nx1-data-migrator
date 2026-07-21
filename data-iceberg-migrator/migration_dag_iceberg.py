@@ -169,6 +169,17 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
 
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
+    # Validate that the table column exists.
+    # Without this check, a missing/misspelled 'table' column defaults to ''
+    # and is later interpreted as '*', unintentionally selecting all tables.
+    if 'table' not in df.columns:
+        permanent_fail(
+            "parse_iceberg_excel",
+            ValueError(
+                "Missing required Excel column: 'table'."
+            )
+        )
+
     grouped = {}
     for _, row in df.iterrows():
         src_db = str(row.get('database', '') or '').strip()
