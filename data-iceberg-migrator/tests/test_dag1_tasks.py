@@ -440,6 +440,21 @@ class TestRecordDiscoveredTables:
         assert any('INSERT INTO' in str(c) for c in mock_iceberg_retry.call_args_list)
         assert result['run_id'] == sample_discovery['run_id']
 
+    def test_insert_covers_partition_schema_columns(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        """The tracking table has partition_schema_* columns, and the INSERT uses an
+        explicit column list — the new columns MUST be listed, otherwise Iceberg
+        rejects the write with INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_FIND_DATA."""
+        self._setup_count(mock_spark, 0)
+        sample_discovery['tables'][0]['partition_schema'] = [{'name': 'dt', 'type': 'date'}]
+        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        insert_sql = next(
+            c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
+        )
+        for col in ('partition_schema_json', 'partition_schema_match', 'partition_schema_differences'):
+            assert col in insert_sql
+        # The captured source partition schema is persisted as JSON
+        assert '"name": "dt"' in insert_sql and '"type": "date"' in insert_sql
+
     def test_updates_existing_record(self, mock_spark, sample_discovery, mock_iceberg_retry):
         self._setup_count(mock_spark, 1)
         m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
@@ -962,6 +977,72 @@ class TestCreateHiveTables:
         )
         assert result['table_results'][0]['existed'] is True
 
+    def test_recreate_tables_drops_and_recreates_existing(self, mock_spark, sample_distcp_result):
+        """recreate_tables=True must DROP an existing destination table (metadata
+        only — EXTERNAL keeps S3 data) and recreate it from scratch rather than
+        just running MSCK REPAIR. This is how a user fixes tables created by an
+        older DAG with wrongly-typed partition columns."""
+        sql_calls = []
+
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            df = MagicMock()
+            df.collect.return_value = []
+            return df  # DESCRIBE succeeds → table exists
+
+        mock_spark.sql.side_effect = recording_sql
+
+        result = m.create_hive_tables.function.__wrapped__(
+            distcp_result=sample_distcp_result, spark=mock_spark,
+            recreate_tables=True, ti=MagicMock(),
+        )
+
+        r = result['table_results'][0]
+        assert r['status'] == 'COMPLETED'
+        assert r['action'] == 'recreated'
+        assert r['existed'] is True
+        all_sql = ' '.join(sql_calls).upper()
+        assert 'DROP TABLE IF EXISTS' in all_sql
+        assert 'CREATE EXTERNAL TABLE' in all_sql
+
+    def test_recreate_tables_accepts_string_true(self, mock_spark, sample_distcp_result):
+        """The param arrives as a native bool normally, but string 'True' (from
+        untemplated contexts) must also trigger recreation."""
+        sql_calls = []
+
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            df = MagicMock()
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        m.create_hive_tables.function.__wrapped__(
+            distcp_result=sample_distcp_result, spark=mock_spark,
+            recreate_tables="True", ti=MagicMock(),
+        )
+        assert 'DROP TABLE IF EXISTS' in ' '.join(sql_calls).upper()
+
+    def test_recreate_tables_false_does_not_drop(self, mock_spark, sample_distcp_result):
+        """Default (recreate_tables=False) must NOT drop an existing table —
+        existing incremental-repair behavior is preserved."""
+        sql_calls = []
+
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            df = MagicMock()
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        result = m.create_hive_tables.function.__wrapped__(
+            distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['table_results'][0]['existed'] is True
+        assert 'DROP TABLE' not in ' '.join(sql_calls).upper()
+
     def test_partition_filter_active_uses_add_partition_not_msck(self, mock_spark, sample_distcp_result):
         """When partition_filter_active=True, table creation must use
         ALTER TABLE ADD PARTITION per filtered partition, not MSCK REPAIR."""
@@ -1195,6 +1276,54 @@ class TestValidateDestinationTables:
         )
         assert result['validation_results'][0]['row_count_match'] is False
 
+    def test_partition_schema_mismatch_detected(self, mock_spark, sample_table_result):
+        """A source date partition column landing as string on the destination
+        must be flagged. The non-partition schema comparison excludes partition
+        columns, so without a dedicated check this would silently pass."""
+        sample_table_result['tables'][0]['partition_schema'] = [
+            {'name': 'dt', 'type': 'date'},
+        ]
+        mock_spark.sql.side_effect = self._make_router(1000)
+        self._setup_dest_schema(mock_spark)  # dest 'dt' is string
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        v = result['validation_results'][0]
+        assert v['partition_schema_match'] is False
+        assert 'dt' in v['partition_schema_differences'].lower()
+        # Non-partition schema still matches; only the partition schema differs
+        assert v['schema_match'] is True
+
+    def test_partition_schema_match_when_types_align(self, mock_spark, sample_table_result):
+        sample_table_result['tables'][0]['partition_schema'] = [
+            {'name': 'dt', 'type': 'date'},
+        ]
+        mock_spark.sql.side_effect = self._make_router(1000)
+        table_mock = MagicMock()
+        table_mock.schema.fields = [
+            self._make_dest_field('id', 'bigint'),
+            self._make_dest_field('amount', 'double'),
+            self._make_dest_field('dt', 'date'),
+        ]
+        mock_spark.table.return_value = table_mock
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        v = result['validation_results'][0]
+        assert v['partition_schema_match'] is True
+        assert v['partition_schema_differences'] == ''
+
+    def test_partition_schema_not_compared_when_source_absent(self, mock_spark, sample_table_result):
+        """Discovery from an older DAG version has no partition_schema. Comparison
+        must be a no-op (match=True) so re-runs don't produce false failures."""
+        sample_table_result['tables'][0].pop('partition_schema', None)
+        mock_spark.sql.side_effect = self._make_router(1000)
+        self._setup_dest_schema(mock_spark)
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['partition_schema_match'] is True
+
     def test_validates_scoped_to_filtered_partitions_when_filter_active(
         self, mock_spark, sample_table_result
     ):
@@ -1334,6 +1463,27 @@ class TestUpdateValidationStatus:
         sample_validation_result['validation_results'][0]['row_count_match'] = False
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
         assert any('VALIDATION_FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
+
+    def test_partition_schema_mismatch_sets_validation_failed(
+        self, mock_spark, sample_validation_result, mock_iceberg_retry
+    ):
+        """Row/partition counts and non-partition schema all match, but a partition
+        schema mismatch alone must still fail validation."""
+        sample_validation_result['validation_results'][0].update({
+            'partition_schema_match': False,
+            'partition_schema_differences': 'Partition type mismatch for dt: date vs string',
+        })
+        m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
+        assert any('VALIDATION_FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
+        assert not any('VALIDATED,' in str(c) for c in mock_iceberg_retry.call_args_list)
+
+    def test_persists_partition_schema_columns(
+        self, mock_spark, sample_validation_result, mock_iceberg_retry
+    ):
+        m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
+        joined = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert 'partition_schema_match' in joined
+        assert 'partition_schema_differences' in joined
 
 
 class TestGenerateHtmlReport:
