@@ -1,0 +1,21 @@
+# SSH endpoint the Airflow DAG connects to (discover + distcp run over SSH).
+#
+# The hadoop-ssh node's equivalent Service was never in version control (it
+# lived only in the live cluster). Committed here so the es-tenant-2 node is
+# fully reproducible. Reachable only inside the cluster.
+#
+# Set the es-tenant-2 Airflow SSH connection Host to:
+#   hadoop-edge-ssh.es-tenant-2.svc.cluster.local   (or just hadoop-edge-ssh)
+apiVersion: v1
+kind: Service
+metadata:
+  name: hadoop-edge-ssh
+  namespace: es-tenant-2
+  labels:
+    app: hadoop-edge
+spec:
+  type: ClusterIP
+  selector:
+    app: hadoop-edge
+  ports:
+    - { name: ssh, port: 22, targetPort: 22 }

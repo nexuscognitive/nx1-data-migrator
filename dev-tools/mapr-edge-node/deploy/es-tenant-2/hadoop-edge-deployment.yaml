@@ -1,0 +1,80 @@
+# es-tenant-2 copy of the MapR-equivalent edge node (namespace: es-tenant-2).
+#
+# Runs ALONGSIDE the shared hadoop-ssh node — it does not replace it. This one
+# is colocated with the es-tenant-2 Airflow so the DAG reaches it in-namespace.
+#
+# Differs from deploy/hadoop-edge-deployment.yaml (hadoop-ssh) in two ways:
+#   1. Image is built for this namespace — the build bakes
+#      fs.defaultFS = hdfs://hadoop-edge.es-tenant-2.svc.cluster.local:9000
+#      via `--build-arg EDGE_NAMESPACE=es-tenant-2` (see ../../Dockerfile).
+#   2. /hadoop/data is backed by a PersistentVolumeClaim (hadoop-edge-pvc.yaml)
+#      instead of emptyDir, so seeded test data persists across restarts.
+#
+# Apply order:  hadoop-edge-pvc.yaml -> this -> the two Service manifests.
+# Point the es-tenant-2 Airflow SSH connection at:
+#   hadoop-edge-ssh.es-tenant-2.svc.cluster.local  (or just hadoop-edge-ssh)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hadoop-edge
+  namespace: es-tenant-2
+  labels:
+    app: hadoop-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hadoop-edge
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: hadoop-edge
+    spec:
+      containers:
+        - name: hadoop-edge
+          # Built for es-tenant-2 (see header). Pin an immutable tag, not :latest.
+          image: nx1registry-hgb9hgbwd8baguad.azurecr.io/mapr-edge-node:es-tenant-2-2026-07-24
+          imagePullPolicy: Always
+          # Pin the headless-service FQDN to this pod's own IP so start-dfs.sh
+          # can reach the NameNode before the pod is Ready (matches entrypoint.sh).
+          command:
+            - /bin/bash
+            - -c
+            - echo "${POD_IP} hadoop-edge.es-tenant-2.svc.cluster.local" >> /etc/hosts; exec /entrypoint.sh
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - { name: ssh, containerPort: 22 }
+            - { name: yarn-ui, containerPort: 8088 }
+            - { name: hdfs-ui, containerPort: 9870 }
+            - { name: hiveserver2, containerPort: 10000 }
+          livenessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - mountPath: /hadoop/data
+              name: hdfs-data
+      volumes:
+        - name: hdfs-data
+          persistentVolumeClaim:
+            claimName: hadoop-edge-data

@@ -1,0 +1,28 @@
+# Persistent storage for the es-tenant-2 edge node's HDFS data + Hive metastore.
+#
+# Replaces the emptyDir used by the hadoop-ssh node so that seeded test data
+# (HDFS warehouse files under /hadoop/data/datanode AND the derby metastore at
+# /hadoop/data/metastore_db) survives pod restarts, Recreate rollouts, and
+# reschedules. Combined with the first-boot seed guard in entrypoint.sh, the
+# test data is created exactly once and then persists.
+#
+# ReadWriteOnce is correct here: single replica, and the Deployment uses
+# strategy: Recreate so the old pod is fully gone before the new one mounts.
+#
+# storageClassName is the cluster's ReadWriteOnce (block) class — Ceph RBD, per
+# nx1-full-package's rwoclass default (ocs-storagecluster-ceph-rbd). Verify with
+# `kubectl get storageclass` and adjust if this cluster differs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hadoop-edge-data
+  namespace: es-tenant-2
+  labels:
+    app: hadoop-edge
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: ocs-storagecluster-ceph-rbd
