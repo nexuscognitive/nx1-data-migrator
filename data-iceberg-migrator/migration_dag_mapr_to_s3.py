@@ -72,18 +72,6 @@ default_args = {
 }
 
 
-def _as_bool(value) -> bool:
-    """Coerce a DAG param / config value to bool.
-
-    Airflow renders boolean Params to a native bool when
-    render_template_as_native_obj=True, but falls back to strings ("True"/"true")
-    in some contexts, so accept both.
-    """
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
 def _compare_partition_schemas(src_partition_schema, dest_partition_schema):
     """Compare source vs destination partition-column schemas (name -> type).
 
@@ -2322,14 +2310,15 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
 
 @task.pyspark(conn_id="spark_default")
 @track_duration
-def create_hive_tables(distcp_result: dict, spark, recreate_tables=False, **context) -> dict:
+def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
     """Create external Hive tables via Spark. Handles incremental (repairs partitions).
 
-    When ``recreate_tables`` is True, any destination table that already exists is
-    DROPPED and recreated from scratch. The destination tables are EXTERNAL, so
-    DROP TABLE removes only the Hive/Iceberg metadata — the underlying S3 data is
-    preserved. This lets a user fix tables created by an older DAG version (e.g.
-    partition columns wrongly typed as STRING) without manually dropping them.
+    When the ``migration_recreate_tables`` Airflow Variable is true, any
+    destination table that already exists is DROPPED and recreated from scratch.
+    The destination tables are EXTERNAL, so DROP TABLE removes only the
+    Hive/Iceberg metadata — the underlying S3 data is preserved. This lets a user
+    fix tables created by an older DAG version (e.g. partition columns wrongly
+    typed as STRING) without manually dropping them.
     """
 
     if not isinstance(distcp_result, dict) or "tables" not in distcp_result:
@@ -2338,7 +2327,7 @@ def create_hive_tables(distcp_result: dict, spark, recreate_tables=False, **cont
         )
         return {}
 
-    recreate_requested = _as_bool(recreate_tables)
+    recreate_requested = get_config().get("recreate_tables", False)
     if recreate_requested:
         logger.info(
             "[create_hive_tables] recreate_tables=True — existing destination tables "
@@ -4353,21 +4342,7 @@ with DAG(
             default="s3a://config-bucket/migration.xlsx",
             type="string",
             description="S3 path to Excel config file",
-        ),
-        "recreate_tables": Param(
-            default=False,
-            type="boolean",
-            title="Drop & recreate destination tables",
-            description=(
-                "If enabled, any destination Hive table that already exists is "
-                "DROPPED and recreated from scratch. Destination tables are "
-                "EXTERNAL, so DROP removes only the metadata, the S3 data is "
-                "preserved. Use this to fix tables created by an older DAG "
-                "version with incorrect partition-column types (e.g. a date "
-                "partition key stored as STRING). Leave disabled for normal "
-                "incremental runs."
-            ),
-        ),
+        )
     },
     render_template_as_native_obj=True,
 ) as dag_mapr_to_s3:
@@ -4393,9 +4368,7 @@ with DAG(
     t_distcp.operator.trigger_rule = "all_done"
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
     t_distcp_status.operator.trigger_rule = "all_done"
-    t_tables = create_hive_tables.partial(
-        recreate_tables="{{ params.recreate_tables }}"
-    ).expand(distcp_result=t_distcp_status)
+    t_tables = create_hive_tables.expand(distcp_result=t_distcp_status)
     t_tables.operator.trigger_rule = "all_done"
     t_tbl_status = update_table_create_status.expand(table_result=t_tables)
     t_tbl_status.operator.trigger_rule = "all_done"

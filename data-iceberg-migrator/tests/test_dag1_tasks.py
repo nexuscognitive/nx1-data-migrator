@@ -978,10 +978,10 @@ class TestCreateHiveTables:
         assert result['table_results'][0]['existed'] is True
 
     def test_recreate_tables_drops_and_recreates_existing(self, mock_spark, sample_distcp_result):
-        """recreate_tables=True must DROP an existing destination table (metadata
-        only — EXTERNAL keeps S3 data) and recreate it from scratch rather than
-        just running MSCK REPAIR. This is how a user fixes tables created by an
-        older DAG with wrongly-typed partition columns."""
+        """migration_recreate_tables=true must DROP an existing destination table
+        (metadata only — EXTERNAL keeps S3 data) and recreate it from scratch
+        rather than just running MSCK REPAIR. This is how a user fixes tables
+        created by an older DAG with wrongly-typed partition columns."""
         sql_calls = []
 
         def recording_sql(sql):
@@ -992,10 +992,10 @@ class TestCreateHiveTables:
 
         mock_spark.sql.side_effect = recording_sql
 
-        result = m.create_hive_tables.function.__wrapped__(
-            distcp_result=sample_distcp_result, spark=mock_spark,
-            recreate_tables=True, ti=MagicMock(),
-        )
+        with patch.object(m, 'get_config', return_value={'recreate_tables': True}):
+            result = m.create_hive_tables.function.__wrapped__(
+                distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+            )
 
         r = result['table_results'][0]
         assert r['status'] == 'COMPLETED'
@@ -1005,28 +1005,9 @@ class TestCreateHiveTables:
         assert 'DROP TABLE IF EXISTS' in all_sql
         assert 'CREATE EXTERNAL TABLE' in all_sql
 
-    def test_recreate_tables_accepts_string_true(self, mock_spark, sample_distcp_result):
-        """The param arrives as a native bool normally, but string 'True' (from
-        untemplated contexts) must also trigger recreation."""
-        sql_calls = []
-
-        def recording_sql(sql):
-            sql_calls.append(sql)
-            df = MagicMock()
-            df.collect.return_value = []
-            return df
-
-        mock_spark.sql.side_effect = recording_sql
-
-        m.create_hive_tables.function.__wrapped__(
-            distcp_result=sample_distcp_result, spark=mock_spark,
-            recreate_tables="True", ti=MagicMock(),
-        )
-        assert 'DROP TABLE IF EXISTS' in ' '.join(sql_calls).upper()
-
     def test_recreate_tables_false_does_not_drop(self, mock_spark, sample_distcp_result):
-        """Default (recreate_tables=False) must NOT drop an existing table —
-        existing incremental-repair behavior is preserved."""
+        """Default (migration_recreate_tables=false) must NOT drop an existing
+        table — existing incremental-repair behavior is preserved."""
         sql_calls = []
 
         def recording_sql(sql):
@@ -1037,9 +1018,10 @@ class TestCreateHiveTables:
 
         mock_spark.sql.side_effect = recording_sql
 
-        result = m.create_hive_tables.function.__wrapped__(
-            distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
-        )
+        with patch.object(m, 'get_config', return_value={'recreate_tables': False}):
+            result = m.create_hive_tables.function.__wrapped__(
+                distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+            )
         assert result['table_results'][0]['existed'] is True
         assert 'DROP TABLE' not in ' '.join(sql_calls).upper()
 
