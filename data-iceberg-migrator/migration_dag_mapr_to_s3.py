@@ -3681,8 +3681,7 @@ def generate_html_report(run_id: str, spark, **context) -> str:
             SUM(CASE WHEN row_count_match = false OR partition_count_match = false OR schema_match = false THEN 1 ELSE 0 END) as tables_failed_validation,
             SUM(CASE WHEN row_count_match = false THEN 1 ELSE 0 END) as total_row_count_mismatches,
             SUM(CASE WHEN partition_count_match = false THEN 1 ELSE 0 END) as total_partition_count_mismatches,
-            SUM(CASE WHEN schema_match = false THEN 1 ELSE 0 END) as total_schema_mismatches,
-            SUM(CASE WHEN partition_schema_match = false THEN 1 ELSE 0 END) as total_partition_schema_mismatches
+            SUM(CASE WHEN schema_match = false OR partition_schema_match = false THEN 1 ELSE 0 END) as total_schema_mismatches
         FROM {tracking_db}.migration_table_status
         WHERE run_id = '{run_id}'
           AND validation_status = 'COMPLETED'
@@ -3745,10 +3744,6 @@ def generate_html_report(run_id: str, spark, **context) -> str:
         <div class="summary-card warning">
             <h3>SCHEMA MISMATCHES</h3>
             <p class="value">{vs.total_schema_mismatches}</p>
-        </div>
-        <div class="summary-card warning">
-            <h3>PARTITION SCHEMA MISMATCHES</h3>
-            <p class="value">{getattr(vs, 'total_partition_schema_mismatches', 0) or 0}</p>
         </div>
     </div>
 
@@ -3916,7 +3911,6 @@ def generate_html_report(run_id: str, spark, **context) -> str:
                     <th>Dest Partitions</th>
                     <th>Partition Match</th>
                     <th>Schema Match</th>
-                    <th>Partition Schema Match</th>
                 </tr>
             </thead>
             <tbody>
@@ -3943,7 +3937,7 @@ def generate_html_report(run_id: str, spark, **context) -> str:
 
     for t in table_status:
         if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
-            html += _not_found_row(t, 8)
+            html += _not_found_row(t, 7)
             continue
         if not t.validation_status:
             html += f"""
@@ -3951,7 +3945,7 @@ def generate_html_report(run_id: str, spark, **context) -> str:
                         <td>{t.source_database}</td>
                         <td><strong>{t.source_table}</strong></td>
                         <td>{t.partition_filter or '<span style="color:#bdc3c7;font-size:11px;">—</span>'}</td>
-                        <td colspan="8" style="color:#7f8c8d;font-style:italic;font-size:12px;">
+                        <td colspan="7" style="color:#7f8c8d;font-style:italic;font-size:12px;">
                             Skipped: {t.error_message or 'upstream task did not complete'}
                         </td>
                     </tr>
@@ -3978,24 +3972,20 @@ def generate_html_report(run_id: str, spark, **context) -> str:
         else:
             part_match_icon = "⚠ WARN: Data mismatch. Check source data accuracy."
 
-        schema_match_class = "validation-pass" if t.schema_match else "validation-fail"
-        schema_match_icon = "✓ PASS" if t.schema_match else "✗ FAIL"
-
-        # Partition schema match — NULL (older runs / non-partitioned tables that
-        # were never checked) renders as N/A rather than a false FAIL.
+        # Schema Match covers BOTH the non-partition columns (schema_match) and the
+        # partition columns (partition_schema_match). partition_schema_match is NULL
+        # for older runs / non-partitioned tables — treated as "no mismatch".
         part_schema_match_val = getattr(t, "partition_schema_match", None)
         part_schema_diffs_val = getattr(t, "partition_schema_differences", "") or ""
-        if part_schema_match_val is None:
-            part_schema_match_class = "duration"
-            part_schema_match_icon = "N/A"
-        elif part_schema_match_val:
-            part_schema_match_class = "validation-pass"
-            part_schema_match_icon = "✓ PASS"
+        schema_ok = bool(t.schema_match) and (part_schema_match_val is not False)
+        if schema_ok:
+            schema_match_class = "validation-pass"
+            schema_match_icon = "✓ PASS"
         else:
-            part_schema_match_class = "validation-fail"
-            part_schema_match_icon = "✗ FAIL"
-            if part_schema_diffs_val:
-                part_schema_match_icon += (
+            schema_match_class = "validation-fail"
+            schema_match_icon = "✗ FAIL"
+            if part_schema_match_val is False and part_schema_diffs_val:
+                schema_match_icon += (
                     f"<br><small style='color:#7f8c8d;'>{part_schema_diffs_val[:120]}</small>"
                 )
 
@@ -4011,7 +4001,6 @@ def generate_html_report(run_id: str, spark, **context) -> str:
                     <td class="metric">{t.dest_partition_count or 0}</td>
                     <td class="{part_match_class}">{part_match_icon}</td>
                     <td class="{schema_match_class}">{schema_match_icon}</td>
-                    <td class="{part_schema_match_class}">{part_schema_match_icon}</td>
                 </tr>
 """
     html += f"""
@@ -4372,7 +4361,7 @@ with DAG(
             description=(
                 "If enabled, any destination Hive table that already exists is "
                 "DROPPED and recreated from scratch. Destination tables are "
-                "EXTERNAL, so DROP removes only the metadata — the S3 data is "
+                "EXTERNAL, so DROP removes only the metadata, the S3 data is "
                 "preserved. Use this to fix tables created by an older DAG "
                 "version with incorrect partition-column types (e.g. a date "
                 "partition key stored as STRING). Leave disabled for normal "
