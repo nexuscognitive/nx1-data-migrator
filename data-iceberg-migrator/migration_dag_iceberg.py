@@ -187,7 +187,7 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
 
         inplace_val = row.get('inplace_migration', None)
         if inplace_val is None or (
-            isinstance(inplace_val, float) and __import__math('math').isnan(inplace_val)
+            isinstance(inplace_val, float) and __import__('math').isnan(inplace_val)
         ):
             inplace_migration = False
         else:
