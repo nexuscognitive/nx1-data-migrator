@@ -425,7 +425,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
 
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-    required_columns = ["database", "table", "dest_database", "bucket", "endpoint", "partition_filter"]
+    required_columns = ["database", "table", "dest_database", "bucket"]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         raise ValueError(
