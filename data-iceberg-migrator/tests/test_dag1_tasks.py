@@ -1005,6 +1005,43 @@ class TestCreateHiveTables:
         assert 'DROP TABLE IF EXISTS' in all_sql
         assert 'CREATE EXTERNAL TABLE' in all_sql
 
+    def test_recreate_refuses_to_drop_iceberg_table(self, mock_spark, sample_distcp_result):
+        """SAFETY: with recreate=true, an existing ICEBERG table (e.g. from a DAG 2
+        in-place migration under the same name) must NOT be dropped — it would
+        destroy the Iceberg table. The table is marked FAILED with a message
+        pointing to the remediation script; no DROP is issued."""
+        sql_calls = []
+
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            df = MagicMock()
+            if sql.strip().upper().startswith('DESCRIBE FORMATTED'):
+                prov = MagicMock()
+                prov.col_name = 'Provider'
+                prov.data_type = 'iceberg'
+                df.collect.return_value = [prov]
+            else:
+                df.collect.return_value = []  # DESCRIBE (exists check) succeeds
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        ti = MagicMock()
+        with patch.object(m, 'get_config', return_value={'recreate_tables': True}), \
+             pytest.raises(Exception, match="Hive table creation failed"):
+            m.create_hive_tables.function.__wrapped__(
+                distcp_result=sample_distcp_result, spark=mock_spark, ti=ti,
+            )
+
+        # No DROP was issued against the Iceberg table
+        assert 'DROP TABLE' not in ' '.join(sql_calls).upper()
+        # Result recorded as FAILED / skipped_iceberg with a remediation hint
+        pushed = ti.xcom_push.call_args.kwargs['value']
+        r = pushed['table_results'][0]
+        assert r['status'] == 'FAILED'
+        assert r['action'] == 'skipped_iceberg'
+        assert 'iceberg_cleanup' in r['error']
+
     def test_recreate_tables_false_does_not_drop(self, mock_spark, sample_distcp_result):
         """Default (migration_recreate_tables=false) must NOT drop an existing
         table — existing incremental-repair behavior is preserved."""

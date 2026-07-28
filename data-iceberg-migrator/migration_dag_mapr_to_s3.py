@@ -72,6 +72,33 @@ default_args = {
 }
 
 
+def _is_iceberg_table(spark, full_name: str) -> bool:
+    """True if ``full_name`` (``db.table``) is an Iceberg table.
+
+    Detected via ``DESCRIBE FORMATTED`` (Iceberg sets ``Provider = iceberg``),
+    mirroring the check DAG 2 uses. Used by ``create_hive_tables`` to REFUSE
+    dropping an Iceberg table during a recreate: a DAG 2 in-place migration
+    converts the DAG 1 Hive table to Iceberg under the SAME name, and dropping it
+    here would destroy it. Run the ``iceberg_cleanup`` remediation script first.
+
+    Returns False when the table cannot be described (treated as non-Iceberg;
+    other code paths handle a genuinely missing table).
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE FORMATTED {full_name}").collect()
+    except Exception:
+        return False
+    for r in rows:
+        col = (r.col_name or "").strip().lower()
+        val = (r.data_type or "").strip().lower()
+        if col == "provider" and "iceberg" in val:
+            return True
+        # Some bundles surface the format only via table properties.
+        if col.startswith("table properties") and "iceberg" in val:
+            return True
+    return False
+
+
 def _compare_partition_schemas(src_partition_schema, dest_partition_schema):
     """Compare source vs destination partition-column schemas (name -> type).
 
@@ -2418,6 +2445,30 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
 
             was_recreated = False
             if exists and recreate_requested:
+                # SAFETY: never drop an Iceberg table. A DAG 2 in-place migration
+                # converts this destination table to Iceberg under the same name;
+                # dropping it here would destroy the Iceberg table (metadata +
+                # snapshots). Refuse and direct the user to the remediation script.
+                if _is_iceberg_table(spark, full_name):
+                    msg = (
+                        f"Refusing to drop {full_name}: it is an ICEBERG table "
+                        f"(likely a DAG 2 in-place migration). Dropping it would "
+                        f"destroy the Iceberg table. Run the iceberg_cleanup "
+                        f"remediation script for this table first, then re-run this "
+                        f"DAG with migration_recreate_tables=true."
+                    )
+                    logger.error(f"[HiveTable] {msg}")
+                    results.append(
+                        {
+                            "source_table": tbl,
+                            "dest_database": dest_db,
+                            "status": "FAILED",
+                            "action": "skipped_iceberg",
+                            "existed": True,
+                            "error": msg,
+                        }
+                    )
+                    continue
                 # EXTERNAL table → DROP removes metadata only; S3 data is kept.
                 # Falls through to the create path below to rebuild the schema
                 # (including correctly-typed partition columns) from discovery.
