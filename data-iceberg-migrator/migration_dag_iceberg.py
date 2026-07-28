@@ -166,10 +166,8 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
         df = ps.read_excel(BytesIO(excel_bytes), engine='openpyxl')
     except Exception as _e:
         permanent_fail("parse_iceberg_excel", _e)
-
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
     required_columns = ["database", "table", "inplace_migration", "destination_iceberg_database"]
-    
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         permanent_fail(
@@ -178,7 +176,6 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
                 f"Missing required Excel columns(s): {','.join(missing_columns)}"
             )
         )
-
     grouped = {}
     for _, row in df.iterrows():
         src_db = str(row.get('database', '') or '').strip()
@@ -206,7 +203,6 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
                         "Allowed values are: T, F, TRUE, FALSE, YES, NO, 1, 0."
                     )
                 )
-
         dest_ice_db_val = row.get('destination_iceberg_database', '')
         dest_ice_db = str(dest_ice_db_val).strip() if dest_ice_db_val is not None else ''
         if not dest_ice_db or dest_ice_db.lower() == 'nan':
