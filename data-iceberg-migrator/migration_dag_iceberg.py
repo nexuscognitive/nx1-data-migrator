@@ -166,9 +166,16 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
         df = ps.read_excel(BytesIO(excel_bytes), engine='openpyxl')
     except Exception as _e:
         permanent_fail("parse_iceberg_excel", _e)
-
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
-
+    required_columns = ["database", "table", "inplace_migration", "destination_iceberg_database"]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        permanent_fail(
+            "parse_iceberg_excel",
+            ValueError(
+                f"Missing required Excel columns(s): {','.join(missing_columns)}"
+            )
+        )
     grouped = {}
     for _, row in df.iterrows():
         src_db = str(row.get('database', '') or '').strip()
@@ -176,11 +183,26 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
             continue
 
         inplace_val = row.get('inplace_migration', None)
-        if inplace_val is None or (isinstance(inplace_val, float) and __import__('math').isnan(inplace_val)) or str(inplace_val).strip().lower() in ('', 'nan', 'f', 'false', 'no', '0'):
+        if inplace_val is None or (
+            isinstance(inplace_val, float) and __import__('math').isnan(inplace_val)
+        ):
             inplace_migration = False
         else:
-            inplace_migration = str(inplace_val).strip().upper() in ('T', 'TRUE', 'YES', '1')
-
+            value = str(inplace_val).strip().lower()
+            true_values = {"t", "true", "yes", "1"}
+            false_values = {"f", "false", "no", "0", "", "nan"}
+            if value in true_values:
+                inplace_migration = True
+            elif value in false_values:
+                inplace_migration = False
+            else:
+                permanent_fail(
+                    "parse_iceberg_excel",
+                    ValueError(
+                        f"Invalid value '{inplace_val}' for column 'inplace_migration'. "
+                        "Allowed values are: T, F, TRUE, FALSE, YES, NO, 1, 0."
+                    )
+                )
         dest_ice_db_val = row.get('destination_iceberg_database', '')
         dest_ice_db = str(dest_ice_db_val).strip() if dest_ice_db_val is not None else ''
         if not dest_ice_db or dest_ice_db.lower() == 'nan':

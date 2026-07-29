@@ -425,7 +425,12 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
 
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-
+    required_columns = ["database", "table", "dest_database", "bucket"]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(
+                f"parse_excel failed, Missing required Excel columns(s): {','.join(missing_columns)}"
+        )
     # Convert to list of dicts
     grouped = {}
     for _, row in df.iterrows():
