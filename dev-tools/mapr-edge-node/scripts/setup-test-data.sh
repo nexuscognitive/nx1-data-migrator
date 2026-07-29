@@ -142,6 +142,14 @@ hdfs dfs -mkdir -p ${WH}/struct_db.db/flex_rules_result_mini
 hdfs dfs -mkdir -p ${WH}/struct_db.db/flex_rules_result_full/capbusinesseffectivedate=2024-01-01
 hdfs dfs -mkdir -p ${WH}/struct_db.db/flex_rules_result_full/capbusinesseffectivedate=2024-02-01
 
+# ── part_types_db (NEW) — partition-column type fidelity (WF-318) ──────────────
+# Reproduces the DATE/SMALLINT partition-column -> STRING bug the client hit:
+# the source is PARTITIONED BY (business_date DATE, cyc_num SMALLINT). The old DAG
+# recreated both partition columns as STRING on the destination; the fix must
+# preserve DATE and SMALLINT. Partition subdirectories are created by the
+# partitionBy(...) Parquet write in [3/11] and registered via MSCK REPAIR in [4/11].
+hdfs dfs -mkdir -p ${WH}/part_types_db.db/sales_by_date
+
 echo "  HDFS directories created."
 
 echo ""
@@ -772,6 +780,48 @@ spark.stop()
 PYEOF
 echo "  All struct_db Parquet data written."
 
+# =============================================================================
+# part_types_db.sales_by_date — partition-column type fidelity (WF-318)
+# Partitioned by a DATE column and a SMALLINT column, written via partitionBy so
+# the on-disk layout is business_date=YYYY-MM-DD/cyc_num=N. This is the exact
+# shape the client migrated: the old DAG emitted both partition keys as STRING on
+# the destination; the fixed DAG must reproduce DATE and SMALLINT.
+# =============================================================================
+pyspark --master local[*] << 'PYEOF'
+import datetime
+from decimal import Decimal
+from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    StructType, StructField, IntegerType, StringType, DecimalType, DateType, ShortType
+)
+spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+WH = "hdfs://localhost:9000/user/hive/warehouse"
+
+# Non-partition columns first; partition columns (business_date, cyc_num) last.
+schema = StructType([
+    StructField("order_id",      IntegerType(),   True),
+    StructField("customer",      StringType(),    True),
+    StructField("amount",        DecimalType(10, 2), True),
+    StructField("business_date", DateType(),      True),   # partition col — DATE
+    StructField("cyc_num",       ShortType(),     True),   # partition col — SMALLINT
+])
+data = [
+    (1, "Alice", Decimal("100.50"), datetime.date(2024, 1, 1), 1),
+    (2, "Bob",   Decimal("200.00"), datetime.date(2024, 1, 1), 1),
+    (3, "Carol", Decimal("150.25"), datetime.date(2024, 2, 1), 2),
+    (4, "Dave",  Decimal("90.00"),  datetime.date(2024, 2, 1), 2),
+    (5, "Eve",   Decimal("310.75"), datetime.date(2024, 3, 1), 3),
+]
+(spark.createDataFrame(data, schema)
+      .write.mode("overwrite")
+      .partitionBy("business_date", "cyc_num")
+      .parquet("{}/part_types_db.db/sales_by_date".format(WH)))
+print("  part_types_db.sales_by_date written (5 rows, 3 partitions; DATE + SMALLINT keys)")
+spark.stop()
+PYEOF
+echo "  part_types_db Parquet data written."
+
 echo ""
 echo "============================================================"
 echo " [4/11] Creating Hive databases and tables"
@@ -1087,6 +1137,27 @@ ALTER TABLE struct_db.flex_rules_result_full
 ALTER TABLE struct_db.flex_rules_result_full
   ADD IF NOT EXISTS PARTITION (capbusinesseffectivedate='2024-02-01');
 
+-- =============================================================================
+-- part_types_db  (NEW — partition-column type fidelity)
+-- =============================================================================
+-- Source table whose partition keys are typed DATE and SMALLINT (not STRING).
+-- Migrating this with the old DAG produced a destination PARTITIONED BY
+-- (business_date STRING, cyc_num STRING); the fixed DAG must reproduce
+-- (business_date DATE, cyc_num SMALLINT). MSCK REPAIR registers the partitions
+-- written by partitionBy(...) in [3/11].
+CREATE DATABASE IF NOT EXISTS part_types_db;
+
+CREATE TABLE IF NOT EXISTS part_types_db.sales_by_date (
+  order_id INT,
+  customer STRING,
+  amount   DECIMAL(10,2)
+)
+PARTITIONED BY (business_date DATE, cyc_num SMALLINT)
+STORED AS PARQUET
+LOCATION 'hdfs://localhost:9000/user/hive/warehouse/part_types_db.db/sales_by_date';
+
+MSCK REPAIR TABLE part_types_db.sales_by_date;
+
 SQL_EOF
 
 $BEELINE -f /tmp/setup-test-data.sql
@@ -1143,6 +1214,9 @@ checks = [
     ("struct_db.mixed_case_struct",             None),   # TC-20
     ("struct_db.flex_rules_result_mini",        None),   # TC-26/27
     ("struct_db.flex_rules_result_full",        None),   # TC-28
+    # ── part_types_db (WF-318): DATE + SMALLINT partition keys ────────────────
+    ("part_types_db.sales_by_date",             None),
+    ("part_types_db.sales_by_date",             "business_date='2024-01-01'"),
 ]
 
 empty_tables = {
@@ -1234,6 +1308,41 @@ try:
         if extra_parts:   print("  WARN: unexpected partitions: {}".format(extra_parts))
     for p in parts:
         print("    {}".format(p[0]))
+except Exception as e:
+    print("  ERROR: {}".format(str(e)))
+
+# ── Partition columns are typed DATE / SMALLINT, not STRING ──────
+print("")
+print("--- Partition-type check: part_types_db.sales_by_date ---")
+try:
+    desc = spark.sql("DESCRIBE part_types_db.sales_by_date").collect()
+    # Read the partition column types from the '# Partition Information' section.
+    part_types = {}
+    in_part = False
+    for r in desc:
+        name = (r.col_name or "").strip()
+        dtype = (r.data_type or "").strip()
+        if name == "# Partition Information":
+            in_part = True
+            continue
+        if in_part and (name == "# col_name" or not name):
+            continue
+        if in_part and name.startswith("#"):
+            break
+        if in_part and name:
+            part_types[name] = dtype
+    expected = {"business_date": "date", "cyc_num": "smallint"}
+    mismatches = {
+        k: (v, part_types.get(k))
+        for k, v in expected.items()
+        if part_types.get(k, "").lower() != v
+    }
+    if not mismatches:
+        print("  Source partition columns typed correctly (business_date=date, cyc_num=smallint): OK")
+    else:
+        print("  WARN: unexpected partition column types: {}".format(mismatches))
+    for k, v in part_types.items():
+        print("    {:<20} {}".format(k, v))
 except Exception as e:
     print("  ERROR: {}".format(str(e)))
 

@@ -71,6 +71,72 @@ default_args = {
     "retry_delay": timedelta(minutes=5),
 }
 
+
+def _is_iceberg_table(spark, full_name: str) -> bool:
+    """True if ``full_name`` (``db.table``) is an Iceberg table.
+
+    Detected via ``DESCRIBE FORMATTED`` (Iceberg sets ``Provider = iceberg``),
+    mirroring the check DAG 2 uses. Used by ``create_hive_tables`` to REFUSE
+    dropping an Iceberg table during a recreate: a DAG 2 in-place migration
+    converts the DAG 1 Hive table to Iceberg under the SAME name, and dropping it
+    here would destroy it. Run the ``iceberg_cleanup`` remediation script first.
+
+    Returns False when the table cannot be described (treated as non-Iceberg;
+    other code paths handle a genuinely missing table).
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE FORMATTED {full_name}").collect()
+    except Exception:
+        return False
+    for r in rows:
+        col = (r.col_name or "").strip().lower()
+        val = (r.data_type or "").strip().lower()
+        if col == "provider" and "iceberg" in val:
+            return True
+        # Some bundles surface the format only via table properties.
+        if col.startswith("table properties") and "iceberg" in val:
+            return True
+    return False
+
+
+def _compare_partition_schemas(src_partition_schema, dest_partition_schema):
+    """Compare source vs destination partition-column schemas (name -> type).
+
+    Returns ``(match: bool, differences: list[str])``.
+
+    An empty source partition schema means there is nothing to compare — either
+    the table is not partitioned, or it was discovered by an older DAG version
+    that did not capture partition-column types. This is treated as a match so
+    re-runs against pre-existing discovery metadata don't produce false failures.
+    """
+    if not src_partition_schema:
+        return True, []
+
+    src = {
+        (c.get("name") or "").lower(): (c.get("type") or "").lower()
+        for c in src_partition_schema
+        if c.get("name")
+    }
+    dest = {
+        (c.get("name") or "").lower(): (c.get("type") or "").lower()
+        for c in dest_partition_schema
+        if c.get("name")
+    }
+
+    diffs = []
+    for name, stype in src.items():
+        if name not in dest:
+            diffs.append(f"Missing partition column: {name}")
+        elif dest[name] != stype:
+            diffs.append(
+                f"Partition type mismatch for {name}: {stype} vs {dest[name]}"
+            )
+    for name in dest:
+        if name not in src:
+            diffs.append(f"Extra partition column in dest: {name}")
+
+    return (len(diffs) == 0), diffs
+
 # =============================================================================
 # DAG 1: SOURCE (MapR or HDP) TO S3 MIGRATION TASKS
 # =============================================================================
@@ -369,6 +435,9 @@ def init_tracking_tables(spark) -> dict:
                 partition_count_match BOOLEAN,
                 schema_match BOOLEAN,
                 schema_differences STRING,
+                partition_schema_json STRING,
+                partition_schema_match BOOLEAN,
+                partition_schema_differences STRING,
                 overall_status STRING,
                 error_message STRING,
                 updated_at TIMESTAMP
@@ -377,6 +446,27 @@ def init_tracking_tables(spark) -> dict:
             PARTITIONED BY (source_database)
             LOCATION '{tracking_loc}/migration_table_status'
         """)
+
+    # Idempotently add partition-schema validation columns to tracking tables
+    # created by an earlier DAG version (CREATE TABLE IF NOT EXISTS above is a
+    # no-op for an existing table, so new columns would otherwise be missing and
+    # the INSERT/UPDATE statements that reference them would fail).
+    for _col_name, _col_type in (
+        ("partition_schema_json", "STRING"),
+        ("partition_schema_match", "BOOLEAN"),
+        ("partition_schema_differences", "STRING"),
+    ):
+        try:
+            spark.sql(
+                f"ALTER TABLE {tracking_db}.migration_table_status "
+                f"ADD COLUMN {_col_name} {_col_type}"
+            )
+            logger.info(
+                f"[init_tracking_tables] Added column {_col_name} to migration_table_status"
+            )
+        except Exception:
+            # Column already exists — expected on every run after the first.
+            pass
 
     return {"status": "initialized", "database": tracking_db}
 
@@ -1198,6 +1288,9 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
             parts = [p for p in parts.split(",") if p]
 
         schema_json = json.dumps(t.get("schema", [])).replace("'", "''")
+        partition_schema_json = json.dumps(t.get("partition_schema", [])).replace(
+            "'", "''"
+        )
         parts_json = json.dumps(parts).replace("'", "''")
         table_type = t.get("table_type", "UNKNOWN")
         partition_filter_active = t.get("partition_filter_active", False)
@@ -1263,6 +1356,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     filtered_partition_count = {filtered_partition_count_sql},
                     full_table_row_count = {full_table_row_count},
                     full_table_partition_count = {full_table_partition_count},
+                    partition_schema_json = '{partition_schema_json}',
                     overall_status = {overall_status_update},
                     error_message = {error_msg_update},
                     updated_at = current_timestamp()
@@ -1300,7 +1394,8 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     schema_differences,
                     overall_status, error_message,
                     updated_at, partition_filter, filtered_partition_count, full_table_row_count, full_table_partition_count,
-                    yarn_application_id
+                    yarn_application_id,
+                    partition_schema_json, partition_schema_match, partition_schema_differences
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
                     '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
@@ -1323,7 +1418,8 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     NULL,
                     {overall_status_insert}, {error_msg_insert},
                     current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count},
-                    NULL
+                    NULL,
+                    '{partition_schema_json}', NULL, NULL
                 )
             """,
                 task_label=f"record_discovered_tables:{t['source_table']}",
@@ -2247,13 +2343,29 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
 @task.pyspark(conn_id="spark_default")
 @track_duration
 def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
-    """Create external Hive tables via Spark. Handles incremental (repairs partitions)."""
+    """Create external Hive tables via Spark. Handles incremental (repairs partitions).
+
+    When the ``migration_recreate_tables`` Airflow Variable is true, any
+    destination table that already exists is DROPPED and recreated from scratch.
+    The destination tables are EXTERNAL, so DROP TABLE removes only the
+    Hive/Iceberg metadata — the underlying S3 data is preserved. This lets a user
+    fix tables created by an older DAG version (e.g. partition columns wrongly
+    typed as STRING) without manually dropping them.
+    """
 
     if not isinstance(distcp_result, dict) or "tables" not in distcp_result:
         logger.warning(
             f"[create_hive_tables] Skipping invalid input: {type(distcp_result)}"
         )
         return {}
+
+    recreate_requested = get_config().get("recreate_tables", False)
+    if recreate_requested:
+        logger.info(
+            "[create_hive_tables] recreate_tables=True — existing destination tables "
+            "will be DROPPED (metadata only; EXTERNAL tables keep their S3 data) and "
+            "recreated from scratch."
+        )
 
     tables = distcp_result["tables"]
 
@@ -2335,6 +2447,43 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 exists = True
             except Exception:
                 pass
+
+            was_recreated = False
+            if exists and recreate_requested:
+                # SAFETY: never drop an Iceberg table. A DAG 2 in-place migration
+                # converts this destination table to Iceberg under the same name;
+                # dropping it here would destroy the Iceberg table (metadata +
+                # snapshots). Refuse and direct the user to the remediation script.
+                if _is_iceberg_table(spark, full_name):
+                    msg = (
+                        f"Refusing to drop {full_name}: it is an ICEBERG table "
+                        f"(likely a DAG 2 in-place migration). Dropping it would "
+                        f"destroy the Iceberg table. Run the iceberg_cleanup "
+                        f"remediation script for this table first, then re-run this "
+                        f"DAG with migration_recreate_tables=true."
+                    )
+                    logger.error(f"[HiveTable] {msg}")
+                    results.append(
+                        {
+                            "source_table": tbl,
+                            "dest_database": dest_db,
+                            "status": "FAILED",
+                            "action": "skipped_iceberg",
+                            "existed": True,
+                            "error": msg,
+                        }
+                    )
+                    continue
+                # EXTERNAL table → DROP removes metadata only; S3 data is kept.
+                # Falls through to the create path below to rebuild the schema
+                # (including correctly-typed partition columns) from discovery.
+                spark.sql(f"DROP TABLE IF EXISTS {full_name}")
+                logger.info(
+                    f"[HiveTable] recreate_tables=True — dropped existing {full_name} "
+                    f"(EXTERNAL: S3 data preserved), will recreate from scratch"
+                )
+                exists = False
+                was_recreated = True
 
             if exists:
                 if is_part:
@@ -2544,14 +2693,17 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                         spark.sql(f"MSCK REPAIR TABLE {full_name} SYNC PARTITIONS")
                 spark.sql(f"REFRESH TABLE {full_name}")
 
-                logger.info(f"[HiveTable] CREATED: {full_name} | location={s3_loc}")
+                logger.info(
+                    f"[HiveTable] {'RECREATED' if was_recreated else 'CREATED'}: "
+                    f"{full_name} | location={s3_loc}"
+                )
                 results.append(
                     {
                         "source_table": tbl,
                         "dest_database": dest_db,
                         "status": "COMPLETED",
-                        "action": "created",
-                        "existed": False,
+                        "action": "recreated" if was_recreated else "created",
+                        "existed": was_recreated,
                         "error": None,
                     }
                 )
@@ -2798,16 +2950,25 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 partition_count_match = source_partition_count == dest_partition_count
 
                 src_schema = t.get("schema", [])
+                src_partition_schema = t.get("partition_schema", [])
                 partition_cols = set(
                     c.strip().lower() for c in (t.get("partition_columns") or "").split(",") if c.strip()
                 )
                 schema_match = True
                 schema_diffs = []
+                partition_schema_match = True
+                partition_schema_diffs = []
                 try:
+                    dest_fields = spark.table(dest_tbl).schema.fields
                     dest_schema = [
                         {"name": f.name, "type": f.dataType.simpleString()}
-                        for f in spark.table(dest_tbl).schema.fields
+                        for f in dest_fields
                         if f.name.lower() not in partition_cols
+                    ]
+                    dest_partition_schema = [
+                        {"name": f.name, "type": f.dataType.simpleString()}
+                        for f in dest_fields
+                        if f.name.lower() in partition_cols
                     ]
                     src_cols = {c["name"].lower(): c["type"] for c in src_schema}
                     dest_cols = {c["name"].lower(): c["type"] for c in dest_schema}
@@ -2822,6 +2983,10 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                         if col_name not in src_cols:
                             schema_match = False
                             schema_diffs.append(f"Extra column in dest: {col_name}")
+
+                    partition_schema_match, partition_schema_diffs = (
+                        _compare_partition_schemas(src_partition_schema, dest_partition_schema)
+                    )
                 except Exception as e:
                     schema_match = False
                     schema_diffs.append(f"Schema check failed: {str(e)[:200]}")
@@ -2838,11 +3003,16 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     "partition_count_match": partition_count_match,
                     "schema_match": schema_match,
                     "schema_differences": "; ".join(schema_diffs) if schema_diffs else "",
-                    "error": None if (partition_count_match and schema_match) else
+                    "partition_schema_match": partition_schema_match,
+                    "partition_schema_differences": (
+                        "; ".join(partition_schema_diffs) if partition_schema_diffs else ""
+                    ),
+                    "error": None if (partition_count_match and schema_match and partition_schema_match) else
                              "; ".join([
                                  f"Partition count mismatch: source={source_partition_count}, dest={dest_partition_count}"
                                  if not partition_count_match else "",
-                                 "; ".join(schema_diffs[:3]) if not schema_match else ""
+                                 "; ".join(schema_diffs[:3]) if not schema_match else "",
+                                 "; ".join(partition_schema_diffs[:3]) if not partition_schema_match else ""
                              ]).strip("; "),
                 })
                 continue
@@ -2942,15 +3112,25 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             # Schema comparison — use spark.table().schema to avoid DESCRIBE truncation,
             # and exclude partition columns (DESCRIBE includes them; source schema does not)
             src_schema = t.get("schema", [])
+            src_partition_schema = t.get("partition_schema", [])
             partition_cols = set(
                 c.strip().lower()
                 for c in (t.get("partition_columns") or "").split(",")
                 if c.strip()
             )
+            dest_fields = spark.table(dest_tbl).schema.fields
             dest_schema = [
                 {"name": f.name, "type": f.dataType.simpleString()}
-                for f in spark.table(dest_tbl).schema.fields
+                for f in dest_fields
                 if f.name.lower() not in partition_cols
+            ]
+            # Partition columns are validated separately: the non-partition schema
+            # comparison excludes them, so without this a wrongly-typed partition
+            # column (e.g. a source date landing as string) would go unnoticed.
+            dest_partition_schema = [
+                {"name": f.name, "type": f.dataType.simpleString()}
+                for f in dest_fields
+                if f.name.lower() in partition_cols
             ]
 
             # Compare schemas
@@ -2975,17 +3155,32 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     schema_match = False
                     schema_diffs.append(f"Extra column in dest: {col_name}")
 
+            # Compare partition-column schemas (name + type)
+            partition_schema_match, partition_schema_diffs = _compare_partition_schemas(
+                src_partition_schema, dest_partition_schema
+            )
+
             # Validations
             row_count_match = source_row_count == dest_row_count
             partition_count_match = source_partition_count == dest_partition_count
 
-            match_summary = f"rows={'✓' if row_count_match else '✗'} partitions={'✓' if partition_count_match else '✗'} schema={'✓' if schema_match else '✗'}"
+            match_summary = (
+                f"rows={'✓' if row_count_match else '✗'} "
+                f"partitions={'✓' if partition_count_match else '✗'} "
+                f"schema={'✓' if schema_match else '✗'} "
+                f"partition_schema={'✓' if partition_schema_match else '✗'}"
+            )
             logger.info(
                 f"[Validation] DONE: {per_table_dest_db}.{tbl} | {match_summary}"
             )
             if schema_diffs:
                 logger.warning(
                     f"[Validation] Schema diffs for {per_table_dest_db}.{tbl}: {'; '.join(schema_diffs[:5])}"
+                )
+            if partition_schema_diffs:
+                logger.warning(
+                    f"[Validation] Partition schema diffs for {per_table_dest_db}.{tbl}: "
+                    f"{'; '.join(partition_schema_diffs[:5])}"
                 )
 
             mismatch_parts = []
@@ -3000,6 +3195,10 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             if not schema_match and schema_diffs:
                 mismatch_parts.append(
                     f"Schema differences: {'; '.join(schema_diffs[:3])}"
+                )
+            if not partition_schema_match and partition_schema_diffs:
+                mismatch_parts.append(
+                    f"Partition schema differences: {'; '.join(partition_schema_diffs[:3])}"
                 )
 
             mismatch_error = "; ".join(mismatch_parts) if mismatch_parts else None
@@ -3018,6 +3217,10 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     "schema_match": schema_match,
                     "schema_differences": (
                         "; ".join(schema_diffs) if schema_diffs else ""
+                    ),
+                    "partition_schema_match": partition_schema_match,
+                    "partition_schema_differences": (
+                        "; ".join(partition_schema_diffs) if partition_schema_diffs else ""
                     ),
                     "error": mismatch_error,
                 }
@@ -3110,11 +3313,16 @@ def update_validation_status(validation_result: dict, spark) -> dict:
         per_val_dest_db = v.get("dest_database", dest_db)
         error_msg = (v.get("error", "") or "").replace("'", "''")[:2000]
         schema_diffs = (v.get("schema_differences", "") or "").replace("'", "''")[:2000]
+        partition_schema_match = v.get("partition_schema_match", True)
+        partition_schema_diffs = (
+            (v.get("partition_schema_differences", "") or "").replace("'", "''")[:2000]
+        )
 
         is_validated = (
             v.get("row_count_match", False)
             and v.get("partition_count_match", False)
             and v.get("schema_match", False)
+            and partition_schema_match
         )
         has_mismatch_only = (
             not is_validated
@@ -3157,6 +3365,8 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 partition_count_match = {str(v.get('partition_count_match', False)).lower()},
                 schema_match = {str(v.get('schema_match', False)).lower()},
                 schema_differences = '{schema_diffs}',
+                partition_schema_match = {str(partition_schema_match).lower()},
+                partition_schema_differences = '{partition_schema_diffs}',
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
                     WHEN overall_status = 'EMPTY_SOURCE' THEN overall_status
@@ -3516,7 +3726,7 @@ def generate_html_report(run_id: str, spark, **context) -> str:
             SUM(CASE WHEN row_count_match = false OR partition_count_match = false OR schema_match = false THEN 1 ELSE 0 END) as tables_failed_validation,
             SUM(CASE WHEN row_count_match = false THEN 1 ELSE 0 END) as total_row_count_mismatches,
             SUM(CASE WHEN partition_count_match = false THEN 1 ELSE 0 END) as total_partition_count_mismatches,
-            SUM(CASE WHEN schema_match = false THEN 1 ELSE 0 END) as total_schema_mismatches
+            SUM(CASE WHEN schema_match = false OR partition_schema_match = false THEN 1 ELSE 0 END) as total_schema_mismatches
         FROM {tracking_db}.migration_table_status
         WHERE run_id = '{run_id}'
           AND validation_status = 'COMPLETED'
@@ -3807,8 +4017,22 @@ def generate_html_report(run_id: str, spark, **context) -> str:
         else:
             part_match_icon = "⚠ WARN: Data mismatch. Check source data accuracy."
 
-        schema_match_class = "validation-pass" if t.schema_match else "validation-fail"
-        schema_match_icon = "✓ PASS" if t.schema_match else "✗ FAIL"
+        # Schema Match covers BOTH the non-partition columns (schema_match) and the
+        # partition columns (partition_schema_match). partition_schema_match is NULL
+        # for older runs / non-partitioned tables — treated as "no mismatch".
+        part_schema_match_val = getattr(t, "partition_schema_match", None)
+        part_schema_diffs_val = getattr(t, "partition_schema_differences", "") or ""
+        schema_ok = bool(t.schema_match) and (part_schema_match_val is not False)
+        if schema_ok:
+            schema_match_class = "validation-pass"
+            schema_match_icon = "✓ PASS"
+        else:
+            schema_match_class = "validation-fail"
+            schema_match_icon = "✗ FAIL"
+            if part_schema_match_val is False and part_schema_diffs_val:
+                schema_match_icon += (
+                    f"<br><small style='color:#7f8c8d;'>{part_schema_diffs_val[:120]}</small>"
+                )
 
         html += f"""
                 <tr>

@@ -21,40 +21,40 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 ### Required Variables
 
-| Variable                      | Description                                     | Example                              | Applies To                                            |
-| ----------------------------- | ----------------------------------------------- | ------------------------------------ | ----------------------------------------------------- |
-| `cluster_ssh_conn_id`         | Airflow SSH connection ID for cluster edge node | `cluster_edge_ssh`                   | `source_to_s3_migration`, `folder_only_data_copy`       |
-| `migration_default_s3_bucket` | Default S3 bucket for migrations                | `s3a://data-lake`                    | `source_to_s3_migration`                                |
-| `migration_tracking_database` | Database name for tracking tables               | `migration_tracking`                 | All DAGs                                              |
-| `migration_tracking_location` | S3 location for tracking tables                 | `s3a://data-lake/migration_tracking` | All DAGs                                              |
-| `migration_report_location`   | S3 location for HTML reports                    | `s3a://data-lake/migration_reports`  | All DAGs                                              |
-| `migration_spark_conn_id`     | Airflow Spark connection ID                     | `spark_default`                      | Currently unused                |
+| Variable                      | Description                                     | Example                              | Applies To                                        |
+| ----------------------------- | ----------------------------------------------- | ------------------------------------ | ------------------------------------------------- |
+| `cluster_ssh_conn_id`         | Airflow SSH connection ID for cluster edge node | `cluster_edge_ssh`                   | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_default_s3_bucket` | Default S3 bucket for migrations                | `s3a://data-lake`                    | `source_to_s3_migration`                          |
+| `migration_tracking_database` | Database name for tracking tables               | `migration_tracking`                 | All DAGs                                          |
+| `migration_tracking_location` | S3 location for tracking tables                 | `s3a://data-lake/migration_tracking` | All DAGs                                          |
+| `migration_report_location`   | S3 location for HTML reports                    | `s3a://data-lake/migration_reports`  | All DAGs                                          |
+| `migration_spark_conn_id`     | Airflow Spark connection ID                     | `spark_default`                      | Currently unused                                  |
 
 ### Authentication Variables
 
-| Variable                   | Description                                       | Required For           | Applies To                                            |
-| -------------------------- | ------------------------------------------------- | ---------------------- | ----------------------------------------------------- |
-| `auth_method`              | Authentication method: `mapr`, `kinit`, or `none` | MapR/Kerberos          | `source_to_s3_migration`, `folder_only_data_copy`       |
-| `mapr_user`                | MapR username used to validate existing ticket    | MapR auth              | `source_to_s3_migration`, `folder_only_data_copy`       |
-| `mapr_ticketfile_location` | MapR ticket file path                             | MapR auth              | `source_to_s3_migration`, `folder_only_data_copy`       |
-| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.    | HTML reports           | `source_to_s3_migration`                                |
+| Variable                   | Description                                       | Required For  | Applies To                                        |
+| -------------------------- | ------------------------------------------------- | ------------- | ------------------------------------------------- |
+| `auth_method`              | Authentication method: `mapr`, `kinit`, or `none` | MapR/Kerberos | `source_to_s3_migration`, `folder_only_data_copy` |
+| `mapr_user`                | MapR username used to validate existing ticket    | MapR auth     | `source_to_s3_migration`, `folder_only_data_copy` |
+| `mapr_ticketfile_location` | MapR ticket file path                             | MapR auth     | `source_to_s3_migration`, `folder_only_data_copy` |
+| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.    | HTML reports  | `source_to_s3_migration`                          |
 
 ### Optional Variables
 
-| Variable                     | Default          | Description                                  | Applies To                                                                            |
-| ---------------------------- | ---------------- | -------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node             | `source_to_s3_migration`, `folder_only_data_copy`                                       |
-| `s3_endpoint`                | _(empty)_        | Default S3 endpoint URL (all buckets)        | `source_to_s3_migration`, `folder_only_data_copy`        |
-| `s3_access_key`              | _(empty)_        | Default S3 access key (all buckets)          | `source_to_s3_migration`, `folder_only_data_copy`        |
-| `s3_secret_key`              | _(empty)_        | Default S3 secret key (all buckets)          | `source_to_s3_migration`, `folder_only_data_copy`        |
-| `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     | `source_to_s3_migration`, `folder_only_data_copy`                                       |
-| `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            | `source_to_s3_migration`, `folder_only_data_copy`                                       |
-| `migration_distcp_preserve_delete` | `true`     | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes)) | `source_to_s3_migration` |
-| `migration_include_db_in_path`     | `true`     | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted) | `source_to_s3_migration` |
-| `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`     | Currently unused                                                                      |
-| `migration_smtp_conn_id`     | `smtp_default`   | Airflow SMTP connection ID for email reports | All DAGs                                                                              |
-| `migration_email_recipients` | _(empty)_        | Comma-separated email addresses for reports  | All DAGs                                                                              |
-| `hdfs_nameservice`           | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR | `source_to_s3_migration`, `folder_only_data_copy` |
+| Variable                           | Default          | Description                                                                                                                                     | Applies To                                        |
+| ---------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `cluster_edge_temp_path`           | `/tmp/migration` | Temporary directory on edge node                                                                                                                | `source_to_s3_migration`, `folder_only_data_copy` |
+| `s3_endpoint`                      | _(empty)_        | Default S3 endpoint URL (all buckets)                                                                                                           | `source_to_s3_migration`, `folder_only_data_copy` |
+| `s3_access_key`                    | _(empty)_        | Default S3 access key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
+| `s3_secret_key`                    | _(empty)_        | Default S3 secret key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_mappers`         | `50`             | Number of DistCp mappers                                                                                                                        | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_bandwidth`       | `100`            | Bandwidth limit per mapper (MB/s)                                                                                                               | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_preserve_delete` | `true`           | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes))                 | `source_to_s3_migration`                          |
+| `migration_include_db_in_path`     | `true`           | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted) | `source_to_s3_migration`                          |
+| `s3_listing_tool`                  | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`                                                                                                        | Currently unused                                  |
+| `migration_smtp_conn_id`           | `smtp_default`   | Airflow SMTP connection ID for email reports                                                                                                    | All DAGs                                          |
+| `migration_email_recipients`       | _(empty)_        | Comma-separated email addresses for reports                                                                                                     | All DAGs                                          |
+| `hdfs_nameservice`                 | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR                                                                                    | `source_to_s3_migration`, `folder_only_data_copy` |
 
 ### Multi-Tenant S3 Credentials (endpoint-based overrides)
 
@@ -111,12 +111,12 @@ single-tenant setups.
 
 ## DAG Parameter Details
 
-| DAG   | Parameter         | Required | Description                             | Example                                          |
-| ----- | ----------------- | -------- | --------------------------------------- | ------------------------------------------------ |
-| DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config                 | `s3a://config-bucket/migration.xlsx`             |
-| DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config               | `s3a://config-bucket/iceberg_migration.xlsx`     |
-| DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config           | `s3a://config-bucket/folder_copy.xlsx`           |
-| DAG 4 | `excel_file_path` | Yes      | S3 path to parquet HMS config           | `s3a://config-bucket/parquet_hms.xlsx`           |
+| DAG   | Parameter         | Required | Description                   | Example                                      |
+| ----- | ----------------- | -------- | ----------------------------- | -------------------------------------------- |
+| DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config       | `s3a://config-bucket/migration.xlsx`         |
+| DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config     | `s3a://config-bucket/iceberg_migration.xlsx` |
+| DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config | `s3a://config-bucket/folder_copy.xlsx`       |
+| DAG 4 | `excel_file_path` | Yes      | S3 path to parquet HMS config | `s3a://config-bucket/parquet_hms.xlsx`       |
 
 ---
 
@@ -443,10 +443,10 @@ cleanup_edge (SSH: Cleanup temp files)
 
 When `partition_filter` is active, the `migration_distcp_preserve_delete` variable controls how filtered partitions are copied. For full-table copies (no `partition_filter`), this setting has no effect — DistCp always uses `-update -delete` against the table root.
 
-| `preserve_delete` | Strategy | Flags | Speed | Cleans up stale files? |
-|---|---|---|---|---|
-| `true` (default) | One DistCp per partition | `-update -delete` | Slower (N jobs) | Yes |
-| `false` | Single DistCp with `-f` path-list | `-update` only | Faster (1 job) | No |
+| `preserve_delete` | Strategy                          | Flags             | Speed           | Cleans up stale files? |
+| ----------------- | --------------------------------- | ----------------- | --------------- | ---------------------- |
+| `true` (default)  | One DistCp per partition          | `-update -delete` | Slower (N jobs) | Yes                    |
+| `false`           | Single DistCp with `-f` path-list | `-update` only    | Faster (1 job)  | No                     |
 
 **Note:** Single DistCp with -f having multiple partition paths to a common destination + -delete option, lead to a exit code 25 - because the destination folder already exists after the first partition is copied. Hence this is an infeasible option.
 
@@ -1283,9 +1283,9 @@ queryable without moving or rewriting any data.
   always registered as **STRING** (`partitionColumnTypeInference` is disabled):
   values keep their exact directory form (`month=01` stays `01`), and string
   partition keys are what Athena/Glue recommend for metastore interop
-- **Safe by default** - tables that already exist in HMS at a *different*
+- **Safe by default** - tables that already exist in HMS at a _different_
   location are recorded as `SKIPPED`, never dropped or replaced; an existing
-  table at the *same* location (an Airflow retry) is MSCK-repaired and
+  table at the _same_ location (an Airflow retry) is MSCK-repaired and
   recorded `REGISTERED`
 - **Validation** - row counts (HMS table vs direct parquet read) and partition
   counts (`SHOW PARTITIONS` vs leaf `key=value` directories on S3) are
@@ -1297,10 +1297,10 @@ queryable without moving or rewriting any data.
 
 One row per table to register:
 
-| database   | table        | s3_location                              |
-| ---------- | ------------ | ---------------------------------------- |
-| sales_data | transactions | s3a://data-lake/sales_data/transactions  |
-| sales_data | orders       | s3://data-lake/sales_data/orders         |
+| database   | table        | s3_location                             |
+| ---------- | ------------ | --------------------------------------- |
+| sales_data | transactions | s3a://data-lake/sales_data/transactions |
+| sales_data | orders       | s3://data-lake/sales_data/orders        |
 
 - All three columns are required; rows with missing cells are skipped with a warning
 - `s3_location` accepts `s3://`, `s3n://`, or `s3a://` (normalized to `s3a://`)
@@ -1334,17 +1334,17 @@ finalize_hms_run
 
 ### Task Summaries
 
-| Task                           | Description                                                                                          |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `init_hms_tracking_tables`     | Creates `hms_registration_runs` and `hms_registration_status` Iceberg tracking tables if missing      |
-| `create_hms_registration_run`  | Inserts a `RUNNING` run record; generates the `hms_reg_...` run ID                                    |
-| `parse_parquet_hms_excel`      | Reads the Excel file from S3; emits one config per valid row                                          |
+| Task                           | Description                                                                                                                                                                                                                                          |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init_hms_tracking_tables`     | Creates `hms_registration_runs` and `hms_registration_status` Iceberg tracking tables if missing                                                                                                                                                     |
+| `create_hms_registration_run`  | Inserts a `RUNNING` run record; generates the `hms_reg_...` run ID                                                                                                                                                                                   |
+| `parse_parquet_hms_excel`      | Reads the Excel file from S3; emits one config per valid row                                                                                                                                                                                         |
 | `register_parquet_tables`      | Infers schema (merged across all footers), detects partition columns from `key=value` dirs (typed STRING), `CREATE EXTERNAL TABLE` + `MSCK REPAIR TABLE`; existing table at same location → repair + `REGISTERED`, at different location → `SKIPPED` |
-| `validate_registered_tables`   | Compares HMS row count vs direct parquet count, and `SHOW PARTITIONS` count vs leaf `key=value` directories on S3 |
-| `update_hms_validation_status` | Writes validation results back to the tracking table (`VALIDATED` / `VALIDATION_FAILED`)              |
-| `generate_hms_html_report`     | Builds the HTML report and writes it to `migration_report_location`                                   |
-| `send_hms_report_email`        | Emails the report via SMTP (skips gracefully when no recipients configured)                           |
-| `finalize_hms_run`             | Aggregates per-table statuses into the run record (`COMPLETED` / `COMPLETED_WITH_FAILURES` / `FAILED`) |
+| `validate_registered_tables`   | Compares HMS row count vs direct parquet count, and `SHOW PARTITIONS` count vs leaf `key=value` directories on S3                                                                                                                                    |
+| `update_hms_validation_status` | Writes validation results back to the tracking table (`VALIDATED` / `VALIDATION_FAILED`)                                                                                                                                                             |
+| `generate_hms_html_report`     | Builds the HTML report and writes it to `migration_report_location`                                                                                                                                                                                  |
+| `send_hms_report_email`        | Emails the report via SMTP (skips gracefully when no recipients configured)                                                                                                                                                                          |
+| `finalize_hms_run`             | Aggregates per-table statuses into the run record (`COMPLETED` / `COMPLETED_WITH_FAILURES` / `FAILED`)                                                                                                                                               |
 
 ### Status Progression
 
@@ -1373,6 +1373,122 @@ Per run: `RUNNING` → `COMPLETED` / `COMPLETED_WITH_FAILURES` / `FAILED`.
   unpartitioned tables
 - No drop/replace support — re-running against a table registered elsewhere
   records `SKIPPED`
+
+---
+
+## Remediation: fixing already-migrated tables
+
+### Recreating DAG 1 destination tables (`migration_recreate_tables`)
+
+DAG 1 normally repairs an existing destination table (`MSCK REPAIR`) instead of
+rewriting it. If a table was created by an older DAG version with wrong
+partition-column types (e.g. a `date` partition key stored as `STRING`), set the
+`migration_recreate_tables` Airflow Variable (or `MIGRATION_RECREATE_TABLES` env
+var) to `true` and re-run DAG 1. On that run, `create_hive_tables` **DROPs** each
+existing destination table and recreates it from scratch with the correct schema.
+
+- Destination tables are **EXTERNAL**, so `DROP TABLE` removes only the
+  Hive/Iceberg metadata — **the S3 data is preserved**.
+- Default is `false`. Flip it on for the remediation run, then set it back to
+  `false` for normal incremental runs (it applies to every table in the run).
+
+### ⚠️ If you also ran DAG 2 with **in-place** migration
+
+DAG 2 **in-place** migration (`inplace_migration = True`) converts the DAG 1
+destination table to an **Iceberg** table _under the same name and location_.
+DAG 1 with `migration_recreate_tables=true` **will refuse to drop an Iceberg
+table** (the table is marked `FAILED` with a message pointing here) — dropping it
+would destroy the Iceberg table's metadata and snapshots.
+
+To remediate such a table you must first strip the Iceberg layer with the
+standalone **`iceberg_cleanup.py`** script, then recreate and re-migrate:
+
+```
+iceberg_cleanup.py --apply   →   DAG 1 (migration_recreate_tables=true)   →   DAG 2 (in-place)
+```
+
+> **DAG 2 snapshot migrations do NOT need this.** A snapshot writes the Iceberg
+> table to a separate `{database}_iceberg` database, so the DAG 1 Hive table keeps
+> its name and DAG 1 recreate is already safe — no cleanup required.
+
+#### `iceberg_cleanup.py`
+
+A self-contained remediation script (not an Airflow DAG). For each named table it:
+
+1. verifies the table **is** an Iceberg table (Hive tables are skipped — nothing
+   to clean);
+2. runs `DROP TABLE` **without PURGE** (metadata-only — **data files are kept**);
+3. deletes the table's `metadata/` folder, returning the S3 location to a plain
+   Parquet/ORC directory that DAG 1 can recreate as a Hive external table.
+
+**Only table definitions and Iceberg metadata are removed; the data referenced by
+the table remains intact on S3.**
+
+Run it with the same Spark configuration the DAGs use (Hive metastore + S3A
+credentials), e.g. via `spark-submit` on the cluster. It **defaults to a dry
+run** — pass `--apply` to make changes:
+
+```bash
+# dry run — reports what would be cleaned, makes no changes
+spark-submit iceberg_cleanup.py --tables db1.tbl_a,db1.tbl_b
+
+# execute
+spark-submit iceberg_cleanup.py --tables db1.tbl_a,db1.tbl_b --apply
+
+# convenience: qualify a bare table list with a single database
+spark-submit iceberg_cleanup.py --database db1 --tables tbl_a,tbl_b --apply
+```
+
+| Per-table status      | Meaning                                           |
+| --------------------- | ------------------------------------------------- |
+| `DRY_RUN`             | Would be cleaned (no `--apply`) — no changes made |
+| `CLEANED`             | Dropped (no purge) and `metadata/` folder removed |
+| `SKIPPED_NOT_ICEBERG` | Table is Hive, not Iceberg — left untouched       |
+| `SKIPPED_NOT_FOUND`   | Table does not exist                              |
+| `FAILED`              | An error occurred (data untouched)                |
+
+### Propagating the fix to Iceberg tables
+
+If DAG 2 was already run, the Iceberg table inherited the **wrong** partition
+type too (both `system.migrate` and `system.snapshot`/CTAS derive their schema
+and partition spec from the **source Hive table**). The fix propagates
+automatically: once DAG 1 has recreated the Hive table with the correct partition
+types, **re-running DAG 2 regenerates the Iceberg table with the correct types**.
+You only need to clean up the stale Iceberg table and run the steps in order.
+
+**If DAG 2 was run with _snapshot_** (`{db}.{tbl}` is Hive, `{db}_iceberg.{tbl}` is
+the Iceberg copy):
+
+```
+1. DAG 1 (migration_recreate_tables=true)          # recreate Hive {db}.{tbl} with correct types (safe — it's Hive)
+2. iceberg_cleanup.py --apply --tables {db}_iceberg.{tbl}   # drop stale snapshot + remove its metadata/ folder
+3. DAG 2 (snapshot)                                # re-snapshot from the fixed Hive table
+```
+
+> DAG 2 self-drops an existing snapshot destination before re-snapshotting, but
+> running `iceberg_cleanup` first also clears any leftover `metadata/` folder so
+> the re-snapshot starts clean.
+
+**If DAG 2 was run with _in-place_** (`{db}.{tbl}` is now an Iceberg table under the
+same name — DAG 1 recreate refuses to drop it):
+
+```
+1. iceberg_cleanup.py --apply --tables {db}.{tbl}  # strip Iceberg layer → back to plain parquet (data kept)
+2. DAG 1 (migration_recreate_tables=true)          # recreate Hive {db}.{tbl} with correct types
+3. DAG 2 (in-place)                                # system.migrate on the corrected Hive table
+```
+
+**Why it works:** in-place `system.migrate` builds the Iceberg schema + identity
+partition spec from the Hive metastore definition; snapshot anchors to the source
+Hive schema (the CTAS fallback does `SELECT * ... PARTITIONED BY (cols)`). Either
+path inherits the corrected partition type once the Hive table is right, and DAG 1
+re-registers partitions with the correct types so DAG 2 has correct partition
+metadata to work from.
+
+> **Note:** regenerating the Iceberg table resets its snapshot/time-travel
+> history (you are rebuilding the metadata, not altering it in place). The
+> underlying data files are untouched — a partition-_type_ fix requires rebuilding
+> the Iceberg metadata.
 
 ---
 

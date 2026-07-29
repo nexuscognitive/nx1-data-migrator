@@ -295,6 +295,14 @@ def get_config() -> dict:
             )
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
+        # When true, create_hive_tables DROPS an existing destination table
+        # (metadata only — EXTERNAL tables keep their S3 data) and recreates it
+        # from scratch, instead of MSCK-repair-only. Used to fix tables created
+        # by an older DAG version with wrongly-typed partition columns.
+        'recreate_tables': str(
+            _var('migration_recreate_tables', 'MIGRATION_RECREATE_TABLES', 'false')
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+
         'owner': dag_owner,
     }
 

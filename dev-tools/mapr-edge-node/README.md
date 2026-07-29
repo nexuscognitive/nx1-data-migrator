@@ -450,6 +450,14 @@ production-scale replica table.
 | `flex_rules_result_mini` | PARQUET | No                               | 3    | Realistic nested struct + array-of-struct (mini production replica)             |
 | `flex_rules_result_full` | PARQUET | Yes (`capbusinesseffectivedate`) | 4    | Full production-width struct DDL — integration test for `CREATE EXTERNAL TABLE` |
 
+### `part_types_db`
+
+Covers the partition column type fidelity check (date instead of string).
+
+| Table           | Format  | Partitioned | Rows | Tests                          |
+| --------------- | ------- | ----------- | ---- | ------------------------------ |
+| `sales_by_date` | PARQUET | Yes         | 5    | Partition column type fidelity |
+
 ---
 
 ## PART B — Error-based-retry regression and retry-policy suite
