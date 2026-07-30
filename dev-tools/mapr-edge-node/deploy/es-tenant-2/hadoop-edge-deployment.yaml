@@ -1,18 +1,5 @@
-# es-tenant-2 copy of the MapR-equivalent edge node (namespace: es-tenant-2).
-#
-# Runs ALONGSIDE the shared hadoop-ssh node — it does not replace it. This one
-# is colocated with the es-tenant-2 Airflow so the DAG reaches it in-namespace.
-#
-# Differs from deploy/hadoop-edge-deployment.yaml (hadoop-ssh) in two ways:
-#   1. Image is built for this namespace — the build bakes
-#      fs.defaultFS = hdfs://hadoop-edge.es-tenant-2.svc.cluster.local:9000
-#      via `--build-arg EDGE_NAMESPACE=es-tenant-2` (see ../../Dockerfile).
-#   2. /hadoop/data is backed by a PersistentVolumeClaim (hadoop-edge-pvc.yaml)
-#      instead of emptyDir, so seeded test data persists across restarts.
-#
-# Apply order:  hadoop-edge-pvc.yaml -> this -> the two Service manifests.
-# Point the es-tenant-2 Airflow SSH connection at:
-#   hadoop-edge-ssh.es-tenant-2.svc.cluster.local  (or just hadoop-edge-ssh)
+# MapR-equivalent edge node for es-tenant-2 (runs alongside the hadoop-ssh node).
+# /hadoop/data is PVC-backed so seeded test data persists across restarts.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,13 +19,14 @@ spec:
       labels:
         app: hadoop-edge
     spec:
+      # Required: es-tenant-2's `metastore` Service otherwise injects
+      # METASTORE_PORT=tcp://... which breaks `hive --service metastore`.
+      enableServiceLinks: false
       containers:
         - name: hadoop-edge
-          # Built for es-tenant-2 (see header). Pin an immutable tag, not :latest.
           image: nx1registry-hgb9hgbwd8baguad.azurecr.io/mapr-edge-node:es-tenant-2-2026-07-24
           imagePullPolicy: Always
-          # Pin the headless-service FQDN to this pod's own IP so start-dfs.sh
-          # can reach the NameNode before the pod is Ready (matches entrypoint.sh).
+          # Pin the NameNode FQDN to this pod's IP so start-dfs.sh works pre-Ready.
           command:
             - /bin/bash
             - -c
