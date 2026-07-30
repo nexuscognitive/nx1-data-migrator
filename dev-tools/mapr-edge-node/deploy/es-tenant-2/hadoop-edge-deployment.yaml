@@ -1,0 +1,68 @@
+# MapR-equivalent edge node for es-tenant-2 (runs alongside the hadoop-ssh node).
+# /hadoop/data is PVC-backed so seeded test data persists across restarts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hadoop-edge
+  namespace: es-tenant-2
+  labels:
+    app: hadoop-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hadoop-edge
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: hadoop-edge
+    spec:
+      # Required: es-tenant-2's `metastore` Service otherwise injects
+      # METASTORE_PORT=tcp://... which breaks `hive --service metastore`.
+      enableServiceLinks: false
+      containers:
+        - name: hadoop-edge
+          image: nx1registry-hgb9hgbwd8baguad.azurecr.io/mapr-edge-node:es-tenant-2-2026-07-24
+          imagePullPolicy: Always
+          # Pin the NameNode FQDN to this pod's IP so start-dfs.sh works pre-Ready.
+          command:
+            - /bin/bash
+            - -c
+            - echo "${POD_IP} hadoop-edge.es-tenant-2.svc.cluster.local" >> /etc/hosts; exec /entrypoint.sh
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - { name: ssh, containerPort: 22 }
+            - { name: yarn-ui, containerPort: 8088 }
+            - { name: hdfs-ui, containerPort: 9870 }
+            - { name: hiveserver2, containerPort: 10000 }
+          livenessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - mountPath: /hadoop/data
+              name: hdfs-data
+      volumes:
+        - name: hdfs-data
+          persistentVolumeClaim:
+            claimName: hadoop-edge-data

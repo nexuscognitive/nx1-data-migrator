@@ -1,0 +1,15 @@
+# Headless Service for HDFS (NameNode RPC/HTTP + DataNode). The name must stay
+# "hadoop-edge" — it matches the fs.defaultFS FQDN baked into the image.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hadoop-edge
+  namespace: es-tenant-2
+spec:
+  clusterIP: None
+  selector:
+    app: hadoop-edge
+  ports:
+    - { name: namenode-rpc, port: 9000, targetPort: 9000 }
+    - { name: datanode, port: 50010, targetPort: 50010 }
+    - { name: namenode-http, port: 9870, targetPort: 9870 }

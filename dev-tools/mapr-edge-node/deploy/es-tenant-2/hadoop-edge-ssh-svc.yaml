@@ -1,0 +1,15 @@
+# SSH endpoint the Airflow DAG connects to. Set the Airflow SSH connection Host
+# to hadoop-edge-ssh.es-tenant-2.svc.cluster.local.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hadoop-edge-ssh
+  namespace: es-tenant-2
+  labels:
+    app: hadoop-edge
+spec:
+  type: ClusterIP
+  selector:
+    app: hadoop-edge
+  ports:
+    - { name: ssh, port: 22, targetPort: 22 }

@@ -19,6 +19,12 @@ ENV HIVE_CONF_DIR=/opt/hive/conf
 ENV SPARK_CONF_DIR=/opt/spark/conf
 ENV PATH=$HADOOP_HOME/bin:$HADOOP_HOME/sbin:$HIVE_HOME/bin:$SPARK_HOME/bin:$PATH
 
+# Namespace this image is built for. Baked into core-site.xml's fs.defaultFS so
+# the DataNode advertises a cross-namespace-correct FQDN. Build per target ns:
+#   docker build --build-arg EDGE_NAMESPACE=es-tenant-2 ...
+# Default keeps the original shared hadoop-ssh image byte-for-byte unchanged.
+ARG EDGE_NAMESPACE=hadoop-ssh
+
 RUN apt-get update && apt-get install -y \
     openjdk-8-jdk python2.7 python-pip ssh openssh-server \
     wget curl net-tools vim procps \
@@ -50,6 +56,11 @@ COPY conf/hdfs-site.xml   $HADOOP_HOME/etc/hadoop/hdfs-site.xml
 COPY conf/mapred-site.xml $HADOOP_HOME/etc/hadoop/mapred-site.xml
 COPY conf/yarn-site.xml   $HADOOP_HOME/etc/hadoop/yarn-site.xml
 COPY conf/hive-site.xml   $HIVE_HOME/conf/hive-site.xml
+
+# Bake the target namespace into fs.defaultFS (see ARG EDGE_NAMESPACE above).
+# No-op when building the default hadoop-ssh image.
+RUN sed -i "s#hadoop-edge\.hadoop-ssh\.svc\.cluster\.local#hadoop-edge.${EDGE_NAMESPACE}.svc.cluster.local#g" \
+    $HADOOP_HOME/etc/hadoop/core-site.xml
 
 COPY scripts/entrypoint.sh        /entrypoint.sh
 COPY scripts/bootstrap-hdfs.sh   /bootstrap-hdfs.sh

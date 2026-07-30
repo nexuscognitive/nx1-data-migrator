@@ -1,0 +1,18 @@
+# Persistent storage for the edge node's HDFS data + Hive metastore, so seeded
+# test data survives pod restarts. ReadWriteOnce is required (single writer —
+# the embedded derby metastore). storageClassName is the cluster's RWO block
+# class (ebs-encrypted on nx1poc1/EKS; adjust per cluster).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hadoop-edge-data
+  namespace: es-tenant-2
+  labels:
+    app: hadoop-edge
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: ebs-encrypted

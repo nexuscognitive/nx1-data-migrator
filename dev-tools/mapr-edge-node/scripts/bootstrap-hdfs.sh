@@ -15,7 +15,7 @@ $HADOOP_HOME/bin/hdfs dfs -mkdir -p /tmp
 $HADOOP_HOME/bin/hdfs dfs -chmod g+w /tmp
 $HADOOP_HOME/bin/hdfs dfs -chmod g+w /user/hive/warehouse
 
-rm -rf /opt/hive/metastore_db
+rm -rf /hadoop/data/metastore_db
 $HIVE_HOME/bin/schematool -initSchema -dbType derby
 
 $HADOOP_HOME/sbin/stop-dfs.sh

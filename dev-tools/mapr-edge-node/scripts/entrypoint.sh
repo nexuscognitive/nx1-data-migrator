@@ -79,6 +79,21 @@ for i in $(seq 1 30); do
     sleep 2
 done
 
+# ── Seed source test data once, then persist it on the data volume ───────────
+# Guarded by a marker on /hadoop/data so it runs on first boot only. With a PVC
+# backing /hadoop/data the seeded HDFS files + Hive metastore survive restarts,
+# so this does not re-run. (`if ... then` keeps set -e from killing the pod if
+# the seed hits a transient error — it just retries next boot.)
+if [ ! -f /hadoop/data/.testdata-seeded ]; then
+    echo "Seeding source test data (first boot only)..."
+    if bash /setup-test-data.sh; then
+        touch /hadoop/data/.testdata-seeded
+        echo "Test data seeded."
+    else
+        echo "WARNING: test data seeding failed; will retry on next boot."
+    fi
+fi
+
 echo "==============================="
 echo "MapR-equivalent edge node ready!"
 echo "Hadoop: 2.7.7 (simulates MapR 2.7.0-mapr-1808)"
