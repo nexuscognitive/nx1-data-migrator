@@ -79,7 +79,9 @@ class TestDiscoverHiveTables:
     def _location_router(self, tables):
         def sql_router(sql):
             df = MagicMock()
-            if 'show tables' in sql.lower():
+            if 'show databases' in sql.lower():
+                df.count.return_value = 1
+            elif 'show tables' in sql.lower():
                 df.collect.return_value = [MagicMock(tableName=t) for t in tables]
             elif 'describe formatted' in sql.lower():
                 loc = MagicMock()
@@ -103,7 +105,9 @@ class TestDiscoverHiveTables:
 
         def sql_router(sql):
             df = MagicMock()
-            if 'show tables' in sql.lower():
+            if 'show databases' in sql.lower():
+                df.count.return_value = 1
+            elif 'show tables' in sql.lower():
                 all_t = ['transactions', 'orders', 'trans_history']
                 like = re.search(r"like '([^']+)'", sql.lower())
                 matched = [t for t in all_t if fnmatch.fnmatch(t, like.group(1).replace('%', '*'))] if like else all_t
@@ -122,6 +126,51 @@ class TestDiscoverHiveTables:
         names = [t['table'] for t in result['discovered_tables']]
         assert 'transactions' in names
         assert 'orders' not in names
+
+    def test_missing_database_records_skip_entry_per_token(self, mock_spark, sample_iceberg_db_config):
+        """SHOW DATABASES matches nothing -> one DATABASE_NOT_FOUND entry per requested token."""
+        sample_iceberg_db_config['table_tokens'] = ['transactions', 'orders']
+
+        def sql_router(sql):
+            df = MagicMock()
+            df.count.return_value = 0
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = sql_router
+        result = m.discover_hive_tables.function.__wrapped__(
+            db_config=sample_iceberg_db_config, spark=mock_spark,
+        )
+        entries = result['discovered_tables']
+        assert [e['table'] for e in entries] == ['transactions', 'orders']
+        assert {e['skip_code'] for e in entries} == {'DATABASE_NOT_FOUND'}
+        assert {e['skip_status'] for e in entries} == {'SKIPPED'}
+        # No DESCRIBE FORMATTED should be attempted against a database that does not exist.
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'describe formatted' not in all_sql
+
+    def test_wildcard_matching_nothing_records_skip_entry(self, mock_spark, sample_iceberg_db_config):
+        """Database exists but the pattern matches no table -> NO_TABLES_MATCHED_PATTERN."""
+        sample_iceberg_db_config['table_tokens'] = ['nosuch*']
+
+        def sql_router(sql):
+            df = MagicMock()
+            if 'show databases' in sql.lower():
+                df.count.return_value = 1
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+
+        mock_spark.sql.side_effect = sql_router
+        result = m.discover_hive_tables.function.__wrapped__(
+            db_config=sample_iceberg_db_config, spark=mock_spark,
+        )
+        entries = result['discovered_tables']
+        assert len(entries) == 1
+        assert entries[0]['table'] == 'nosuch*'
+        assert entries[0]['skip_code'] == 'NO_TABLES_MATCHED_PATTERN'
+        assert entries[0]['skip_status'] == 'SKIPPED'
 
 
 class TestMigrateTablesToIceberg:
@@ -380,6 +429,9 @@ class TestMigrateTablesToIceberg:
     def test_discovery_skips_backup_tables(self, mock_spark):
         def show_tables(sql):
             df = MagicMock()
+            if 'show databases' in sql.lower():
+                df.count.return_value = 1
+                return df
             df.collect.return_value = [
                 MagicMock(tableName='sales'),
                 MagicMock(tableName='sales_backup_'),
