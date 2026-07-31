@@ -1172,7 +1172,6 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
         return {}
 
     src_db = migration_result['source_database']
-    dest_db = migration_result['destination_database']
 
     validation_results = []
 
