@@ -4,13 +4,13 @@ Data platform migration tools (MapR/HDFS to S3/Iceberg) and access control autom
 
 ## Repository Structure
 
-| Directory                        | Description                                                                                                                                      |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `data-iceberg-migrator/`         | Airflow DAGs for migrating Hive tables from MapR-FS/HDFS to S3 and converting to Iceberg format                                                  |
-| `ranger-policies-generator/`     | Airflow DAG for automating Apache Ranger policies and Keycloak role mappings from Excel config                                                   |
-| `code-scanner/`                  | Standalone CLI tool for static analysis of Spark, HDFS, JDK, and Python migration patterns                                                       |
-| `airflow-3-migration-assistant/` | Standalone CLI tool that scans Airflow 2 DAG files and reports or auto-applies changes required for Airflow 3 compatibility                      |
-| `dev-tools/hadoop-edge-node/`    | Docker-based local Hadoop/Hive/Spark edge node for end-to-end DAG testing against the nx1 tenant platform                                        |
+| Directory                        | Description                                                                                                                 |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `data-iceberg-migrator/`         | Airflow DAGs for migrating Hive tables from MapR-FS/HDFS to S3 and converting to Iceberg format                             |
+| `ranger-policies-generator/`     | Airflow DAG for automating Apache Ranger policies and Keycloak role mappings from Excel config                              |
+| `code-scanner/`                  | Standalone CLI tool for static analysis of Spark, HDFS, JDK, and Python migration patterns                                  |
+| `airflow-3-migration-assistant/` | Standalone CLI tool that scans Airflow 2 DAG files and reports or auto-applies changes required for Airflow 3 compatibility |
+| `dev-tools/hadoop-edge-node/`    | Docker-based local Hadoop/Hive/Spark edge node for end-to-end DAG testing against the nx1 tenant platform                   |
 
 ## Deployment
 
@@ -120,21 +120,22 @@ Add one connection manually:
 
 **Airflow UI → Admin → Variables** — add these:
 
-| Key                           | Value for local testing                               |
-| ----------------------------- | ----------------------------------------------------- |
-| `cluster_ssh_conn_id`         | `cluster_edge_ssh`                                    |
-| `cluster_edge_temp_path`      | `/tmp/migration`                                      |
-| `auth_method`                 | `none`                                                |
-| `migration_distcp_mappers`    | `1`                                                   |
-| `migration_distcp_bandwidth`  | `10`                                                  |
-| `migration_spark_conn_id`     | `spark_default`                                       |
-| `migration_smtp_conn_id`      | `smtp_default`                                        |
-| `s3_listing_tool`             | `hadoop`                                              |
-| `migration_default_s3_bucket` | `s3a://<your-tenant-bucket>/<path>`                   |
-| `migration_tracking_database` | `migration_tracking_<your_initials>`                  |
-| `migration_tracking_location` | `s3a://<bucket>/<path>/migration_tracking_<initials>` |
-| `migration_report_location`   | `s3a://<bucket>/<path>/migration_reports_<initials>`  |
-| `migration_email_recipients`  | `your@email.com`                                      |
+| Key                                | Value for local testing                               |
+| ---------------------------------- | ----------------------------------------------------- |
+| `cluster_ssh_conn_id`              | `cluster_edge_ssh`                                    |
+| `cluster_edge_temp_path`           | `/tmp/migration`                                      |
+| `cluster_edge_discovery_temp_path` | `/tmp`                                                |
+| `auth_method`                      | `none`                                                |
+| `migration_distcp_mappers`         | `1`                                                   |
+| `migration_distcp_bandwidth`       | `10`                                                  |
+| `migration_spark_conn_id`          | `spark_default`                                       |
+| `migration_smtp_conn_id`           | `smtp_default`                                        |
+| `s3_listing_tool`                  | `hadoop`                                              |
+| `migration_default_s3_bucket`      | `s3a://<your-tenant-bucket>/<path>`                   |
+| `migration_tracking_database`      | `migration_tracking_<your_initials>`                  |
+| `migration_tracking_location`      | `s3a://<bucket>/<path>/migration_tracking_<initials>` |
+| `migration_report_location`        | `s3a://<bucket>/<path>/migration_reports_<initials>`  |
+| `migration_email_recipients`       | `your@email.com`                                      |
 
 ### Common issues
 

@@ -231,6 +231,7 @@ def get_config() -> dict:
         # SSH Configuration (for MapR migration)
         'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh'),
         'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration'),
+        'edge_discovery_temp_path': _var('cluster_edge_discovery_temp_path', 'CLUSTER_EDGE_DISCOVERY_TEMP_PATH', '/tmp'),
 
         # S3 Configuration
         'default_s3_bucket': _var('migration_default_s3_bucket', 'MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake'),
@@ -335,6 +336,15 @@ def _login_shell(cmd: str, cluster_type: str = 'MapR') -> str:
         return f"source ~/.profile 2>/dev/null || true\n{cmd}"
     return f"bash -l <<'__LOGIN_SHELL_EOF__'\n{cmd}\n__LOGIN_SHELL_EOF__\n"
 
+def _edge_path_template(path: str) -> str:
+    if not path:
+        return path
+    p = path.replace('${USER}', '${MIG_USER}').replace('$USER', '${MIG_USER}').replace('{user}', '${MIG_USER}')
+    if p.startswith('~'):
+        p = '/user/${MIG_USER}' + p[1:]
+    p = p.rstrip('/')
+    return p or '/'
+
 
 def cluster_login(run_id: str) -> dict:
     """SSH to edge node, perform cluster login (MapR or Kerberos), create temp dir.
@@ -345,7 +355,7 @@ def cluster_login(run_id: str) -> dict:
 
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
-    temp_dir = f"{config['edge_temp_path']}/{run_id}"
+    temp_dir = f"{_edge_path_template(config['edge_temp_path'])}/{run_id}"
 
     auth_method = config.get('auth_method', 'mapr')
     mapr_user = config.get('mapr_user', '')
@@ -383,12 +393,18 @@ echo "Authentication successful"
 """)
 
     auth_script_parts.append(f"""
+MIG_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
+[ -z "$MIG_USER" ] && MIG_USER=$(id -un)
+export MIG_USER
+echo "MAPR_EFFECTIVE_USER=$MIG_USER"
+
 echo "=== Creating temp directory ==="
-mkdir -p {temp_dir}
-chmod 755 {temp_dir}
+RESOLVED_TEMP_DIR="{temp_dir}"
+mkdir -p "$RESOLVED_TEMP_DIR"
+chmod 755 "$RESOLVED_TEMP_DIR"
 
 echo "CLUSTER_LOGIN_SUCCESS"
-echo "TEMP_DIR={temp_dir}"
+echo "TEMP_DIR=$RESOLVED_TEMP_DIR"
 """)
     full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
@@ -415,7 +431,15 @@ echo "TEMP_DIR={temp_dir}"
                 f"Output: {output[-500:]}"
             )
 
-    return {'temp_dir': temp_dir, 'run_id': run_id}
+    resolved = temp_dir
+    for line in output.splitlines():
+        if line.startswith("TEMP_DIR="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                resolved = val
+            break
+
+    return {'temp_dir': resolved, 'run_id': run_id}
 
 
 def _s3a_committer_opts(config: dict) -> str:

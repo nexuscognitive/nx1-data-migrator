@@ -43,7 +43,8 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 | Variable                           | Default          | Description                                                                                                                                     | Applies To                                        |
 | ---------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| `cluster_edge_temp_path`           | `/tmp/migration` | Temporary directory on edge node                                                                                                                | `source_to_s3_migration`, `folder_only_data_copy` |
+| `cluster_edge_temp_path`           | `/tmp/migration` | Temp dir on edge node for run-scoped files and DistCp logs. Supports `${USER}`, expanded to the MapR ticket user.                               | `source_to_s3_migration`, `folder_only_data_copy` |
+| `cluster_edge_discovery_temp_path` | `/tmp`           | Local temp dir on edge node for the Spark discovery scratch folder. Literal path only (no `${USER}`).                                           | `source_to_s3_migration`                          |
 | `s3_endpoint`                      | _(empty)_        | Default S3 endpoint URL (all buckets)                                                                                                           | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_access_key`                    | _(empty)_        | Default S3 access key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_secret_key`                    | _(empty)_        | Default S3 secret key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
@@ -55,6 +56,21 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | `migration_smtp_conn_id`           | `smtp_default`   | Airflow SMTP connection ID for email reports                                                                                                    | All DAGs                                          |
 | `migration_email_recipients`       | _(empty)_        | Comma-separated email addresses for reports                                                                                                     | All DAGs                                          |
 | `hdfs_nameservice`                 | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR                                                                                    | `source_to_s3_migration`, `folder_only_data_copy` |
+
+#### Edge-node temp paths for service accounts
+
+`cluster_edge_temp_path` supports `${USER}`, `$USER`, `{user}`, and a leading `~`. These expand on the edge node to the **MapR ticket user** (parsed from `maprlogin print`), not the SSH/Linux login user.
+
+Example for a tenant service account:
+
+    cluster_edge_temp_path = /user/${USER}/tmp/migration
+
+The resolved path is echoed as `TEMP_DIR=` and the identity as `MAPR_EFFECTIVE_USER=`
+in the `cluster_login_setup` task log.
+
+`cluster_edge_discovery_temp_path` does **not** support placeholders — the discovery
+directory is created over a plain SSH command and then written to over SFTP, which does
+not expand shell variables. Use a literal path.
 
 ### Multi-Tenant S3 Credentials (endpoint-based overrides)
 

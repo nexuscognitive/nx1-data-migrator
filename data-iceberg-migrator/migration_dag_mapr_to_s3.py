@@ -705,7 +705,12 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
         dest_bucket_slug = f"{dest_bucket_slug}_{pf_slug}"
 
     with ssh.get_conn() as client:
-        temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}"
+        discovery_root = str(config.get("edge_discovery_temp_path") or "/tmp").rstrip("/") or "/tmp"
+        if "$" in discovery_root or discovery_root.startswith("~"):
+            raise ValueError(
+                f"cluster_edge_discovery_temp_path must be a literal path, got: {discovery_root}"
+            )
+        temp_dir = f"{discovery_root}/discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}"
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
 
