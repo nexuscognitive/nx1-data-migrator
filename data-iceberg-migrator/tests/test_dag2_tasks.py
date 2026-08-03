@@ -821,6 +821,95 @@ class TestGenerateIcebergHtmlReport:
         assert 'Hive Total Partitions' in html
         assert 'Source Partitions (non-empty)' in html
 
+    class _Row(SimpleNamespace):
+        """Row stub that also answers asDict(), which _row_value() needs to see error_message."""
+
+        def asDict(self, recursive=False):
+            return dict(self.__dict__)
+
+    def test_status_column_carries_reason_and_no_per_table_detail_section(
+        self, mock_spark, sample_iceberg_run_id,
+    ):
+        """Skip reason renders under the status badge; the per-table detail table is gone."""
+        tbl_row = self._Row(
+            source_database='sales_s3', source_table='transactions',
+            migration_type='SNAPSHOT', destination_table='sales_s3_iceberg.transactions',
+            status='SKIPPED', migration_duration_seconds=None,
+            validation_duration_seconds=None, validation_status=None,
+            row_count_match=None, partition_count_match=None, schema_match=None,
+            source_hive_row_count=None, destination_iceberg_row_count=None,
+            source_hive_partition_count=None, dest_iceberg_partition_count=None,
+            error_message="[TABLE_NOT_FOUND] Table 'sales_s3.transactions' does not exist",
+        )
+        ivs_row = MagicMock()
+        ivs_row.__getitem__ = lambda self, k: 0
+        ivs_row.total_tables_validated = 0
+
+        def router(sql):
+            df = MagicMock()
+            if 'order by' in sql.lower():
+                df.collect.return_value = [tbl_row]
+            elif 'sum(case when' in sql.lower():
+                df.collect.return_value = [ivs_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+        m.generate_iceberg_html_report.function(run_id=sample_iceberg_run_id, spark=mock_spark)
+
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        html = fs_mock.create.return_value.write.call_args[0][0].decode('utf-8')
+
+        # Status cell: badge, then the human label, then the raw code.
+        status_cell = html.split('<td class="status-cell">')[1].split('</td>')[0]
+        assert 'SKIPPED' in status_cell
+        assert 'Table not found in metastore' in status_cell
+        assert 'TABLE_NOT_FOUND' in status_cell
+
+        # The reason breakdown stays; the per-table detail table is removed.
+        assert 'Reason breakdown' in html
+        assert 'Per-table detail' not in html
+
+    def test_status_column_has_no_reason_markup_for_successful_table(
+        self, mock_spark, sample_iceberg_run_id,
+    ):
+        """A VALIDATED table has no error_message, so nothing is added under the badge."""
+        tbl_row = self._Row(
+            source_database='sales_s3', source_table='transactions',
+            migration_type='SNAPSHOT', destination_table='sales_s3_iceberg.transactions',
+            status='VALIDATED', migration_duration_seconds=10.0,
+            validation_duration_seconds=1.0, validation_status='COMPLETED',
+            row_count_match=True, partition_count_match=True, schema_match=True,
+            source_hive_row_count=5, destination_iceberg_row_count=5,
+            source_hive_partition_count=1, dest_iceberg_partition_count=1,
+            error_message=None,
+        )
+        ivs_row = MagicMock()
+        ivs_row.__getitem__ = lambda self, k: 0
+        ivs_row.total_tables_validated = 0
+
+        def router(sql):
+            df = MagicMock()
+            if 'order by' in sql.lower():
+                df.collect.return_value = [tbl_row]
+            elif 'sum(case when' in sql.lower():
+                df.collect.return_value = [ivs_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+        m.generate_iceberg_html_report.function(run_id=sample_iceberg_run_id, spark=mock_spark)
+
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        html = fs_mock.create.return_value.write.call_args[0][0].decode('utf-8')
+
+        status_cell = html.split('<td class="status-cell">')[1].split('</td>')[0]
+        assert 'VALIDATED' in status_cell
+        assert 'status-reason' not in status_cell
+        assert 'reason-key' not in status_cell
+
 
 class TestSendIcebergReportEmail:
 

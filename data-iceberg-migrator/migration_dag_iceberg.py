@@ -1606,6 +1606,14 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
             padding: 10px 12px;
             border-bottom: 1px solid #ecf0f1;
         }}
+        /* Table/destination identifiers have no spaces to break on, so without an
+           explicit cap one long name stretches its column across the table. */
+        td.name {{
+            max-width: 200px;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            font-size: 12px;
+        }}
         tr:hover {{
             background-color: #f8f9fa;
         }}
@@ -1666,21 +1674,21 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
             font-weight: bold;
         }}
         .reason-key {{
-            margin-left: 8px;
+            margin-top: 2px;
             color: #95a5a6;
             font-size: 11px;
             font-family: Consolas, 'Courier New', monospace;
         }}
-        .reason-detail {{
-            margin-top: 5px;
+        td.status-cell {{
+            max-width: 320px;
+        }}
+        .status-reason {{
+            margin-top: 6px;
             color: #4d5656;
             font-size: 12px;
-            line-height: 1.45;
+            line-height: 1.4;
             white-space: normal;
             word-break: break-word;
-        }}
-        td.reason {{
-            max-width: 520px;
         }}
     </style>
 </head>
@@ -1796,13 +1804,23 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
         _code, _label, _detail = _split_reason(t)
         badge_title_attr = f' title="{_esc(_detail)}"' if _detail else ''
 
+        # The reason sits under the badge so a SKIPPED/FAILED row explains itself
+        # in place — this is the only per-table reason left in the report.
+        status_reason_html = ''
+        if _label:
+            status_reason_html += f'\n                        <div class="status-reason">{_esc(_label)}</div>'
+        if _code:
+            status_reason_html += f'\n                        <div class="reason-key">{_esc(_code)}</div>'
+
         html += f"""
                 <tr>
                     <td>{_esc(str(t.source_database or ''))}</td>
-                    <td><strong>{_esc(str(t.source_table or ''))}</strong></td>
+                    <td class="name"><strong>{_esc(str(t.source_table or ''))}</strong></td>
                     <td>{_esc(str(t.migration_type or ''))}</td>
-                    <td>{_esc(str(t.destination_table or ''))}</td>
-                    <td><span class="status-badge {status_class}"{badge_title_attr}>{t.status}</span></td>
+                    <td class="name">{_esc(str(t.destination_table or ''))}</td>
+                    <td class="status-cell">
+                        <span class="status-badge {status_class}"{badge_title_attr}>{t.status}</span>{status_reason_html}
+                    </td>
                     <td class="duration">{migration_dur}</td>
                     <td class="duration">{validation_dur}</td>
                 </tr>
@@ -1814,7 +1832,7 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
 
         <div class="section-divider"></div>
 
-        <h2>Why Tables Were Skipped or Failed</h2>
+        <h2>Tables that Skipped or Failed</h2>
 """
 
     if not not_migrated:
@@ -1842,41 +1860,6 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
                     <td><span class="reason-code">{_esc(_label)}</span></td>
                     <td class="reason-key">{_esc(_code or 'unclassified')}</td>
                     <td class="metric">{_count}</td>
-                </tr>
-"""
-        html += """
-            </tbody>
-        </table>
-
-        <h3 style="color: #34495e;">Per-table detail</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>Database</th>
-                    <th>Table / Pattern</th>
-                    <th>Migration Type</th>
-                    <th>Status</th>
-                    <th>Reason</th>
-                    <th>Detail</th>
-                </tr>
-            </thead>
-            <tbody>
-"""
-        for t in not_migrated:
-            _code, _label, _detail = _split_reason(t)
-            _status = t.status or ''
-            _status_class = 'status-skipped' if _status == 'SKIPPED' else 'status-failed'
-            html += f"""
-                <tr>
-                    <td>{_esc(str(t.source_database or ''))}</td>
-                    <td><strong>{_esc(str(t.source_table or ''))}</strong></td>
-                    <td>{_esc(str(t.migration_type or ''))}</td>
-                    <td><span class="status-badge {_status_class}">{_esc(_status)}</span></td>
-                    <td>
-                        <span class="reason-code">{_esc(_label or 'No reason recorded')}</span>
-                        <div class="reason-key">{_esc(_code or 'unclassified')}</div>
-                    </td>
-                    <td class="reason"><div class="reason-detail">{_esc(_detail or 'No detail was recorded for this table.')}</div></td>
                 </tr>
 """
         html += """
@@ -1921,7 +1904,7 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
-                    <td><strong>{t.source_table}</strong></td>
+                    <td class="name"><strong>{t.source_table}</strong></td>
                     <td class="metric">{(t.source_hive_row_count or 0):,}</td>
                     <td class="metric">{(t.destination_iceberg_row_count or 0):,}</td>
                     <td class="{row_match_class}">{row_match_icon}</td>
@@ -1965,7 +1948,7 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
-                    <td><strong>{t.source_table}</strong></td>
+                    <td class="name"><strong>{t.source_table}</strong></td>
                     <td class="metric">{migration_dur:.1f}s</td>
                     <td class="metric">{validation_dur:.1f}s</td>
                     <td class="metric">{total_dur:.1f}s ({total_dur/60:.1f}m)</td>
