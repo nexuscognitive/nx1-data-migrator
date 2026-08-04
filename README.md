@@ -4,13 +4,13 @@ Data platform migration tools (MapR/HDFS to S3/Iceberg) and access control autom
 
 ## Repository Structure
 
-| Directory                        | Description                                                                                                                                      |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `data-iceberg-migrator/`         | Airflow DAGs for migrating Hive tables from MapR-FS/HDFS to S3 and converting to Iceberg format                                                  |
-| `ranger-policies-generator/`     | Airflow DAG for automating Apache Ranger policies and Keycloak role mappings from Excel config                                                   |
-| `code-scanner/`                  | Standalone CLI tool for static analysis of Spark, HDFS, JDK, and Python migration patterns                                                       |
-| `airflow-3-migration-assistant/` | Standalone CLI tool that scans Airflow 2 DAG files and reports or auto-applies changes required for Airflow 3 compatibility                      |
-| `dev-tools/hadoop-edge-node/`    | Docker-based local Hadoop/Hive/Spark edge node for end-to-end DAG testing against the nx1 tenant platform                                        |
+| Directory                        | Description                                                                                                                 |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `data-iceberg-migrator/`         | Airflow DAGs for migrating Hive tables from MapR-FS/HDFS to S3 and converting to Iceberg format                             |
+| `ranger-policies-generator/`     | Airflow DAG for automating Apache Ranger policies and Keycloak role mappings from Excel config                              |
+| `code-scanner/`                  | Standalone CLI tool for static analysis of Spark, HDFS, JDK, and Python migration patterns                                  |
+| `airflow-3-migration-assistant/` | Standalone CLI tool that scans Airflow 2 DAG files and reports or auto-applies changes required for Airflow 3 compatibility |
+| `dev-tools/hadoop-edge-node/`    | Docker-based local Hadoop/Hive/Spark edge node for end-to-end DAG testing against the nx1 tenant platform                   |
 
 ## Deployment
 
@@ -124,6 +124,7 @@ Add one connection manually:
 | ----------------------------- | ----------------------------------------------------- |
 | `cluster_ssh_conn_id`         | `cluster_edge_ssh`                                    |
 | `cluster_edge_temp_path`      | `/tmp/migration`                                      |
+| `cluster_hive_scratch_dir`    | `/tmp`                                                |
 | `auth_method`                 | `none`                                                |
 | `migration_distcp_mappers`    | `1`                                                   |
 | `migration_distcp_bandwidth`  | `10`                                                  |
