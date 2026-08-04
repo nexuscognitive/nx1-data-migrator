@@ -30,7 +30,7 @@ MOCK_VARIABLES = {
     'cluster_type':                 'HDP',
     'hdfs_nameservice':             '',
     'cluster_edge_temp_path':       '/tmp/migration',
-    'cluster_hive_scratch_dir': '/tmp',
+    'cluster_hive_scratch_dir': '/tmp/hive',
     's3_listing_tool':              'hadoop',
     'migration_smtp_conn_id':       'smtp_default',
     'migration_email_recipients':   'user@example.com',
