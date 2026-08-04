@@ -231,7 +231,7 @@ def get_config() -> dict:
         # SSH Configuration (for MapR migration)
         'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh'),
         'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration'),
-        'hive_scratch_dir': _var('cluster_hive_scratch_dir', 'CLUSTER_HIVE_SCRATCH_DIR', '/tmp'),
+        'hive_scratch_dir': _var('cluster_hive_scratch_dir', 'CLUSTER_HIVE_SCRATCH_DIR', '/tmp/hive'),
 
         # S3 Configuration
         'default_s3_bucket': _var('migration_default_s3_bucket', 'MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake'),
@@ -343,7 +343,7 @@ def _hive_scratch_dir(config: dict) -> str:
     Rejects shell/format placeholders: the value is interpolated into a Python
     script that is written over SFTP, which does not expand shell variables.
     """
-    path = str(config.get('hive_scratch_dir') or '/tmp').strip().rstrip('/') or '/tmp'
+    path = str(config.get('hive_scratch_dir') or '/tmp/hive').strip().rstrip('/') or '/tmp/hive'
     if '$' in path or '{' in path or path.startswith('~'):
         raise ValueError(
             f"cluster_hive_scratch_dir must be a literal path, got: {path}"

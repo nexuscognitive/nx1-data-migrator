@@ -44,7 +44,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | Variable                           | Default          | Description                                                                                                                                     | Applies To                                        |
 | ---------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
 | `cluster_edge_temp_path`           | `/tmp/migration` | Temporary directory on edge node                                                                                                                | `source_to_s3_migration`, `folder_only_data_copy` |
-| `cluster_hive_scratch_dir`         | `/tmp`           | Hive scratch dir for PySpark sessions started on the **source edge node**. Literal path only (no `${USER}`).                                    | `source_to_s3_migration`                          |
+| `cluster_hive_scratch_dir`         | `/tmp/hive`      | Hive scratch dir for PySpark sessions started on the **source edge node**. Literal path only (no `${USER}`).                                    | `source_to_s3_migration`                          |
 | `s3_endpoint`                      | _(empty)_        | Default S3 endpoint URL (all buckets)                                                                                                           | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_access_key`                    | _(empty)_        | Default S3 access key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_secret_key`                    | _(empty)_        | Default S3 secret key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
@@ -71,8 +71,8 @@ there — discovery aborts in `validate_prerequisites` with:
 over SSH on the source edge node (`validate_prerequisites` and
 `discover_tables_via_spark_ssh`), overriding whatever `hive-site.xml` sets.
 
-The default `/tmp` is world-writable on both MapR-FS and the local filesystem
-and works for every service account. Only change it if `/tmp` is restricted on
+The default `/tmp/hive` is world-writable on both MapR-FS and the local filesystem
+and works for every service account. Only change it if `/tmp/hive` is restricted on
 your cluster.
 
 Placeholders are **not** supported. The value is baked into a Python script that

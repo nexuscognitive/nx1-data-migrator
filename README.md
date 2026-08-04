@@ -124,7 +124,7 @@ Add one connection manually:
 | ----------------------------- | ----------------------------------------------------- |
 | `cluster_ssh_conn_id`         | `cluster_edge_ssh`                                    |
 | `cluster_edge_temp_path`      | `/tmp/migration`                                      |
-| `cluster_hive_scratch_dir`    | `/tmp`                                                |
+| `cluster_hive_scratch_dir`    | `/tmp/hive`                                           |
 | `auth_method`                 | `none`                                                |
 | `migration_distcp_mappers`    | `1`                                                   |
 | `migration_distcp_bandwidth`  | `10`                                                  |
