@@ -211,7 +211,11 @@ def get_config() -> dict:
         _run_id = None
         _dag_run_conf = {}
 
-    def _var(base_key: str, env_var: str, default: str) -> str:
+    def _var(base_key: str, env_var: str, default: str, conf_key: str = None) -> str:
+        if conf_key and conf_key in _dag_run_conf:
+            _val = _dag_run_conf.get(conf_key)
+            if _val is not None and str(_val).strip():
+                return str(_val).strip()
         if _run_id:
             try:
                 scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
@@ -229,8 +233,8 @@ def get_config() -> dict:
 
     config = {
         # SSH Configuration (for MapR migration)
-        'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh'),
-        'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration'),
+        'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh', conf_key='ssh_conn_id'),
+        'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration', conf_key='edge_temp_path'),
 
         # S3 Configuration
         'default_s3_bucket': _var('migration_default_s3_bucket', 'MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake'),
@@ -259,9 +263,9 @@ def get_config() -> dict:
         # Cluster type for display/reporting purposes ('MapR' or 'HDP')
         'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
-        'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr'),  # 'mapr' or 'kinit'
-        'mapr_user': _var('mapr_user', 'MAPR_USER', ''),
-        'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}'),
+        'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
+        'mapr_user': _var('mapr_user', 'MAPR_USER', '', conf_key='mapr_user'),
+        'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}', conf_key='mapr_ticketfile_location'),
         # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
         'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', ''),
 
@@ -316,7 +320,11 @@ def get_config() -> dict:
         except Exception:
             pass
 
-    logger.debug(f"[get_config] dag_owner={dag_owner!r} run_id={_run_id!r}")
+    logger.info(
+        f"[get_config] run_id={_run_id!r} ssh_conn_id={config['ssh_conn_id']!r} "
+        f"mapr_user={config['mapr_user']!r} edge_temp_path={config['edge_temp_path']!r} "
+        f"dag_owner={dag_owner!r}"
+    )
     return config
 
 # SSH timeout: 24 hours

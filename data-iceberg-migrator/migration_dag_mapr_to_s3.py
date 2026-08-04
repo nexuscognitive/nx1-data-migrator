@@ -4398,7 +4398,15 @@ with DAG(
             default="s3a://config-bucket/migration.xlsx",
             type="string",
             description="S3 path to Excel config file",
-        )
+        ),
+        "ssh_conn_id": Param(default="", type="string",
+            description="Airflow SSH connection ID for this run (blank = cluster_ssh_conn_id Variable)"),
+        "mapr_user": Param(default="", type="string",
+            description="MapR ticket user expected on the edge node (blank = mapr_user Variable)"),
+        "edge_temp_path": Param(default="", type="string",
+            description="Edge-node temp dir for this run (blank = cluster_edge_temp_path Variable)"),
+        "hive_scratch_dir": Param(default="", type="string",
+            description="Hive scratch dir for edge-node Spark sessions (blank = cluster_hive_scratch_dir Variable)"),
     },
     render_template_as_native_obj=True,
 ) as dag_mapr_to_s3:
