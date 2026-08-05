@@ -59,6 +59,128 @@ default_args = {
 }
 
 # =============================================================================
+# SKIP / FAILURE REASON CLASSIFICATION
+# =============================================================================
+# Every table that does not get migrated is recorded with an explicit reason
+# code instead of a generic "unsupported format" message. The code is stored in
+# iceberg_migration_table_status.error_message as "[CODE] detail", so the HTML
+# report can render a short human label plus the full underlying detail.
+
+REASON_LABELS = {
+    'TABLE_NOT_FOUND': 'Table not found in metastore',
+    'DATABASE_NOT_FOUND': 'Database not found in metastore',
+    'NO_TABLES_MATCHED_PATTERN': 'No tables matched the Excel pattern',
+    'SOURCE_IS_VIEW': 'Source object is a view, not a table',
+    'ALREADY_ICEBERG': 'Table is already Iceberg',
+    'SOURCE_NOT_V1_TABLE': 'Source is not a Hive V1 table',
+    'TEXT_FORMAT_INPLACE_UNSUPPORTED': 'Text-format table (in-place unsupported)',
+    'FORMAT_UNDETECTED_INPLACE': 'Storage format could not be determined',
+    'UNSUPPORTED_SOURCE_FORMAT': 'Unsupported source file format',
+    'UNSUPPORTED_DATA_TYPE': 'Unsupported column data type',
+    'METADATA_READ_ERROR': 'Table metadata could not be read',
+    'PERMISSION_DENIED': 'Permission denied on table or storage path',
+    'DATA_PATH_MISSING': 'Data location missing in storage',
+    'DESTINATION_EXISTS': 'Destination table already exists',
+    'RESOURCE_ERROR': 'Spark ran out of resources',
+    'CONCURRENT_COMMIT_CONFLICT': 'Concurrent Iceberg commit conflict',
+    'TASK_DID_NOT_PROCESS': 'Table was never processed by the migration task',
+    'MIGRATION_ERROR': 'Migration error',
+    'VALIDATION_ERROR': 'Validation error',
+}
+
+
+def reason(code: str, detail: str) -> str:
+    """Format a reason as '[CODE] detail' (whitespace collapsed) for error_message."""
+    return f"[{code}] {' '.join(str(detail).split())}"
+
+
+def sql_lit(text, limit: int = 2000) -> str:
+    """Escape a value so it can be inlined into a single-quoted Spark SQL literal."""
+    return str(text)[:limit].replace("\\", "\\\\").replace("'", "''")
+
+
+def _err_has(err_lower: str, *needles: str) -> bool:
+    return any(n in err_lower for n in needles)
+
+
+def classify_metadata_error(err_text: str, db: str, obj: str):
+    """Map a metastore/DESCRIBE failure to (code, status, detail).
+
+    status is the tracking status to record: SKIPPED for config-level problems
+    (the object simply is not there), FAILED for genuine errors that need
+    attention (permissions, unreadable metadata).
+    """
+    e = (err_text or '').lower()
+    if _err_has(e, 'nosuchdatabaseexception', 'schema_not_found', 'database not found',
+                'unknown database', f"database '{db.lower()}' not found"):
+        return ('DATABASE_NOT_FOUND', 'SKIPPED',
+                f"Database '{db}' does not exist in the Hive metastore, so '{obj}' could not be read. "
+                f"Check the 'database' column in the Excel config. Underlying error: {err_text}")
+    if _err_has(e, 'table or view not found', 'nosuchtableexception', 'table_or_view_not_found',
+                'table not found', 'cannot find table'):
+        return ('TABLE_NOT_FOUND', 'SKIPPED',
+                f"Table '{db}.{obj}' does not exist in the Hive metastore. Underlying error: {err_text}")
+    if _err_has(e, 'access denied', 'accessdenied', 'permission denied', 'not authorized',
+                'status code: 403', 'forbidden'):
+        return ('PERMISSION_DENIED', 'FAILED',
+                f"Access to '{db}.{obj}' or its storage location was denied. "
+                f"Underlying error: {err_text}")
+    return ('METADATA_READ_ERROR', 'FAILED',
+            f"DESCRIBE FORMATTED failed for '{db}.{obj}', so its storage format, location and partition "
+            f"columns are unknown. Underlying error: {err_text}")
+
+
+def classify_migration_error(err_text: str, src_db: str, tbl: str, dest_table: str, inplace: bool):
+    """Map an exception raised while migrating one table to (code, detail)."""
+    e = (err_text or '').lower()
+    target = f"{src_db}.{tbl} (in place)" if inplace else f"{src_db}.{tbl} -> {dest_table}"
+    tail = f"Underlying error: {err_text}"
+
+    if 'non-v1 table' in e:
+        return ('SOURCE_NOT_V1_TABLE',
+                f"{src_db}.{tbl} is not a Hive V1 table (it is a DataSource V2 table, typically already "
+                f"Iceberg), and system.migrate only accepts V1 tables. {tail}")
+    if _err_has(e, 'nosuchdatabaseexception', 'schema_not_found', 'database not found', 'unknown database'):
+        return ('DATABASE_NOT_FOUND',
+                f"A database referenced while migrating {target} does not exist. {tail}")
+    if _err_has(e, 'table or view not found', 'nosuchtableexception', 'table_or_view_not_found',
+                'cannot find table'):
+        return ('TABLE_NOT_FOUND',
+                f"Table {src_db}.{tbl} was not found while migrating {target} — it was dropped or renamed "
+                f"after discovery, or the name in the Excel config is wrong. {tail}")
+    if _err_has(e, 'access denied', 'accessdenied', 'permission denied', 'not authorized',
+                'status code: 403', 'forbidden'):
+        return ('PERMISSION_DENIED',
+                f"Access denied while migrating {target} — the Spark role cannot read the source data or "
+                f"write the destination location. {tail}")
+    if _err_has(e, 'path does not exist', 'filenotfoundexception', 'no such file or directory',
+                'nosuchkey', 'status code: 404'):
+        return ('DATA_PATH_MISSING',
+                f"The data location for {src_db}.{tbl} is missing in storage — the metastore points at a "
+                f"path that no longer contains data. {tail}")
+    if _err_has(e, 'already exists', 'tablealreadyexists'):
+        return ('DESTINATION_EXISTS',
+                f"Destination table {dest_table} already exists and could not be replaced. {tail}")
+    if _err_has(e, 'lazysimpleserde', 'unsupported file format', 'is not a parquet file',
+                'not an orc file', 'malformed orc', 'unsupported format'):
+        return ('UNSUPPORTED_SOURCE_FORMAT',
+                f"The source files of {src_db}.{tbl} are in a format Iceberg cannot register or read "
+                f"(only Parquet/ORC/Avro data files can be migrated). {tail}")
+    if _err_has(e, 'unsupported data type', 'unsupported type', 'cannot convert', 'cannot be cast',
+                'cannot up cast'):
+        return ('UNSUPPORTED_DATA_TYPE',
+                f"A column type in {src_db}.{tbl} has no Iceberg equivalent or could not be converted. {tail}")
+    if _err_has(e, 'outofmemory', 'java heap space', 'container killed', 'no space left',
+                'gc overhead limit', 'executor lost'):
+        return ('RESOURCE_ERROR',
+                f"Spark ran out of memory/disk while migrating {target}. {tail}")
+    if _err_has(e, 'commitfailedexception', 'concurrent', 'conflict', 'metadata location has changed'):
+        return ('CONCURRENT_COMMIT_CONFLICT',
+                f"An Iceberg commit for {target} conflicted with another writer. {tail}")
+    return ('MIGRATION_ERROR', f"Migration of {target} failed. {tail}")
+
+
+# =============================================================================
 # DAG 2: ICEBERG MIGRATION TASKS
 # =============================================================================
 @task.pyspark(conn_id='spark_default')
@@ -177,9 +299,16 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
             )
         )
     grouped = {}
-    for _, row in df.iterrows():
+    for _idx, row in df.iterrows():
         src_db = str(row.get('database', '') or '').strip()
         if not src_db:
+            # Nothing can be looked up without a database, and there is no table
+            # identity to record in tracking — surface it in the task log instead
+            # of dropping the row silently.
+            logger.warning(
+                f"[ParseIcebergExcel] Excel row {int(_idx) + 2}: blank 'database' column — row ignored "
+                f"(table='{row.get('table', '')}')"
+            )
             continue
 
         inplace_val = row.get('inplace_migration', None)
@@ -257,45 +386,32 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
         pattern_str = db_config.get('table_pattern', '*')
         raw_tokens = [t.strip() for t in pattern_str.split(',') if t.strip()] or ['*']
 
-    def resolve_tokens(spark, db, tokens):
-        resolved = []
-        seen = set()
-        for tok in tokens:
-            if tok == '*':
-                rows = spark.sql(f"SHOW TABLES IN {db}").collect()
-                for r in rows:
-                    t = r.tableName
-                    if _is_iceberg_backup_table(t):
-                        logger.info(f"[IcebergDiscover] Skipping Iceberg backup table: {db}.{t}")
-                        continue
-                    if t not in seen:
-                        seen.add(t)
-                        resolved.append(t)
-            elif '*' in tok:
-                rows = spark.sql(f"SHOW TABLES IN {db} LIKE '{tok}'").collect()
-                for r in rows:
-                    t = r.tableName
-                    if _is_iceberg_backup_table(t):
-                        logger.info(f"[IcebergDiscover] Skipping Iceberg backup table: {db}.{t}")
-                        continue
-                    if t not in seen:
-                        seen.add(t)
-                        resolved.append(t)
-            else:
-                if tok not in seen:
-                    seen.add(tok)
-                    resolved.append(tok)
-        return resolved
+    def skip_entry(name, code, status, detail, location=None):
+        """Metadata entry for something we already know cannot be migrated.
+
+        migrate_tables_to_iceberg records these verbatim, so the exact reason
+        (not a generic 'unsupported format') reaches tracking and the report.
+        """
+        return {
+            'table': name,
+            'location': location,
+            'source_format': 'UNKNOWN',
+            'partition_columns': [],
+            'skip_code': code,
+            'skip_status': status,
+            'skip_message': detail,
+        }
 
     def parse_describe_formatted(desc_rows):
-        """Extract location, source_format, and partition column names from
-        DESCRIBE FORMATTED output. source_format is one of
-        TEXT / PARQUET / ORC / AVRO / UNKNOWN, derived from InputFormat /
-        Provider / Serde Library."""
+        """Extract location, source_format, partition columns and the raw storage
+        descriptors from DESCRIBE FORMATTED output. source_format is one of
+        TEXT / PARQUET / ORC / AVRO / ICEBERG / VIEW / UNKNOWN, derived from
+        InputFormat / Provider / Serde Library."""
         location = None
         input_format = None
         provider = None
         serde = None
+        table_type = None
         partition_columns: list[str] = []
         section = 'columns'
         for row in desc_rows:
@@ -319,10 +435,17 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                     input_format = val
                 elif col == 'Provider':
                     provider = val
-                elif col.lower() == 'serde library':
+                elif col_lower == 'serde library':
                     serde = val
+                elif col_lower in ('type', 'table type'):
+                    table_type = val
         sig = ' '.join(s for s in (input_format, provider, serde) if s).lower()
-        if 'parquet' in sig:
+        if 'iceberg' in sig:
+            # Already migrated (or created) as Iceberg by an earlier run.
+            source_format = 'ICEBERG'
+        elif (table_type or '').upper() in ('VIEW', 'VIRTUAL_VIEW'):
+            source_format = 'VIEW'
+        elif 'parquet' in sig:
             source_format = 'PARQUET'
         elif 'orc' in sig:
             source_format = 'ORC'
@@ -334,41 +457,132 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
             source_format = 'TEXT'
         else:
             source_format = 'UNKNOWN'
-        return location, source_format, partition_columns
+        format_signature = (
+            f"InputFormat={input_format or 'n/a'}, Provider={provider or 'n/a'}, "
+            f"SerDe={serde or 'n/a'}, Type={table_type or 'n/a'}"
+        )
+        return {
+            'location': location,
+            'source_format': source_format,
+            'partition_columns': partition_columns,
+            'table_type': table_type,
+            'format_signature': format_signature,
+        }
 
-    matched_tables = resolve_tokens(spark, src_db, raw_tokens)
+    tables_metadata = []
+
+    # ---------------------------------------------------------------------
+    # Database-level check: without this the whole discovery task explodes and
+    # every table of this Excel group ends up with no tracking row at all.
+    # ---------------------------------------------------------------------
+    if not _database_exists(spark, src_db):
+        detail = (
+            f"Database '{src_db}' from the Excel config does not exist in the Hive metastore, so none of "
+            f"its tables could be discovered (requested: {', '.join(raw_tokens)}). Check the 'database' "
+            f"column, or run the MapR-to-S3 migration for this database first."
+        )
+        logger.error(f"[IcebergDiscover] DATABASE_NOT_FOUND: {detail}")
+        for tok in raw_tokens:
+            tables_metadata.append(skip_entry(tok, 'DATABASE_NOT_FOUND', 'SKIPPED', detail))
+        return {**db_config, 'discovered_tables': tables_metadata}
+
+    # ---------------------------------------------------------------------
+    # Token resolution: wildcards that match nothing and literal names that do
+    # not exist are recorded with their own reason instead of vanishing (or
+    # failing later with a generic error).
+    # ---------------------------------------------------------------------
+    matched_tables = []
+    seen = set()
+    for tok in raw_tokens:
+        if '*' in tok:
+            try:
+                if tok == '*':
+                    rows = spark.sql(f"SHOW TABLES IN {src_db}").collect()
+                else:
+                    rows = spark.sql(f"SHOW TABLES IN {src_db} LIKE '{tok}'").collect()
+            except Exception as e:
+                code, status, detail = classify_metadata_error(str(e), src_db, tok)
+                logger.error(f"[IcebergDiscover] {code} while expanding pattern '{tok}': {detail[:300]}")
+                tables_metadata.append(skip_entry(tok, code, status, detail))
+                continue
+            names = [r.tableName for r in rows]
+            backups = [n for n in names if _is_iceberg_backup_table(n)]
+            for b in backups:
+                logger.info(f"[IcebergDiscover] Skipping Iceberg backup table: {src_db}.{b}")
+            names = [n for n in names if not _is_iceberg_backup_table(n)]
+            if not names:
+                detail = (
+                    f"No table in database '{src_db}' matched the pattern '{tok}' from the Excel config"
+                    + (f" ({len(backups)} Iceberg backup table(s) matched and were excluded on purpose)"
+                       if backups else " (the database is empty or the pattern is wrong)")
+                    + "."
+                )
+                logger.warning(f"[IcebergDiscover] NO_TABLES_MATCHED_PATTERN: {detail}")
+                tables_metadata.append(
+                    skip_entry(tok, 'NO_TABLES_MATCHED_PATTERN', 'SKIPPED', detail)
+                )
+                continue
+            for n in names:
+                if n not in seen:
+                    seen.add(n)
+                    matched_tables.append(n)
+        else:
+            if tok in seen:
+                continue
+            seen.add(tok)
+            try:
+                exists = spark.sql(f"SHOW TABLES IN {src_db} LIKE '{tok}'").count() > 0
+            except Exception as e:
+                # Don't mislabel a permission/metastore error as "table not found".
+                code, status, detail = classify_metadata_error(str(e), src_db, tok)
+                logger.error(f"[IcebergDiscover] {code} while looking up '{src_db}.{tok}': {str(e)[:300]}")
+                tables_metadata.append(skip_entry(tok, code, status, detail))
+                continue
+            if not exists:
+                detail = (
+                    f"Table '{src_db}.{tok}' listed in the Excel config does not exist in the Hive "
+                    f"metastore (checked with SHOW TABLES IN {src_db} LIKE '{tok}'). Verify the spelling "
+                    f"and that the table was created in S3 by the MapR-to-S3 migration."
+                )
+                logger.warning(f"[IcebergDiscover] TABLE_NOT_FOUND: {detail}")
+                tables_metadata.append(skip_entry(tok, 'TABLE_NOT_FOUND', 'SKIPPED', detail))
+                continue
+            matched_tables.append(tok)
 
     logger.info(f"[IcebergDiscover] Database '{src_db}': {len(matched_tables)} table(s) matched tokens={raw_tokens}")
 
-    tables_metadata = []
     for tbl in matched_tables:
         logger.info(f"[IcebergDiscover] Getting metadata for {src_db}.{tbl}")
         try:
             desc_df = spark.sql(f"DESCRIBE FORMATTED {src_db}.{tbl}")
-            location, source_format, partition_columns = parse_describe_formatted(desc_df.collect())
+            info = parse_describe_formatted(desc_df.collect())
 
             logger.info(
-                f"[IcebergDiscover] {src_db}.{tbl} | format={source_format} | "
-                f"partitions={partition_columns or 'none'} | location={location}"
+                f"[IcebergDiscover] {src_db}.{tbl} | format={info['source_format']} | "
+                f"partitions={info['partition_columns'] or 'none'} | location={info['location']} | "
+                f"{info['format_signature']}"
             )
 
             tables_metadata.append({
                 'table': tbl,
-                'location': location,
-                'source_format': source_format,
-                'partition_columns': partition_columns,
+                'location': info['location'],
+                'source_format': info['source_format'],
+                'partition_columns': info['partition_columns'],
+                'table_type': info['table_type'],
+                'format_signature': info['format_signature'],
             })
         except Exception as e:
-            logger.error(f"[IcebergDiscover] Failed to get metadata for {src_db}.{tbl}: {str(e)[:300]}")
-            tables_metadata.append({
-                'table': tbl,
-                'location': None,
-                'source_format': 'UNKNOWN',
-                'partition_columns': [],
-                'discovery_error': str(e),
-            })
+            # A table can disappear between SHOW TABLES and DESCRIBE FORMATTED, or
+            # be unreadable for permission reasons — say which one it was.
+            code, status, detail = classify_metadata_error(str(e), src_db, tbl)
+            logger.error(f"[IcebergDiscover] {code} for {src_db}.{tbl}: {str(e)[:300]}")
+            tables_metadata.append(skip_entry(tbl, code, status, detail))
 
-    logger.info(f"[IcebergDiscover] Completed discovery for '{src_db}': {len(tables_metadata)} table(s) ready for migration")
+    logger.info(
+        f"[IcebergDiscover] Completed discovery for '{src_db}': "
+        f"{sum(1 for t in tables_metadata if not t.get('skip_code'))} table(s) ready for migration, "
+        f"{sum(1 for t in tables_metadata if t.get('skip_code'))} not migratable"
+    )
 
     return {
         **db_config,
@@ -392,6 +606,14 @@ def _table_exists(spark, db: str, tbl: str) -> bool:
     """True if {db}.{tbl} exists in the metastore."""
     try:
         return spark.sql(f"SHOW TABLES IN {db} LIKE '{tbl}'").count() > 0
+    except Exception:
+        return False
+
+
+def _database_exists(spark, db: str) -> bool:
+    """True if database {db} exists in the metastore."""
+    try:
+        return spark.sql(f"SHOW DATABASES LIKE '{db}'").count() > 0
     except Exception:
         return False
 
@@ -462,72 +684,133 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             f"({'backups dropped by Iceberg after commit' if drop_backup else 'backups retained; stale ones cleaned on next run'})"
         )
 
-    if not inplace:
+    # Nothing migratable (e.g. the source database itself is missing) → don't
+    # create an empty destination database just to report skips into it.
+    _migratable = [t for t in discovery.get('discovered_tables', []) if not t.get('skip_code')]
+    if not inplace and _migratable:
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
 
     results = []
     _permanent_failure = None
 
+    from datetime import datetime as _dt
+
+    def _record_not_migrated(tbl, code, detail, status='SKIPPED', location=None, started_at=None):
+        """Record one table that was not migrated, with an explicit reason code.
+
+        Writes '[CODE] detail' into error_message so tracking and the HTML report
+        show why this specific table was skipped/failed rather than a generic
+        'unsupported format' message.
+        """
+        mig_type = 'INPLACE' if inplace else 'SNAPSHOT'
+        dest_table = f"{src_db}.{tbl}" if inplace else f"{dest_db}.{tbl}"
+        duration = (_dt.utcnow() - (started_at or _dt.utcnow())).total_seconds()
+        message = reason(code, detail)
+        tbl_lit = sql_lit(tbl, 500)
+
+        results.append({
+            'source_table': f"{src_db}.{tbl}",
+            'destination_table': dest_table,
+            'migration_type': mig_type,
+            'status': status,
+            'reason_code': code,
+            'error': message,
+        })
+
+        execute_with_iceberg_retry(spark, f"""
+            DELETE FROM {tracking_db}.iceberg_migration_table_status
+            WHERE run_id = '{run_id}'
+              AND source_database = '{src_db}'
+              AND source_table = '{tbl_lit}'
+        """, task_label=f"migrate:{code.lower()}:delete:{tbl}")
+
+        execute_with_iceberg_retry(spark, f"""
+            INSERT INTO {tracking_db}.iceberg_migration_table_status
+            VALUES (
+                '{run_id}', '{dag_run_id}', '{src_db}', '{tbl_lit}', '{mig_type}',
+                '{dest_db}', '{tbl_lit}', '{sql_lit(location or "")}',
+                current_timestamp(), current_timestamp(),
+                {duration}, '{status}',
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                '{sql_lit(message)}',
+                current_timestamp()
+            )
+        """, task_label=f"migrate:{code.lower()}:insert:{tbl}")
+
+        _log = logger.error if status == 'FAILED' else logger.warning
+        _log(
+            f"[IcebergMigrate] {status} {src_db}.{tbl} | reason={code} "
+            f"({REASON_LABELS.get(code, code)}) | {' '.join(str(detail).split())[:500]}"
+        )
+
     for tbl_meta in discovery.get('discovered_tables', []):
         tbl = tbl_meta['table']
         location = tbl_meta.get('location')
         source_format = tbl_meta.get('source_format', 'UNKNOWN')
+        format_signature = tbl_meta.get('format_signature') or 'storage descriptors not reported by DESCRIBE FORMATTED'
         partition_columns = tbl_meta.get('partition_columns', []) or []
         is_partitioned = bool(partition_columns)
+        tbl_migrate_start = _dt.utcnow()
+
+        # Reasons already established during discovery: table not found, database
+        # not found, wildcard matched nothing, metadata unreadable. Recorded here
+        # verbatim so each one keeps its own precise reason.
+        if tbl_meta.get('skip_code'):
+            _record_not_migrated(
+                tbl,
+                tbl_meta['skip_code'],
+                tbl_meta.get('skip_message') or 'No further detail was captured during discovery.',
+                status=tbl_meta.get('skip_status', 'SKIPPED'),
+                location=location,
+                started_at=tbl_migrate_start,
+            )
+            continue
 
         logger.info(
             f"[IcebergMigrate] Starting migration for {src_db}.{tbl} | "
             f"strategy={'INPLACE' if inplace else 'SNAPSHOT'} | dest={dest_db}.{tbl} | "
             f"source_format={source_format} | partition_cols={partition_columns or 'none'}"
         )
-        from datetime import datetime as _dt
-        tbl_migrate_start = _dt.utcnow()
 
-        # Text-format INPLACE is unsupported: Iceberg's migrate procedure rejects
-        # LazySimpleSerDe (see TableMigrationUtil.listPartition), and we can't
-        # safely overwrite the source Hive table in place. Record as SKIPPED
-        # (not FAILED) so the run continues and the report distinguishes a
-        # known limitation from an actual failure.
-        if source_format in ('TEXT', 'UNKNOWN') and inplace:
-            if source_format == 'UNKNOWN':
-                error_msg = (
-                    "Inplace Iceberg migration skipped: format detection returned UNKNOWN "
-                    "(likely a text-format table whose SerDe was not parsed from DESCRIBE FORMATTED)"
-                ).replace("'", "''")
-                logger.warning(f"[IcebergMigrate] SKIPPED unknown-format inplace: {src_db}.{tbl}")
-            else:
-                error_msg = (
-                    "Inplace Iceberg migration is not supported for text-format Hive tables "
-                ).replace("'", "''")
-            tbl_fail_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
-            results.append({
-                'source_table': f"{src_db}.{tbl}",
-                'destination_table': f"{src_db}.{tbl}",
-                'migration_type': 'INPLACE',
-                'status': 'SKIPPED',
-                'error': error_msg,
-            })
-            execute_with_iceberg_retry(spark, f"""
-                DELETE FROM {tracking_db}.iceberg_migration_table_status
-                WHERE run_id = '{run_id}'
-                  AND source_database = '{src_db}'
-                  AND source_table = '{tbl}'
-            """, task_label=f"migrate:text_inplace_skip:delete:{tbl}")
-            execute_with_iceberg_retry(spark, f"""
-                INSERT INTO {tracking_db}.iceberg_migration_table_status
-                VALUES (
-                    '{run_id}', '{dag_run_id}', '{src_db}', '{tbl}', 'INPLACE',
-                    '{dest_db}', '{tbl}', '{location or ""}',
-                    current_timestamp(), current_timestamp(),
-                    {tbl_fail_duration}, 'SKIPPED',
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                    '{error_msg}',
-                    current_timestamp()
+        # In-place limitations. Each is recorded as SKIPPED (not FAILED) so the run
+        # continues, but with the reason that actually applies to this table instead
+        # of one shared "unsupported format" message.
+        if inplace:
+            inplace_block = None
+            if source_format == 'ICEBERG':
+                inplace_block = (
+                    'ALREADY_ICEBERG',
+                    f"{src_db}.{tbl} is already an Iceberg table ({format_signature}), so there is nothing "
+                    f"to convert in place — it was most likely migrated by an earlier run."
                 )
-            """, task_label=f"migrate:text_inplace_skip:insert:{tbl}")
-            if source_format != 'UNKNOWN':  # UNKNOWN already warned above
-                logger.warning(f"[IcebergMigrate] SKIPPED text-format inplace: {src_db}.{tbl}")
-            continue
+            elif source_format == 'VIEW':
+                inplace_block = (
+                    'SOURCE_IS_VIEW',
+                    f"{src_db}.{tbl} is a view ({format_signature}), not a physical Hive table. "
+                    f"system.migrate can only convert physical tables — recreate the view on top of the "
+                    f"migrated Iceberg tables instead."
+                )
+            elif source_format == 'TEXT':
+                inplace_block = (
+                    'TEXT_FORMAT_INPLACE_UNSUPPORTED',
+                    f"{src_db}.{tbl} stores its data as text ({format_signature}). Iceberg's system.migrate "
+                    f"procedure only registers Parquet/ORC/Avro data files (see "
+                    f"TableMigrationUtil.listPartition), so this table cannot be converted in place. "
+                    f"Set inplace_migration=F for this table to migrate it via CTAS instead."
+                )
+            elif source_format == 'UNKNOWN':
+                inplace_block = (
+                    'FORMAT_UNDETECTED_INPLACE',
+                    f"The storage format of {src_db}.{tbl} could not be determined ({format_signature}), and "
+                    f"in-place migration is only safe for Parquet/ORC/Avro V1 Hive tables. Check the table "
+                    f"definition, or set inplace_migration=F to migrate it via CTAS."
+                )
+            if inplace_block:
+                _record_not_migrated(
+                    tbl, inplace_block[0], inplace_block[1],
+                    location=location, started_at=tbl_migrate_start,
+                )
+                continue
 
         try:
             hive_count = spark.sql(f"SELECT COUNT(*) as c FROM {src_db}.{tbl}").collect()[0]['c']
@@ -597,13 +880,23 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 #   Iceberg table at the destination warehouse path (separate from the source
                 #   external location) and metadata/ is written there, not in the source dir.
                 # - PARQUET / ORC: system.snapshot is the preferred zero-copy path.
+                # - ICEBERG / VIEW source: system.snapshot has no Hive data files to
+                #   register, but a plain CTAS read works, so migrate them that way.
                 if source_format == 'UNKNOWN':
                     logger.warning(
-                        f"[IcebergMigrate] {src_db}.{tbl}: source_format=UNKNOWN — "
-                        f"system.snapshot rejects text-format SerDes; falling back to CTAS. "
-                        f"Check DESCRIBE FORMATTED output (InputFormat/Serde Library may not have been parsed)."
+                        f"[IcebergMigrate] {src_db}.{tbl}: storage format could not be determined "
+                        f"({format_signature}) — system.snapshot rejects text/unsupported SerDes, "
+                        f"falling back to CTAS."
                     )
-                use_ctas = source_format in ('TEXT', 'UNKNOWN') or (source_format == 'AVRO' and hive_count == 0)
+                elif source_format in ('VIEW', 'ICEBERG'):
+                    logger.info(
+                        f"[IcebergMigrate] {src_db}.{tbl} is {source_format} ({format_signature}) — "
+                        f"system.snapshot cannot register it; creating {dest_table} via CTAS instead."
+                    )
+                use_ctas = (
+                    source_format in ('TEXT', 'UNKNOWN', 'VIEW', 'ICEBERG')
+                    or (source_format == 'AVRO' and hive_count == 0)
+                )
                 if use_ctas:
                     partition_clause = f"PARTITIONED BY ({', '.join(partition_columns)})" if partition_columns else ""
                     logger.info(
@@ -747,117 +1040,25 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
 
         except Exception as e:
             err_text = str(e)
+            dest_table_name = f"{src_db}.{tbl}" if inplace else f"{dest_db}.{tbl}"
+            code, detail = classify_migration_error(err_text, src_db, tbl, dest_table_name, inplace)
+
             # Spark's migrate() only accepts V1 source tables. If a table is already
             # DataSource V2 (for example already Iceberg), treat this as a known
             # skip condition for INPLACE mode instead of failing the whole task.
-            if inplace and 'non-v1 table' in err_text.lower():
-                skip_msg = (
-                    f"Inplace Iceberg migration skipped for {src_db}.{tbl}: source table is non-v1 "
-                    f"(likely already Iceberg/DataSource V2). Use snapshot mode or point to the original Hive V1 table."
+            if inplace and code == 'SOURCE_NOT_V1_TABLE':
+                _record_not_migrated(
+                    tbl, code,
+                    f"{detail} Set inplace_migration=F to migrate it via snapshot/CTAS, or point the Excel "
+                    f"row at the original Hive V1 table.",
+                    status='SKIPPED', location=location, started_at=tbl_migrate_start,
                 )
-                skip_msg_sql = skip_msg[:2000].replace("'", "''")
-                tbl_skip_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
-
-                results.append({
-                    'source_table': f"{src_db}.{tbl}",
-                    'destination_table': f"{src_db}.{tbl}",
-                    'migration_type': 'INPLACE',
-                    'status': 'SKIPPED',
-                    'error': skip_msg,
-                })
-
-                execute_with_iceberg_retry(spark, f"""
-                    DELETE FROM {tracking_db}.iceberg_migration_table_status
-                    WHERE run_id = '{run_id}'
-                      AND source_database = '{src_db}'
-                      AND source_table = '{tbl}'
-                """, task_label=f"migrate:non_v1_inplace_skip:delete:{tbl}")
-
-                execute_with_iceberg_retry(spark, f"""
-                    INSERT INTO {tracking_db}.iceberg_migration_table_status
-                    VALUES (
-                        '{run_id}',
-                        '{dag_run_id}',
-                        '{src_db}',
-                        '{tbl}',
-                        'INPLACE',
-                        '{dest_db}',
-                        '{tbl}',
-                        '{location or ""}',
-                        current_timestamp(),
-                        current_timestamp(),
-                        {tbl_skip_duration},
-                        'SKIPPED',
-                        NULL,
-                        NULL,
-                        NULL,
-                        NULL,
-                        NULL,
-                        NULL,
-                        NULL,
-                        NULL,
-                        NULL,
-                        NULL,
-                        NULL,
-                        NULL,
-                        '{skip_msg_sql}',
-                        current_timestamp()
-                    )
-                """, task_label=f"migrate:non_v1_inplace_skip:insert:{tbl}")
-
-                logger.warning(f"[IcebergMigrate] SKIPPED non-v1 inplace source: {src_db}.{tbl} | reason={err_text[:300]}")
                 continue
 
-            error_msg = f"Migration to Iceberg failed for {dest_db}.{tbl}: {err_text[:2000]}".replace("'", "''")
-            tbl_fail_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
-
-            results.append({
-                'source_table': f"{src_db}.{tbl}",
-                'destination_table': f"{dest_db}.{tbl}" if not inplace else f"{src_db}.{tbl}",
-                'migration_type': "INPLACE" if inplace else "SNAPSHOT",
-                'status': 'FAILED',
-                'error': str(e)
-            })
-
-            execute_with_iceberg_retry(spark, f"""
-                DELETE FROM {tracking_db}.iceberg_migration_table_status
-                WHERE run_id = '{run_id}'
-                  AND source_database = '{src_db}'
-                  AND source_table = '{tbl}'
-            """, task_label=f"migrate:failed:delete:{tbl}")
-
-            execute_with_iceberg_retry(spark, f"""
-                INSERT INTO {tracking_db}.iceberg_migration_table_status
-                VALUES (
-                    '{run_id}',
-                    '{dag_run_id}',
-                    '{src_db}',
-                    '{tbl}',
-                    '{"INPLACE" if inplace else "SNAPSHOT"}',
-                    '{dest_db}',
-                    '{tbl}',
-                    '{location or ""}',
-                    current_timestamp(),
-                    current_timestamp(),
-                    {tbl_fail_duration},
-                    'FAILED',
-                    NULL,
-                    NULL,
-                    NULL,
-                    NULL,
-                    NULL,
-                    NULL,
-                    NULL,
-                    NULL,
-                    NULL,
-                    NULL,
-                    NULL,
-                    NULL,
-                    '{error_msg}',
-                    current_timestamp()
-                )
-            """, task_label=f"migrate:failed:insert:{tbl}")
-            logger.error(f"ERROR: {error_msg}")
+            _record_not_migrated(
+                tbl, code, detail,
+                status='FAILED', location=location, started_at=tbl_migrate_start,
+            )
             if is_permanent_error("iceberg_migrate", e):
                 _permanent_failure = (f"migrate_tables_to_iceberg:{src_db}.{tbl}", e)
 
@@ -941,10 +1142,16 @@ def update_migration_durations(migration_result: dict, spark) -> dict:
             """,
             task_label=f"update_migration_durations:failure_patch:{tbl_name}")
 
+    _never_processed = sql_lit(reason(
+        'TASK_DID_NOT_PROCESS',
+        'The migration task ended before it reached this table (earlier table failed the task, Spark '
+        'session lost, or the worker was killed), so no per-table reason was captured. Re-run the DAG for '
+        'this database to get a definite result for this table.'
+    ))
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.iceberg_migration_table_status
         SET status = 'FAILED',
-            error_message = COALESCE(error_message, 'Iceberg migration task did not process this table'),
+            error_message = COALESCE(error_message, '{_never_processed}'),
             updated_at = current_timestamp()
         WHERE run_id = '{run_id}'
           AND source_database = '{src_db}'
@@ -965,7 +1172,6 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
         return {}
 
     src_db = migration_result['source_database']
-    dest_db = migration_result['destination_database']
 
     validation_results = []
 
@@ -1060,15 +1266,24 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
             })
 
         except Exception as e:
-            error_msg = f"Validation failed for {dest_db}.{tbl}: {str(e)[:2000]}"
+            code, detail = classify_migration_error(str(e), src_db, tbl, dest_tbl, False)
+            if code == 'MIGRATION_ERROR':
+                code = 'VALIDATION_ERROR'
+                detail = (
+                    f"Comparing {src_db}.{tbl} with {dest_tbl} failed. Underlying error: {str(e)}"
+                )
+            else:
+                detail = f"During validation — {detail}"
+            error_msg = reason(code, detail)
             validation_results.append({
                 'source_table': tbl,
                 'destination_table': dest_tbl,
                 'status': 'FAILED',
+                'reason_code': code,
                 'per_table_validation_duration': (_dt.utcnow() - tbl_val_start).total_seconds(),
-                'error': str(e)[:2000]
+                'error': error_msg[:2000]
             })
-            logger.error(f"ERROR: {error_msg}")
+            logger.error(f"[IcebergValidation] FAILED {src_db}.{tbl} | reason={code} | {error_msg[:500]}")
 
     failed_validations = [v for v in validation_results if v['status'] == 'FAILED']
     mismatched = [
@@ -1134,13 +1349,35 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
             v.get('schema_match', False)
         )
 
-        if not is_validated and v.get('error'):
-            mismatch_msg = str(v['error']).replace("'", "''")[:2000]
-            error_message_sql = f"'{mismatch_msg}'"
-        elif is_validated:
+        if is_validated:
             error_message_sql = "NULL"
         else:
-            error_message_sql = "error_message"
+            # Spell out which check failed instead of leaving VALIDATION_FAILED
+            # rows with an empty (or pre-existing, unrelated) error_message.
+            problems = []
+            if not v.get('row_count_match', False):
+                _src_rows = v.get('source_hive_row_count', 0) or 0
+                _dst_rows = v.get('dest_iceberg_row_count', 0) or 0
+                problems.append(
+                    f"row count mismatch — source Hive={_src_rows:,} vs destination Iceberg={_dst_rows:,} "
+                    f"(difference {_src_rows - _dst_rows:,})"
+                )
+            if not v.get('partition_count_match', True):
+                problems.append(
+                    f"partition count mismatch — Hive non-empty partitions="
+                    f"{v.get('source_hive_partition_count', 0) or 0} vs Iceberg data partitions="
+                    f"{v.get('dest_iceberg_partition_count', 0) or 0}"
+                )
+            if not v.get('schema_match', False):
+                problems.append(
+                    f"schema mismatch — {v.get('schema_differences') or 'no column-level detail captured'}"
+                )
+            if v.get('error'):
+                problems.append(f"validation error — {v['error']}")
+            detail = '; '.join(problems) or (
+                'validation did not pass but no specific difference was captured'
+            )
+            error_message_sql = f"'{sql_lit(reason('VALIDATION_ERROR', detail))}'"
 
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.iceberg_migration_table_status
@@ -1186,11 +1423,17 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
             """,
             task_label=f"update_iceberg_validation_status:failure_patch:{v['source_table']}")
 
+    _val_never_processed = sql_lit(reason(
+        'TASK_DID_NOT_PROCESS',
+        'The table migrated successfully but the validation task ended before comparing it with the source '
+        '(earlier table failed the task, or the Spark session was lost), so row/partition/schema checks were '
+        'never run for it.'
+    ))
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.iceberg_migration_table_status
         SET validation_status = 'SKIPPED',
             status = CASE WHEN status = 'FAILED' THEN 'FAILED' ELSE 'VALIDATION_FAILED' END,
-            error_message = COALESCE(error_message, 'Iceberg validation task did not process this table'),
+            error_message = COALESCE(error_message, '{_val_never_processed}'),
             updated_at = current_timestamp()
         WHERE run_id = '{run_id}'
           AND source_database = '{src_db}'
@@ -1205,7 +1448,9 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
 @task.pyspark(conn_id='spark_default')
 def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
     """Generate comprehensive HTML Iceberg migration report."""
+    import re as _re
     from datetime import datetime
+    from html import escape as _esc
 
     config = get_config()
     tracking_db = config['tracking_database']
@@ -1246,6 +1491,36 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
         if hasattr(row, 'asDict'):
             return row.asDict(recursive=True).get(field_name, default)
         return default
+
+    _REASON_RE = _re.compile(r'^\[([A-Z0-9_]+)\]\s*(.*)$', _re.S)
+
+    def _split_reason(row):
+        """Split error_message ('[CODE] detail') into (code, label, detail).
+
+        Rows written before the reason codes existed (or by another writer) fall
+        back to code='' and the raw message as the detail, so nothing is lost.
+        """
+        raw = str(_row_value(row, 'error_message', '') or '').strip()
+        if not raw:
+            return '', '', ''
+        m = _REASON_RE.match(raw)
+        if m:
+            code = m.group(1)
+            return code, REASON_LABELS.get(code, code.replace('_', ' ').capitalize()), m.group(2).strip()
+        return '', 'Reason not classified', raw
+
+    # Every table that did not end up as a validated/completed Iceberg table,
+    # with the reason that actually applies to it.
+    not_migrated = [
+        t for t in migration_status
+        if (t.status or '') == 'SKIPPED' or 'FAILED' in (t.status or '')
+    ]
+    reason_breakdown = {}
+    for t in not_migrated:
+        code, label, _detail = _split_reason(t)
+        key = (code, label or 'No reason recorded')
+        reason_breakdown[key] = reason_breakdown.get(key, 0) + 1
+    reason_breakdown = sorted(reason_breakdown.items(), key=lambda kv: (-kv[1], kv[0][1]))
 
     # Generate HTML
     html = f"""
@@ -1331,6 +1606,14 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
             padding: 10px 12px;
             border-bottom: 1px solid #ecf0f1;
         }}
+        /* Table/destination identifiers have no spaces to break on, so without an
+           explicit cap one long name stretches its column across the table. */
+        td.name {{
+            max-width: 200px;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            font-size: 12px;
+        }}
         tr:hover {{
             background-color: #f8f9fa;
         }}
@@ -1380,6 +1663,32 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
         .section-divider {{
             margin: 40px 0;
             border-top: 2px dashed #ecf0f1;
+        }}
+        .reason-code {{
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 10px;
+            background-color: #eaf2f8;
+            color: #1f4e79;
+            font-size: 12px;
+            font-weight: bold;
+        }}
+        .reason-key {{
+            margin-top: 2px;
+            color: #95a5a6;
+            font-size: 11px;
+            font-family: Consolas, 'Courier New', monospace;
+        }}
+        td.status-cell {{
+            max-width: 320px;
+        }}
+        .status-reason {{
+            margin-top: 6px;
+            color: #4d5656;
+            font-size: 12px;
+            line-height: 1.4;
+            white-space: normal;
+            word-break: break-word;
         }}
     </style>
 </head>
@@ -1492,17 +1801,26 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
 
         migration_dur = f"{t.migration_duration_seconds:.1f}s" if t.migration_duration_seconds else "N/A"
         validation_dur = f"{t.validation_duration_seconds:.1f}s" if t.validation_duration_seconds else "N/A"
-        row_error = _row_value(t, 'error', '') or _row_value(t, 'error_message', '') or ''
-        reason_tooltip = str(row_error).replace('"', '&quot;') if t.status in ('SKIPPED', 'FAILED') else ''
-        badge_title_attr = f' title="{reason_tooltip}"' if reason_tooltip else ''
+        _code, _label, _detail = _split_reason(t)
+        badge_title_attr = f' title="{_esc(_detail)}"' if _detail else ''
+
+        # The reason sits under the badge so a SKIPPED/FAILED row explains itself
+        # in place — this is the only per-table reason left in the report.
+        status_reason_html = ''
+        if _label:
+            status_reason_html += f'\n                        <div class="status-reason">{_esc(_label)}</div>'
+        if _code:
+            status_reason_html += f'\n                        <div class="reason-key">{_esc(_code)}</div>'
 
         html += f"""
                 <tr>
-                    <td>{t.source_database}</td>
-                    <td><strong>{t.source_table}</strong></td>
-                    <td>{t.migration_type}</td>
-                    <td>{t.destination_table}</td>
-                    <td><span class="status-badge {status_class}"{badge_title_attr}>{t.status}</span></td>
+                    <td>{_esc(str(t.source_database or ''))}</td>
+                    <td class="name"><strong>{_esc(str(t.source_table or ''))}</strong></td>
+                    <td>{_esc(str(t.migration_type or ''))}</td>
+                    <td class="name">{_esc(str(t.destination_table or ''))}</td>
+                    <td class="status-cell">
+                        <span class="status-badge {status_class}"{badge_title_attr}>{t.status}</span>{status_reason_html}
+                    </td>
                     <td class="duration">{migration_dur}</td>
                     <td class="duration">{validation_dur}</td>
                 </tr>
@@ -1512,6 +1830,44 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
             </tbody>
         </table>
 
+        <div class="section-divider"></div>
+
+        <h2>Tables that Skipped or Failed</h2>
+"""
+
+    if not not_migrated:
+        html += """
+        <p style="color: #27ae60; font-weight: bold;">
+            Every table in this run was migrated — nothing was skipped or failed.
+        </p>
+"""
+    else:
+        html += """
+        <h3 style="color: #34495e;">Reason breakdown</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Reason</th>
+                    <th>Reason code</th>
+                    <th>Tables affected</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+        for (_code, _label), _count in reason_breakdown:
+            html += f"""
+                <tr>
+                    <td><span class="reason-code">{_esc(_label)}</span></td>
+                    <td class="reason-key">{_esc(_code or 'unclassified')}</td>
+                    <td class="metric">{_count}</td>
+                </tr>
+"""
+        html += """
+            </tbody>
+        </table>
+"""
+
+    html += """
         <div class="section-divider"></div>
 
         <h2>Validation Results (Hive vs Iceberg)</h2>
@@ -1548,7 +1904,7 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
-                    <td><strong>{t.source_table}</strong></td>
+                    <td class="name"><strong>{t.source_table}</strong></td>
                     <td class="metric">{(t.source_hive_row_count or 0):,}</td>
                     <td class="metric">{(t.destination_iceberg_row_count or 0):,}</td>
                     <td class="{row_match_class}">{row_match_icon}</td>
@@ -1592,7 +1948,7 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
-                    <td><strong>{t.source_table}</strong></td>
+                    <td class="name"><strong>{t.source_table}</strong></td>
                     <td class="metric">{migration_dur:.1f}s</td>
                     <td class="metric">{validation_dur:.1f}s</td>
                     <td class="metric">{total_dur:.1f}s ({total_dur/60:.1f}m)</td>

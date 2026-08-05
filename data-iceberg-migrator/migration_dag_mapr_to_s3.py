@@ -29,6 +29,7 @@ from migrator_utils.migrations.partition_utils import (
 )
 from migrator_utils.migrations.shared import (
     SSH_COMMAND_TIMEOUT,
+    _hive_scratch_dir,
     _login_shell,
     build_s3_opts,
     cluster_login,
@@ -238,10 +239,17 @@ fi
             logger.info(
                 "[3/4] Testing PySpark with Hive metastore support (enableHiveSupport + SHOW DATABASES)..."
             )
-            pyspark_inner = """
+            hive_scratch_dir = _hive_scratch_dir(config)
+            pyspark_inner = f"""
 pyspark --master local[*] << 'PYSPARK_VALIDATION_EOF'
 from pyspark.sql import SparkSession
-spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+spark = (
+    SparkSession.builder
+    .config("spark.hadoop.hive.exec.scratchdir", "{hive_scratch_dir}")
+    .config("spark.hadoop.hive.exec.local.scratchdir", "{hive_scratch_dir}")
+    .enableHiveSupport()
+    .getOrCreate()
+)
 spark.sparkContext.setLogLevel("ERROR")
 spark.sql("SHOW DATABASES").collect()
 spark.stop()
@@ -725,6 +733,8 @@ from partition_utils import apply_partition_filter, partitions_to_where_clause
 
 spark = SparkSession.builder \\
     .appName("table_discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}") \\
+    .config("spark.hadoop.hive.exec.scratchdir", "{hive_scratch_dir}") \\
+    .config("spark.hadoop.hive.exec.local.scratchdir", "{hive_scratch_dir}") \\
     .enableHiveSupport() \\
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
@@ -1152,6 +1162,7 @@ spark.stop()
             ),
             temp_dir=temp_dir,
             include_db_in_path=include_db_in_path,
+            hive_scratch_dir=_hive_scratch_dir(config),
         )
 
         script_path = f"{temp_dir}/discover_tables.py"
