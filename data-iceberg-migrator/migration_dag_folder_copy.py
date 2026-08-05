@@ -1038,7 +1038,7 @@ with DAG(
             type=['null', 'string'],
             description=(
                 'Tenant/environment key from the migration_tenant_profiles Variable '
-                'Blank = use the global cluster_* Variables.'
+                '(e.g. tenant_1, tenant_2). Blank = use the global cluster_* Variables.'
             )
         ),
     },
