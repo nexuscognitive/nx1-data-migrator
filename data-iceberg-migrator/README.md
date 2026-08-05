@@ -45,6 +45,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | ---------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
 | `cluster_edge_temp_path`           | `/tmp/migration` | Temporary directory on edge node                                                                                                                | `source_to_s3_migration`, `folder_only_data_copy` |
 | `cluster_hive_scratch_dir`         | `/tmp/hive`      | Hive scratch dir for PySpark sessions started on the **source edge node**. Literal path only (no `${USER}`).                                    | `source_to_s3_migration`                          |
+| `migration_tenant_profiles`        | `{}`             | Per-tenant config groups as JSON, selected at trigger time via the `tenant` DAG param                                                           | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_endpoint`                      | _(empty)_        | Default S3 endpoint URL (all buckets)                                                                                                           | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_access_key`                    | _(empty)_        | Default S3 access key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_secret_key`                    | _(empty)_        | Default S3 secret key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
@@ -79,6 +80,65 @@ restricted on your cluster.
 Placeholders are **not** supported. The value is baked into a Python script that
 is written over SFTP, which does not expand shell variables, so a `${USER}` here
 would be created as a literal directory of that name. Use a literal path.
+
+#### Per-run configuration via tenant profiles
+
+The edge node, service account and temp paths differ per tenant. Rather than
+editing the global Variables between runs — which repoints any run already in
+flight, and makes it impossible to migrate two tenants at once — keep one
+Variable holding all tenants and pick one at trigger time.
+
+**Airflow Variable `migration_tenant_profiles`** — a JSON object keyed by
+tenant or environment name:
+
+```json
+{
+  "tenant_1": {
+    "ssh_conn_id": "cluster_edge_ssh_tenant_1",
+    "mapr_user": "mapr_tenant_1",
+    "edge_temp_path": "/user/svc_tenant_1/tmp/migration"
+  },
+  "tenant_2": {
+    "ssh_conn_id": "cluster_edge_ssh_tenant_2",
+    "mapr_user": "mapr_tenant_2"
+  }
+}
+```
+
+**Trigger with just the tenant name:**
+
+```json
+{
+  "excel_file_path": "s3a://config-bucket/tenant_1.xlsx",
+  "tenant": "tenant_1"
+}
+```
+
+Only include the keys that actually differ per tenant. Anything omitted falls
+through to the global Variable, so `tenant_2` above uses
+`cluster_edge_temp_path` as normal.
+
+Accepted keys in a profile: `ssh_conn_id`, `mapr_user`,
+`mapr_ticketfile_location`, `auth_method`, `edge_temp_path`,
+`hive_scratch_dir`.
+
+**Resolution order** for these settings:
+
+1. Key supplied directly in the trigger config (e.g. `{"ssh_conn_id": "..."}`)
+2. Tenant profile, when `tenant` is set
+3. Run-scoped Variable `<variable_name>__<run_id>`
+4. Global Variable
+5. Environment variable
+6. Built-in default
+
+An unknown `tenant`, malformed JSON, or an unrecognised key inside a profile
+**fails the run** rather than falling back to the global Variables — a typo
+must not silently migrate a tenant against another tenant's edge node. The
+resolved tenant and connection are logged by every task on the `[get_config]`
+line, and the full config is recorded in the `migration_runs` tracking row.
+
+Leaving `tenant` blank resolves exactly as before, so single-tenant setups need
+no change.
 
 ### Multi-Tenant S3 Credentials (endpoint-based overrides)
 
@@ -138,8 +198,10 @@ single-tenant setups.
 | DAG   | Parameter         | Required | Description                   | Example                                      |
 | ----- | ----------------- | -------- | ----------------------------- | -------------------------------------------- |
 | DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config       | `s3a://config-bucket/migration.xlsx`         |
+| DAG 1 | `tenant`          | No       | Tenant profile key (optional) | `tenant_1`                                   |
 | DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config     | `s3a://config-bucket/iceberg_migration.xlsx` |
 | DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config | `s3a://config-bucket/folder_copy.xlsx`       |
+| DAG 3 | `tenant`          | No       | Tenant profile key (optional) | `tenant_1`                                   |
 | DAG 4 | `excel_file_path` | Yes      | S3 path to parquet HMS config | `s3a://config-bucket/parquet_hms.xlsx`       |
 
 ---

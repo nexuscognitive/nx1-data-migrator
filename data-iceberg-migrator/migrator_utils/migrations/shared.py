@@ -5,6 +5,7 @@ Contains configuration, S3 helpers, retry logic, and constants
 used across mapr_to_s3, iceberg, folder_copy, and s3_metadata DAGs.
 """
 
+import json
 import logging
 import math
 import os
@@ -199,6 +200,58 @@ def normalize_s3(path: str) -> str:
 # SHARED CONFIGURATION
 # =============================================================================
 
+TENANT_PROFILE_KEYS = frozenset({
+    'ssh_conn_id',
+    'mapr_user',
+    'mapr_ticketfile_location',
+    'auth_method',
+    'edge_temp_path',
+    'hive_scratch_dir',
+})
+
+
+def _load_tenant_profile(tenant: str) -> dict:
+    """ Load one tenant's settings from the `migration_tenant_profiles` Variable """
+    raw = Variable.get(
+        'migration_tenant_profiles',
+        default_var=os.getenv('MIGRATION_TENANT_PROFILES', '{}'),
+    )
+    try:
+        profiles = raw if isinstance(raw, dict) else json.loads(raw or '{}')
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Airflow Variable 'migration_tenant_profiles' is not valid JSON: {exc}"
+        ) from exc
+
+    if not isinstance(profiles, dict):
+        raise ValueError(
+            "Airflow Variable 'migration_tenant_profiles' must be a JSON object "
+            "keyed by tenant name."
+        )
+
+    if tenant not in profiles:
+        known = ', '.join(sorted(profiles)) or '<none defined>'
+        raise ValueError(
+            f"tenant={tenant!r} not found in 'migration_tenant_profiles'. "
+            f"Known tenants: {known}"
+        )
+
+    profile = profiles[tenant] or {}
+    if not isinstance(profile, dict):
+        raise ValueError(
+            f"Profile for tenant={tenant!r} must be a JSON object, got {type(profile).__name__}."
+        )
+
+    unknown = set(profile) - TENANT_PROFILE_KEYS
+    if unknown:
+        raise ValueError(
+            f"Profile for tenant={tenant!r} has unsupported key(s): "
+            f"{', '.join(sorted(unknown))}. Allowed: {', '.join(sorted(TENANT_PROFILE_KEYS))}."
+        )
+
+    logger.info(f"[get_config] Loaded tenant profile {tenant!r}: {sorted(profile)}")
+    return profile
+
 def get_config() -> dict:
     """Shared configuration for all migration DAGs."""
     try:
@@ -211,11 +264,16 @@ def get_config() -> dict:
         _run_id = None
         _dag_run_conf = {}
 
+    _tenant = str(_dag_run_conf.get('tenant') or '').strip()
+    _profile = _load_tenant_profile(_tenant) if _tenant else {}
+
     def _var(base_key: str, env_var: str, default: str, conf_key: str = None) -> str:
-        if conf_key and conf_key in _dag_run_conf:
-            _val = _dag_run_conf.get(conf_key)
-            if _val is not None and str(_val).strip():
-                return str(_val).strip()
+        if conf_key:
+            for _source in (_dag_run_conf, _profile):
+                if conf_key in _source:
+                    _val = _source.get(conf_key)
+                    if _val is not None and str(_val).strip():
+                        return str(_val).strip()
         if _run_id:
             try:
                 scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
@@ -322,7 +380,8 @@ def get_config() -> dict:
             pass
 
     logger.info(
-        f"[get_config] run_id={_run_id!r} ssh_conn_id={config['ssh_conn_id']!r} "
+        f"[get_config] run_id={_run_id!r} tenant={_tenant or None!r} "
+        f"ssh_conn_id={config['ssh_conn_id']!r} "
         f"mapr_user={config['mapr_user']!r} edge_temp_path={config['edge_temp_path']!r} "
         f"dag_owner={dag_owner!r}"
     )
