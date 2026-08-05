@@ -44,6 +44,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | Variable                           | Default          | Description                                                                                                                                     | Applies To                                        |
 | ---------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
 | `cluster_edge_temp_path`           | `/tmp/migration` | Temporary directory on edge node                                                                                                                | `source_to_s3_migration`, `folder_only_data_copy` |
+| `cluster_hive_scratch_dir`         | `/tmp/hive`      | Hive scratch dir for PySpark sessions started on the **source edge node**. Literal path only (no `${USER}`).                                    | `source_to_s3_migration`                          |
 | `s3_endpoint`                      | _(empty)_        | Default S3 endpoint URL (all buckets)                                                                                                           | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_access_key`                    | _(empty)_        | Default S3 access key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_secret_key`                    | _(empty)_        | Default S3 secret key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
@@ -55,6 +56,28 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | `migration_smtp_conn_id`           | `smtp_default`   | Airflow SMTP connection ID for email reports                                                                                                    | All DAGs                                          |
 | `migration_email_recipients`       | _(empty)_        | Comma-separated email addresses for reports                                                                                                     | All DAGs                                          |
 | `hdfs_nameservice`                 | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR                                                                                    | `source_to_s3_migration`, `folder_only_data_copy` |
+
+#### Hive scratch dir on the edge node
+
+`hive-site.xml` on the edge node points `hive.exec.scratchdir` at the login
+user's own directory. That works when the DAG runs as the MapR superuser or DAG
+owner, but fails for a **tenant service account**, which has no write access
+there — discovery aborts in `validate_prerequisites` with:
+
+    AnalysisException: ... does not have access to /user/<dag-owner>/...
+
+`cluster_hive_scratch_dir` is applied as `spark.hadoop.hive.exec.scratchdir` and
+`spark.hadoop.hive.exec.local.scratchdir` on every Spark session the DAG starts
+over SSH on the source edge node (`validate_prerequisites` and
+`discover_tables_via_spark_ssh`), overriding whatever `hive-site.xml` sets.
+
+The default `/tmp/hive` is world-writable on both MapR-FS and the local filesystem
+and works for every service account. Only change it if `/tmp/hive` is restricted on
+your cluster.
+
+Placeholders are **not** supported. The value is baked into a Python script that
+is written over SFTP, which does not expand shell variables, so a `${USER}` here
+would be created as a literal directory of that name. Use a literal path.
 
 ### Multi-Tenant S3 Credentials (endpoint-based overrides)
 
@@ -314,7 +337,7 @@ cleanup_edge (SSH: Cleanup temp files)
      - `mapr`: `maprlogin print | grep -q <mapr_user>` — confirms a valid MapR ticket for the configured user
      - `kinit`: `klist -s` — confirms a valid Kerberos TGT in the ccache (populated by the login shell)
      - `none`: skipped (auto-passes)
-  3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`
+  3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`. The Hive scratch dir is overridden to `cluster_hive_scratch_dir` so the check passes under a tenant service account
   4. **Hadoop FS** - Runs `hadoop fs -ls /` (MapR) or `hadoop fs -ls hdfs://<nameservice>/` (HDFS HA) to confirm filesystem access
 - Sources `/etc/profile.d/*.sh` via a bash login shell before each check to ensure cluster auth and environment variables are loaded
 - If **all four checks pass**, proceeds with migration
@@ -385,6 +408,7 @@ cleanup_edge (SSH: Cleanup temp files)
 **Purpose:** Discover table metadata from Hive using PySpark
 
 - Executes on edge node via SSH on each database in Excel config
+- Starts the Spark session with the Hive scratch dir set to `cluster_hive_scratch_dir`
 - Discovers tables matching the pattern (supports `*` wildcards)
 - For each table, extracts:
   - **Schema** - Column names and data types
