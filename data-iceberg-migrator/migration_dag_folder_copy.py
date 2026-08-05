@@ -1032,7 +1032,22 @@ with DAG(
             default='s3a://config-bucket/folder_copy.xlsx',
             type='string',
             description='S3 path to Excel config file (columns: source_path, target_bucket, dest_folder)'
-        )
+        ),
+        'ssh_conn_id': Param(
+            default='',
+            type='string',
+            description='Airflow SSH connection ID for this run (blank = cluster_ssh_conn_id Variable)'
+        ),
+        'mapr_user': Param(
+            default='',
+            type='string',
+            description='MapR ticket user expected on the edge node (blank = mapr_user Variable)'
+        ),
+        'edge_temp_path': Param(
+            default='',
+            type='string',
+            description='Edge-node temp dir for this run (blank = cluster_edge_temp_path Variable)'
+        ),
     },
     render_template_as_native_obj=True,
 ) as dag_folder_copy:

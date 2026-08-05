@@ -490,7 +490,9 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
 
     run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
-    spark.sql(f"""
+    execute_with_iceberg_retry(
+        spark,
+        f"""
         INSERT INTO {tracking_db}.migration_runs
         VALUES (
             '{run_id}',
@@ -502,7 +504,9 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
             0, 0, 0,
             '{json.dumps(config).replace("'", "''")}'
         )
-    """)
+        """,
+        task_label=f"create_migration_run:{run_id}",
+    )
 
     return run_id
 

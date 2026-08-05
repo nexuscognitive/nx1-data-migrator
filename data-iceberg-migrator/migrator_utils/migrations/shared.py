@@ -235,7 +235,7 @@ def get_config() -> dict:
         # SSH Configuration (for MapR migration)
         'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh', conf_key='ssh_conn_id'),
         'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration', conf_key='edge_temp_path'),
-        'hive_scratch_dir': _var('cluster_hive_scratch_dir', 'CLUSTER_HIVE_SCRATCH_DIR', '/tmp/hive'),
+        'hive_scratch_dir': _var('cluster_hive_scratch_dir', 'CLUSTER_HIVE_SCRATCH_DIR', '/tmp/hive', conf_key='hive_scratch_dir'),
 
         # S3 Configuration
         'default_s3_bucket': _var('migration_default_s3_bucket', 'MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake'),

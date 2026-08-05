@@ -71,9 +71,10 @@ there — discovery aborts in `validate_prerequisites` with:
 over SSH on the source edge node (`validate_prerequisites` and
 `discover_tables_via_spark_ssh`), overriding whatever `hive-site.xml` sets.
 
-The default `/tmp/hive` is world-writable on both MapR-FS and the local filesystem
-and works for every service account. Only change it if `/tmp/hive` is restricted on
-your cluster.
+The default `/tmp/hive` is Hive's own default scratch root. Hive creates a per-user
+subdirectory beneath it (`/tmp/hive/<user>`), so each tenant service account gets
+its own writable space without further setup. Only override this if `/tmp` is
+restricted on your cluster.
 
 Placeholders are **not** supported. The value is baked into a Python script that
 is written over SFTP, which does not expand shell variables, so a `${USER}` here
