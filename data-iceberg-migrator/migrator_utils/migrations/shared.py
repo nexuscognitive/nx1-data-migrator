@@ -477,8 +477,9 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
             )
 
     resolved_sa_user = sa_user
+    resolved_sa_source = ('config:service_account_user_id' if sa_user else 'login shell (.profile)')
     resolved = temp_dir
-    resolved_log_dir = f"{distcp_log_root}/{config.get('sa_user') or 'migration'}/distcp_logs/{run_id}"
+    resolved_log_dir = f"{distcp_log_root}/{sa_user or 'migration'}/distcp_logs/{run_id}"
     for line in output.splitlines():
         if line.startswith("TEMP_DIR="):
             val = line.split("=", 1)[1].strip()
@@ -492,8 +493,30 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_sa_user = val
+        elif line.startswith("SERVICE_ACCOUNT_SOURCE="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                resolved_sa_source = val
 
-    return {'temp_dir': resolved, 'run_id': run_id, 'distcp_log_dir': resolved_log_dir, 'service_account_user_id': resolved_sa_user,}
+    logger.info("=== Service Account ===")
+    logger.info(f"[cluster_login] Service account user : {resolved_sa_user}")
+    logger.info(f"[cluster_login] Resolved from        : {resolved_sa_source}")
+    logger.info(f"[cluster_login] Edge temp dir        : {resolved}")
+    logger.info(f"[cluster_login] DistCp log dir       : {resolved_log_dir}")
+    if not sa_user:
+        logger.warning(
+            "[cluster_login] service_account_user_id is not configured — paths were "
+            "derived from the edge node's .profile identity. Set it explicitly so "
+            "temp and log paths are predictable per tenant."
+        )
+
+    return {
+        'temp_dir': resolved,
+        'run_id': run_id,
+        'distcp_log_dir': resolved_log_dir,
+        'service_account_user_id': resolved_sa_user,
+        'service_account_source': resolved_sa_source,
+    }
 
 
 def _s3a_committer_opts(config: dict) -> str:
