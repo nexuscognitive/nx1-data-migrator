@@ -1459,6 +1459,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
     tables = discovery["tables"]
     temp_dir = cluster_setup["temp_dir"]
+    distcp_log_dir = cluster_setup.get("distcp_log_dir") or temp_dir
     mappers = config["distcp_mappers"]
     bandwidth = config["distcp_bandwidth"]
     preserve_delete = config.get("distcp_preserve_delete", True)
@@ -1645,7 +1646,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
 run_distcp_with_retry hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
-    -log {temp_dir}/distcp_{tbl}_part{part_idx}.log \\
+    -log {distcp_log_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
 """
 
@@ -1819,7 +1820,7 @@ echo "=== Creating empty partition directories ==="
 echo "=== Running distcp using source path list (delete disabled) ==="
 set +e
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
-    -log {temp_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
+    -log {distcp_log_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
 echo "$DISTCP_OUTPUT"
@@ -1890,7 +1891,7 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 echo "=== Running distcp ==="
 set +e
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
-    -log {temp_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
+    -log {distcp_log_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
 echo "$DISTCP_OUTPUT"

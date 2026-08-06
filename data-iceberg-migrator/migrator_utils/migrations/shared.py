@@ -233,6 +233,7 @@ def get_config() -> dict:
         'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration'),
         'edge_discovery_temp_path': _var('cluster_edge_discovery_temp_path', 'CLUSTER_EDGE_DISCOVERY_TEMP_PATH', '/tmp'),
         'hive_scratch_dir': _var('cluster_hive_scratch_dir', 'CLUSTER_HIVE_SCRATCH_DIR', '/tmp/hive'),
+        'distcp_log_root': _var('cluster_distcp_log_root', 'CLUSTER_DISTCP_LOG_ROOT', '/tmp'),
 
         # S3 Configuration
         'default_s3_bucket': _var('migration_default_s3_bucket', 'MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake'),
@@ -371,6 +372,7 @@ def cluster_login(run_id: str) -> dict:
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
     temp_dir = f"{_edge_path_template(config['edge_temp_path'])}/{run_id}"
+    distcp_log_root = str(config.get('distcp_log_root') or '/tmp').rstrip('/') or '/tmp'
 
     auth_method = config.get('auth_method', 'mapr')
     mapr_user = config.get('mapr_user', '')
@@ -418,8 +420,14 @@ RESOLVED_TEMP_DIR="{temp_dir}"
 mkdir -p "$RESOLVED_TEMP_DIR"
 chmod 755 "$RESOLVED_TEMP_DIR"
 
+echo "=== Creating DistCp log directory on cluster FS ==="
+RESOLVED_DISTCP_LOG_DIR="{distcp_log_root}/$MIG_USER/distcp_logs/{run_id}"
+hadoop fs -mkdir -p "$RESOLVED_DISTCP_LOG_DIR"
+hadoop fs -chmod 700 "$RESOLVED_DISTCP_LOG_DIR" || true
+
 echo "CLUSTER_LOGIN_SUCCESS"
 echo "TEMP_DIR=$RESOLVED_TEMP_DIR"
+echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 """)
     full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
@@ -447,14 +455,18 @@ echo "TEMP_DIR=$RESOLVED_TEMP_DIR"
             )
 
     resolved = temp_dir
+    resolved_log_dir = f"{distcp_log_root}/{config.get('mapr_user') or 'migration'}/distcp_logs/{run_id}"
     for line in output.splitlines():
         if line.startswith("TEMP_DIR="):
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved = val
-            break
+        elif line.startswith("DISTCP_LOG_DIR="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                resolved_log_dir = val
 
-    return {'temp_dir': resolved, 'run_id': run_id}
+    return {'temp_dir': resolved, 'run_id': run_id, 'distcp_log_dir': resolved_log_dir}
 
 
 def _s3a_committer_opts(config: dict) -> str:
