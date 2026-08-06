@@ -263,7 +263,8 @@ def get_config() -> dict:
         'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr'),  # 'mapr' or 'kinit'
-        'mapr_user': _var('mapr_user', 'MAPR_USER', ''),
+        'service_account_user_id': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '') or _var('mapr_user', 'MAPR_USER', '')).strip(),
+        'mapr_user': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '') or _var('mapr_user', 'MAPR_USER', '')).strip(),
         'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}'),
         # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
         'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', ''),
@@ -375,12 +376,24 @@ def cluster_login(run_id: str) -> dict:
     distcp_log_root = str(config.get('distcp_log_root') or '/tmp').rstrip('/') or '/tmp'
 
     auth_method = config.get('auth_method', 'mapr')
-    mapr_user = config.get('mapr_user', '')
-    mapr_ticketfile = config.get('mapr_ticketfile_location', '/tmp/maprticket_${USER}')
+    sa_user = str(config.get('service_account_user_id') or config.get('mapr_user') or '').strip()
+    mapr_user = sa_user
+    mapr_ticketfile = _edge_path_template(config.get('mapr_ticketfile_location', '/tmp/maprticket_${USER}'))
 
     auth_script_parts = []
 
     auth_script_parts.append(f"""
+
+CONFIGURED_SA_USER="{sa_user}"
+if [ -n "$CONFIGURED_SA_USER" ]; then
+    MIG_USER="$CONFIGURED_SA_USER"
+    MIG_USER_SOURCE="config:service_account_user_id"
+else
+    MIG_USER=$(id -un)
+    MIG_USER_SOURCE="login shell (.profile)"
+fi
+export MIG_USER
+
 echo "=== Cluster Authentication ({auth_method}) ==="
 
 if [ "{auth_method}" = "mapr" ]; then
@@ -410,10 +423,19 @@ echo "Authentication successful"
 """)
 
     auth_script_parts.append(f"""
-MIG_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
-[ -z "$MIG_USER" ] && MIG_USER=$(id -un)
-export MIG_USER
+if [ -z "$CONFIGURED_SA_USER" ]; then
+    TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
+    if [ -n "$TICKET_USER" ]; then
+        MIG_USER="$TICKET_USER"
+        MIG_USER_SOURCE="active MapR ticket"
+    fi
+    export MIG_USER
+    echo "WARNING: service_account_user_id is not configured. Falling back to"
+    echo "WARNING: '$MIG_USER' from $MIG_USER_SOURCE. Set service_account_user_id"
+    echo "WARNING: explicitly so temp and log paths do not depend on .profile."
+fi
 echo "MAPR_EFFECTIVE_USER=$MIG_USER"
+echo "SERVICE_ACCOUNT_SOURCE=$MIG_USER_SOURCE"
 
 echo "=== Creating temp directory ==="
 RESOLVED_TEMP_DIR="{temp_dir}"
@@ -454,8 +476,9 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
                 f"Output: {output[-500:]}"
             )
 
+    resolved_sa_user = sa_user
     resolved = temp_dir
-    resolved_log_dir = f"{distcp_log_root}/{config.get('mapr_user') or 'migration'}/distcp_logs/{run_id}"
+    resolved_log_dir = f"{distcp_log_root}/{config.get('sa_user') or 'migration'}/distcp_logs/{run_id}"
     for line in output.splitlines():
         if line.startswith("TEMP_DIR="):
             val = line.split("=", 1)[1].strip()
@@ -465,8 +488,12 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_log_dir = val
+        elif line.startswith("MAPR_EFFECTIVE_USER="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                resolved_sa_user = val
 
-    return {'temp_dir': resolved, 'run_id': run_id, 'distcp_log_dir': resolved_log_dir}
+    return {'temp_dir': resolved, 'run_id': run_id, 'distcp_log_dir': resolved_log_dir, 'service_account_user_id': resolved_sa_user,}
 
 
 def _s3a_committer_opts(config: dict) -> str:
