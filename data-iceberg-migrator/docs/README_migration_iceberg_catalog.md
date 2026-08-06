@@ -1,4 +1,4 @@
-# DAG 5: Iceberg Catalog Migration (Hadoop → Hive)
+# DAG 4: Iceberg Catalog Migration (Hadoop → Hive)
 
 Iceberg-to-Iceberg catalog migration from a **Hadoop catalog** to a **Hive (HMS) catalog**, implemented via the Iceberg `rewrite_table_path` stored procedure. DAG ID: `iceberg_catalog_migration`.
 
