@@ -11,7 +11,7 @@ This implementation provides four independent but complementary migration DAGs:
 1. **`source_to_s3_migration`** - Migrates Hive tables from source (MapR-FS/HDP-HDFS) to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
 3. **`folder_only_data_copy`** - Copies raw folders from source cluster (MapR-FS/HDP-HDFS) to S3 via DistCp — no Hive metadata
-4. **`parquet_hms_registration`** - Registers plain parquet files on S3 as external Hive Metastore tables — schema inferred, partitions auto-discovered
+4. **`iceberg_catalog_migration`** - Migrates existing Iceberg tables from a Hadoop catalog to a Hive (HMS) catalog via the `rewrite_table_path` procedure — full snapshot history preserved
 
 ---
 
@@ -139,7 +139,7 @@ single-tenant setups.
 | DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config       | `s3a://config-bucket/migration.xlsx`         |
 | DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config     | `s3a://config-bucket/iceberg_migration.xlsx` |
 | DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config | `s3a://config-bucket/folder_copy.xlsx`       |
-| DAG 4 | `excel_file_path` | Yes      | S3 path to parquet HMS config | `s3a://config-bucket/parquet_hms.xlsx`       |
+| DAG 4 | `excel_file_path` | Yes      | S3 path to Iceberg catalog migration config | `s3a://config-bucket/iceberg_rewrite_migration.xlsx` |
 
 ---
 
@@ -1287,116 +1287,174 @@ COMPLETED_WITH_ERRORS
 
 ---
 
-## DAG 4: Parquet HMS Registration (`parquet_hms_registration`)
+## DAG 4: Iceberg Catalog Migration (`iceberg_catalog_migration`)
+
+> Full reference: [README_migration_iceberg_catalog.md](README_migration_iceberg_catalog.md)
 
 ### Purpose
 
-Registers plain parquet files already sitting on S3 (e.g. copied by DAG 3 or an
-external migration) as **external Hive Metastore tables**, so they become
-queryable without moving or rewriting any data.
+Migrates **existing Iceberg tables** from a **Hadoop catalog** to a **Hive (HMS)
+catalog**. The Iceberg data and metadata files must already be copied to the
+destination S3 bucket; this DAG rewrites the path references embedded in the
+metadata (via the `rewrite_table_path` stored procedure) and registers the table
+in HMS with `register_table`.
+
+Unlike DAG 2 (which converts *Hive* tables to Iceberg), DAG 4 is
+Iceberg-to-Iceberg: no data is rewritten and full snapshot history, partition
+transforms, exact schema types, and table properties are preserved.
+
+---
+
+### Prerequisites
+
+- Both **data files** and **metadata files** for every table are already present
+  under `dest_s3_prefix` on S3
+- The destination Spark/Iceberg runtime is **Iceberg 1.4+** (required for
+  `rewrite_table_path`; register-only rows do not invoke the procedure)
+- Both source and destination buckets are reachable from the Spark workers —
+  `rewrite_table_path` reads the source metadata/manifests to know what to
+  rewrite. This DAG does **not** configure S3 credentials itself; it relies on
+  the endpoints/credentials registered through the nx1 portal's object store
+  configuration
+
+---
 
 ### Key Features
 
-- **Schema inference** - column names and types are inferred directly from the
-  parquet files via Spark with `mergeSchema=true`, so the footers of **all**
-  files are unioned — columns added or removed by schema evolution are not
-  silently dropped; no schema input required
-- **Automatic partition discovery** - Hive-style `key=value` directory layouts
-  are detected, the table is created with the matching `PARTITIONED BY` clause,
-  and partitions are registered with `MSCK REPAIR TABLE`. Partition columns are
-  always registered as **STRING** (`partitionColumnTypeInference` is disabled):
-  values keep their exact directory form (`month=01` stays `01`), and string
-  partition keys are what Athena/Glue recommend for metastore interop
-- **Safe by default** - tables that already exist in HMS at a _different_
-  location are recorded as `SKIPPED`, never dropped or replaced; an existing
-  table at the _same_ location (an Airflow retry) is MSCK-repaired and
-  recorded `REGISTERED`
-- **Validation** - row counts (HMS table vs direct parquet read) and partition
-  counts (`SHOW PARTITIONS` vs leaf `key=value` directories on S3) are
-  compared after registration
-- **Tracking & reporting** - run-level and per-table status in Iceberg tracking
+- **Two row categories** — a row is **rewrite** when `source_s3_prefix` differs
+  from `dest_s3_prefix`, and **register-only** when `source_s3_prefix` is blank
+  or equal to `dest_s3_prefix` (metadata already points at the destination, so
+  the rewrite is skipped and the table is registered straight from the dest
+  metadata file)
+- **History preserved** — every snapshot's paths are rewritten, so time travel,
+  partition transforms (`year`, `month`, `bucket`, `truncate`, …), exact schema
+  types, and table properties survive the move
+- **Incremental** — re-copy new/changed data and metadata files to the
+  destination, then re-run; the DAG rewrites whatever is present at the
+  destination. Change detection and syncing are **not** handled by the DAG
+- **Five-way validation** — row count, partition count, schema, path-rewrite
+  verification (no snapshot still references `source_s3_prefix`), and snapshot
+  count
+- **Tracking & reporting** — run-level and per-table status in Iceberg tracking
   tables, HTML report written to S3 and emailed
 
-### Excel Configuration
+---
 
-One row per table to register:
+### Excel Configuration Format
 
-| database   | table        | s3_location                             |
-| ---------- | ------------ | --------------------------------------- |
-| sales_data | transactions | s3a://data-lake/sales_data/transactions |
-| sales_data | orders       | s3://data-lake/sales_data/orders        |
+| Column             | Required    | Description                                                                                                                                          | Example                         |
+| ------------------ | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| `database`         | **Yes**     | HMS database name (same for source and destination)                                                                                                  | `analytics`                     |
+| `table`            | No          | Table name(s) — single, comma-separated, or wildcard; defaults to `*`                                                                                | `orders` or `trans*` or `*`     |
+| `source_s3_prefix` | Conditional | Original source prefix embedded in the pre-copied metadata. **Leave blank** or set equal to `dest_s3_prefix` to mark the row as register-only         | `s3a://source-bucket/warehouse` |
+| `dest_s3_prefix`   | **Yes**     | Destination prefix the metadata paths are rewritten to (or where the table already lives, for register-only rows)                                    | `s3a://dest-bucket/warehouse`   |
 
-- All three columns are required; rows with missing cells are skipped with a warning
-- `s3_location` accepts `s3://`, `s3n://`, or `s3a://` (normalized to `s3a://`)
-- The target database is created with `CREATE DATABASE IF NOT EXISTS` when missing
-- Duplicate `(database, table)` rows: the first row wins
-- Partition columns are **not** configured — they are discovered from the
-  directory layout. Locations without `key=value` directories are registered as
-  unpartitioned tables.
+Rows are grouped by `(database, source_s3_prefix, dest_s3_prefix)`; multiple rows
+for the same group accumulate their table tokens. Blank `source_s3_prefix` cells
+are mirrored to `dest_s3_prefix` before grouping.
+
+**Excel Sample:**
+
+```
+| database  | table      | source_s3_prefix              | dest_s3_prefix              |
+|-----------|------------|-------------------------------|-----------------------------|
+| analytics | orders     | s3a://source-bucket/warehouse | s3a://dest-bucket/warehouse |  ← rewrite
+| analytics | customers  | s3a://source-bucket/warehouse | s3a://dest-bucket/warehouse |  ← rewrite
+| reporting | *          | s3a://source-bucket/warehouse | s3a://dest-bucket/warehouse |  ← rewrite
+| ops       | inventory  |                               | s3a://dest-bucket/ops       |  ← register-only (blank source)
+| ops       | snapshots  | s3a://dest-bucket/ops         | s3a://dest-bucket/ops       |  ← register-only (source == dest)
+```
+
+---
 
 ### Task Flow
 
 ```
-init_hms_tracking_tables
-        |
-create_hms_registration_run
-        |
-parse_parquet_hms_excel
-        |
-register_parquet_tables          (mapped: one task per Excel row)
-        |
-validate_registered_tables       (mapped, max 3 concurrent)
-        |
-update_hms_validation_status     (mapped)
-        |
-generate_hms_html_report
-        |
-send_hms_report_email
-        |
-finalize_hms_run
+init_tracking_tables
+    ↓
+create_migration_run
+    ↓
+parse_excel
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  Dynamic Task Mapping (one set of tasks per database config)      │
+│  (every mapped task uses trigger_rule = all_done)                 │
+│                                                                   │
+│  validate_data_presence                                           │
+│    ↓                                                              │
+│  update_data_presence_in_tracking                                 │
+│    ↓                                                              │
+│  discover_tables (PySpark)                                        │
+│    ↓                                                              │
+│  update_discovered_tables_in_tracking                             │
+│    ↓                                                              │
+│  rewrite_and_register_tables                                      │
+│    ↓                                                              │
+│  update_rewrite_and_register_in_tracking                          │
+│    ↓                                                              │
+│  validate_dest_tables  (max 3 concurrent)                         │
+│    ↓                                                              │
+│  update_validation_in_tracking                                    │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+generate_html_report
+    ↓
+send_report_email
+    ↓
+finalize_run
 ```
+
+---
 
 ### Task Summaries
 
-| Task                           | Description                                                                                                                                                                                                                                          |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `init_hms_tracking_tables`     | Creates `hms_registration_runs` and `hms_registration_status` Iceberg tracking tables if missing                                                                                                                                                     |
-| `create_hms_registration_run`  | Inserts a `RUNNING` run record; generates the `hms_reg_...` run ID                                                                                                                                                                                   |
-| `parse_parquet_hms_excel`      | Reads the Excel file from S3; emits one config per valid row                                                                                                                                                                                         |
-| `register_parquet_tables`      | Infers schema (merged across all footers), detects partition columns from `key=value` dirs (typed STRING), `CREATE EXTERNAL TABLE` + `MSCK REPAIR TABLE`; existing table at same location → repair + `REGISTERED`, at different location → `SKIPPED` |
-| `validate_registered_tables`   | Compares HMS row count vs direct parquet count, and `SHOW PARTITIONS` count vs leaf `key=value` directories on S3                                                                                                                                    |
-| `update_hms_validation_status` | Writes validation results back to the tracking table (`VALIDATED` / `VALIDATION_FAILED`)                                                                                                                                                             |
-| `generate_hms_html_report`     | Builds the HTML report and writes it to `migration_report_location`                                                                                                                                                                                  |
-| `send_hms_report_email`        | Emails the report via SMTP (skips gracefully when no recipients configured)                                                                                                                                                                          |
-| `finalize_hms_run`             | Aggregates per-table statuses into the run record (`COMPLETED` / `COMPLETED_WITH_FAILURES` / `FAILED`)                                                                                                                                               |
+| Task                                       | Description                                                                                                                                                                                                                                                        |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init_tracking_tables`                     | Creates `rewrite_migration_runs` and `rewrite_migration_table_status` Iceberg tracking tables if missing                                                                                                                                                           |
+| `create_migration_run`                     | Inserts a `RUNNING` run record; generates the `rewrite_run_{YYYYMMDD_HHMMSS}_{uuid8}` run ID                                                                                                                                                                       |
+| `parse_excel`                              | Reads the Excel file from S3 and groups rows by `(database, source_s3_prefix, dest_s3_prefix)` for dynamic task mapping; raises if no valid rows                                                                                                                   |
+| `validate_data_presence`                   | Lists table directories under `dest_s3_prefix`, filters by the row's table tokens, and verifies each path exists, has a `metadata/` subdirectory, and contains files → `CONFIRMED` / `MISSING` / `FAILED`                                                          |
+| `update_data_presence_in_tracking`         | Inserts (or, on rerun, updates) the initial per-table tracking rows with presence status, file count, size, and `overall_status`                                                                                                                                   |
+| `discover_tables`                          | Reads schema, partition spec, row count, and snapshot count from the destination `metadata.json` for each `CONFIRMED` table (not from HMS, which may not have it registered yet)                                                                                   |
+| `update_discovered_tables_in_tracking`     | Writes discovery results — schema/partition JSON, source counts, `DISCOVERED` status — back to the tracking table                                                                                                                                                  |
+| `rewrite_and_register_tables`              | Drops any stale HMS registration (no `PURGE`), then: **register-only** → resolve latest dest `metadata.json` and `register_table`; **rewrite** → temporarily register from the source metadata, `CALL rewrite_table_path`, drop the temp, register the new metadata |
+| `update_rewrite_and_register_in_tracking`  | Records create status/duration and overwrites `source_row_count` / `source_partition_count` with post-register counts; `overall_status` is sticky (`FAILED` / `DATA_MISSING` are not overwritten)                                                                  |
+| `validate_dest_tables`                     | Compares row count, partition count, schema, snapshot count, and verifies no snapshot's `manifest_list` still references `source_s3_prefix` (path check skipped for register-only tables)                                                                          |
+| `update_validation_in_tracking`            | Writes validation results and the final `VALIDATED` / `VALIDATION_FAILED` status, with a race-safe catch-all for rows no validator reached                                                                                                                         |
+| `generate_html_report`                     | Builds the HTML report and writes it to `{report_location}/{run_id}_rewrite_report.html`                                                                                                                                                                           |
+| `send_report_email`                        | Emails the report (subject `Iceberg Catalog Migration Report — {run_id}`); skips silently when no recipients configured                                                                                                                                            |
+| `finalize_run`                             | Aggregates per-table statuses into the run record (`COMPLETED` / `COMPLETED_WITH_MISSING` / `COMPLETED_WITH_FAILURES` / `FAILED`)                                                                                                                                  |
+
+---
 
 ### Status Progression
 
-Per table: `REGISTERED` → `VALIDATED` (or `VALIDATION_FAILED`), with terminal
-`SKIPPED` (table already in HMS at a different location) and `FAILED`
-(registration error) states.
-Per run: `RUNNING` → `COMPLETED` / `COMPLETED_WITH_FAILURES` / `FAILED`.
+```
+DATA_CONFIRMED  (metadata and data files found at destination)
+    ↓
+DISCOVERED  (metadata read from destination, tracking record updated)
+    ↓
+TABLE_CREATED  (rewrite_table_path + register_table executed)
+    ↓
+VALIDATED  (row count, partition count, schema, path rewrite, snapshot count all match)
 
-### Notes & Limitations
+DATA_MISSING → skipped in all downstream steps, visible in report
+(Any stage) → FAILED or VALIDATION_FAILED
+```
 
-- **Partition columns are always STRING.** Spark's partition type inference is
-  explicitly disabled (`spark.sql.sources.partitionColumnTypeInference.enabled=false`),
-  so directory values are never coerced (`month=01` and `month=1` stay distinct,
-  leading zeros survive, `dt=2024-01-01` is not turned into a DATE). Query with
-  string predicates (`WHERE year='2024'`) or cast in the query. See the
-  [Athena guidance on string partition keys](https://docs.aws.amazon.com/athena/latest/ug/performance-tuning-data-optimization-techniques.html)
-  and the [Spark partition discovery docs](https://spark.apache.org/docs/latest/sql-data-sources-parquet.html)
-- **Schema evolution is handled at registration** via `mergeSchema=true`: the
-  registered schema is the union of all file footers; files missing
-  later-added columns read those columns as NULL (standard parquet behavior).
-  Genuinely incompatible type changes across files fail the registration loudly
-- Empty partition directories are registered by MSCK and return zero rows when
-  queried; validation counts directories on both sides, so empty partitions do
-  not flag a mismatch
-- Non-Hive-style layouts (no `key=value` directories) are registered as
-  unpartitioned tables
-- No drop/replace support — re-running against a table registered elsewhere
-  records `SKIPPED`
+| Per-table status    | Meaning                                                                     |
+| ------------------- | --------------------------------------------------------------------------- |
+| `DATA_CONFIRMED`    | Data and metadata files present at destination S3 — tracking row inserted   |
+| `DISCOVERED`        | Metadata read from destination, schema/partition info recorded              |
+| `DATA_MISSING`      | No files or missing `metadata/` directory — skipped                         |
+| `TABLE_CREATED`     | `rewrite_table_path` + `register_table` completed, validation pending       |
+| `VALIDATED`         | All five validation checks passed — migration success                       |
+| `VALIDATION_FAILED` | Row count, partition count, schema, path-rewrite, or snapshot-count mismatch |
+| `FAILED`            | Error at data presence check, discovery, or table creation                  |
+
+**Per-run statuses:** `COMPLETED` · `COMPLETED_WITH_MISSING` (no failures, some
+tables had no data at the destination) · `COMPLETED_WITH_FAILURES` · `FAILED`
+(run-level tracking error).
 
 ---
 
@@ -1534,6 +1592,13 @@ metadata to work from.
 
 1. **migration_tracking.data_copy_runs**: Run-level metadata for folder-only data copy runs.
 2. **migration_tracking.data_copy_status**: Folder-level tracking — one row per source/destination pair per run.
+
+---
+
+### Iceberg Catalog Migration Tracking
+
+1. **migration_tracking.rewrite_migration_runs**: Run-level metadata for Hadoop-catalog-to-HMS Iceberg migrations.
+2. **migration_tracking.rewrite_migration_table_status**: Table-level tracking — data presence, discovery, registration, and validation; partitioned by `source_database`.
 
 ---
 
