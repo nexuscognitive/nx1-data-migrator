@@ -189,8 +189,10 @@ to inspect another tenant's logs, either relax the mode after the run or point
 Directory creation runs under `set -e`, so if `cluster_distcp_log_root` is not
 writable by the service account, `cluster_login_setup` fails immediately rather
 than the run failing later at the DistCp step. Logs are **not** deleted at the end
-of a run — `cleanup_edge` leaves them in place because the validation steps read
-them back. Include this path in your normal cluster retention policy.
+of a run: the validation steps read them back, which is why the DAG's
+`cleanup_edge` task is left disabled (see
+[Edge-node cleanup](#edge-node-cleanup-currently-disabled)). Include this path in
+your normal cluster retention policy.
 
 #### Hive scratch dir on the edge node
 
@@ -273,6 +275,7 @@ single-tenant setups.
 | ----- | ----------------- | -------- | ------------------------------------------- | ---------------------------------------------------- |
 | DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config                     | `s3a://config-bucket/migration.xlsx`                 |
 | DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config                   | `s3a://config-bucket/iceberg_migration.xlsx`         |
+| DAG 2 | `iceberg_drop_backup` | No   | Drop `<table>_backup_` after a successful **in-place** migration. Default `false` — keep it `false` on any cutover run, the backup is the rollback path | `false`                                              |
 | DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config               | `s3a://config-bucket/folder_copy.xlsx`               |
 | DAG 4 | `excel_file_path` | Yes      | S3 path to Iceberg catalog migration config | `s3a://config-bucket/iceberg_rewrite_migration.xlsx` |
 
@@ -452,8 +455,6 @@ generate_html_report
 send_migration_report_email (PySpark: Email report)
 ↓
 finalize_run
-↓
-cleanup_edge (SSH: Cleanup temp files)
 ```
 
 ---
@@ -749,13 +750,14 @@ All run sequences are safe — no combination corrupts data:
 **Type:** PySpark  
 **Purpose:** Send HTML migration report via email using SMTP
 
-- Receives HTML content directly from `generate_html_report` task
+- Reads the report back from S3 using the `report_path` returned by `generate_html_report`
 - Extracts email configuration:
   - SMTP connection ID from Airflow variable
   - Recipients list (comma-separated) from Airflow variable
 - Sends email with:
   - Subject: `Migration Report - {run_id}`
-  - Body: Full HTML report (no S3 read required)
+  - Body: a one-line pointer to the run
+  - **Attachment: the full HTML report** — open the attachment, not the body
 - **Skips email if:**
   - No recipients configured (`migration_email_recipients` variable empty)
   - Returns `{'sent': False, 'reason': 'no_recipients'}`
@@ -781,15 +783,20 @@ All run sequences are safe — no combination corrupts data:
 
 ---
 
-#### Step 15 - `cleanup_edge`
+#### Edge-node cleanup (currently disabled)
 
-**Type:** SSH  
-**Purpose:** Clean up temporary files on MapR edge node
+A `cleanup_edge` task exists in the DAG file but is **commented out of the task
+wiring**, so the DAG has 16 active tasks and ends at `finalize_run`.
 
-- Removes temporary directory created in `cluster_login_setup`
-- Cleans up DistCp log files
-- Ensures edge node disk space is freed
-- Failures are ignored
+It is disabled deliberately: the DistCp logs under the run's temp directory are
+read back by the validation steps, so deleting them at the end of the run would
+remove the evidence those checks depend on.
+
+**What this means operationally:** the per-run directories under
+`cluster_edge_temp_path` and the DistCp logs under `cluster_distcp_log_root` are
+**not** removed by the DAG. Include both paths in the cluster's normal retention
+policy, or clear old run directories as part of routine housekeeping. Re-enabling
+automatic cleanup is a possible future enhancement.
 
 ---
 
@@ -853,7 +860,11 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 - Converts existing Hive table to Iceberg format
 - Uses Spark procedure: CALL spark_catalog.system.migrate('{table}')
 - Overwrites table metadata - table becomes Iceberg table
-- Original Hive table is lost (irreversible)
+- **The original Hive table is not dropped.** `system.migrate` renames it to
+  `<table>_backup_`, which is retained unless `iceberg_drop_backup=true` is set on
+  the run. That backup is the rollback path — it still references the same data
+  files, so restoring it reverts the conversion. See
+  [Backups and rollback](#backups-and-rollback) below.
 
 ---
 
@@ -864,6 +875,8 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 - Location: Same as source (metadata changes only)
 - Storage: No data duplication
 - Queries: Must use Iceberg-compatible engine
+- Source table: Renamed to `<table>_backup_` (retained by default)
+- Re-run: Recorded `SKIPPED` with reason `ALREADY_ICEBERG` — never fails
 
 ---
 
@@ -885,6 +898,37 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 - Location: Same as source (metadata layer only)
 - Storage: Minimal duplication (metadata only)
 - Queries: Can query both Hive and Iceberg versions
+
+---
+
+### Backups and rollback
+
+**In-place migration always leaves a backup.** `system.migrate` renames the source
+Hive table to `<table>_backup_` instead of dropping it, and that table still
+references the same data files. It is the rollback path for an in-place cutover.
+
+- **Discovery skips `*_backup_` and `*__BACKUP__`**, so backups are never
+  re-migrated and never appear as extra tables in a later run.
+- **`iceberg_drop_backup`** (DAG param, default `false`; also settable via the
+  Airflow Variable `migration_iceberg_drop_backup`) passes `drop_backup => true`
+  to the procedure. Keep it `false` on any cutover run — setting it `true` is what
+  removes the ability to roll back. Use it only to retire backups after a clean soak.
+- **Stale backups from a previous run** are dropped automatically before
+  re-migrating a table. That drop, and every backup drop the tooling performs, is
+  **metadata-only — never `PURGE`**, because the backup shares data files with the
+  live Iceberg table. A hand-written `DROP TABLE ... PURGE` on a backup would
+  destroy live data.
+- **Rollback has a deadline.** Restoring `<table>_backup_` is clean only *before*
+  writes resume against the Iceberg table. Once new Iceberg files exist at the
+  table's location, the backup no longer describes the current file set and
+  restoring it loses those writes.
+
+**Snapshot migration needs no backup** — it leaves the source Hive table untouched
+and live, so rolling back is just dropping the Iceberg table in the destination
+database (metadata-only).
+
+Strategy rules, phase flow and the full cutover/rollback procedure:
+[Hive_Iceberg_Migration_Rulebook.md](Hive_Iceberg_Migration_Rulebook.md).
 
 ---
 
@@ -916,10 +960,6 @@ init_iceberg_tracking_tables
 create_iceberg_migration_run
     ↓
 parse_iceberg_excel
-    ↓
-lookup_parent_migration_run (Links to DAG 1)
-    ↓
-update_parent_run_id
     ↓
 ┌───────────────────────────────────────────────┐
 │  Dynamic Task Mapping (per database config)   │
@@ -986,32 +1026,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 3 - `lookup_parent_migration_run`
-
-**Type:** PySpark
-**Purpose:** Find parent MapR-to-S3 migration run ID by querying DAG 1 tracking tables
-
-- Expands table patterns to get concrete table names
-- For each table, queries DAG 1 tracking
-  1. Finds most recent successful MapR-to-S3 migration for this table
-  2. Only considers migrations that reached TABLE_CREATED or COPIED status
-  3. Creates mapping: {database.table: parent_run_id}
-- Determines most common parent run ID
-- Returns lookup result
-
----
-
-#### Step 4 - `update_parent_run_id`
-
-**Type:** PySpark
-**Purpose:** Update iceberg_migration_runs table with parent run link
-
-- Extracts parent run ID from lookup result
-- Updates run record if parent found
-
----
-
-#### Step 5 - `discover_hive_tables`
+#### Step 3 - `discover_hive_tables`
 
 **Type:** PySpark (mapped per database)  
 **Purpose:** Discover Hive tables matching pattern in the source database
@@ -1023,7 +1038,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 6 - `migrate_tables_to_iceberg`
+#### Step 4 - `migrate_tables_to_iceberg`
 
 **Type:** PySpark (mapped per database)
 **Purpose:** Migrate Hive tables to Iceberg format using Spark procedures
@@ -1035,7 +1050,8 @@ finalize_iceberg_run
     A. **Inplace Migration:**
     - Converts Hive table to Iceberg in-place
     - Same database and table name
-    - Overwrites table metadata (irreversible)
+    - Overwrites table metadata; the source table is renamed to `<table>_backup_`
+      rather than dropped (retained unless `iceberg_drop_backup=true`)
     - Table type changes from Hive external to Iceberg
       B. **Snapshot Migration:**
     - Creates new Iceberg table
@@ -1047,7 +1063,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 7 - `update_migration_durations`
+#### Step 5 - `update_migration_durations`
 
 **Type:** PySpark (mapped per database)  
 **Purpose:** Update tracking table with migration durations extracted from XCom
@@ -1057,7 +1073,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 8 - `validate_iceberg_tables`
+#### Step 6 - `validate_iceberg_tables`
 
 **Type:** PySpark (mapped per database)  
 **Purpose:** Validate Iceberg tables: comprehensive Hive vs Iceberg comparison
@@ -1071,7 +1087,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 9 - `update_iceberg_validation_status`
+#### Step 7 - `update_iceberg_validation_status`
 
 **Type:** PySpark (mapped per database)  
 **Purpose:** Update Iceberg tracking with validation results
@@ -1091,7 +1107,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 10 - `generate_iceberg_html_report`
+#### Step 8 - `generate_iceberg_html_report`
 
 **Type:** PySpark
 **Purpose:** Generate comprehensive HTML migration report
@@ -1109,18 +1125,19 @@ finalize_iceberg_run
 
 ---
 
-#### Step 11 - `send_iceberg_report_email`
+#### Step 9 - `send_iceberg_report_email`
 
 **Type:** PySpark  
 **Purpose:** Send HTML Iceberg migration report via email using SMTP
 
-- Receives HTML content directly from `generate_iceberg_html_report` task
+- Reads the report back from S3 using the `report_path` returned by `generate_iceberg_html_report`
 - Extracts email configuration:
   - SMTP connection ID from Airflow variable
   - Recipients list (comma-separated) from Airflow variable
 - Sends email with:
   - Subject: `Iceberg Migration Report - {run_id}`
-  - Body: Full HTML report (no S3 read required)
+  - Body: a one-line pointer to the run
+  - **Attachment: the full HTML report** — open the attachment, not the body
 - **Skips email if:**
   - No recipients configured (`migration_email_recipients` variable empty)
   - Returns `{'sent': False, 'reason': 'no_recipients'}`
@@ -1129,7 +1146,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 12 - `finalize_iceberg_run`
+#### Step 10 - `finalize_iceberg_run`
 
 **Type:** PySpark  
 **Purpose:** Aggregate statistics and mark migration run as complete
