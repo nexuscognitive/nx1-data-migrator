@@ -59,12 +59,13 @@ else:
 # of the discovery job itself. Tables carrying these are skipped by every
 # downstream phase and reported as-is; they must never abort the whole database.
 #
-# NOTE: DAG 2 calls the same physical condition DATA_PATH_MISSING (REASON_LABELS in
-# migration_dag_iceberg.py). The two vocabularies otherwise agree — DAG 2 spells
-# TABLE_NOT_FOUND and DATABASE_NOT_FOUND identically — so this is the one place they
-# diverge, and querying both tracking tables for "source data missing" needs both
-# spellings. Kept distinct only because DAG 1 stores it in overall_status while DAG 2
-# embeds its code in error_message; align them if that ever stops being worth it.
+# NOTE: DAG 2 has a DATA_PATH_MISSING reason code (REASON_LABELS in
+# migration_dag_iceberg.py) for the same physical condition, so querying both
+# tracking tables for "source data missing" needs two spellings. They are not
+# equivalent, though: DAG 2's only labels a failure, it does not skip the table, and
+# it is decided by matching the exception text — the approach this DAG deliberately
+# rejected in favour of fs.exists(). Unifying them means changing DAG 2's detection,
+# not just its spelling; worth its own ticket rather than a rename here.
 SKIPPABLE_DISCOVERY_ERRORS = (
     "TABLE_NOT_FOUND",
     "DATABASE_NOT_FOUND",
@@ -1330,6 +1331,16 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
         if t.get("error_type") == "FAILED":
             t["error_type"] = _classify_discovery_error(
                 t.get("error", ""), t.get("source_path_exists")
+            )
+        elif not t.get("error_type") and t.get("source_path_exists") is False:
+            # Whether an orphan throws is format-dependent: a converted Parquet table
+            # raises when spark.table() lists files, but a TEXTFILE/Avro schema comes
+            # from the catalog and the only throwing call (COUNT(*)) is swallowed
+            # remotely. Without this the table reaches DistCp with 0 source files and
+            # is reported EMPTY_SOURCE, which finalize_run counts as successful.
+            t["error_type"] = "SOURCE_PATH_NOT_FOUND"
+            t["error"] = (
+                f"Source data path does not exist: {t.get('source_location', '')}"
             )
 
     logger.info(

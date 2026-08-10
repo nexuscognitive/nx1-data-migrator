@@ -605,6 +605,32 @@ class TestDiscoverTablesViaSshSpark:
         assert by_table['good_one'].get('error_type') is None
         assert by_table['good_two'].get('error_type') is None
 
+    def test_orphan_that_never_threw_is_still_classified(self, mock_ssh_hook, sample_run_id):
+        """Whether an orphan throws during discovery is format-dependent: for a
+        converted Parquet table spark.table() lists files and raises, but for
+        TEXTFILE/Avro the schema comes from the catalog and the only throwing call
+        (COUNT(*)) is swallowed. Such a table emits as a *success* record carrying
+        source_path_exists=False, and would otherwise reach DistCp with 0 source
+        files and be reported EMPTY_SOURCE — which finalize_run counts as
+        successful. The root is gone; say so."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record('good_one'),
+            self._make_metadata_record(
+                'textfile_orphan', file_format='TEXTFILE', source_path_exists=False,
+            ),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['good_one', 'textfile_orphan'],
+        )
+
+        by_table = {t['source_table']: t for t in result['tables']}
+        assert by_table['textfile_orphan']['error_type'] == 'SOURCE_PATH_NOT_FOUND'
+        # The reason must be concrete: it is what lands in tracking and the report.
+        assert 'maprfs:/datalake/sales/textfile_orphan' in by_table['textfile_orphan']['error']
+        assert by_table['good_one'].get('error_type') is None
+
     def test_genuine_discovery_failure_still_aborts_batch(self, mock_ssh_hook, sample_run_id):
         """The abort remains for errors that mean discovery metadata is unreliable —
         proceeding there would silently under-migrate."""
@@ -1039,11 +1065,12 @@ class TestUpdateDistcpStatus:
         UPDATE must not run for it and overwrite that with COPIED/FAILED."""
         sample_distcp_result['distcp_results'][0]['status'] = 'SOURCE_PATH_NOT_FOUND'
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
-        per_table = [
-            c.args[1] for c in mock_iceberg_retry.call_args_list
-            if "distcp_status = 'COPIED'" in c.args[1] or "distcp_status = 'FAILED'" in c.args[1]
-        ]
-        assert per_table == []
+        # Key on the per-table UPDATE's own task_label. Matching on the emitted
+        # distcp_status would be vacuous: the UPDATE writes r['status'] verbatim, so
+        # a skipped row that slipped through would write SOURCE_PATH_NOT_FOUND, not
+        # COPIED/FAILED, and any such filter matches nothing either way.
+        labels = [c.kwargs.get('task_label') for c in mock_iceberg_retry.call_args_list]
+        assert 'update_distcp_status:transactions' not in labels
 
     def test_failure_update_preserves_skippable_statuses(
         self, mock_spark, sample_distcp_result, mock_iceberg_retry
@@ -1992,15 +2019,47 @@ class TestFinalizeRun:
         sql_calls = [str(c) for c in mock_spark.sql.call_args_list]
         assert any('COMPLETED' in c for c in sql_calls)
 
-    def test_summary_counts_skippable_statuses(self, mock_spark, sample_run_id):
+    def _run_with_stats(self, mock_spark, run_id, **counts):
+        """Returns the raw SQL strings. Note `c.args[0]`, not `str(c)`: the repr of a
+        mock call escapes newlines, so splitlines() on it yields one giant line and
+        any per-line assertion silently degrades to matching the whole statement."""
         stats_row = MagicMock()
-        stats_row.__getitem__ = lambda self, k: 5
+        stats_row.__getitem__ = lambda self, k: counts[k]
         df = MagicMock()
         df.collect.return_value = [stats_row]
         mock_spark.sql.return_value = df
+        m.finalize_run.function(run_id=run_id, spark=mock_spark)
+        return [c.args[0] for c in mock_spark.sql.call_args_list if c.args]
 
-        m.finalize_run.function(run_id=sample_run_id, spark=mock_spark)
-        sql_calls = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
-        assert '_SKIPPABLE_STATUS_SQL_IN' not in sql_calls
+    def test_not_found_rollup_counts_every_skippable_status(self, mock_spark, sample_run_id):
+        """Pin the `not_found` rollup specifically. Asserting the status names appear
+        anywhere in the SQL is vacuous — the `successful` rollup on the line above
+        satisfies that on its own, so the two old literals here would pass."""
+        sqls = self._run_with_stats(
+            mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=1
+        )
+        not_found_expr = next(
+            line for sql in sqls for line in sql.splitlines() if 'as not_found' in line
+        )
+        assert '_SKIPPABLE_STATUS_SQL_IN' not in not_found_expr
         for status in m.SKIPPABLE_DISCOVERY_ERRORS:
-            assert status in sql_calls
+            assert status in not_found_expr
+
+    def test_skipped_table_downgrades_run_to_completed_with_missing(
+        self, mock_spark, sample_run_id
+    ):
+        """A run whose only anomaly is a skipped table must not finish bare COMPLETED
+        — that is the whole reason the skip is acceptable. failed=0 matters: with a
+        non-zero failed count this short-circuits to COMPLETED_WITH_FAILURES and the
+        branch under test never runs."""
+        sqls = ' '.join(self._run_with_stats(
+            mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=1
+        ))
+        assert "status = 'COMPLETED_WITH_MISSING'" in sqls
+
+    def test_clean_run_still_completes(self, mock_spark, sample_run_id):
+        sqls = ' '.join(self._run_with_stats(
+            mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=0
+        ))
+        assert "status = 'COMPLETED'" in sqls
+        assert 'COMPLETED_WITH_MISSING' not in sqls
