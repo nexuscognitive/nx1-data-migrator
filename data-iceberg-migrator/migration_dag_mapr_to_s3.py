@@ -1362,37 +1362,9 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
         failed_count = len(real_failures)
         total_count = len(metadata)
         failed_names = ", ".join([t["source_table"] for t in real_failures[:3]])
-        if failed_count > 3:
-            failed_names += f" (and {failed_count - 3} more)"
 
         raise Exception(
             f"Discovery failed for {failed_count}/{total_count} table(s) in {src_db}: {failed_names}. "
-        )
-
-    # If every table that reached the filesystem reads as absent, an unmounted volume
-    # or a misresolved fs.defaultFS is likelier than N independent orphans — and
-    # skipping all of them ends the run COMPLETED_WITH_MISSING with nothing migrated
-    # and no failed task. Needs more than one probe: for a single table "all absent"
-    # is exactly the orphan case, so the skip has to win. TABLE_NOT_FOUND and
-    # DATABASE_NOT_FOUND never reached the filesystem, so they are not evidence.
-    path_missing = [
-        t for t in metadata if t.get("error_type") == "SOURCE_PATH_NOT_FOUND"
-    ]
-    probed = [
-        t for t in metadata
-        if t.get("error_type") not in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND")
-    ]
-    if path_missing and len(probed) > 1 and len(path_missing) == len(probed):
-        missing_paths = ", ".join(
-            t.get("source_location") or t["source_table"] for t in path_missing[:3]
-        )
-        if len(path_missing) > 3:
-            missing_paths += f" (and {len(path_missing) - 3} more)"
-        raise Exception(
-            f"All {len(path_missing)} table(s) probed in {src_db} report a missing source "
-            f"data path. Treating this as a filesystem or configuration fault rather than "
-            f"{len(path_missing)} independently orphaned metastore entries — verify the "
-            f"source volume is mounted and fs.defaultFS is correct. Paths: {missing_paths}"
         )
 
     return {
