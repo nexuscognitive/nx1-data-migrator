@@ -9,6 +9,25 @@ import pytest
 from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
 
 
+def assert_each_overall_status_case_preserves_skippable(calls):
+    """Every statement rewriting `overall_status` through a CASE must carry the
+    preserve guard, expanded rather than left as a literal placeholder.
+
+    Asserted per statement, not on the joined SQL: several of these UPDATEs fire in
+    one task, so a joined assertion stays green if any *one* keeps the guard.
+    Returns the matched task labels so callers can pin which UPDATEs they hit."""
+    guarded = [
+        (c.kwargs.get('task_label'), c.args[1])
+        for c in calls
+        if 'overall_status = CASE' in c.args[1]
+    ]
+    assert guarded, 'no overall_status CASE statement was emitted'
+    for label, sql in guarded:
+        assert m._PRESERVE_SKIPPABLE_STATUS_SQL in sql, f'guard missing from {label}'
+        assert '_PRESERVE_SKIPPABLE_STATUS_SQL' not in sql, f'unexpanded in {label}'
+    return [label for label, _ in guarded]
+
+
 class TestValidatePrerequisites:
 
     def test_all_checks_pass(self, mock_ssh_hook):
@@ -277,62 +296,33 @@ class TestClusterLoginSetup:
 
 
 class TestClassifyDiscoveryError:
-    """The classifier decides whether a per-table discovery error is a permanent
-    source-data condition (skip the table, migrate its siblings) or an unreliable
-    result (abort the database). Both directions are costly: a false positive
-    silently skips a table that should have been migrated, a false negative blocks
-    a whole database. It keys off `source_path_exists`, the remote script's direct
-    fs.exists() on the table's LOCATION, rather than the wording of the exception.
-    """
+    """Skip the table and migrate its siblings, or abort the whole database? Decided
+    on the remote fs.exists(), never on the wording of the exception."""
 
-    @pytest.mark.parametrize('error', [
-        # The form reported in WF-343
-        "u'Path does not exist: maprfs:/datalake/sales/orders;'",
-        'java.io.FileNotFoundException: File maprfs:///datalake/sales/orders does not exist.',
-        ('org.apache.hadoop.mapred.InvalidInputException: '
-         'Input path does not exist: maprfs:/datalake/sales/orders'),
-    ])
-    def test_missing_root_location_is_skippable(self, error):
-        assert m._classify_discovery_error(error, False) == 'SOURCE_PATH_NOT_FOUND'
+    def test_missing_root_location_is_skippable(self):
+        assert m._classify_discovery_error(
+            "u'Path does not exist: maprfs:/datalake/sales/orders;'", False
+        ) == 'SOURCE_PATH_NOT_FOUND'
+
+    def test_intact_root_location_is_not_skippable(self):
+        # A leaf file vanishing mid-listing (compaction, or one missing partition)
+        # is indistinguishable from a gone root in the text; only fs.exists() tells
+        # them apart, and this table is still migratable on retry.
+        assert m._classify_discovery_error(
+            'java.io.FileNotFoundException: File does not exist: '
+            'maprfs:/datalake/sales/orders/part-00000-abc.snappy.parquet', True
+        ) == 'FAILED'
 
     def test_root_gone_wins_over_an_unrelated_error(self):
-        """Deliberate policy, not an incidental path variant: once the root is
-        verifiably gone the table is unmigratable no matter what else failed on the
-        way, so it is skipped rather than retried. The raw error is still recorded
-        in tracking, so the OOM is not lost."""
+        # Unmigratable whatever else failed on the way; the raw error still lands
+        # in tracking.
         assert m._classify_discovery_error(
             'java.lang.OutOfMemoryError: GC overhead limit exceeded', False
         ) == 'SOURCE_PATH_NOT_FOUND'
 
-    @pytest.mark.parametrize('error', [
-        # A leaf file under the table root vanished mid-listing (concurrent compaction
-        # or rewrite). The root is intact, so the table is migratable on retry — this
-        # must NOT be recorded as an orphaned metastore entry.
-        ('java.io.FileNotFoundException: File does not exist: '
-         'maprfs:/datalake/sales/orders/part-00000-abc.snappy.parquet\n'
-         "It is possible the underlying files have been updated... 'REFRESH TABLE tableName'"),
-        ('org.apache.spark.SparkException: Job aborted due to stage failure: Task 3 in '
-         'stage 1.0 failed 4 times: java.io.FileNotFoundException: '
-         'maprfs:/datalake/sales/orders/dt=2024-01-01/part-7.parquet (No such file or directory)'),
-        # One partition directory gone, root fine: 99 intact partitions must not be
-        # dropped from the migration.
-        'Path does not exist: maprfs:/datalake/sales/orders/dt=2024-01-01',
-        # A sibling table whose path prefix-extends ours.
-        'Path does not exist: maprfs:/datalake/sales/orders_archive',
-        # Executor-local scratch from a lost executor — transient, keep its retries.
-        ('java.io.FileNotFoundException: /tmp/blockmgr-9f2c/0c/shuffle_0_1_0.index '
-         '(No such file or directory)'),
-    ])
-    def test_intact_root_location_is_not_skippable(self, error):
-        assert m._classify_discovery_error(error, True) == 'FAILED'
-
     def test_permission_error_is_not_skippable_even_when_root_reads_as_absent(self):
-        """Not being allowed to see the data is not the same as the data being gone;
-        skipping would bury an ACL problem as "source needs cleanup".
-
-        Defensive: HDFS/MapR throw on an ACL problem rather than returning False, so
-        the remote script is not expected to produce this combination. Pins the guard
-        in case a filesystem does."""
+        # An ACL problem normally throws, leaving None; pins the guard in case a
+        # filesystem returns False instead.
         assert m._classify_discovery_error(
             'org.apache.hadoop.security.AccessControlException: Permission denied: '
             'user=svc_migration, path="maprfs:/datalake/sales/orders"',
@@ -340,8 +330,7 @@ class TestClassifyDiscoveryError:
         ) == 'FAILED'
 
     def test_unknown_existence_is_not_skippable(self):
-        """If the fs lookup itself failed, or DESCRIBE never yielded a location,
-        there is no ground truth — abort rather than guess."""
+        """No ground truth — abort rather than guess."""
         assert m._classify_discovery_error(
             'Path does not exist: maprfs:/datalake/sales/orders', None
         ) == 'FAILED'
@@ -561,9 +550,8 @@ class TestDiscoverTablesViaSshSpark:
         })
 
     def test_generated_remote_script_is_valid_python(self, mock_ssh_hook, sample_run_id):
-        """The discovery script is built as a string and only ever executed on the
-        edge node, so a syntax error there surfaces as an opaque Spark failure in
-        production. Compile it here instead."""
+        """The script only ever runs on the edge node, where a syntax error surfaces
+        as an opaque Spark failure. Compile it here instead."""
         _, client, _, _ = mock_ssh_hook
         self._run_discovery(
             client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
@@ -572,16 +560,19 @@ class TestDiscoverTablesViaSshSpark:
         script = sftp_file.__enter__.return_value.write.call_args[0][0]
         compile(script, 'discover_tables.py', 'exec')
         # Guard the two fields the driver-side classifier depends on.
-        assert 'source_path_exists = bool(fs.exists(path))' in script
+        probe = 'source_path_exists = bool(fs.exists(path))'
+        assert probe in script
         assert '"source_path_exists": source_path_exists' in script
+        # Load-bearing ordering, ~150 lines apart in one template: reversed, the
+        # blanket handler only ever sees None and every orphan aborts its database
+        # again — WF-343 restored with the rest of this suite green.
+        assert script.index(probe) < script.index('spark.table("{0}.{1}"')
 
     def test_orphaned_metastore_entry_does_not_abort_sibling_tables(
         self, mock_ssh_hook, sample_run_id
     ):
-        """WF-343: a table registered in the metastore whose data path was deleted
-        is a permanent source-data condition, not a discovery failure. It must be
-        classified SOURCE_PATH_NOT_FOUND and skipped, leaving healthy sibling
-        tables in the same database to migrate."""
+        """WF-343: an orphaned metastore entry is a source-data condition, not a
+        discovery failure — skip it and migrate its healthy siblings."""
         _, client, _, _ = mock_ssh_hook
         metadata = [
             self._make_metadata_record('good_one'),
@@ -606,13 +597,9 @@ class TestDiscoverTablesViaSshSpark:
         assert by_table['good_two'].get('error_type') is None
 
     def test_orphan_that_never_threw_is_still_classified(self, mock_ssh_hook, sample_run_id):
-        """Whether an orphan throws during discovery is format-dependent: for a
-        converted Parquet table spark.table() lists files and raises, but for
-        TEXTFILE/Avro the schema comes from the catalog and the only throwing call
-        (COUNT(*)) is swallowed. Such a table emits as a *success* record carrying
-        source_path_exists=False, and would otherwise reach DistCp with 0 source
-        files and be reported EMPTY_SOURCE — which finalize_run counts as
-        successful. The root is gone; say so."""
+        """A TEXTFILE/Avro orphan never throws — its schema comes from the catalog —
+        so it emits as a success record and would reach DistCp with 0 files and be
+        reported EMPTY_SOURCE, which finalize_run counts as successful."""
         _, client, _, _ = mock_ssh_hook
         metadata = [
             self._make_metadata_record('good_one'),
@@ -632,8 +619,8 @@ class TestDiscoverTablesViaSshSpark:
         assert by_table['good_one'].get('error_type') is None
 
     def test_genuine_discovery_failure_still_aborts_batch(self, mock_ssh_hook, sample_run_id):
-        """The abort remains for errors that mean discovery metadata is unreliable —
-        proceeding there would silently under-migrate."""
+        """The abort remains when the metadata is unreliable: proceeding would
+        silently under-migrate."""
         _, client, _, _ = mock_ssh_hook
         metadata = [
             self._make_metadata_record('good_one'),
@@ -646,6 +633,72 @@ class TestDiscoverTablesViaSshSpark:
 
         with pytest.raises(Exception, match="Discovery failed for"):
             self._run_discovery(client, metadata, sample_run_id, ['good_one', 'flaky'])
+
+    def _orphan_record(self, table, **overrides):
+        return self._make_metadata_record(
+            table,
+            error=f"u'Path does not exist: maprfs:/datalake/sales/{table};'",
+            error_type='FAILED',
+            source_path_exists=False,
+            **overrides,
+        )
+
+    def test_every_probed_table_missing_aborts_instead_of_skipping_all(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """An unmounted volume makes every table read as absent; skipping all of them
+        ends the run COMPLETED_WITH_MISSING with nothing migrated and no failed task."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [self._orphan_record('orders'), self._orphan_record('customers')]
+
+        with pytest.raises(Exception, match="report a missing source data path"):
+            self._run_discovery(client, metadata, sample_run_id, ['orders', 'customers'])
+
+    def test_sole_table_missing_is_still_skipped(self, mock_ssh_hook, sample_run_id):
+        """With one table, "all absent" *is* the orphan case, so the skip wins."""
+        _, client, _, _ = mock_ssh_hook
+        result = self._run_discovery(
+            client, [self._orphan_record('orders')], sample_run_id, ['orders'],
+        )
+        assert result['tables'][0]['error_type'] == 'SOURCE_PATH_NOT_FOUND'
+
+    def test_metastore_absences_do_not_dilute_the_all_missing_check(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """TABLE_NOT_FOUND never reached the filesystem, so it says nothing about the
+        mount. Counting it would leave 2-of-3 and let a total outage through."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._orphan_record('orders'),
+            self._orphan_record('customers'),
+            self._make_metadata_record(
+                'never_existed', error='Table not found', error_type='TABLE_NOT_FOUND',
+            ),
+        ]
+
+        with pytest.raises(Exception, match="All 2 table\\(s\\) probed"):
+            self._run_discovery(
+                client, metadata, sample_run_id,
+                ['orders', 'customers', 'never_existed'],
+            )
+
+    def test_one_healthy_sibling_keeps_the_skip(self, mock_ssh_hook, sample_run_id):
+        """A single table whose path is present rules out an environment-wide cause,
+        so the orphans go back to being skipped rather than fatal."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._orphan_record('orders'),
+            self._orphan_record('customers'),
+            self._make_metadata_record('good_one'),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['orders', 'customers', 'good_one'],
+        )
+        by_table = {t['source_table']: t for t in result['tables']}
+        assert by_table['orders']['error_type'] == 'SOURCE_PATH_NOT_FOUND'
+        assert by_table['customers']['error_type'] == 'SOURCE_PATH_NOT_FOUND'
+        assert by_table['good_one'].get('error_type') is None
 
     def test_abort_message_reports_untruncated_failure_count(self, mock_ssh_hook, sample_run_id):
         """The message lists at most 3 names; it must say how many more it hid."""
@@ -1075,16 +1128,27 @@ class TestUpdateDistcpStatus:
     def test_failure_update_preserves_skippable_statuses(
         self, mock_spark, sample_distcp_result, mock_iceberg_retry
     ):
-        """The CASE guard that stops a phase failure from clobbering a skipped
-        table's status is built from SKIPPABLE_DISCOVERY_ERRORS via f-string
-        interpolation — assert the status names actually reach the SQL."""
+        """The guard is f-string interpolated, so assert it reaches the statement
+        that needs it."""
         sample_distcp_result['distcp_results'][0]['status'] = 'FAILED'
         sample_distcp_result['distcp_results'][0]['error'] = 'Network error'
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
-        sql_calls = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
-        assert '_PRESERVE_SKIPPABLE_STATUS_SQL' not in sql_calls
-        for status in m.SKIPPABLE_DISCOVERY_ERRORS:
-            assert status in sql_calls
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert 'update_distcp_status:failure_patch:transactions' in labels
+
+    def test_catchall_preserves_skippable_statuses(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """The catchall for tables distcp never reported on carries its own copy of
+        the guard, and the failure-patch test above cannot reach it."""
+        sample_distcp_result['distcp_results'] = []
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert any(label.startswith('update_distcp:catchall:') for label in labels)
 
     def test_normalizes_zero_row_completed_to_empty_source(
         self, mock_spark, sample_distcp_result, mock_iceberg_retry
@@ -1515,11 +1579,28 @@ class TestUpdateTableCreateStatus:
         assert per_table == []
 
     def test_preserves_skippable_statuses(self, mock_spark, sample_table_result, mock_iceberg_retry):
+        sample_table_result['table_results'][0].update({
+            'status': 'FAILED', 'error': 'forced failure for test',
+        })
         m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
-        sql_calls = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
-        assert '_PRESERVE_SKIPPABLE_STATUS_SQL' not in sql_calls
-        for status in m.SKIPPABLE_DISCOVERY_ERRORS:
-            assert status in sql_calls
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        # Both the per-table UPDATE and its failure patch rewrite overall_status.
+        assert 'update_table_create_status:transactions' in labels
+        assert 'update_table_create_status:failure_patch:transactions' in labels
+
+    def test_catchall_preserves_skippable_statuses(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        sample_table_result['table_results'] = []
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert any(
+            label.startswith('update_table_create_status:catchall:') for label in labels
+        )
 
     def test_catchall_preserves_empty_source_overall_status(
         self, mock_spark, sample_table_result, mock_iceberg_retry
@@ -1826,11 +1907,33 @@ class TestUpdateValidationStatus:
 
     def test_preserves_skippable_statuses(self, mock_spark, sample_validation_result, mock_iceberg_retry):
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
-        sql_calls = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
-        assert '_PRESERVE_SKIPPABLE_STATUS_SQL' not in sql_calls
-        assert '_SKIPPABLE_STATUS_SQL_IN' not in sql_calls
-        for status in m.SKIPPABLE_DISCOVERY_ERRORS:
-            assert status in sql_calls
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert 'update_validation_status:transactions' in labels
+        # This task alone also guards error_message, so a skipped table keeps the
+        # reason it was skipped instead of picking up a validation verdict.
+        per_table = next(
+            c.args[1] for c in mock_iceberg_retry.call_args_list
+            if c.kwargs.get('task_label') == 'update_validation_status:transactions'
+        )
+        assert (
+            f"WHEN overall_status IN ({m._SKIPPABLE_STATUS_SQL_IN}) THEN error_message"
+            in per_table
+        )
+        assert '_SKIPPABLE_STATUS_SQL_IN' not in per_table
+
+    def test_catchall_preserves_skippable_statuses(
+        self, mock_spark, sample_validation_result, mock_iceberg_retry
+    ):
+        sample_validation_result['validation_results'] = []
+        m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert any(
+            label.startswith('update_validation_status:catchall:') for label in labels
+        )
 
     def test_sets_validation_failed_on_mismatch(self, mock_spark, sample_validation_result, mock_iceberg_retry):
         sample_validation_result['validation_results'][0]['row_count_match'] = False
@@ -1967,10 +2070,8 @@ class TestGenerateHtmlReport:
         assert 'SOURCE PATH MISSING' in html
         assert 'status-path-not-found' in html
         assert 'SOURCE_PATH_NOT_FOUND' in html
-        # The path is the actionable part — ops needs it to decide between cleaning
-        # up the metastore entry and restoring the data. The location is preferred
-        # over the full Spark exception, and it is HTML-escaped: the metacharacters
-        # live in source_location precisely because that is the field rendered.
+        # The location is rendered in place of the full Spark exception, and escaped —
+        # the metacharacters live in source_location because that is the field shown.
         assert 'maprfs:/datalake/cap/curated/mktg/target/&lt;t_ce_phonepref_ref&gt;' in html
         assert '<t_ce_phonepref_ref>' not in html
         assert 'It is possible the underlying files' not in html
@@ -2020,9 +2121,9 @@ class TestFinalizeRun:
         assert any('COMPLETED' in c for c in sql_calls)
 
     def _run_with_stats(self, mock_spark, run_id, **counts):
-        """Returns the raw SQL strings. Note `c.args[0]`, not `str(c)`: the repr of a
-        mock call escapes newlines, so splitlines() on it yields one giant line and
-        any per-line assertion silently degrades to matching the whole statement."""
+        """Returns the raw SQL strings. `c.args[0]`, not `str(c)`: a mock call's repr
+        escapes newlines, so splitlines() yields one line and per-line assertions
+        silently degrade to matching the whole statement."""
         stats_row = MagicMock()
         stats_row.__getitem__ = lambda self, k: counts[k]
         df = MagicMock()
@@ -2032,9 +2133,8 @@ class TestFinalizeRun:
         return [c.args[0] for c in mock_spark.sql.call_args_list if c.args]
 
     def test_not_found_rollup_counts_every_skippable_status(self, mock_spark, sample_run_id):
-        """Pin the `not_found` rollup specifically. Asserting the status names appear
-        anywhere in the SQL is vacuous — the `successful` rollup on the line above
-        satisfies that on its own, so the two old literals here would pass."""
+        """Pin the `not_found` rollup specifically: asserting the names appear anywhere
+        is vacuous, since the `successful` rollup above satisfies that on its own."""
         sqls = self._run_with_stats(
             mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=1
         )
@@ -2048,10 +2148,9 @@ class TestFinalizeRun:
     def test_skipped_table_downgrades_run_to_completed_with_missing(
         self, mock_spark, sample_run_id
     ):
-        """A run whose only anomaly is a skipped table must not finish bare COMPLETED
-        — that is the whole reason the skip is acceptable. failed=0 matters: with a
-        non-zero failed count this short-circuits to COMPLETED_WITH_FAILURES and the
-        branch under test never runs."""
+        """A run whose only anomaly is a skipped table must not finish bare COMPLETED.
+        failed=0 matters: any other value short-circuits to COMPLETED_WITH_FAILURES
+        and the branch under test never runs."""
         sqls = ' '.join(self._run_with_stats(
             mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=1
         ))

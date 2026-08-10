@@ -55,28 +55,18 @@ else:
         f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults"
     )
 
-# Discovery outcomes that describe the state of the source rather than a failure
-# of the discovery job itself. Tables carrying these are skipped by every
-# downstream phase and reported as-is; they must never abort the whole database.
-#
-# NOTE: DAG 2 has a DATA_PATH_MISSING reason code (REASON_LABELS in
-# migration_dag_iceberg.py) for the same physical condition, so querying both
-# tracking tables for "source data missing" needs two spellings. They are not
-# equivalent, though: DAG 2's only labels a failure, it does not skip the table, and
-# it is decided by matching the exception text — the approach this DAG deliberately
-# rejected in favour of fs.exists(). Unifying them means changing DAG 2's detection,
-# not just its spelling; worth its own ticket rather than a rename here.
+# Source-state outcomes, not discovery failures: skipped by every downstream phase,
+# reported as-is, and never abort the whole database.
+# DAG 2 spells the same physical condition DATA_PATH_MISSING (REASON_LABELS in
+# migration_dag_iceberg.py), so cross-DAG queries need both names.
 SKIPPABLE_DISCOVERY_ERRORS = (
     "TABLE_NOT_FOUND",
     "DATABASE_NOT_FOUND",
     "SOURCE_PATH_NOT_FOUND",
 )
 
-# "Not allowed to see it" is not "not there" — skipping would bury a permissions
-# problem as "source gone". Belt-and-braces: this only fires if fs.exists() returns
-# False despite an ACL problem, and HDFS/MapR throw AccessControlException instead,
-# which leaves source_path_exists None and aborts anyway. Kept because the failure
-# it guards against is silent, and four string compares are cheap.
+# "Not allowed to see it" is not "not there". Belt-and-braces: an ACL problem
+# normally throws, leaving source_path_exists None, which aborts anyway.
 _PERMISSION_DENIED_MARKERS = (
     "permission denied",
     "accesscontrolexception",
@@ -86,31 +76,26 @@ _PERMISSION_DENIED_MARKERS = (
 
 _SKIPPABLE_STATUS_SQL_IN = ", ".join(f"'{s}'" for s in SKIPPABLE_DISCOVERY_ERRORS)
 
-# Later phases roll up their own outcome but must leave a skipped table's status
-# alone — it already describes why the table was never copied.
+# Later phases roll up their own outcome but must not overwrite a skipped table's
+# status, which already says why it was never copied.
 _PRESERVE_SKIPPABLE_STATUS_SQL = (
     f"WHEN overall_status IN ({_SKIPPABLE_STATUS_SQL_IN}) THEN overall_status"
 )
+
 
 def _classify_discovery_error(error: str, source_path_exists: bool | None) -> str:
     """Refine the remote script's blanket FAILED into a skippable status when the
     table's LOCATION root is verifiably gone (orphaned metastore entry).
 
-    Keyed off the remote fs.exists() on the root rather than the wording of the
-    exception, because the wording cannot distinguish the root being gone from a
-    path *under* it being gone. Spark's file index names leaf files, so a
-    concurrent compaction raises FileNotFoundException for a .parquet file inside
-    an intact table — transient, and it must keep its retries. A single missing
-    partition directory is the same shape at higher cost: the other partitions are
-    still migratable, so the table must not be dropped from the run.
+    Keyed off the remote fs.exists() on the root, not the exception wording, which
+    cannot tell the root being gone from a path *under* it being gone — Spark's file
+    index names leaf files, so a compaction or one missing partition raises the same
+    FileNotFoundException on a table that is still migratable.
 
-    `source_path_exists` is None when the lookup could not be made; that is
-    treated as unknown, not absent, so discovery still aborts rather than guess.
+    None means the lookup could not be made: unknown, not absent, so discovery aborts.
 
-    Known blind spot: a table whose partitions carry their own LOCATIONs outside the
-    root reads as absent even though its data is present. DistCp copies from the
-    root, so such a table was already unmigratable by this DAG — this makes it
-    unmigratable-and-flagged rather than unmigratable-and-loud."""
+    Blind spot: a table whose partitions live outside the root reads as absent. DistCp
+    copies from the root, so it was already unmigratable — now it is flagged as such."""
     if source_path_exists is not False:
         return "FAILED"
     err = (error or "").lower()
@@ -120,8 +105,7 @@ def _classify_discovery_error(error: str, source_path_exists: bool | None) -> st
 
 
 def _skippable_discovery_message(table: dict) -> str:
-    """Reason a table was skipped. The remote script always sets `error` for these,
-    so the fallback only covers an exception whose str() came back empty."""
+    """Reason a table was skipped; the fallback only covers an empty exception str()."""
     return table.get("error") or "Skipped during discovery"
 
 
@@ -958,8 +942,7 @@ for tbl in missing_tables:
 
 for tbl in table_list:
     loc = None
-    # None means "could not determine" — the driver treats that as unknown rather
-    # than as absent, so a failed fs lookup never reads as an orphaned entry.
+    # None = could not determine; the driver reads that as unknown, not absent.
     source_path_exists = None
     table_type = "UNKNOWN"
     input_format = None
@@ -1034,9 +1017,7 @@ for tbl in table_list:
                     source_total_size = int(content_summary.getLength())
                     source_file_count = int(content_summary.getFileCount())
             except Exception as e:
-                # source_path_exists is still None if the probe itself failed, and the
-                # driver aborts the whole database on None. Say why, or the operator
-                # cannot tell a failed probe from a location that never parsed.
+                # None here aborts the whole database, so say why.
                 print("WARNING: filesystem probe for {{0}}.{{1}} at '{{2}}' failed ({{3}}). source_path_exists={{4}}".format(
                     src_db, tbl, loc, str(e)[:200], source_path_exists))
 
@@ -1236,9 +1217,8 @@ for tbl in table_list:
     except Exception as e:
         record = _default_metadata_record(tbl)
         record.update({{
-            # Carry the location and the direct fs.exists() result even on failure:
-            # together they let the driver tell an orphaned metastore entry from an
-            # unrelated read failure, without parsing the exception text.
+            # Carried on failure too: this is what lets the driver tell an orphaned
+            # metastore entry from an unrelated read failure.
             "source_location": loc or "",
             "source_path_exists": source_path_exists,
             "serde_properties": serde_properties,
@@ -1333,12 +1313,10 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
                 t.get("error", ""), t.get("source_path_exists")
             )
         elif not t.get("error_type") and t.get("source_path_exists") is False:
-            # Whether an orphan throws is format-dependent: a converted Parquet table
-            # raises when spark.table() lists files, but a TEXTFILE/Avro schema comes
-            # from the catalog and the only throwing call (COUNT(*)) is swallowed
-            # remotely. Without this the table reaches DistCp with 0 source files and
-            # is reported EMPTY_SOURCE, which finalize_run counts as successful.
-            t["error_type"] = "SOURCE_PATH_NOT_FOUND"
+            # An orphan only throws for converted Parquet; a TEXTFILE/Avro schema comes
+            # from the catalog. Without this it reaches DistCp with 0 files and reports
+            # EMPTY_SOURCE, which finalize_run counts as successful.
+            t["error_type"] = _classify_discovery_error("", False)
             t["error"] = (
                 f"Source data path does not exist: {t.get('source_location', '')}"
             )
@@ -1360,16 +1338,16 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
                 f"  Source database not found: {src_db} (token='{t['source_table']}') — will be skipped in downstream phases"
             )
         elif t.get("error_type") == "SOURCE_PATH_NOT_FOUND":
-            # error, not warning: this is the only line telling an operator a table
-            # went unmigrated on an otherwise green run.
+            # error, not warning: the only line flagging an unmigrated table on an
+            # otherwise green run.
             logger.error(
                 f"  Source data path missing for {src_db}.{t['source_table']} — orphaned "
                 f"metastore entry, will be skipped in downstream phases | "
                 f"error={t.get('error', '')[:200]}"
             )
         else:
-            # source_path_exists tells the operator why this was not skippable:
-            # True = data is there, None = the probe could not answer.
+            # source_path_exists says why this was not skippable: True = data is
+            # there, None = the probe could not answer.
             logger.error(
                 f"  Discovery FAILED: {src_db}.{t['source_table']} "
                 f"| source_path_exists={t.get('source_path_exists')} "
@@ -1389,6 +1367,32 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
 
         raise Exception(
             f"Discovery failed for {failed_count}/{total_count} table(s) in {src_db}: {failed_names}. "
+        )
+
+    # If every table that reached the filesystem reads as absent, an unmounted volume
+    # or a misresolved fs.defaultFS is likelier than N independent orphans — and
+    # skipping all of them ends the run COMPLETED_WITH_MISSING with nothing migrated
+    # and no failed task. Needs more than one probe: for a single table "all absent"
+    # is exactly the orphan case, so the skip has to win. TABLE_NOT_FOUND and
+    # DATABASE_NOT_FOUND never reached the filesystem, so they are not evidence.
+    path_missing = [
+        t for t in metadata if t.get("error_type") == "SOURCE_PATH_NOT_FOUND"
+    ]
+    probed = [
+        t for t in metadata
+        if t.get("error_type") not in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND")
+    ]
+    if path_missing and len(probed) > 1 and len(path_missing) == len(probed):
+        missing_paths = ", ".join(
+            t.get("source_location") or t["source_table"] for t in path_missing[:3]
+        )
+        if len(path_missing) > 3:
+            missing_paths += f" (and {len(path_missing) - 3} more)"
+        raise Exception(
+            f"All {len(path_missing)} table(s) probed in {src_db} report a missing source "
+            f"data path. Treating this as a filesystem or configuration fault rather than "
+            f"{len(path_missing)} independently orphaned metastore entries — verify the "
+            f"source volume is mounted and fs.defaultFS is correct. Paths: {missing_paths}"
         )
 
     return {
@@ -4144,9 +4148,8 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         else:
             badge_class = "status-not-found"
             badge_label = "TABLE_NOT_FOUND"
-        # For a missing path the location is the actionable detail — it decides
-        # whether ops drops the metastore entry or restores the data. Prefer it over
-        # error_message, which is the full (possibly multi-line) Spark exception.
+        # The location is the actionable detail here; error_message is the full
+        # (possibly multi-line) Spark exception.
         detail = ""
         if t.overall_status == "SOURCE_PATH_NOT_FOUND":
             reason = t.source_location or t.error_message or ""
