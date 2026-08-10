@@ -88,14 +88,7 @@ _PRESERVE_SKIPPABLE_STATUS_SQL = (
     f"WHEN overall_status IN ({_SKIPPABLE_STATUS_SQL_IN}) THEN overall_status"
 )
 
-_SKIPPABLE_DISCOVERY_MESSAGES = {
-    "TABLE_NOT_FOUND": "Table not found on source",
-    "DATABASE_NOT_FOUND": "Source database does not exist on the cluster",
-    "SOURCE_PATH_NOT_FOUND": "Source data path does not exist (orphaned metastore entry)",
-}
-
-
-def _classify_discovery_error(error: str, source_path_exists) -> str:
+def _classify_discovery_error(error: str, source_path_exists: bool | None) -> str:
     """Refine the remote script's blanket FAILED into a skippable status when the
     table's LOCATION root is verifiably gone (orphaned metastore entry).
 
@@ -118,10 +111,9 @@ def _classify_discovery_error(error: str, source_path_exists) -> str:
 
 
 def _skippable_discovery_message(table: dict) -> str:
-    """Reason a table was skipped, preferring the concrete error from the cluster."""
-    return table.get("error") or _SKIPPABLE_DISCOVERY_MESSAGES.get(
-        table.get("error_type"), "Skipped during discovery"
-    )
+    """Reason a table was skipped. The remote script always sets `error` for these,
+    so the fallback only covers an exception whose str() came back empty."""
+    return table.get("error") or "Skipped during discovery"
 
 
 def _resolve_dag_owner() -> str:
