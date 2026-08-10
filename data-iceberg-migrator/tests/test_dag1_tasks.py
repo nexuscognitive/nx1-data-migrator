@@ -276,6 +276,61 @@ class TestClusterLoginSetup:
             m.cluster_login_setup.function(run_id='run_test')
 
 
+class TestClassifyDiscoveryError:
+    """The classifier decides whether a per-table discovery error is a permanent
+    source-data condition (skip the table, migrate its siblings) or an unreliable
+    result (abort the database). Both directions of error are costly: a false
+    positive silently skips a table that should have been migrated, a false
+    negative blocks a whole database. Hence the table-driven cases."""
+
+    LOC = 'maprfs:///datalake/sales/orders'
+
+    @pytest.mark.parametrize('error', [
+        # Spark AnalysisException — the form reported in WF-343
+        "u'Path does not exist: maprfs:/datalake/sales/orders;'",
+        # Hadoop FileNotFoundException — 'File <uri> does not exist', no 'path' token
+        'java.io.FileNotFoundException: File maprfs:///datalake/sales/orders does not exist.',
+        # MapR phrasing
+        'java.io.FileNotFoundException: Requested file maprfs:/datalake/sales/orders does not exist.',
+        # InputFormat path check
+        ('org.apache.hadoop.mapred.InvalidInputException: '
+         'Input path does not exist: maprfs:/datalake/sales/orders'),
+    ])
+    def test_missing_source_path_forms_are_skippable(self, error):
+        assert m._classify_discovery_error(error, self.LOC) == 'SOURCE_PATH_NOT_FOUND'
+
+    @pytest.mark.parametrize('error', [
+        # Executor loss / shuffle spill: matches 'no such file or directory' but the
+        # path is executor-local scratch, not the table's data. Must stay retryable.
+        ('java.io.FileNotFoundException: /tmp/blockmgr-9f2c/0c/shuffle_0_1_0.index '
+         '(No such file or directory)'),
+        # ACL problem on the source — permanent, but not a missing path, and it
+        # must not be silently skipped as though the data were gone.
+        ('org.apache.hadoop.security.AccessControlException: Permission denied: '
+         'user=svc_migration, path="maprfs:/datalake/sales/orders"'),
+        # Genuinely unclassifiable
+        'java.lang.OutOfMemoryError: GC overhead limit exceeded',
+        'org.apache.spark.SparkException: Job aborted due to stage failure',
+    ])
+    def test_other_errors_are_not_skippable(self, error):
+        assert m._classify_discovery_error(error, self.LOC) == 'FAILED'
+
+    def test_unknown_location_is_not_skippable(self):
+        """If DESCRIBE never yielded a location there is nothing to corroborate the
+        error against, so fall back to aborting rather than guessing."""
+        assert m._classify_discovery_error(
+            'Path does not exist: maprfs:/datalake/sales/orders', ''
+        ) == 'FAILED'
+
+    def test_path_belonging_to_a_different_table_is_not_skippable(self):
+        assert m._classify_discovery_error(
+            'Path does not exist: maprfs:/datalake/sales/some_other_table', self.LOC
+        ) == 'FAILED'
+
+    def test_empty_error_is_not_skippable(self):
+        assert m._classify_discovery_error('', self.LOC) == 'FAILED'
+
+
 class TestDiscoverTablesViaSshSpark:
 
     def _make_discovery_output(self, metadata_json):
@@ -1370,6 +1425,13 @@ class TestUpdateTableCreateStatus:
         m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
         assert any('TABLE_CREATED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_preserves_skippable_statuses(self, mock_spark, sample_table_result, mock_iceberg_retry):
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        sql_calls = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
+        assert '_PRESERVE_SKIPPABLE_STATUS_SQL' not in sql_calls
+        for status in m.SKIPPABLE_DISCOVERY_ERRORS:
+            assert status in sql_calls
+
     def test_catchall_preserves_empty_source_overall_status(
         self, mock_spark, sample_table_result, mock_iceberg_retry
     ):
@@ -1673,6 +1735,14 @@ class TestUpdateValidationStatus:
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
         assert any('VALIDATED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_preserves_skippable_statuses(self, mock_spark, sample_validation_result, mock_iceberg_retry):
+        m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
+        sql_calls = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
+        assert '_PRESERVE_SKIPPABLE_STATUS_SQL' not in sql_calls
+        assert '_SKIPPABLE_STATUS_SQL_IN' not in sql_calls
+        for status in m.SKIPPABLE_DISCOVERY_ERRORS:
+            assert status in sql_calls
+
     def test_sets_validation_failed_on_mismatch(self, mock_spark, sample_validation_result, mock_iceberg_retry):
         sample_validation_result['validation_results'][0]['row_count_match'] = False
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
@@ -1784,6 +1854,7 @@ class TestGenerateHtmlReport:
             s3_files_transferred=0, file_count_match=None,
             distcp_status=None, file_format='UNKNOWN',
             partition_filter=None, filtered_partition_count=None,
+            error_message='Path does not exist: maprfs:/datalake/cap/curated/mktg/target/t_ce_phonepref_ref',
         )
 
         def sql_router(sql):
@@ -1805,6 +1876,9 @@ class TestGenerateHtmlReport:
         assert 'SOURCE PATH MISSING' in html
         assert 'status-path-not-found' in html
         assert 'SOURCE_PATH_NOT_FOUND' in html
+        # The path is the actionable part — ops needs it to decide between cleaning
+        # up the metastore entry and restoring the data.
+        assert 'maprfs:/datalake/cap/curated/mktg/target/t_ce_phonepref_ref' in html
 
 
 class TestSendMigrationReportEmail:
@@ -1849,3 +1923,16 @@ class TestFinalizeRun:
         m.finalize_run.function(run_id=sample_run_id, spark=mock_spark)
         sql_calls = [str(c) for c in mock_spark.sql.call_args_list]
         assert any('COMPLETED' in c for c in sql_calls)
+
+    def test_summary_counts_skippable_statuses(self, mock_spark, sample_run_id):
+        stats_row = MagicMock()
+        stats_row.__getitem__ = lambda self, k: 5
+        df = MagicMock()
+        df.collect.return_value = [stats_row]
+        mock_spark.sql.return_value = df
+
+        m.finalize_run.function(run_id=sample_run_id, spark=mock_spark)
+        sql_calls = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert '_SKIPPABLE_STATUS_SQL_IN' not in sql_calls
+        for status in m.SKIPPABLE_DISCOVERY_ERRORS:
+            assert status in sql_calls

@@ -57,20 +57,35 @@ else:
 # Discovery outcomes that describe the state of the source rather than a failure
 # of the discovery job itself. Tables carrying these are skipped by every
 # downstream phase and reported as-is; they must never abort the whole database.
+#
+# DAG 2 names the same physical condition DATA_PATH_MISSING (see REASON_LABELS in
+# migration_dag_iceberg.py). The names differ deliberately: there it is a labelled
+# failure reason, here it is a tracking status in the same vocabulary as
+# TABLE_NOT_FOUND/DATABASE_NOT_FOUND, which downstream phases and the report
+# already branch on.
 SKIPPABLE_DISCOVERY_ERRORS = (
     "TABLE_NOT_FOUND",
     "DATABASE_NOT_FOUND",
     "SOURCE_PATH_NOT_FOUND",
 )
 
-# Hive/Spark wording for "the metastore knows this table but its data is gone".
-# Matched against the remote error string because the remote script cannot tell
-# an orphaned entry from a genuine read failure at the point it catches it.
-_MISSING_SOURCE_PATH_MARKERS = (
-    "path does not exist",
-    "file does not exist",
+# Wording for an absent path. Deliberately broad: Spark says "Path does not
+# exist", MapR-FS raises FileNotFoundException("File <uri> does not exist"), and
+# the InputFormat check says "Input path does not exist". The location check in
+# _classify_discovery_error is what keeps a match this broad honest.
+_MISSING_PATH_MARKERS = (
+    "does not exist",
     "no such file or directory",
-    "input path does not exist",
+    "filenotfoundexception",
+)
+
+# An ACL failure names the path in much the same wording, but the data may well
+# be there — skipping the table would bury a permissions problem as "source gone".
+_PERMISSION_DENIED_MARKERS = (
+    "permission denied",
+    "accesscontrolexception",
+    "access denied",
+    "not authorized",
 )
 
 _SKIPPABLE_STATUS_SQL_IN = ", ".join(f"'{s}'" for s in SKIPPABLE_DISCOVERY_ERRORS)
@@ -88,13 +103,29 @@ _SKIPPABLE_DISCOVERY_MESSAGES = {
 }
 
 
-def _classify_discovery_error(error: str) -> str:
+def _error_names_path(error_lower: str, source_location: str) -> bool:
+    """True when *error_lower* names *source_location*, compared scheme-less so a
+    metastore location of maprfs:///a/b still matches maprfs:/a/b in the error."""
+    path = re.sub(r"^[a-z0-9+.\-]+:/*", "/", (source_location or "").strip().lower())
+    path = re.sub(r"/+", "/", path).rstrip("/")
+    return len(path) > 1 and path in re.sub(r"/+", "/", error_lower)
+
+
+def _classify_discovery_error(error: str, source_location: str) -> str:
     """Refine the remote script's blanket FAILED into a skippable status when the
-    error means the source data path is gone (orphaned metastore entry)."""
+    error says this table's own data path is gone (orphaned metastore entry).
+
+    Requiring the error to name the table's location is what separates a missing
+    source from an executor-side path that merely happens to be absent: a lost
+    shuffle spill under /tmp/blockmgr-* matches the wording but is transient and
+    must keep its retries. With no location to corroborate against, abort rather
+    than guess."""
     err = (error or "").lower()
-    if any(marker in err for marker in _MISSING_SOURCE_PATH_MARKERS):
-        return "SOURCE_PATH_NOT_FOUND"
-    return "FAILED"
+    if any(marker in err for marker in _PERMISSION_DENIED_MARKERS):
+        return "FAILED"
+    if not any(marker in err for marker in _MISSING_PATH_MARKERS):
+        return "FAILED"
+    return "SOURCE_PATH_NOT_FOUND" if _error_names_path(err, source_location) else "FAILED"
 
 
 def _skippable_discovery_message(table: dict) -> str:
@@ -1206,6 +1237,9 @@ for tbl in table_list:
     except Exception as e:
         record = _default_metadata_record(tbl)
         record.update({{
+            # Carry the location even on failure: the driver needs it to tell an
+            # orphaned metastore entry from an unrelated read failure.
+            "source_location": loc or "",
             "serde_properties": serde_properties,
             "filtered_partitions": filtered_partitions,
             "partition_filter_active": partition_filter_active,
@@ -1294,7 +1328,9 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
 
     for t in metadata:
         if t.get("error_type") == "FAILED":
-            t["error_type"] = _classify_discovery_error(t.get("error", ""))
+            t["error_type"] = _classify_discovery_error(
+                t.get("error", ""), t.get("source_location", "")
+            )
 
     logger.info(
         f"Discovery complete for database '{src_db}': {len(metadata)} table(s) found"
@@ -1314,9 +1350,9 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
             )
         elif t.get("error_type") == "SOURCE_PATH_NOT_FOUND":
             logger.warning(
-                f"  Source data path missing for {src_db}.{t['source_table']} "
-                f"(location='{t.get('source_location', '')}') — orphaned metastore entry, "
-                f"will be skipped in downstream phases"
+                f"  Source data path missing for {src_db}.{t['source_table']} — orphaned "
+                f"metastore entry, will be skipped in downstream phases | "
+                f"error={t.get('error', '')[:200]}"
             )
         else:
             logger.error(
@@ -4089,13 +4125,20 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         else:
             badge_class = "status-not-found"
             badge_label = "TABLE_NOT_FOUND"
+        # For a missing path the location is the actionable detail — it decides
+        # whether ops drops the metastore entry or restores the data.
+        detail = (
+            f' <span style="color:#6c757d;font-size:11px;">{t.error_message}</span>'
+            if t.overall_status == "SOURCE_PATH_NOT_FOUND" and t.error_message
+            else ""
+        )
         return f"""
                     <tr>
                         <td>{t.source_database}</td>
                         <td><strong>{t.source_table}</strong></td>
                         <td>{pf}</td>
                         <td colspan="{colspan}">
-                            <span class="status-badge {badge_class}">{badge_label}</span>
+                            <span class="status-badge {badge_class}">{badge_label}</span>{detail}
                         </td>
                     </tr>
     """
