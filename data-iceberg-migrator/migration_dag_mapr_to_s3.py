@@ -54,6 +54,56 @@ else:
         f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults"
     )
 
+# Discovery outcomes that describe the state of the source rather than a failure
+# of the discovery job itself. Tables carrying these are skipped by every
+# downstream phase and reported as-is; they must never abort the whole database.
+SKIPPABLE_DISCOVERY_ERRORS = (
+    "TABLE_NOT_FOUND",
+    "DATABASE_NOT_FOUND",
+    "SOURCE_PATH_NOT_FOUND",
+)
+
+# Hive/Spark wording for "the metastore knows this table but its data is gone".
+# Matched against the remote error string because the remote script cannot tell
+# an orphaned entry from a genuine read failure at the point it catches it.
+_MISSING_SOURCE_PATH_MARKERS = (
+    "path does not exist",
+    "file does not exist",
+    "no such file or directory",
+    "input path does not exist",
+)
+
+_SKIPPABLE_STATUS_SQL_IN = ", ".join(f"'{s}'" for s in SKIPPABLE_DISCOVERY_ERRORS)
+
+# Later phases roll up their own outcome but must leave a skipped table's status
+# alone — it already describes why the table was never copied.
+_PRESERVE_SKIPPABLE_STATUS_SQL = (
+    f"WHEN overall_status IN ({_SKIPPABLE_STATUS_SQL_IN}) THEN overall_status"
+)
+
+_SKIPPABLE_DISCOVERY_MESSAGES = {
+    "TABLE_NOT_FOUND": "Table not found on source",
+    "DATABASE_NOT_FOUND": "Source database does not exist on the cluster",
+    "SOURCE_PATH_NOT_FOUND": "Source data path does not exist (orphaned metastore entry)",
+}
+
+
+def _classify_discovery_error(error: str) -> str:
+    """Refine the remote script's blanket FAILED into a skippable status when the
+    error means the source data path is gone (orphaned metastore entry)."""
+    err = (error or "").lower()
+    if any(marker in err for marker in _MISSING_SOURCE_PATH_MARKERS):
+        return "SOURCE_PATH_NOT_FOUND"
+    return "FAILED"
+
+
+def _skippable_discovery_message(table: dict) -> str:
+    """Reason a table was skipped, preferring the concrete error from the cluster."""
+    return table.get("error") or _SKIPPABLE_DISCOVERY_MESSAGES.get(
+        table.get("error_type"), "Skipped during discovery"
+    )
+
+
 def _resolve_dag_owner() -> str:
     """Read portal username from Airflow Variable at DAG parse/trigger time."""
     try:
@@ -1242,6 +1292,10 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
         json_str = output[json_start + len("===JSON_START===") : json_end].strip()
         metadata = json.loads(json_str)
 
+    for t in metadata:
+        if t.get("error_type") == "FAILED":
+            t["error_type"] = _classify_discovery_error(t.get("error", ""))
+
     logger.info(
         f"Discovery complete for database '{src_db}': {len(metadata)} table(s) found"
     )
@@ -1258,6 +1312,12 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
             logger.warning(
                 f"  Source database not found: {src_db} (token='{t['source_table']}') — will be skipped in downstream phases"
             )
+        elif t.get("error_type") == "SOURCE_PATH_NOT_FOUND":
+            logger.warning(
+                f"  Source data path missing for {src_db}.{t['source_table']} "
+                f"(location='{t.get('source_location', '')}') — orphaned metastore entry, "
+                f"will be skipped in downstream phases"
+            )
         else:
             logger.error(
                 f"  Discovery FAILED: {src_db}.{t['source_table']} | error={t.get('error','')[:200]}"
@@ -1265,12 +1325,14 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
 
     real_failures = [
         t for t in metadata
-        if "error" in t and t.get("error_type") not in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND")
+        if "error" in t and t.get("error_type") not in SKIPPABLE_DISCOVERY_ERRORS
     ]
     if real_failures:
         failed_count = len(real_failures)
         total_count = len(metadata)
         failed_names = ", ".join([t["source_table"] for t in real_failures[:3]])
+        if failed_count > 3:
+            failed_names += f" (and {failed_count - 3} more)"
 
         raise Exception(
             f"Discovery failed for {failed_count}/{total_count} table(s) in {src_db}: {failed_names}. "
@@ -1304,18 +1366,10 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
 
     for t in discovery["tables"]:
         error_type = t.get("error_type")
-        is_missing = error_type in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND")
+        is_missing = error_type in SKIPPABLE_DISCOVERY_ERRORS
         disc_status = error_type if is_missing else "COMPLETED"
         if is_missing:
-            default_msg = (
-                "Source database does not exist on the cluster"
-                if error_type == "DATABASE_NOT_FOUND"
-                else "Table not found on source"
-            )
-            err_msg_escaped = (
-                (t.get("error") or default_msg)
-                .replace("'", "''")[:2000]
-            )
+            err_msg_escaped = _skippable_discovery_message(t).replace("'", "''")[:2000]
             overall_status_insert = f"'{error_type}'"
             error_msg_insert = f"'{err_msg_escaped}'"
             overall_status_update = f"'{error_type}'"
@@ -1497,7 +1551,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
     results = []
     for t in tables:
-        if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+        if t.get("error_type") in SKIPPABLE_DISCOVERY_ERRORS:
             results.append(
                 {
                     "source_database": t["source_database"],
@@ -2225,7 +2279,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
             r["status"] = "EMPTY_SOURCE"
 
     for r in distcp_result.get("distcp_results", []):
-        if r.get("status") in ("SKIPPED", "EMPTY_SOURCE", "TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+        if r.get("status") in ("SKIPPED", "EMPTY_SOURCE", *SKIPPABLE_DISCOVERY_ERRORS):
             continue
         overall = "COPIED" if r["status"] == "COMPLETED" else "FAILED"
         error_msg = r.get("error", "").replace("'", "''") if r.get("error") else ""
@@ -2285,8 +2339,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 SET distcp_status = 'FAILED',
                     overall_status = CASE
                         WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
-                        WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
-                        WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                        {_PRESERVE_SKIPPABLE_STATUS_SQL}
                         ELSE 'FAILED'
                     END,
                     error_message = '{per_table_error}',
@@ -2366,8 +2419,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
             SET distcp_status='FAILED',
                 overall_status = CASE
                     WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
-                    WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
-                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                    {_PRESERVE_SKIPPABLE_STATUS_SQL}
                     ELSE 'FAILED'
                 END,
                 error_message=COALESCE(error_message,'S3 copy task did not process this table'),
@@ -2420,7 +2472,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
         tbl = t["source_table"]
         dest_db = t.get("dest_database") or distcp_result["dest_database"]
 
-        if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+        if t.get("error_type") in SKIPPABLE_DISCOVERY_ERRORS:
             results.append(
                 {
                     "source_table": tbl,
@@ -2807,7 +2859,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
     table_duration = table_result.get("_task_duration", 0.0)
 
     for r in table_result.get("table_results", []):
-        if r.get("status") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+        if r.get("status") in SKIPPABLE_DISCOVERY_ERRORS:
             continue
         per_table_dest_db = r.get("dest_database", table_result["dest_database"])
         overall = (
@@ -2828,8 +2880,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
                     WHEN overall_status = 'EMPTY_SOURCE' THEN overall_status
-                    WHEN overall_status = 'TABLE_NOT_FOUND' THEN overall_status
-                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN overall_status
+                    {_PRESERVE_SKIPPABLE_STATUS_SQL}
                     ELSE '{overall}'
                 END,
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
@@ -2853,8 +2904,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                 SET table_create_status = 'FAILED',
                     overall_status = CASE
                         WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
-                        WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
-                        WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                        {_PRESERVE_SKIPPABLE_STATUS_SQL}
                         ELSE 'FAILED'
                     END,
                     error_message = '{per_table_error}',
@@ -2896,8 +2946,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
             SET table_create_status = 'FAILED',
                 overall_status = CASE
                     WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
-                    WHEN overall_status = 'TABLE_NOT_FOUND'    THEN 'TABLE_NOT_FOUND'
-                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                    {_PRESERVE_SKIPPABLE_STATUS_SQL}
                     ELSE 'FAILED'
                 END,
                 error_message = COALESCE(error_message, 'Table creation task did not process this table'),
@@ -2942,17 +2991,13 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
         per_table_dest_db = t.get("dest_database", dest_db)
         dest_tbl = f"{per_table_dest_db}.{tbl}"
 
-        if t.get("error_type") in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+        if t.get("error_type") in SKIPPABLE_DISCOVERY_ERRORS:
             validation_results.append(
                 {
                     "source_table": tbl,
                     "dest_database": per_table_dest_db,
                     "status": t["error_type"],
-                    "error": (
-                        "Source database does not exist on the cluster"
-                        if t["error_type"] == "DATABASE_NOT_FOUND"
-                        else "Table not found on source"
-                    ),
+                    "error": _skippable_discovery_message(t),
                 }
             )
             continue
@@ -3414,14 +3459,12 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
                     WHEN overall_status = 'EMPTY_SOURCE' THEN overall_status
-                    WHEN overall_status = 'TABLE_NOT_FOUND' THEN overall_status
-                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN overall_status
+                    {_PRESERVE_SKIPPABLE_STATUS_SQL}
                     ELSE '{final_overall_status}'
                 END,
                 error_message = CASE
                     WHEN overall_status = 'FAILED' THEN error_message
-                    WHEN overall_status = 'TABLE_NOT_FOUND' THEN error_message
-                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN error_message
+                    WHEN overall_status IN ({_SKIPPABLE_STATUS_SQL_IN}) THEN error_message
                     ELSE {error_message_sql}
                 END,
                 updated_at = current_timestamp()
@@ -3483,8 +3526,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN 'FAILED'
                     WHEN overall_status = 'EMPTY_SOURCE' THEN 'EMPTY_SOURCE'
-                    WHEN overall_status = 'TABLE_NOT_FOUND' THEN 'TABLE_NOT_FOUND'
-                    WHEN overall_status = 'DATABASE_NOT_FOUND' THEN 'DATABASE_NOT_FOUND'
+                    {_PRESERVE_SKIPPABLE_STATUS_SQL}
                     ELSE 'VALIDATION_FAILED'
                 END,
                 error_message = COALESCE(error_message, 'Validation task did not process this table'),
@@ -3552,6 +3594,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     failed_tables = sum(1 for t in table_status if "FAILED" in (t.overall_status or ""))
     not_found_tables = sum(1 for t in table_status if t.overall_status == "TABLE_NOT_FOUND")
     db_not_found_tables = sum(1 for t in table_status if t.overall_status == "DATABASE_NOT_FOUND")
+    path_not_found_tables = sum(
+        1 for t in table_status if t.overall_status == "SOURCE_PATH_NOT_FOUND"
+    )
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (
         1024**3
     )
@@ -3679,6 +3724,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             background-color: #ffe0b2;
             color: #8a4b00;
         }}
+        .status-path-not-found {{
+            background-color: #f3e5f5;
+            color: #6a1b9a;
+        }}
         .status-warning {{
             background-color: #fff3cd;
             color: #856404;
@@ -3759,6 +3808,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             <div class="summary-card">
                 <h3>DATABASE NOT FOUND</h3>
                 <p class="value">{db_not_found_tables}</p>
+            </div>
+            <div class="summary-card">
+                <h3>SOURCE PATH MISSING</h3>
+                <p class="value">{path_not_found_tables}</p>
             </div>
             <div class="summary-card info">
                 <h3>TOTAL DATA</h3>
@@ -3912,6 +3965,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif status == "DATABASE_NOT_FOUND":
             status_class = "status-db-not-found"
             status_label = status
+        elif status == "SOURCE_PATH_NOT_FOUND":
+            status_class = "status-path-not-found"
+            status_label = status
         elif "VALIDATED_WITH_WARNINGS" in status:
             status_class = "status-warning"
             status_label = status
@@ -4027,6 +4083,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         if t.overall_status == "DATABASE_NOT_FOUND":
             badge_class = "status-db-not-found"
             badge_label = "DATABASE_NOT_FOUND"
+        elif t.overall_status == "SOURCE_PATH_NOT_FOUND":
+            badge_class = "status-path-not-found"
+            badge_label = "SOURCE_PATH_NOT_FOUND"
         else:
             badge_class = "status-not-found"
             badge_label = "TABLE_NOT_FOUND"
@@ -4042,7 +4101,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     """
 
     for t in table_status:
-        if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+        if t.overall_status in SKIPPABLE_DISCOVERY_ERRORS:
             html += _not_found_row(t, 7)
             continue
         if not t.validation_status:
@@ -4138,7 +4197,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
 """
 
     for t in table_status:
-        if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+        if t.overall_status in SKIPPABLE_DISCOVERY_ERRORS:
             html += _not_found_row(t, 10)
             continue
         if not t.distcp_status:
@@ -4219,7 +4278,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
 """
 
     for t in table_status:
-        if t.overall_status in ("TABLE_NOT_FOUND", "DATABASE_NOT_FOUND"):
+        if t.overall_status in SKIPPABLE_DISCOVERY_ERRORS:
             continue
         data_gb = (t.s3_total_size_bytes_after or 0) / (1024**3)
         distcp_speed = (
@@ -4292,9 +4351,9 @@ def finalize_run(run_id: str, spark, cluster_setup: dict = None) -> dict:
         stats_result = spark.sql(f"""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED', 'EMPTY_SOURCE', 'TABLE_NOT_FOUND', 'DATABASE_NOT_FOUND') THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED', 'EMPTY_SOURCE', {_SKIPPABLE_STATUS_SQL_IN}) THEN 1 ELSE 0 END) as successful,
                 SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN overall_status IN ('TABLE_NOT_FOUND', 'DATABASE_NOT_FOUND') THEN 1 ELSE 0 END) as not_found
+                SUM(CASE WHEN overall_status IN ({_SKIPPABLE_STATUS_SQL_IN}) THEN 1 ELSE 0 END) as not_found
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'
         """).collect()
