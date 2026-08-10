@@ -71,8 +71,11 @@ SKIPPABLE_DISCOVERY_ERRORS = (
     "SOURCE_PATH_NOT_FOUND",
 )
 
-# An ACL failure can make the location read as absent, but "not allowed to see it"
-# is not "not there" — skipping would bury a permissions problem as "source gone".
+# "Not allowed to see it" is not "not there" — skipping would bury a permissions
+# problem as "source gone". Belt-and-braces: this only fires if fs.exists() returns
+# False despite an ACL problem, and HDFS/MapR throw AccessControlException instead,
+# which leaves source_path_exists None and aborts anyway. Kept because the failure
+# it guards against is silent, and four string compares are cheap.
 _PERMISSION_DENIED_MARKERS = (
     "permission denied",
     "accesscontrolexception",
@@ -101,7 +104,12 @@ def _classify_discovery_error(error: str, source_path_exists: bool | None) -> st
     still migratable, so the table must not be dropped from the run.
 
     `source_path_exists` is None when the lookup could not be made; that is
-    treated as unknown, not absent, so discovery still aborts rather than guess."""
+    treated as unknown, not absent, so discovery still aborts rather than guess.
+
+    Known blind spot: a table whose partitions carry their own LOCATIONs outside the
+    root reads as absent even though its data is present. DistCp copies from the
+    root, so such a table was already unmigratable by this DAG — this makes it
+    unmigratable-and-flagged rather than unmigratable-and-loud."""
     if source_path_exists is not False:
         return "FAILED"
     err = (error or "").lower()
@@ -1024,8 +1032,12 @@ for tbl in table_list:
                     content_summary = fs.getContentSummary(path)
                     source_total_size = int(content_summary.getLength())
                     source_file_count = int(content_summary.getFileCount())
-            except Exception:
-                pass
+            except Exception as e:
+                # source_path_exists is still None if the probe itself failed, and the
+                # driver aborts the whole database on None. Say why, or the operator
+                # cannot tell a failed probe from a location that never parsed.
+                print("WARNING: filesystem probe for {{0}}.{{1}} at '{{2}}' failed ({{3}}). source_path_exists={{4}}".format(
+                    src_db, tbl, loc, str(e)[:200], source_path_exists))
 
         file_format = "PARQUET"
         if input_format:
@@ -1345,8 +1357,12 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
                 f"error={t.get('error', '')[:200]}"
             )
         else:
+            # source_path_exists tells the operator why this was not skippable:
+            # True = data is there, None = the probe could not answer.
             logger.error(
-                f"  Discovery FAILED: {src_db}.{t['source_table']} | error={t.get('error','')[:200]}"
+                f"  Discovery FAILED: {src_db}.{t['source_table']} "
+                f"| source_path_exists={t.get('source_path_exists')} "
+                f"| error={t.get('error','')[:200]}"
             )
 
     real_failures = [

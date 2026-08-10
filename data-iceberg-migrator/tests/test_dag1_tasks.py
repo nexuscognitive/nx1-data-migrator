@@ -291,12 +291,18 @@ class TestClassifyDiscoveryError:
         'java.io.FileNotFoundException: File maprfs:///datalake/sales/orders does not exist.',
         ('org.apache.hadoop.mapred.InvalidInputException: '
          'Input path does not exist: maprfs:/datalake/sales/orders'),
-        # The root is verifiably gone, so the table cannot be migrated whatever
-        # else went wrong on the way; the raw error is still kept in tracking.
-        'java.lang.OutOfMemoryError: GC overhead limit exceeded',
     ])
     def test_missing_root_location_is_skippable(self, error):
         assert m._classify_discovery_error(error, False) == 'SOURCE_PATH_NOT_FOUND'
+
+    def test_root_gone_wins_over_an_unrelated_error(self):
+        """Deliberate policy, not an incidental path variant: once the root is
+        verifiably gone the table is unmigratable no matter what else failed on the
+        way, so it is skipped rather than retried. The raw error is still recorded
+        in tracking, so the OOM is not lost."""
+        assert m._classify_discovery_error(
+            'java.lang.OutOfMemoryError: GC overhead limit exceeded', False
+        ) == 'SOURCE_PATH_NOT_FOUND'
 
     @pytest.mark.parametrize('error', [
         # A leaf file under the table root vanished mid-listing (concurrent compaction
@@ -322,7 +328,11 @@ class TestClassifyDiscoveryError:
 
     def test_permission_error_is_not_skippable_even_when_root_reads_as_absent(self):
         """Not being allowed to see the data is not the same as the data being gone;
-        skipping would bury an ACL problem as "source needs cleanup"."""
+        skipping would bury an ACL problem as "source needs cleanup".
+
+        Defensive: HDFS/MapR throw on an ACL problem rather than returning False, so
+        the remote script is not expected to produce this combination. Pins the guard
+        in case a filesystem does."""
         assert m._classify_discovery_error(
             'org.apache.hadoop.security.AccessControlException: Permission denied: '
             'user=svc_migration, path="maprfs:/datalake/sales/orders"',
@@ -696,7 +706,8 @@ class TestRecordDiscoveredTables:
             **sample_discovery,
             'tables': [{
                 **sample_discovery['tables'][0],
-                'error': "Path does not exist: maprfs:/data/sales_data/transactions",
+                'source_location': "maprfs:/data/sales_data/o'brien",
+                'error': "Path does not exist: maprfs:/data/sales_data/o'brien",
                 'error_type': 'SOURCE_PATH_NOT_FOUND',
             }],
         }
@@ -704,6 +715,10 @@ class TestRecordDiscoveredTables:
         all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
         assert "'SOURCE_PATH_NOT_FOUND'" in all_sql
         assert 'Path does not exist' in all_sql
+        # A quote in the location must not break out of the SQL literal. Failure rows
+        # only started carrying a location in this change, so nothing pinned this.
+        assert "o''brien" in all_sql
+        assert "o'brien'" not in all_sql
 
 
 class TestRunDistcpSsh:
@@ -1901,8 +1916,8 @@ class TestGenerateHtmlReport:
             s3_files_transferred=0, file_count_match=None,
             distcp_status=None, file_format='UNKNOWN',
             partition_filter=None, filtered_partition_count=None,
-            source_location='maprfs:/datalake/cap/curated/mktg/target/t_ce_phonepref_ref',
-            error_message="u'Path does not exist: <maprfs>;' It is possible the "
+            source_location='maprfs:/datalake/cap/curated/mktg/target/<t_ce_phonepref_ref>',
+            error_message="u'Path does not exist;' It is possible the "
                           'underlying files have been updated',
         )
 
@@ -1927,10 +1942,11 @@ class TestGenerateHtmlReport:
         assert 'SOURCE_PATH_NOT_FOUND' in html
         # The path is the actionable part — ops needs it to decide between cleaning
         # up the metastore entry and restoring the data. The location is preferred
-        # over the full Spark exception, and anything rendered is HTML-escaped.
-        assert 'maprfs:/datalake/cap/curated/mktg/target/t_ce_phonepref_ref' in html
+        # over the full Spark exception, and it is HTML-escaped: the metacharacters
+        # live in source_location precisely because that is the field rendered.
+        assert 'maprfs:/datalake/cap/curated/mktg/target/&lt;t_ce_phonepref_ref&gt;' in html
+        assert '<t_ce_phonepref_ref>' not in html
         assert 'It is possible the underlying files' not in html
-        assert '<maprfs>' not in html
 
 
 class TestSendMigrationReportEmail:
