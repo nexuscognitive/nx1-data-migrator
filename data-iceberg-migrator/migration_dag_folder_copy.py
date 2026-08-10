@@ -427,11 +427,21 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
             skipped += 1
             continue
 
+        if re.match(r'(?i)^s3:(?!//)', raw_bucket):
+            raw_bucket = raw_bucket[3:].strip()
+
         dest_bucket = normalize_s3(raw_bucket)
+        scheme, _, bucket_body = dest_bucket.partition('://')
+        bucket_body = re.sub(r'/{2,}', '/', bucket_body).strip('/')
+        dest_bucket = f"{scheme}://{bucket_body}" if bucket_body else dest_bucket.rstrip('/')
 
         raw_val = row.get('dest_folder', '')
         dest_folder = '' if ps.isna(raw_val) else str(raw_val).strip().strip('/')
+        dest_folder = re.sub(r'/{2,}', '/', dest_folder).strip('/')
         dest_folder = dest_folder or os.path.basename(source_path.rstrip('/'))
+
+        if dest_folder and dest_bucket.endswith(f"/{dest_folder}"):
+            dest_bucket = dest_bucket[: -(len(dest_folder) + 1)].rstrip('/')
 
         raw_endpoint = row.get('endpoint', '')
         dest_endpoint = '' if (raw_endpoint is None or str(raw_endpoint).strip().lower() in ('', 'nan', 'none')) else str(raw_endpoint).strip()
@@ -598,6 +608,7 @@ exit 0
 
     started_at = _dt.utcnow()
     started_at_str = started_at.strftime('%Y-%m-%d %H:%M:%S')
+    distcp_reported = False
 
     try:
         with ssh.get_conn() as client:
@@ -754,7 +765,7 @@ exit 0
                     f"(exit {exit_code}): {error_output[:1000] or output[-1000:]}"
                 )[:2000]
                 logger.error(f"[FolderDistCp] FAILED: {error_msg}")
-                return {
+                result = {
                     'run_id': run_id,
                     'source_path': source_path,
                     'dest_bucket': dest_bucket,
@@ -780,6 +791,11 @@ exit 0
                     'distcp_files_copied': distcp_files,
                     'throughput_mbps': throughput,
                 }
+                context['ti'].xcom_push(key='return_value', value=result)
+                distcp_reported = True
+                raise Exception(
+                    f"DistCp failed for {source_path} -> {s3_dest}: {error_msg}"
+                )
 
             logger.info(
                 f"[FolderDistCp] COMPLETED: {source_path} -> {s3_dest} | "
@@ -816,10 +832,12 @@ exit 0
             }
 
     except Exception as e:
+        if distcp_reported:
+            raise
         completed_at = _dt.utcnow()
         error_msg = str(e)[:2000]
         logger.error(f"[FolderDistCp] ERROR: {source_path} -> {s3_dest}: {error_msg}")
-        return {
+        result = {
             'run_id': run_id,
             'source_path': source_path,
             'dest_bucket': dest_bucket,
@@ -845,6 +863,10 @@ exit 0
             'distcp_files_copied': 0,
             'throughput_mbps': 0.0,
         }
+        context['ti'].xcom_push(key='return_value', value=result)
+        raise Exception(
+            f"DistCp failed for {source_path} -> {s3_dest}: {error_msg}"
+        ) from e
 
 
 @task.pyspark(conn_id='spark_default')
@@ -956,17 +978,24 @@ def validate_data_copy(copy_status: dict, **context) -> dict:
 
     # If the copy itself failed, skip SSH validation and mark as VALIDATION_SKIPPED
     upstream_status = copy_status.get('status')
-    if upstream_status in ('FAILED', 'SOURCE_NOT_FOUND', 'EMPTY_SOURCE', 'SKIPPED'):
-        passthrough_status = (
-            'VALIDATION_SKIPPED' if upstream_status == 'FAILED' else upstream_status
-        )
+    if upstream_status == 'FAILED':
+        logger.warning(f"[FolderValidate] Skipping validation — copy FAILED for {source_path}")
+        result = {
+            **copy_status,
+            'validation_status': 'VALIDATION_SKIPPED',
+            'validation_error': copy_status.get('error'),
+        }
+        context['ti'].xcom_push(key='return_value', value=result)
+        raise Exception(f"Validation skipped — upstream copy FAILED for {source_path}")
+
+    if upstream_status in ('SOURCE_NOT_FOUND', 'EMPTY_SOURCE', 'SKIPPED'):
         logger.warning(
             f"[FolderValidate] Passing through status={upstream_status} for {source_path} "
             f"— no SSH validation performed"
         )
         result = {
             **copy_status,
-            'validation_status': passthrough_status,
+            'validation_status': upstream_status,
             'validation_error': copy_status.get('error'),
         }
         ti = context.get('ti')
@@ -1043,16 +1072,14 @@ fi
         'validation_error': validation_error,
     }
     if validation_status != 'VALIDATED':
-        logger.error(
-            f"[FolderValidate] {validation_status} for {source_path} -> {s3_dest}: "
-            f"{validation_error or 'file count or size mismatch'}"
-        )
         result['validation_error'] = (
             validation_error or 'file count or size mismatch'
         )
-        ti = context.get('ti')
-        if ti is not None:
-            ti.xcom_push(key='return_value', value=result)
+        context['ti'].xcom_push(key='return_value', value=result)
+        raise Exception(
+            f"Validation {validation_status} for {source_path} -> {s3_dest}: "
+            f"{validation_error or 'file count or size mismatch'}"
+        )
     return result
 
 
@@ -1128,15 +1155,16 @@ def finalize_data_copy_run(run_id: str, spark, cluster_setup: dict = None) -> di
     config = get_config()
     tracking_db = config['tracking_database']
 
-    total = successful = failed = skipped = 0
+    total = successful = failed = skipped = not_found = 0
     overall_status = 'FAILED'
 
     try:
         stats = spark.sql(f"""
             SELECT
                 COUNT(*)                                                              AS total_folders,
-                SUM(CASE WHEN status IN ('VALIDATED', 'EMPTY_SOURCE')                      THEN 1 ELSE 0 END) AS successful_folders,
-                SUM(CASE WHEN status IN ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED', 'SOURCE_NOT_FOUND') THEN 1 ELSE 0 END) AS failed_folders,
+                SUM(CASE WHEN status IN ('VALIDATED', 'EMPTY_SOURCE', 'SOURCE_NOT_FOUND')  THEN 1 ELSE 0 END) AS successful_folders,
+                SUM(CASE WHEN status IN ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED') THEN 1 ELSE 0 END) AS failed_folders,
+                SUM(CASE WHEN status IN ('SOURCE_NOT_FOUND')                               THEN 1 ELSE 0 END) AS not_found_folders,
                 SUM(CASE WHEN status IN ('SKIPPED')                                        THEN 1 ELSE 0 END) AS skipped_folders
             FROM {tracking_db}.data_copy_status
             WHERE run_id = '{run_id}'
@@ -1153,13 +1181,14 @@ def finalize_data_copy_run(run_id: str, spark, cluster_setup: dict = None) -> di
             total      = int(stats[0]['total_folders'] or 0)
             successful = int(stats[0]['successful_folders'] or 0)
             failed     = int(stats[0]['failed_folders'] or 0)
+            not_found  = int(stats[0]['not_found_folders'] or 0)
             skipped    = int(stats[0]['skipped_folders'] or 0)
             overall_status = 'COMPLETED' if failed == 0 else 'COMPLETED_WITH_ERRORS'
     except Exception as e:
         logger.error(
             f"[FolderCopy] Failed to query data_copy_status for run_id '{run_id}': {str(e)}"
         )
-        total = successful = failed = skipped = 0
+        total = successful = failed = skipped = not_found = 0
         overall_status = 'FAILED'
 
     execute_with_iceberg_retry(spark, f"""
@@ -1186,7 +1215,8 @@ def finalize_data_copy_run(run_id: str, spark, cluster_setup: dict = None) -> di
 
     logger.info(
         f"[FolderCopy] Run {run_id} finalized: status={overall_status} | "
-        f"total={total} | successful={successful} | failed={failed} | skipped={skipped}"
+        f"total={total} | successful={successful} | failed={failed} | "
+        f"not_found={not_found} | skipped={skipped}"
     )
     return {
         'run_id': run_id,
@@ -1194,6 +1224,7 @@ def finalize_data_copy_run(run_id: str, spark, cluster_setup: dict = None) -> di
         'total_folders': total,
         'successful_folders': successful,
         'failed_folders': failed,
+        'not_found_folders': not_found,
         'skipped_folders': skipped,
     }
 
@@ -1220,17 +1251,41 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
         ORDER BY source_path
     """).collect()
 
+    non_distcp_statuses = ('EMPTY_SOURCE', 'SOURCE_NOT_FOUND', 'SKIPPED')
+    copied_rows = [f for f in folders if (f.status or '') not in non_distcp_statuses]
+
+    badge_classes = {
+        'VALIDATED': 'status-completed',
+        'COMPLETED': 'status-completed',
+        'FAILED': 'status-failed',
+        'VALIDATION_FAILED': 'status-failed',
+        'VALIDATION_SKIPPED': 'status-failed',
+        'EMPTY_SOURCE': 'status-empty',
+        'SOURCE_NOT_FOUND': 'status-not-found',
+        'SKIPPED': 'status-skipped',
+    }
+
     total_folders     = len(folders)
     validated         = sum(1 for f in folders if f.status == 'VALIDATED')
     failed            = sum(1 for f in folders if (f.status or '') in ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED'))
     source_not_found  = sum(1 for f in folders if (f.status or '') == 'SOURCE_NOT_FOUND')
     empty_source      = sum(1 for f in folders if (f.status or '') == 'EMPTY_SOURCE')
     skipped           = sum(1 for f in folders if (f.status or '') == 'SKIPPED')
+    successful        = validated + empty_source + source_not_found
     incremental       = sum(1 for f in folders if f.is_incremental)
     total_bytes       = sum(f.dest_size_bytes or 0 for f in folders)
     total_files       = sum(f.dest_file_count or 0 for f in folders)
-    total_bytes_copied = sum(f.bytes_copied or 0 for f in folders)
     total_gb          = total_bytes / (1024 ** 3)
+
+    size_match_count      = sum(1 for f in copied_rows if f.size_match)
+    size_mismatch_count   = len(copied_rows) - size_match_count
+    fcount_match_count    = sum(1 for f in copied_rows if f.file_count_match)
+    fcount_mismatch_count = len(copied_rows) - fcount_match_count
+    total_src_gb  = sum(f.source_size_bytes or 0 for f in copied_rows) / (1024 ** 3)
+    total_dest_gb = sum(f.dest_size_bytes or 0 for f in copied_rows) / (1024 ** 3)
+    size_diff_pct = (
+        abs(total_src_gb - total_dest_gb) / total_src_gb * 100 if total_src_gb > 0 else 0.0
+    )
 
     _throughputs = [
         float(getattr(f, 'throughput_mbps', 0) or 0)
@@ -1240,11 +1295,7 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
     avg_throughput = (sum(_throughputs) / len(_throughputs)) if _throughputs else 0.0
 
     run_status = (run_row.status if run_row else 'UNKNOWN')
-    excel_path = (run_row.excel_file_path if run_row else '')
-    started_at = str(run_row.started_at if run_row else '')
-    completed_at = str(run_row.completed_at if run_row else '')
     dag_run_id = str(getattr(run_row, 'dag_run_id', '') or '') if run_row else ''
-    cluster_type = config.get('cluster_type', 'MapR')
 
     if isinstance(cluster_setup, dict):
         sa_user = str(cluster_setup.get('service_account_user_id') or '').strip()
@@ -1260,7 +1311,35 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
     sa_display = sa_user or 'not configured'
     sa_source = sa_source or 'unknown'
 
-    failure_rows = [f for f in folders if (f.status or '') != 'VALIDATED']
+    def _status_row(f, colspan):
+        status_val = f.status or ''
+        source_cell = _html_escape(str(f.source_path or ''))
+        if status_val == 'EMPTY_SOURCE':
+            return f"""
+                <tr>
+                    <td>{source_cell}</td>
+                    <td colspan="{colspan}">
+                        <span class="status-badge status-empty">EMPTY_SOURCE</span>
+                    </td>
+                </tr>
+"""
+        if status_val == 'SOURCE_NOT_FOUND':
+            return f"""
+                <tr>
+                    <td>{source_cell}</td>
+                    <td colspan="{colspan}">
+                        <span class="status-badge status-not-found">SOURCE_NOT_FOUND</span>
+                    </td>
+                </tr>
+"""
+        return f"""
+                <tr>
+                    <td>{source_cell}</td>
+                    <td colspan="{colspan}" style="color:#7f8c8d;font-style:italic;font-size:12px;">
+                        Skipped: {_html_escape(str(f.error_message or 'upstream task did not complete'))[:400]}
+                    </td>
+                </tr>
+"""
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1271,45 +1350,144 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0; padding: 20px;
+            margin: 0;
+            padding: 20px;
             background-color: #f5f5f5;
         }}
         .container {{
-            max-width: 1400px; margin: 0 auto;
-            background-color: white; padding: 30px;
-            border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            max-width: 1400px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }}
-        h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
-        h2 {{ color: #34495e; margin-top: 30px; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; }}
+        h1 {{
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }}
+        h2 {{
+            color: #34495e;
+            margin-top: 30px;
+            border-bottom: 2px solid #ecf0f1;
+            padding-bottom: 8px;
+        }}
         .summary-grid {{
-            display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 20px; margin: 20px 0;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
         }}
         .summary-card {{
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white; padding: 20px; border-radius: 8px;
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }}
-        .summary-card.success {{ background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); }}
-        .summary-card.warning {{ background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }}
-        .summary-card.info    {{ background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }}
-        .summary-card h3 {{ margin: 0 0 10px 0; font-size: 14px; opacity: 0.9; }}
-        .summary-card .value {{ font-size: 32px; font-weight: bold; margin: 0; }}
-        table {{ width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 13px; }}
-        th {{ background-color: #34495e; color: white; padding: 10px 12px; text-align: left; position: sticky; top: 0; }}
-        td {{ padding: 9px 12px; border-bottom: 1px solid #ecf0f1; }}
-        tr:hover {{ background-color: #f8f9fa; }}
-        .status-badge {{ padding: 3px 10px; border-radius: 10px; font-size: 11px; font-weight: bold; display: inline-block; }}
-        .status-completed  {{ background-color: #d4edda; color: #155724; }}
-        .status-failed     {{ background-color: #f8d7da; color: #721c24; }}
-        .status-skipped    {{ background-color: #fff3cd; color: #856404; }}
-        .metric {{ font-weight: bold; color: #2980b9; }}
-        .pass {{ color: #27ae60; font-weight: bold; }}
-        .fail {{ color: #e74c3c; font-weight: bold; }}
-        .neutral-cell {{ color: #bdc3c7; font-weight: bold; }}
-        .timestamp {{ color: #95a5a6; font-size: 12px; }}
-        .section-divider {{ margin: 40px 0; border-top: 2px dashed #ecf0f1; }}
-        .error-cell {{ color: #721c24; font-size: 11px; word-break: break-word; max-width: 300px; }}
+        .summary-card.success {{
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }}
+        .summary-card.warning {{
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }}
+        .summary-card.info {{
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }}
+        .summary-card h3 {{
+            margin: 0 0 10px 0;
+            font-size: 14px;
+            opacity: 0.9;
+        }}
+        .summary-card .value {{
+            font-size: 32px;
+            font-weight: bold;
+            margin: 0;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 14px;
+        }}
+        th {{
+            background-color: #34495e;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            position: sticky;
+            top: 0;
+        }}
+        td {{
+            padding: 10px 12px;
+            border-bottom: 1px solid #ecf0f1;
+        }}
+        tr:hover {{
+            background-color: #f8f9fa;
+        }}
+        .status-badge {{
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            display: inline-block;
+        }}
+        .status-completed {{
+            background-color: #d4edda;
+            color: #155724;
+        }}
+        .status-failed {{
+            background-color: #f8d7da;
+            color: #721c24;
+        }}
+        .status-skipped {{
+            background-color: #fff3cd;
+            color: #856404;
+        }}
+        .status-empty {{
+            background-color: #e8f4fd;
+            color: #1a6fa3;
+        }}
+        .status-not-found {{
+            background-color: #e2e3e5;
+            color: #6c757d;
+        }}
+        .status-warning {{
+            background-color: #fff3cd;
+            color: #856404;
+        }}
+        .metric {{
+            font-weight: bold;
+            color: #2980b9;
+        }}
+        .duration {{
+            color: #7f8c8d;
+            font-size: 12px;
+        }}
+        .validation-pass {{
+            color: #27ae60;
+            font-weight: bold;
+        }}
+        .validation-fail {{
+            color: #e74c3c;
+            font-weight: bold;
+        }}
+        .validation-warn {{
+            color: #856404;
+            background-color: #fff3cd;
+            font-weight: bold;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }}
+        .timestamp {{
+            color: #95a5a6;
+            font-size: 12px;
+        }}
+        .section-divider {{
+            margin: 40px 0;
+            border-top: 2px dashed #ecf0f1;
+        }}
     </style>
 </head>
 <body>
@@ -1318,33 +1496,25 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
     <div class="timestamp">
         Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
         Run ID: <strong>{run_id}</strong><br>
-        DAG Run ID: <strong>{_html_escape(dag_run_id)}</strong><br>
-        Excel: <strong>{_html_escape(str(excel_path))}</strong><br>
-        Cluster Type: <strong>{_html_escape(str(cluster_type))}</strong><br>
-        Service Account: <strong>{_html_escape(sa_display)}</strong>
-        <span style="color:#7f8c8d;">(source: {_html_escape(sa_source)})</span><br>
-        Started: <strong>{started_at}</strong> &nbsp; Completed: <strong>{completed_at}</strong>
+        DAG Run: <strong>{_html_escape(dag_run_id)}</strong><br>
+        Service Account: <strong>{_html_escape(sa_display)}</strong> <span style="opacity:0.7">({_html_escape(sa_source)})</span>
     </div>
 
-    <h2>Summary</h2>
+    <h2>Copy Summary</h2>
     <div class="summary-grid">
-        <div class="summary-card">
-            <h3>RUN STATUS</h3>
-            <p class="value" style="font-size:20px;">{run_status}</p>
-        </div>
         <div class="summary-card">
             <h3>TOTAL FOLDERS</h3>
             <p class="value">{total_folders}</p>
         </div>
         <div class="summary-card success">
-            <h3>VALIDATED</h3>
-            <p class="value">{validated}</p>
+            <h3>SUCCESSFUL</h3>
+            <p class="value">{successful}</p>
         </div>
         <div class="summary-card warning">
             <h3>FAILED</h3>
             <p class="value">{failed}</p>
         </div>
-        <div class="summary-card warning">
+        <div class="summary-card">
             <h3>SOURCE NOT FOUND</h3>
             <p class="value">{source_not_found}</p>
         </div>
@@ -1352,35 +1522,57 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
             <h3>EMPTY SOURCE</h3>
             <p class="value">{empty_source}</p>
         </div>
-        <div class="summary-card info">
+        <div class="summary-card">
             <h3>SKIPPED</h3>
             <p class="value">{skipped}</p>
+        </div>
+        <div class="summary-card info">
+            <h3>TOTAL DATA</h3>
+            <p class="value">{total_gb:.6f} GB</p>
+        </div>
+        <div class="summary-card info">
+            <h3>TOTAL FILES</h3>
+            <p class="value">{total_files:,}</p>
+        </div>
+        <div class="summary-card">
+            <h3>INCREMENTAL RUNS</h3>
+            <p class="value">{incremental}</p>
         </div>
         <div class="summary-card info">
             <h3>AVG THROUGHPUT (MB/s)</h3>
             <p class="value">{avg_throughput:.2f}</p>
         </div>
-        <div class="summary-card info">
-            <h3>INCREMENTAL</h3>
-            <p class="value">{incremental}</p>
+    </div>
+
+    <div class="section-divider"></div>
+
+    <h2>Data Validation Summary</h2>
+    <div class="summary-grid">
+        <div class="summary-card {'success' if size_mismatch_count == 0 else 'warning'}">
+            <h3>SIZE MATCH</h3>
+            <p class="value">{size_match_count} / {size_match_count + size_mismatch_count}</p>
+        </div>
+        <div class="summary-card {'success' if fcount_mismatch_count == 0 else 'warning'}">
+            <h3>FILE COUNT MATCH</h3>
+            <p class="value">{fcount_match_count} / {fcount_match_count + fcount_mismatch_count}</p>
         </div>
         <div class="summary-card info">
-            <h3>TOTAL DATA (S3)</h3>
-            <p class="value">{total_gb:.3f} GB</p>
+            <h3>SOURCE SIZE</h3>
+            <p class="value">{total_src_gb:.6f} GB</p>
         </div>
         <div class="summary-card info">
-            <h3>TOTAL FILES (S3)</h3>
-            <p class="value">{total_files:,}</p>
+            <h3>DEST SIZE</h3>
+            <p class="value">{total_dest_gb:.6f} GB</p>
         </div>
-        <div class="summary-card info">
-            <h3>BYTES COPIED</h3>
-            <p class="value">{total_bytes_copied / (1024**3):.3f} GB</p>
+        <div class="summary-card {'success' if size_diff_pct < 1.0 else 'warning'}">
+            <h3>SIZE DELTA</h3>
+            <p class="value">{size_diff_pct:.2f}%</p>
         </div>
     </div>
 
     <div class="section-divider"></div>
 
-    <h2>Copy Details</h2>
+    <h2>Folder Copy Details</h2>
     <table>
         <thead>
             <tr>
@@ -1388,18 +1580,9 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
                 <th>Destination</th>
                 <th>Status</th>
                 <th>Incremental</th>
-                <th>Src Files</th>
-                <th>Dest Files</th>
-                <th>File Match</th>
-                <th>Src Size (GB)</th>
-                <th>Dest Size (GB)</th>
-                <th>Size Match</th>
-                <th>Bytes Copied (GB)</th>
-                <th>Files Copied</th>
-                <th>Duration</th>
-                <th>MB/s</th>
+                <th>DistCp Duration</th>
                 <th>YARN App ID</th>
-                <th>Error</th>
+                <th>Total Duration</th>
             </tr>
         </thead>
         <tbody>
@@ -1407,34 +1590,23 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
 
     for f in folders:
         status = f.status or ''
-        if 'VALIDATED' in status:
-            badge_cls = 'status-completed'
-        elif 'FAILED' in status or 'SKIPPED' in status:
-            badge_cls = 'status-failed'
-        else:
-            badge_cls = 'status-skipped'
+        if status in non_distcp_statuses or status in ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED'):
+            html += _status_row(f, 6)
+            continue
 
-        src_gb  = (f.source_size_bytes or 0) / (1024 ** 3)
-        dest_gb = (f.dest_size_bytes or 0) / (1024 ** 3)
-        copied_gb = (f.bytes_copied or 0) / (1024 ** 3)
-        if status in ('EMPTY_SOURCE', 'SOURCE_NOT_FOUND', 'SKIPPED'):
-            fc_class = sm_class = 'neutral-cell'
-            fc_icon = sm_icon = '—'
-        else:
-            fc_class = 'pass' if f.file_count_match else 'fail'
-            fc_icon  = '✓' if f.file_count_match else '✗'
-            sm_class = 'pass' if f.size_match else 'fail'
-            sm_icon  = '✓' if f.size_match else '✗'
-        incr_lbl = '✓' if f.is_incremental else ''
-        error_cell = (
-            f'<span class="error-cell">{_html_escape(str(f.error_message or ""))[:400]}</span>'
-            if f.error_message else ''
-        )
-
+        badge_cls = badge_classes.get(status, 'status-warning')
         _dur = float(getattr(f, 'distcp_duration_seconds', 0) or 0)
+        _started = getattr(f, 'started_at', None)
+        _completed = getattr(f, 'completed_at', None)
+        _total_dur = _dur
+        if _started is not None and _completed is not None:
+            try:
+                _total_dur = max((_completed - _started).total_seconds(), 0.0)
+            except Exception:
+                _total_dur = _dur
         dur_cell = f"{_dur:.1f}s" if _dur else 'N/A'
-        _tput = float(getattr(f, 'throughput_mbps', 0) or 0)
-        tput_cell = f"{_tput:.2f}" if _tput else 'N/A'
+        if f.is_incremental:
+            dur_cell += " <span style='background-color: #fff3cd; padding: 2px 6px; border-radius: 4px; font-size: 10px;'>INCREMENTAL</span>"
 
         _yarn_raw = str(getattr(f, 'yarn_application_id', '') or '')
         _yarn_ids = [x for x in _yarn_raw.split(',') if x]
@@ -1451,27 +1623,79 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
         elif _yarn_ids:
             yarn_cell = f"<small style='font-family:monospace;color:#666;'>{_html_escape(_yarn_ids[0])}</small>"
         else:
-            yarn_cell = ''
+            yarn_cell = 'N/A'
 
         html += f"""
+                <tr>
+                    <td>{_html_escape(str(f.source_path or ''))}</td>
+                    <td>{_html_escape(str(f.dest_bucket or ''))}/{_html_escape(str(f.dest_path or ''))}</td>
+                    <td><span class="status-badge {badge_cls}">{status}</span></td>
+                    <td style="text-align:center">{'✓' if f.is_incremental else ''}</td>
+                    <td class="duration">{dur_cell}</td>
+                    <td>{yarn_cell}</td>
+                    <td class="metric">{_total_dur:.1f}s</td>
+                </tr>
+"""
+
+    html += """
+        </tbody>
+    </table>
+
+    <div class="section-divider"></div>
+
+    <h2>Data Validation Results</h2>
+    <table>
+        <thead>
             <tr>
-                <td>{_html_escape(str(f.source_path or ''))}</td>
-                <td>{_html_escape(str(f.dest_bucket or ''))}/{_html_escape(str(f.dest_path or ''))}</td>
-                <td><span class="status-badge {badge_cls}">{status}</span></td>
-                <td style="text-align:center">{incr_lbl}</td>
-                <td class="metric">{(f.source_file_count or 0):,}</td>
-                <td class="metric">{(f.dest_file_count or 0):,}</td>
-                <td class="{fc_class}">{fc_icon}</td>
-                <td class="metric">{src_gb:.4f}</td>
-                <td class="metric">{dest_gb:.4f}</td>
-                <td class="{sm_class}">{sm_icon}</td>
-                <td class="metric">{copied_gb:.4f}</td>
-                <td class="metric">{(f.files_copied or 0):,}</td>
-                <td class="metric">{dur_cell}</td>
-                <td class="metric">{tput_cell}</td>
-                <td>{yarn_cell}</td>
-                <td>{error_cell}</td>
+                <th>Source Path</th>
+                <th>Source Size (GB)</th>
+                <th>S3 Size Before (GB)</th>
+                <th>S3 Size After (GB)</th>
+                <th>S3 Size Transferred (GB)</th>
+                <th>Size Match</th>
+                <th>Source Files</th>
+                <th>S3 Files Before</th>
+                <th>S3 Files After</th>
+                <th>S3 Files Transferred</th>
+                <th>File Count Match</th>
             </tr>
+        </thead>
+        <tbody>
+"""
+
+    for f in folders:
+        status = f.status or ''
+        if status in non_distcp_statuses or status in ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED'):
+            html += _status_row(f, 10)
+            continue
+
+        src_gb = (f.source_size_bytes or 0) / (1024 ** 3)
+        dest_gb = (f.dest_size_bytes or 0) / (1024 ** 3)
+        transferred_gb = (f.bytes_copied or 0) / (1024 ** 3)
+        before_gb = max(dest_gb - transferred_gb, 0.0)
+        files_after = f.dest_file_count or 0
+        files_transferred = f.files_copied or 0
+        files_before = max(files_after - files_transferred, 0)
+
+        size_match_class = 'validation-pass' if f.size_match else 'validation-fail'
+        size_match_icon = '✓ PASS' if f.size_match else '✗ FAIL'
+        count_match_class = 'validation-pass' if f.file_count_match else 'validation-fail'
+        count_match_icon = '✓ PASS' if f.file_count_match else '✗ FAIL'
+
+        html += f"""
+                <tr>
+                    <td>{_html_escape(str(f.source_path or ''))}</td>
+                    <td class="metric">{src_gb:.6f}</td>
+                    <td class="metric">{before_gb:.6f}</td>
+                    <td class="metric">{dest_gb:.6f}</td>
+                    <td class="metric">{transferred_gb:.6f}</td>
+                    <td class="{size_match_class}">{size_match_icon}</td>
+                    <td class="metric">{(f.source_file_count or 0):,}</td>
+                    <td class="metric">{files_before:,}</td>
+                    <td class="metric">{files_after:,}</td>
+                    <td class="metric">{files_transferred:,}</td>
+                    <td class="{count_match_class}">{count_match_icon}</td>
+                </tr>
 """
 
     html += """
@@ -1485,66 +1709,44 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
         <thead>
             <tr>
                 <th>Source Path</th>
-                <th>Data Volume (GB)</th>
-                <th>DistCp Speed (MB/s)</th>
-                <th>Files/sec</th>
-                <th>Duration</th>
+                <th>Data Volume</th>
+                <th>DistCp Speed</th>
+                <th>Files/Second</th>
+                <th>End-to-End Duration</th>
             </tr>
         </thead>
         <tbody>
 """
 
     for f in folders:
+        if (f.status or '') == 'SOURCE_NOT_FOUND':
+            continue
         _dur = float(getattr(f, 'distcp_duration_seconds', 0) or 0)
+        _started = getattr(f, 'started_at', None)
+        _completed = getattr(f, 'completed_at', None)
+        _total_dur = _dur
+        if _started is not None and _completed is not None:
+            try:
+                _total_dur = max((_completed - _started).total_seconds(), 0.0)
+            except Exception:
+                _total_dur = _dur
         data_gb = (f.dest_size_bytes or 0) / (1024 ** 3)
-        speed_mbps = (f.dest_size_bytes or 0) / (1024 ** 2) / (_dur or 1)
+        speed_mbps = float(getattr(f, 'throughput_mbps', 0) or 0)
         files_per_sec = (f.dest_file_count or 0) / (_dur or 1)
         html += f"""
-            <tr>
-                <td>{_html_escape(str(f.source_path or ''))}</td>
-                <td class="metric">{data_gb:.6f}</td>
-                <td class="metric">{speed_mbps:.6f}</td>
-                <td class="metric">{files_per_sec:,.2f}</td>
-                <td class="metric">{_dur:.1f}s ({_dur / 60:.1f}m)</td>
-            </tr>
+                <tr>
+                    <td>{_html_escape(str(f.source_path or ''))}</td>
+                    <td class="metric">{data_gb:.6f} GB</td>
+                    <td class="metric">{speed_mbps:.6f} MB/s</td>
+                    <td class="metric">{files_per_sec:,.0f}</td>
+                    <td class="metric">{_total_dur:.1f}s ({_total_dur / 60:.1f}m)</td>
+                </tr>
 """
 
     html += """
         </tbody>
     </table>
-"""
 
-    if failure_rows:
-        html += """
-    <div class="section-divider"></div>
-
-    <h2>Failures</h2>
-    <table>
-        <thead>
-            <tr>
-                <th>Source Path</th>
-                <th>Destination</th>
-                <th>Status</th>
-                <th>Error</th>
-            </tr>
-        </thead>
-        <tbody>
-"""
-        for f in failure_rows:
-            html += f"""
-            <tr>
-                <td>{_html_escape(str(f.source_path or ''))}</td>
-                <td>{_html_escape(str(f.dest_bucket or ''))}/{_html_escape(str(f.dest_path or ''))}</td>
-                <td><span class="status-badge status-failed">{_html_escape(str(f.status or ''))}</span></td>
-                <td class="error-cell">{_html_escape(str(f.error_message or ''))[:400]}</td>
-            </tr>
-"""
-        html += """
-        </tbody>
-    </table>
-"""
-
-    html += """
     <div style="margin-top:50px; padding-top:20px; border-top:1px solid #ecf0f1; color:#95a5a6; font-size:12px;">
         <p>This report was automatically generated by the Folder Data Copy DAG.</p>
     </div>
@@ -1571,7 +1773,7 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
         'report_path': report_path,
         'overall_status': run_status,
         'total_folders': total_folders,
-        'successful_folders': validated + empty_source,
+        'successful_folders': successful,
     }
 
 
@@ -1642,37 +1844,6 @@ def send_data_copy_report_email(report_result: dict, run_id: str, spark) -> dict
         if is_permanent_error("send_email", e):
             permanent_fail("send_data_copy_report_email", e)
         raise Exception(f"Failed to send Folder Data Copy report email: {str(e)}") from e
-
-
-@task
-def check_data_copy_run_outcome(finalize_result: dict) -> dict:
-    """Fail the DAG run when any folder failed, so a red run is visible in the UI."""
-    if not isinstance(finalize_result, dict) or 'run_id' not in finalize_result:
-        logger.warning(
-            f"[check_data_copy_run_outcome] Skipping invalid input: {type(finalize_result)}"
-        )
-        return {}
-
-    run_id = finalize_result['run_id']
-    total = int(finalize_result.get('total_folders', 0) or 0)
-    failed = int(finalize_result.get('failed_folders', 0) or 0)
-
-    if total == 0:
-        raise Exception(
-            f"[FolderCopy] Run {run_id} wrote no folder records to data_copy_status — "
-            f"upstream tasks failed before any folder was processed."
-        )
-
-    if failed > 0:
-        raise Exception(
-            f"[FolderCopy] Run {run_id} finished with {failed}/{total} folder(s) failed. "
-            f"See the data copy report and data_copy_status for per-folder errors."
-        )
-
-    logger.info(
-        f"[FolderCopy] Run {run_id} outcome check passed: {total} folder(s), 0 failed"
-    )
-    return finalize_result
 
 
 # =============================================================================
@@ -1755,13 +1926,8 @@ with DAG(
         run_id=t_fc_run_id
     )
 
-    # Terminal gate — turns the DAG run red when folders failed
-    t_fc_gate = check_data_copy_run_outcome.override(
-        trigger_rule='all_done', retries=0
-    )(finalize_result=t_fc_final)
-
     # Dependency chain — prereqs → init → run_id → excel → cluster → work
     # Per-folder chain is linear: distcp → record_status → validate → update_validation
     t_fc_prereq >> t_fc_init >> t_fc_run_id >> t_fc_cluster >> t_fc_excel
     t_fc_excel >> t_fc_distcp >> t_fc_record >> t_fc_copy_validate >> t_fc_val_status
-    t_fc_val_status >> t_fc_final >> t_fc_report >> t_fc_email >> t_fc_gate
+    t_fc_val_status >> t_fc_final >> t_fc_report >> t_fc_email

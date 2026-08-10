@@ -1270,8 +1270,6 @@ finalize_data_copy_run
 generate_data_copy_html_report
     ↓
 send_data_copy_report_email
-    ↓
-check_data_copy_run_outcome  (terminal gate — fails the run if any folder failed)
 ```
 
 > `cluster_login_setup` runs **before** `parse_folder_copy_excel` so the resolved
@@ -1333,8 +1331,15 @@ check_data_copy_run_outcome  (terminal gate — fails the run if any folder fail
 **Purpose:** Read and parse the Excel config file from S3
 
 - Reads `source_path`, `target_bucket`, `dest_folder` columns
-- Normalises `target_bucket` to `s3a://`
+- Normalises `target_bucket` to `s3a://`, after first stripping a bare `S3:` / `s3:` prefix
+  that is not followed by `//` — otherwise `S3:my-bucket` normalises to the invalid
+  `s3a://S3:my-bucket`
+- Collapses doubled separators and strips trailing slashes from the bucket path, and strips
+  leading and trailing slashes from `dest_folder`
+- When the bucket path already ends with `/{dest_folder}`, the duplicated segment is removed
+  from the bucket so the destination is not written twice
 - Defaults `dest_folder` to `basename(source_path)` if not specified
+- Logs the final destination per row at INFO
 - Returns a list of folder config dicts for dynamic task mapping
 - Raises if no valid rows are found
 
@@ -1360,8 +1365,12 @@ check_data_copy_run_outcome  (terminal gate — fails the run if any folder fail
 - Computes `distcp_duration_seconds` and `throughput_mbps`
 - Computes `files_copied` and `bytes_copied` as before/after deltas
 - Sets `file_count_match` (exact) and `size_match` (within 1% tolerance)
-- On failure returns a FAILED result dict — does not raise — so tracking can record it;
-  metrics parsed before the failure are retained
+- On a non-zero DistCp exit code, or any SSH error, the FAILED result dict is pushed to XCom
+  with `key='return_value'` **before** the task raises, so every downstream `all_done` task
+  still receives it — the failure is recorded, reported and emailed, while the task itself
+  goes red and turns the DAG run red. Metrics parsed before the failure are retained
+- `SOURCE_NOT_FOUND` and `EMPTY_SOURCE` are legitimate outcomes: they return their result dict
+  and do **not** raise
 - **Timeout:** 24 hours (`SSH_COMMAND_TIMEOUT`)
 
 ---
@@ -1382,6 +1391,11 @@ check_data_copy_run_outcome  (terminal gate — fails the run if any folder fail
 - Re-runs `hadoop fs -ls -R` and `hadoop fs -du -s` on the S3 destination
 - Sets `VALIDATED` only if destination exists, file count matches, and size is within 1%
 - Otherwise sets `VALIDATION_FAILED` with a descriptive error
+- For `VALIDATION_SKIPPED` and `VALIDATION_FAILED` the result is pushed to XCom with
+  `key='return_value'` **before** the task raises, so `update_data_copy_validation` and every
+  other downstream `all_done` task still records, reports and emails the outcome
+- `SOURCE_NOT_FOUND`, `EMPTY_SOURCE` and `SKIPPED` rows pass straight through with the
+  matching `validation_status` and do not raise
 
 ---
 
@@ -1398,9 +1412,15 @@ check_data_copy_run_outcome  (terminal gate — fails the run if any folder fail
 **Purpose:** Aggregate folder counts and mark the run as complete
 
 - Queries `data_copy_status` for authoritative counts
-- `successful_folders` counts `VALIDATED` + `EMPTY_SOURCE`; `failed_folders` counts
-  `FAILED`, `VALIDATION_FAILED`, `VALIDATION_SKIPPED`, and `SOURCE_NOT_FOUND`;
-  `skipped_folders` counts `SKIPPED`
+- Counting matches DAG 1's `finalize_run`: `successful_folders` counts `VALIDATED` +
+  `EMPTY_SOURCE` + `SOURCE_NOT_FOUND`; `failed_folders` counts `FAILED`,
+  `VALIDATION_FAILED` and `VALIDATION_SKIPPED`; `skipped_folders` counts `SKIPPED`
+- `SOURCE_NOT_FOUND` counts as **successful** — a path that is not on the source is a
+  spreadsheet error, not a copy failure, so a run whose only problem is a missing path
+  reports `COMPLETED`. It is surfaced separately by the `not_found_folders` value in the
+  returned dict, the finalize log line, and the SOURCE NOT FOUND card in the report
+- `not_found_folders` is computed for the return value and the log only; there is no
+  tracking column for it
 - Sets run status to `COMPLETED` (zero failures) or `COMPLETED_WITH_ERRORS`
 - Sets run status to `FAILED` when the run wrote **no** folder records at all, or when the
   stats query itself fails
@@ -1415,16 +1435,35 @@ check_data_copy_run_outcome  (terminal gate — fails the run if any folder fail
 **Type:** PySpark
 **Purpose:** Generate an HTML report and write it to S3
 
-- Header: DAG run ID, Excel path, cluster type, and the service account with its source
-  (resolved from `cluster_setup` first, then the tracking row, then config)
-- Summary cards: run status, total/validated/failed folders, source-not-found, empty-source,
-  skipped, average throughput (MB/s), incremental count, total GB, files, bytes copied
-- Per-folder details table with source path, destination, copy status badge, file/size match
-  indicators, duration, MB/s, YARN application ID(s), and error snippets
-- `EMPTY_SOURCE`, `SOURCE_NOT_FOUND`, and `SKIPPED` rows render a neutral em dash in the
-  match columns rather than a failure cross
-- Performance Metrics table: data volume, DistCp speed, files/sec, duration per folder
-- Failures table listing every non-`VALIDATED` folder with its status and error
+Structure, stylesheet and status vocabulary mirror DAG 1's `generate_html_report`.
+
+- Header, four lines only: generated timestamp, tracking run ID, DAG run, and the service
+  account with its source (resolved from `cluster_setup` first, then the tracking row, then
+  config)
+- **Copy Summary** cards: total folders, successful, failed, source not found, empty source,
+  skipped, total data, total files, incremental runs, average throughput (MB/s). `SUCCESSFUL`
+  matches the finalize counting; `FAILED` covers only `FAILED`, `VALIDATION_FAILED` and
+  `VALIDATION_SKIPPED`
+- **Data Validation Summary** cards: size match, file count match, source size, dest size,
+  size delta. Every count and total here covers only folders that actually ran DistCp —
+  `EMPTY_SOURCE`, `SOURCE_NOT_FOUND` and `SKIPPED` rows are excluded
+- **Folder Copy Details**: source path, destination, status badge, incremental, DistCp
+  duration, YARN application ID(s), total duration. The incremental marker is an inline pill
+  on the duration cell. Total Duration is the row's end-to-end time
+  (`completed_at - started_at`), falling back to `distcp_duration_seconds` when either
+  timestamp is missing and clamped to `0.0` if the pair is inverted
+- **Data Validation Results**: source and S3 sizes before/after/transferred, file counts
+  before/after/transferred, and `✓ PASS` / `✗ FAIL` match cells
+- **Performance Metrics**: data volume, DistCp speed, files/second, end-to-end duration.
+  DistCp Speed reads the stored `throughput_mbps` column so it agrees with the AVG
+  THROUGHPUT card, and End-to-End Duration uses the same value as Total Duration above
+- Status badge classes map exactly: `VALIDATED`/`COMPLETED` → `status-completed`;
+  `FAILED`/`VALIDATION_FAILED`/`VALIDATION_SKIPPED` → `status-failed`; `EMPTY_SOURCE` →
+  `status-empty`; `SOURCE_NOT_FOUND` → `status-not-found`; `SKIPPED` → `status-skipped`;
+  anything else → `status-warning`
+- There is no Failures section and no Error column. Rows that did not complete a copy render
+  as a single colspan cell in both detail tables — an `EMPTY_SOURCE` or `SOURCE_NOT_FOUND`
+  badge, or italic `Skipped: {error_message}` text carrying the failure message
 - Writes to `{report_location}/{run_id}_data_copy_report.html`
 - Returns `report_path` (S3 key); email task reads the report directly from S3
 
@@ -1443,32 +1482,17 @@ check_data_copy_run_outcome  (terminal gate — fails the run if any folder fail
 
 ---
 
-#### Step 13 - `check_data_copy_run_outcome`
-
-**Type:** Python (terminal gate)
-**Purpose:** Make the Airflow DAG run go red when folders failed
-
-- Runs last, after the report and the email, with `trigger_rule='all_done'` and `retries=0`
-  so it never delays or re-runs the pipeline
-- Because `run_folder_distcp_ssh` returns FAILED instead of raising, without this gate a run
-  where every folder failed would still report SUCCESS
-- Raises if `total_folders == 0` (no folder records were written for the run)
-- Raises if `failed_folders > 0`, naming the failed/total counts
-- Otherwise returns the finalize result unchanged
-- Report and email stay **upstream** of the gate, so they are always produced first
-
----
-
 ### DAG Failure Callback
 
 `_folder_copy_dag_failure_callback` is registered as the DAG's `on_failure_callback` and is
-best-effort recovery for a cancelled or manually-failed run:
+diagnostic only — Airflow runs DAG-level callbacks in the scheduler, where there is no Spark
+session, so it performs no Spark or SQL work:
 
 - Reads the tracking `run_id` from the `create_data_copy_run` XCom
-- Marks the `data_copy_runs` row `CANCELLED` with `completed_at` when it is still `RUNNING`
-- Regenerates and writes the HTML report using the same builder as
-  `generate_data_copy_html_report`
-- Requires an active Spark session; if there is none it logs and returns
+- Logs clearly when no tracking `run_id` can be found (the run failed before
+  `create_data_copy_run` wrote a record)
+- Otherwise logs a WARNING naming the `run_id`, stating that the run ended without a report
+  and that `data_copy_runs` still shows `RUNNING` for it
 - Every failure inside the callback is logged and swallowed — nothing propagates into the
   scheduler
 
