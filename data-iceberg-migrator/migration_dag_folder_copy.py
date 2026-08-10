@@ -7,9 +7,12 @@ For migrating raw data directories that don't have associated Hive tables.
 Excel columns: source_path | target_bucket | dest_folder | endpoint
 """
 
+import contextlib
 import logging
 import os
+import re
 from datetime import datetime, timedelta
+from html import escape as _html_escape
 from pathlib import Path
 
 from airflow import DAG
@@ -24,7 +27,9 @@ from migrator_utils.migrations.shared import (
     cluster_login,
     execute_with_iceberg_retry,
     get_config,
+    is_permanent_error,
     normalize_s3,
+    permanent_fail,
 )
 
 _dag_stem = Path(__file__).stem
@@ -55,6 +60,49 @@ default_args = {
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
 }
+
+def _folder_copy_dag_failure_callback(context) -> None:
+    try:
+        dag_run = None
+        task_instance = None
+        try:
+            dag_run = context.get('dag_run')
+            task_instance = context.get('task_instance')
+        except Exception:
+            pass
+        run_ref = getattr(dag_run, 'run_id', None)
+        task_ref = getattr(task_instance, 'task_id', None)
+        logger.error(
+            f"[FolderCopy] DAG failure callback — dag_run_id={run_ref} task_id={task_ref}"
+        )
+
+        tracking_run_id = None
+        try:
+            creator_ti = dag_run.get_task_instance('create_data_copy_run')
+            if creator_ti is not None:
+                tracking_run_id = creator_ti.xcom_pull(
+                    task_ids='create_data_copy_run', key='return_value'
+                )
+        except Exception as e:
+            logger.warning(
+                f"[FolderCopy] Failure callback could not read the tracking run_id XCom: {e}"
+            )
+        if not tracking_run_id:
+            logger.warning(
+                "[FolderCopy] Failure callback found no tracking run_id — "
+                "the run failed before create_data_copy_run wrote a record."
+            )
+            return
+
+        logger.warning(
+            f"[FolderCopy] Run {tracking_run_id} ended without a report. "
+            f"data_copy_runs still shows status RUNNING for {tracking_run_id} — "
+            f"re-run the DAG or reconcile the tracking row manually."
+        )
+    except Exception:
+        with contextlib.suppress(Exception):
+            logger.error("[FolderCopy] DAG failure callback raised and was suppressed")
+
 
 @task
 def cluster_login_setup(run_id: str) -> dict:
@@ -174,7 +222,11 @@ def init_folder_copy_tracking_tables(spark) -> dict:
             successful_folders INT,
             failed_folders  INT,
             error_message   STRING,
-            created_at      TIMESTAMP
+            created_at      TIMESTAMP,
+            dag_run_id      STRING,
+            service_account_user_id STRING,
+            service_account_source  STRING,
+            skipped_folders INT
         )
         USING iceberg
         LOCATION '{tracking_loc}/data_copy_runs'
@@ -199,36 +251,136 @@ def init_folder_copy_tracking_tables(spark) -> dict:
             file_count_match  BOOLEAN,
             size_match        BOOLEAN,
             error_message     STRING,
-            updated_at        TIMESTAMP
+            updated_at        TIMESTAMP,
+            yarn_application_id STRING,
+            distcp_started_at   TIMESTAMP,
+            distcp_completed_at TIMESTAMP,
+            distcp_duration_seconds DOUBLE,
+            distcp_bytes_copied BIGINT,
+            distcp_files_copied BIGINT,
+            throughput_mbps     DOUBLE
         )
         USING iceberg
         LOCATION '{tracking_loc}/data_copy_status'
     """)
+
+    for _col_name, _col_type in (
+        ("yarn_application_id", "STRING"),
+        ("distcp_started_at", "TIMESTAMP"),
+        ("distcp_completed_at", "TIMESTAMP"),
+        ("distcp_duration_seconds", "DOUBLE"),
+        ("distcp_bytes_copied", "BIGINT"),
+        ("distcp_files_copied", "BIGINT"),
+        ("throughput_mbps", "DOUBLE"),
+    ):
+        try:
+            spark.sql(
+                f"ALTER TABLE {tracking_db}.data_copy_status "
+                f"ADD COLUMN {_col_name} {_col_type}"
+            )
+            logger.info(f"[FolderCopy] Added column {_col_name} to data_copy_status")
+        except Exception as _alter_exc:
+            logger.debug(
+                f"[FolderCopy] ALTER TABLE {tracking_db}.data_copy_status "
+                f"ADD COLUMN {_col_name} {_col_type} did not apply: {_alter_exc}"
+            )
+
+    for _col_name, _col_type in (
+        ("dag_run_id", "STRING"),
+        ("service_account_user_id", "STRING"),
+        ("service_account_source", "STRING"),
+        ("skipped_folders", "INT"),
+    ):
+        try:
+            spark.sql(
+                f"ALTER TABLE {tracking_db}.data_copy_runs "
+                f"ADD COLUMN {_col_name} {_col_type}"
+            )
+            logger.info(f"[FolderCopy] Added column {_col_name} to data_copy_runs")
+        except Exception as _alter_exc:
+            logger.debug(
+                f"[FolderCopy] ALTER TABLE {tracking_db}.data_copy_runs "
+                f"ADD COLUMN {_col_name} {_col_type} did not apply: {_alter_exc}"
+            )
+
+    for _table_name, _expected in (
+        ('data_copy_status', (
+            'yarn_application_id',
+            'distcp_started_at',
+            'distcp_completed_at',
+            'distcp_duration_seconds',
+            'distcp_bytes_copied',
+            'distcp_files_copied',
+            'throughput_mbps',
+        )),
+        ('data_copy_runs', (
+            'dag_run_id',
+            'service_account_user_id',
+            'service_account_source',
+            'skipped_folders',
+        )),
+    ):
+        try:
+            described = spark.sql(f"DESCRIBE {tracking_db}.{_table_name}").collect()
+            present = set()
+            for _row in described:
+                try:
+                    present.add(str(_row['col_name']).strip().lower())
+                except Exception:
+                    continue
+            missing = sorted(c for c in _expected if c.lower() not in present)
+        except Exception as _desc_exc:
+            logger.debug(
+                f"[FolderCopy] Could not DESCRIBE {tracking_db}.{_table_name}: {_desc_exc}"
+            )
+            missing = []
+        if missing:
+            logger.warning(
+                f"[FolderCopy] Tracking table {tracking_db}.{_table_name} is missing "
+                f"expected column(s) after schema evolution: {', '.join(missing)}. "
+                f"Subsequent INSERT/UPDATE statements referencing them will fail — "
+                f"check ALTER TABLE privileges on {tracking_db}."
+            )
+
     logger.info("[FolderCopy] Tracking tables initialized: data_copy_runs, data_copy_status")
     return {'status': 'initialized', 'database': tracking_db}
 
 
 @task.pyspark(conn_id='spark_default')
-def create_data_copy_run(excel_file_path: str, spark) -> str:
+def create_data_copy_run(excel_file_path: str, spark, dag_run_id: str = '') -> str:
     """Create a run record in data_copy_runs at the start of a folder-only copy DAG run."""
     import uuid
     from datetime import datetime
     config = get_config()
     tracking_db = config['tracking_database']
     run_id = f"folder_run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+    sa_user = str(config.get('service_account_user_id') or '').strip()
+    sa_source = 'config:service_account_user_id' if sa_user else 'pending (.profile fallback)'
+    esc_excel = str(excel_file_path or '').replace("'", "''")
+    esc_dag_run_id = str(dag_run_id or '').replace("'", "''")
+    esc_sa_user = sa_user.replace("'", "''")
+    esc_sa_source = sa_source.replace("'", "''")
+
     spark.sql(f"""
         INSERT INTO {tracking_db}.data_copy_runs (
             run_id, excel_file_path, started_at, completed_at,
             status, total_folders, successful_folders, failed_folders,
-            error_message, created_at
+            error_message, created_at,
+            dag_run_id, service_account_user_id, service_account_source,
+            skipped_folders
         ) VALUES (
             '{run_id}',
-            '{excel_file_path}',
+            '{esc_excel}',
             current_timestamp(),
             NULL,
             'RUNNING',
             NULL, NULL, NULL, NULL,
-            current_timestamp()
+            current_timestamp(),
+            '{esc_dag_run_id}',
+            '{esc_sa_user}',
+            '{esc_sa_source}',
+            NULL
         )
     """)
     logger.info(f"[FolderCopy] Created run record: {run_id}")
@@ -306,7 +458,7 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
 
 
 @task
-def run_folder_distcp_ssh(folder_config: dict, **context) -> dict:
+def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **context) -> dict:
     """Copy a single source folder to S3 via SSH DistCp with -update for incremental runs."""
     from datetime import datetime as _dt
 
@@ -323,9 +475,32 @@ def run_folder_distcp_ssh(folder_config: dict, **context) -> dict:
     mappers = config['distcp_mappers']
     bandwidth = config['distcp_bandwidth']
 
+    cluster_setup = cluster_setup if isinstance(cluster_setup, dict) else {}
+    distcp_log_dir = (
+        cluster_setup.get('distcp_log_dir')
+        or cluster_setup.get('temp_dir')
+        or '/tmp'
+    )
+    log_name = re.sub(r'[^A-Za-z0-9_.-]', '_', str(dest_folder or 'folder')).strip('_') or 'folder'
+
+    allow_delete_raw = config.get('folder_copy_allow_delete')
+    if allow_delete_raw is None:
+        try:
+            from airflow.models import Variable
+            allow_delete_raw = Variable.get('folder_copy_allow_delete', default_var=None)
+        except Exception:
+            allow_delete_raw = None
+    if allow_delete_raw is None:
+        allow_delete_raw = os.environ.get('FOLDER_COPY_ALLOW_DELETE')
+    allow_delete = str(allow_delete_raw).strip().lower() in ('true', '1', 'yes', 'on')
+
+    delete_flag = ''
+    if config.get('distcp_preserve_delete') is True and allow_delete:
+        delete_flag = ' -delete'
+
     s3_opts = build_s3_opts(dest_bucket, config, dest_endpoint)
 
-    cmd = f'''set -e
+    cmd = f'''set +e
 
 calculate_s3_metrics() {{
     local location=$1
@@ -342,6 +517,30 @@ calculate_s3_metrics() {{
     echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
 }}
 
+emit_metrics() {{
+    echo "===DISTCP_METRICS_START==="
+    echo "INCREMENTAL=$1"
+    echo "SRC_FILE_COUNT=$2"
+    echo "SRC_TOTAL_SIZE=$3"
+    echo "S3_FILE_COUNT_BEFORE=$4"
+    echo "S3_TOTAL_SIZE_BEFORE=$5"
+    echo "S3_FILE_COUNT_AFTER=$6"
+    echo "S3_TOTAL_SIZE_AFTER=$7"
+    echo "BYTES_COPIED=$8"
+    echo "FILES_COPIED=$9"
+    echo "===DISTCP_METRICS_END==="
+}}
+
+echo "=== Source existence check ==="
+SOURCE_EXISTS=true
+hadoop fs -test -d "{source_path}" 2>/dev/null || SOURCE_EXISTS=false
+echo "SOURCE_EXISTS=$SOURCE_EXISTS"
+if [ "$SOURCE_EXISTS" = "false" ]; then
+    echo "SOURCE_NOT_FOUND=true"
+    emit_metrics false 0 0 0 0 0 0 0 0
+    exit 0
+fi
+
 INCR=false
 hadoop fs{s3_opts} -test -d "{s3_dest}" 2>/dev/null && INCR=true
 echo "INCREMENTAL=$INCR"
@@ -350,6 +549,8 @@ echo "=== S3 metrics BEFORE distcp ==="
 S3_BEFORE=$(calculate_s3_metrics "{s3_dest}")
 S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
 S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
+[ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
 echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
 echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
 
@@ -361,18 +562,35 @@ SRC_TOTAL_SIZE=$(hadoop fs -du -s "{source_path}" 2>/dev/null | awk '{{print $1}
 echo "SRC_FILE_COUNT=$SRC_FILE_COUNT"
 echo "SRC_TOTAL_SIZE=$SRC_TOTAL_SIZE"
 
+if [ "$SRC_FILE_COUNT" -eq 0 ]; then
+    echo "EMPTY_SOURCE=true"
+    hadoop fs{s3_opts} -mkdir -p "{s3_dest}" 2>/dev/null || true
+    emit_metrics "$INCR" 0 "$SRC_TOTAL_SIZE" "$S3_FILE_COUNT_BEFORE" "$S3_TOTAL_SIZE_BEFORE" "$S3_FILE_COUNT_BEFORE" "$S3_TOTAL_SIZE_BEFORE" 0 0
+    exit 0
+fi
+
 echo "=== Running distcp ==="
-hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
-    "{source_path}" "{s3_dest}"
+DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update{delete_flag} -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+    -log {distcp_log_dir}/distcp_{log_name}.log "{source_path}" "{s3_dest}" 2>&1)
 DISTCP_EXIT=$?
+echo "$DISTCP_OUTPUT"
 echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
+
+BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | grep -oE '[0-9,]+' | tail -1 | tr -d ',')
+FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -iE "Files Copied|Number of files copied" | grep -oE '[0-9,]+' | tail -1 | tr -d ',')
+[ -z "$BYTES_COPIED" ] && BYTES_COPIED=0
+[ -z "$FILES_COPIED" ] && FILES_COPIED=0
 
 echo "=== S3 metrics AFTER distcp ==="
 S3_AFTER=$(calculate_s3_metrics "{s3_dest}")
 S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
 S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_AFTER" ] && S3_FILE_COUNT_AFTER=0
+[ -z "$S3_TOTAL_SIZE_AFTER" ] && S3_TOTAL_SIZE_AFTER=0
 echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
 echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
+
+emit_metrics "$INCR" "$SRC_FILE_COUNT" "$SRC_TOTAL_SIZE" "$S3_FILE_COUNT_BEFORE" "$S3_TOTAL_SIZE_BEFORE" "$S3_FILE_COUNT_AFTER" "$S3_TOTAL_SIZE_AFTER" "$BYTES_COPIED" "$FILES_COPIED"
 
 [ "$DISTCP_EXIT" -ne 0 ] && exit $DISTCP_EXIT
 exit 0
@@ -383,58 +601,192 @@ exit 0
 
     try:
         with ssh.get_conn() as client:
-            _, stdout, stderr = client.exec_command(_login_shell(cmd, config.get('cluster_type', 'MapR')), timeout=SSH_COMMAND_TIMEOUT)
+            _, stdout, stderr = client.exec_command(
+                _login_shell(cmd, config.get('cluster_type', 'MapR')),
+                timeout=SSH_COMMAND_TIMEOUT,
+                get_pty=True,
+            )
             output = stdout.read().decode()
             error_output = stderr.read().decode()
             exit_code = stdout.channel.recv_exit_status()
 
-            logger.info(f"[FolderDistCp] {source_path} -> {s3_dest} (last 1000 chars):")
-            logger.info(output[-1000:])
+            logger.info(f"=== [FolderDistCp] {source_path} -> {s3_dest} (FULL stdout) ===")
+            logger.info(output)
+            if error_output.strip():
+                logger.info(f"=== [FolderDistCp] {source_path} -> {s3_dest} (FULL stderr) ===")
+                logger.info(error_output)
 
-            is_incr = "INCREMENTAL=true" in output
-
-            src_file_count = 0
-            src_size_bytes = 0
-            s3_files_before = 0
-            s3_size_before = 0
-            s3_files_after = 0
-            s3_size_after = 0
-
-            try:
-                for line in output.split('\n'):
-                    line = line.strip()
-                    if line.startswith('SRC_FILE_COUNT='):
-                        src_file_count = int(line.split('=', 1)[1] or 0)
-                    elif line.startswith('SRC_TOTAL_SIZE='):
-                        src_size_bytes = int(line.split('=', 1)[1] or 0)
-                    elif line.startswith('S3_FILE_COUNT_BEFORE='):
-                        s3_files_before = int(line.split('=', 1)[1] or 0)
-                    elif line.startswith('S3_TOTAL_SIZE_BEFORE='):
-                        s3_size_before = int(line.split('=', 1)[1] or 0)
-                    elif line.startswith('S3_FILE_COUNT_AFTER='):
-                        s3_files_after = int(line.split('=', 1)[1] or 0)
-                    elif line.startswith('S3_TOTAL_SIZE_AFTER='):
-                        s3_size_after = int(line.split('=', 1)[1] or 0)
-            except Exception:
-                pass
-
-            files_copied = max(s3_files_after - s3_files_before, 0)
-            bytes_copied = max(s3_size_after - s3_size_before, 0)
-            file_count_match = src_file_count == s3_files_after
-            size_match = abs(src_size_bytes - s3_size_after) <= max(1, int(src_size_bytes * 0.01))
-
-            if exit_code != 0:
-                logger.error(f"[FolderDistCp] FAILED: {source_path} -> {s3_dest}")
-                logger.error(error_output[:1000])
-                raise Exception(
-                    f"DistCp failed for {source_path} -> {s3_dest} "
-                    f"(exit {exit_code}): {error_output[:1000]}"
+            combined_output = output + "\n" + error_output
+            yarn_application_ids = re.findall(r"application_\d+_\d+", combined_output)
+            yarn_application_ids = list(dict.fromkeys(yarn_application_ids))
+            yarn_application_id = yarn_application_ids[-1] if yarn_application_ids else None
+            if yarn_application_ids:
+                logger.info(
+                    f"[FolderDistCp] YARN Application IDs for {source_path}: {yarn_application_ids}"
+                )
+                logger.info(
+                    f"[FolderDistCp] Last YARN Application ID for {source_path}: {yarn_application_id}"
+                )
+            else:
+                logger.warning(
+                    f"[FolderDistCp] No YARN Application ID found for {source_path}"
                 )
 
+            metrics = {
+                'INCREMENTAL': 'false',
+                'SRC_FILE_COUNT': 0,
+                'SRC_TOTAL_SIZE': 0,
+                'S3_FILE_COUNT_BEFORE': 0,
+                'S3_TOTAL_SIZE_BEFORE': 0,
+                'S3_FILE_COUNT_AFTER': 0,
+                'S3_TOTAL_SIZE_AFTER': 0,
+                'BYTES_COPIED': 0,
+                'FILES_COPIED': 0,
+            }
+            m_start = output.find("===DISTCP_METRICS_START===")
+            m_end = output.find("===DISTCP_METRICS_END===")
+            if m_start != -1 and m_end != -1:
+                metrics_block = output[m_start + len("===DISTCP_METRICS_START==="):m_end]
+            else:
+                logger.warning(
+                    f"[FolderDistCp] Metrics block not found for {source_path} — "
+                    f"falling back to scanning full output"
+                )
+                metrics_block = output
+            for line in metrics_block.splitlines():
+                line = line.strip()
+                if '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                key = key.strip()
+                if key not in metrics:
+                    continue
+                val = val.strip()
+                if key == 'INCREMENTAL':
+                    metrics[key] = val
+                else:
+                    try:
+                        metrics[key] = int(val or 0)
+                    except ValueError:
+                        logger.warning(
+                            f"[FolderDistCp] Could not parse metric '{key}={val}' for {source_path}"
+                        )
+
             completed_at = _dt.utcnow()
+            duration = max((completed_at - started_at).total_seconds(), 0.0)
+            completed_at_str = completed_at.strftime('%Y-%m-%d %H:%M:%S')
+
+            if 'SOURCE_NOT_FOUND=true' in output or 'SOURCE_EXISTS=false' in output:
+                logger.error(f"[FolderDistCp] SOURCE_NOT_FOUND: {source_path}")
+                return {
+                    'run_id': run_id,
+                    'source_path': source_path,
+                    'dest_bucket': dest_bucket,
+                    'dest_path': dest_folder,
+                    'dest_endpoint': dest_endpoint,
+                    'status': 'SOURCE_NOT_FOUND',
+                    'started_at': started_at_str,
+                    'completed_at': completed_at_str,
+                    'source_file_count': 0,
+                    'source_size_bytes': 0,
+                    'dest_file_count': 0,
+                    'dest_size_bytes': 0,
+                    'files_copied': 0,
+                    'bytes_copied': 0,
+                    'is_incremental': False,
+                    'file_count_match': False,
+                    'size_match': False,
+                    'error': f"Source path does not exist: {source_path}",
+                    'yarn_application_id': yarn_application_id,
+                    'yarn_application_ids': yarn_application_ids,
+                    'distcp_duration_seconds': duration,
+                    'distcp_bytes_copied': 0,
+                    'distcp_files_copied': 0,
+                    'throughput_mbps': 0.0,
+                }
+
+            is_incr = str(metrics['INCREMENTAL']).lower() == 'true'
+            src_files = metrics['SRC_FILE_COUNT']
+            src_bytes = metrics['SRC_TOTAL_SIZE']
+            dest_files = metrics['S3_FILE_COUNT_AFTER']
+            dest_bytes = metrics['S3_TOTAL_SIZE_AFTER']
+            transferred_files = max(dest_files - metrics['S3_FILE_COUNT_BEFORE'], 0)
+            transferred_bytes = max(dest_bytes - metrics['S3_TOTAL_SIZE_BEFORE'], 0)
+            distcp_bytes = metrics['BYTES_COPIED']
+            distcp_files = metrics['FILES_COPIED']
+            throughput = (distcp_bytes / 1048576.0 / duration) if duration > 0 else 0.0
+
+            if 'EMPTY_SOURCE=true' in output:
+                logger.warning(
+                    f"[FolderDistCp] EMPTY_SOURCE: {source_path} has 0 files — "
+                    f"S3 prefix created at {s3_dest}"
+                )
+                return {
+                    'run_id': run_id,
+                    'source_path': source_path,
+                    'dest_bucket': dest_bucket,
+                    'dest_path': dest_folder,
+                    'dest_endpoint': dest_endpoint,
+                    'status': 'EMPTY_SOURCE',
+                    'started_at': started_at_str,
+                    'completed_at': completed_at_str,
+                    'source_file_count': src_files,
+                    'source_size_bytes': src_bytes,
+                    'dest_file_count': dest_files,
+                    'dest_size_bytes': dest_bytes,
+                    'files_copied': transferred_files,
+                    'bytes_copied': transferred_bytes,
+                    'is_incremental': is_incr,
+                    'file_count_match': False,
+                    'size_match': False,
+                    'error': None,
+                    'yarn_application_id': yarn_application_id,
+                    'yarn_application_ids': yarn_application_ids,
+                    'distcp_duration_seconds': duration,
+                    'distcp_bytes_copied': distcp_bytes,
+                    'distcp_files_copied': distcp_files,
+                    'throughput_mbps': throughput,
+                }
+
+            if exit_code != 0:
+                error_msg = (
+                    f"DistCp failed for {source_path} -> {s3_dest} "
+                    f"(exit {exit_code}): {error_output[:1000] or output[-1000:]}"
+                )[:2000]
+                logger.error(f"[FolderDistCp] FAILED: {error_msg}")
+                return {
+                    'run_id': run_id,
+                    'source_path': source_path,
+                    'dest_bucket': dest_bucket,
+                    'dest_path': dest_folder,
+                    'dest_endpoint': dest_endpoint,
+                    'status': 'FAILED',
+                    'started_at': started_at_str,
+                    'completed_at': completed_at_str,
+                    'source_file_count': src_files,
+                    'source_size_bytes': src_bytes,
+                    'dest_file_count': dest_files,
+                    'dest_size_bytes': dest_bytes,
+                    'files_copied': transferred_files,
+                    'bytes_copied': transferred_bytes,
+                    'is_incremental': is_incr,
+                    'file_count_match': False,
+                    'size_match': False,
+                    'error': error_msg,
+                    'yarn_application_id': yarn_application_id,
+                    'yarn_application_ids': yarn_application_ids,
+                    'distcp_duration_seconds': duration,
+                    'distcp_bytes_copied': distcp_bytes,
+                    'distcp_files_copied': distcp_files,
+                    'throughput_mbps': throughput,
+                }
+
             logger.info(
                 f"[FolderDistCp] COMPLETED: {source_path} -> {s3_dest} | "
-                f"incremental={is_incr} | files_copied={files_copied} | bytes_copied={bytes_copied}"
+                f"incremental={is_incr} | "
+                f"files_copied={transferred_files} | bytes_copied={transferred_bytes} | "
+                f"duration={duration:.1f}s | "
+                f"throughput={throughput:.2f} MB/s"
             )
             return {
                 'run_id': run_id,
@@ -444,24 +796,30 @@ exit 0
                 'dest_endpoint': dest_endpoint,
                 'status': 'COMPLETED',
                 'started_at': started_at_str,
-                'completed_at': completed_at.strftime('%Y-%m-%d %H:%M:%S'),
-                'source_file_count': src_file_count,
-                'source_size_bytes': src_size_bytes,
-                'dest_file_count': s3_files_after,
-                'dest_size_bytes': s3_size_after,
-                'files_copied': files_copied,
-                'bytes_copied': bytes_copied,
+                'completed_at': completed_at_str,
+                'source_file_count': src_files,
+                'source_size_bytes': src_bytes,
+                'dest_file_count': dest_files,
+                'dest_size_bytes': dest_bytes,
+                'files_copied': transferred_files,
+                'bytes_copied': transferred_bytes,
                 'is_incremental': is_incr,
-                'file_count_match': file_count_match,
-                'size_match': size_match,
+                'file_count_match': src_files == dest_files,
+                'size_match': abs(src_bytes - dest_bytes) <= max(1, int(src_bytes * 0.01)),
                 'error': None,
+                'yarn_application_id': yarn_application_id,
+                'yarn_application_ids': yarn_application_ids,
+                'distcp_duration_seconds': duration,
+                'distcp_bytes_copied': distcp_bytes,
+                'distcp_files_copied': distcp_files,
+                'throughput_mbps': throughput,
             }
 
     except Exception as e:
         completed_at = _dt.utcnow()
         error_msg = str(e)[:2000]
         logger.error(f"[FolderDistCp] ERROR: {source_path} -> {s3_dest}: {error_msg}")
-        result = {
+        return {
             'run_id': run_id,
             'source_path': source_path,
             'dest_bucket': dest_bucket,
@@ -480,14 +838,24 @@ exit 0
             'file_count_match': False,
             'size_match': False,
             'error': error_msg,
+            'yarn_application_id': None,
+            'yarn_application_ids': [],
+            'distcp_duration_seconds': max((completed_at - started_at).total_seconds(), 0.0),
+            'distcp_bytes_copied': 0,
+            'distcp_files_copied': 0,
+            'throughput_mbps': 0.0,
         }
-        context['ti'].xcom_push(key='return_value', value=result)
-        raise Exception(f"DistCp failed for {source_path} -> {s3_dest}: {error_msg}") from e
 
 
 @task.pyspark(conn_id='spark_default')
 def record_data_copy_status(distcp_result: dict, spark) -> dict:
     """Insert a row into data_copy_status for the completed/failed folder copy."""
+    if not isinstance(distcp_result, dict) or 'run_id' not in distcp_result:
+        logger.warning(
+            f"[record_data_copy_status] Skipping invalid input: {type(distcp_result)}"
+        )
+        return {}
+
     config = get_config()
     tracking_db = config['tracking_database']
 
@@ -495,9 +863,9 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
     source_path   = distcp_result['source_path'].replace("'", "''")
     dest_bucket   = distcp_result['dest_bucket'].replace("'", "''")
     dest_path     = distcp_result['dest_path'].replace("'", "''")
-    status        = distcp_result['status']
-    started_at    = distcp_result.get('started_at', '')
-    completed_at  = distcp_result.get('completed_at', '')
+    status        = str(distcp_result['status']).replace("'", "''")
+    started_at    = str(distcp_result.get('started_at', '') or '').replace("'", "''")
+    completed_at  = str(distcp_result.get('completed_at', '') or '').replace("'", "''")
     error_msg     = (distcp_result.get('error') or '').replace("'", "''")[:2000]
 
     src_file_count  = distcp_result.get('source_file_count', 0) or 0
@@ -510,6 +878,15 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
     file_count_match = str(distcp_result.get('file_count_match', False)).lower()
     size_match       = str(distcp_result.get('size_match', False)).lower()
 
+    yarn_ids = distcp_result.get('yarn_application_ids') or (
+        [distcp_result['yarn_application_id']] if distcp_result.get('yarn_application_id') else []
+    )
+    yarn_app_id = ','.join(str(x) for x in yarn_ids).replace("'", "''")
+    distcp_duration = float(distcp_result.get('distcp_duration_seconds', 0.0) or 0.0)
+    distcp_bytes = int(distcp_result.get('distcp_bytes_copied', 0) or 0)
+    distcp_files = int(distcp_result.get('distcp_files_copied', 0) or 0)
+    throughput_mbps = float(distcp_result.get('throughput_mbps', 0.0) or 0.0)
+
     execute_with_iceberg_retry(spark, f"""
         INSERT INTO {tracking_db}.data_copy_status (
             run_id, source_path, dest_bucket, dest_path,
@@ -518,7 +895,10 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
             dest_file_count, dest_size_bytes,
             files_copied, bytes_copied,
             is_incremental, file_count_match, size_match,
-            error_message, updated_at
+            error_message, updated_at,
+            yarn_application_id, distcp_started_at, distcp_completed_at,
+            distcp_duration_seconds, distcp_bytes_copied, distcp_files_copied,
+            throughput_mbps
         ) VALUES (
             '{run_id}',
             '{source_path}',
@@ -537,7 +917,14 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
             {file_count_match},
             {size_match},
             '{error_msg}',
-            current_timestamp()
+            current_timestamp(),
+            '{yarn_app_id}',
+            CAST('{started_at}' AS TIMESTAMP),
+            CAST('{completed_at}' AS TIMESTAMP),
+            {distcp_duration},
+            {distcp_bytes},
+            {distcp_files},
+            {throughput_mbps}
         )
     """, task_label=f"record_data_copy_status:{source_path}")
 
@@ -550,6 +937,11 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
 @task
 def validate_data_copy(copy_status: dict, **context) -> dict:
     """Re-verify the S3 destination after copy: recount files/bytes and update data_copy_status."""
+    if not isinstance(copy_status, dict) or 'run_id' not in copy_status:
+        logger.warning(
+            f"[validate_data_copy] Skipping invalid input: {type(copy_status)}"
+        )
+        return {}
 
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
@@ -563,11 +955,24 @@ def validate_data_copy(copy_status: dict, **context) -> dict:
     s3_opts = build_s3_opts(dest_bucket, config, dest_endpoint)
 
     # If the copy itself failed, skip SSH validation and mark as VALIDATION_SKIPPED
-    if copy_status.get('status') == 'FAILED':
-        logger.warning(f"[FolderValidate] Skipping validation — copy FAILED for {source_path}")
-        result = {**copy_status, 'validation_status': 'VALIDATION_SKIPPED'}
-        context['ti'].xcom_push(key='return_value', value=result)
-        raise Exception(f"Validation skipped — upstream copy FAILED for {source_path}")
+    upstream_status = copy_status.get('status')
+    if upstream_status in ('FAILED', 'SOURCE_NOT_FOUND', 'EMPTY_SOURCE', 'SKIPPED'):
+        passthrough_status = (
+            'VALIDATION_SKIPPED' if upstream_status == 'FAILED' else upstream_status
+        )
+        logger.warning(
+            f"[FolderValidate] Passing through status={upstream_status} for {source_path} "
+            f"— no SSH validation performed"
+        )
+        result = {
+            **copy_status,
+            'validation_status': passthrough_status,
+            'validation_error': copy_status.get('error'),
+        }
+        ti = context.get('ti')
+        if ti is not None:
+            ti.xcom_push(key='return_value', value=result)
+        return result
 
     cmd = f"""
 if ! hadoop fs{s3_opts} -test -d "{s3_dest}" 2>/dev/null; then
@@ -638,17 +1043,28 @@ fi
         'validation_error': validation_error,
     }
     if validation_status != 'VALIDATED':
-        context['ti'].xcom_push(key='return_value', value=result)
-        raise Exception(
-            f"Validation {validation_status} for {source_path} -> {s3_dest}: "
+        logger.error(
+            f"[FolderValidate] {validation_status} for {source_path} -> {s3_dest}: "
             f"{validation_error or 'file count or size mismatch'}"
         )
+        result['validation_error'] = (
+            validation_error or 'file count or size mismatch'
+        )
+        ti = context.get('ti')
+        if ti is not None:
+            ti.xcom_push(key='return_value', value=result)
     return result
 
 
 @task.pyspark(conn_id='spark_default')
 def update_data_copy_validation(validation_result: dict, spark) -> dict:
     """Update data_copy_status with final validation metrics and status."""
+    if not isinstance(validation_result, dict) or 'run_id' not in validation_result:
+        logger.warning(
+            f"[update_data_copy_validation] Skipping invalid input: {type(validation_result)}"
+        )
+        return {}
+
     config = get_config()
     tracking_db = config['tracking_database']
 
@@ -657,12 +1073,24 @@ def update_data_copy_validation(validation_result: dict, spark) -> dict:
     dest_bucket = validation_result['dest_bucket'].replace("'", "''")
     dest_path   = validation_result['dest_path'].replace("'", "''")
 
-    validation_status = validation_result.get('validation_status', 'VALIDATION_FAILED')
+    validation_status = str(
+        validation_result.get('validation_status', 'VALIDATION_FAILED')
+    ).replace("'", "''")
     dest_file_count   = validation_result.get('dest_file_count', 0) or 0
     dest_size_bytes   = validation_result.get('dest_size_bytes', 0) or 0
     file_count_match  = str(validation_result.get('file_count_match', False)).lower()
     size_match        = str(validation_result.get('size_match', False)).lower()
-    val_error         = (validation_result.get('validation_error') or '').replace("'", "''")[:2000]
+    val_error         = str(validation_result.get('validation_error') or '').replace("'", "''")[:2000]
+
+    yarn_ids = validation_result.get('yarn_application_ids') or (
+        [validation_result['yarn_application_id']]
+        if validation_result.get('yarn_application_id') else []
+    )
+    yarn_app_id = ','.join(str(x) for x in yarn_ids).replace("'", "''")
+    distcp_duration = float(validation_result.get('distcp_duration_seconds', 0.0) or 0.0)
+    distcp_bytes = int(validation_result.get('distcp_bytes_copied', 0) or 0)
+    distcp_files = int(validation_result.get('distcp_files_copied', 0) or 0)
+    throughput_mbps = float(validation_result.get('throughput_mbps', 0.0) or 0.0)
 
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.data_copy_status
@@ -671,6 +1099,14 @@ def update_data_copy_validation(validation_result: dict, spark) -> dict:
             dest_size_bytes  = {dest_size_bytes},
             file_count_match = {file_count_match},
             size_match       = {size_match},
+            yarn_application_id = CASE
+                                 WHEN '{yarn_app_id}' != '' THEN '{yarn_app_id}'
+                                 ELSE yarn_application_id
+                               END,
+            distcp_duration_seconds = {distcp_duration},
+            distcp_bytes_copied     = {distcp_bytes},
+            distcp_files_copied     = {distcp_files},
+            throughput_mbps         = {throughput_mbps},
             error_message    = CASE
                                  WHEN '{val_error}' != '' THEN '{val_error}'
                                  ELSE error_message
@@ -687,28 +1123,44 @@ def update_data_copy_validation(validation_result: dict, spark) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def finalize_data_copy_run(run_id: str, spark) -> dict:
+def finalize_data_copy_run(run_id: str, spark, cluster_setup: dict = None) -> dict:
     """Aggregate folder-level counts and mark the data_copy_runs record as COMPLETED."""
     config = get_config()
     tracking_db = config['tracking_database']
 
-    stats = spark.sql(f"""
-        SELECT
-            COUNT(*)                                                              AS total_folders,
-            SUM(CASE WHEN status IN ('VALIDATED')                                      THEN 1 ELSE 0 END) AS successful_folders,
-            SUM(CASE WHEN status IN ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED') THEN 1 ELSE 0 END) AS failed_folders
-        FROM {tracking_db}.data_copy_status
-        WHERE run_id = '{run_id}'
-    """).collect()
+    total = successful = failed = skipped = 0
+    overall_status = 'FAILED'
 
-    if stats:
-        total      = int(stats[0]['total_folders']      or 0)
-        successful = int(stats[0]['successful_folders'] or 0)
-        failed     = int(stats[0]['failed_folders']     or 0)
-    else:
-        total = successful = failed = 0
+    try:
+        stats = spark.sql(f"""
+            SELECT
+                COUNT(*)                                                              AS total_folders,
+                SUM(CASE WHEN status IN ('VALIDATED', 'EMPTY_SOURCE')                      THEN 1 ELSE 0 END) AS successful_folders,
+                SUM(CASE WHEN status IN ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED', 'SOURCE_NOT_FOUND') THEN 1 ELSE 0 END) AS failed_folders,
+                SUM(CASE WHEN status IN ('SKIPPED')                                        THEN 1 ELSE 0 END) AS skipped_folders
+            FROM {tracking_db}.data_copy_status
+            WHERE run_id = '{run_id}'
+        """).collect()
 
-    overall_status = 'COMPLETED' if failed == 0 else 'COMPLETED_WITH_ERRORS'
+        if not stats or int(stats[0]['total_folders'] or 0) == 0:
+            logger.warning(
+                f"[FolderCopy] No folder records found for run_id '{run_id}'. "
+                f"Upstream tasks (excel parse / distcp / record) likely failed before "
+                f"writing any records."
+            )
+            overall_status = 'FAILED'
+        else:
+            total      = int(stats[0]['total_folders'] or 0)
+            successful = int(stats[0]['successful_folders'] or 0)
+            failed     = int(stats[0]['failed_folders'] or 0)
+            skipped    = int(stats[0]['skipped_folders'] or 0)
+            overall_status = 'COMPLETED' if failed == 0 else 'COMPLETED_WITH_ERRORS'
+    except Exception as e:
+        logger.error(
+            f"[FolderCopy] Failed to query data_copy_status for run_id '{run_id}': {str(e)}"
+        )
+        total = successful = failed = skipped = 0
+        overall_status = 'FAILED'
 
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.data_copy_runs
@@ -716,13 +1168,25 @@ def finalize_data_copy_run(run_id: str, spark) -> dict:
             completed_at       = current_timestamp(),
             total_folders      = {total},
             successful_folders = {successful},
-            failed_folders     = {failed}
+            failed_folders     = {failed},
+            skipped_folders    = {skipped}
         WHERE run_id = '{run_id}'
     """, task_label="finalize_data_copy_run")
 
+    if isinstance(cluster_setup, dict) and cluster_setup.get('service_account_user_id'):
+        _sa = str(cluster_setup['service_account_user_id']).replace("'", "''")
+        _sa_src = str(cluster_setup.get('service_account_source') or 'unknown').replace("'", "''")
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.data_copy_runs
+            SET service_account_user_id = '{_sa}',
+                service_account_source  = '{_sa_src}'
+            WHERE run_id = '{run_id}'
+        """, task_label="finalize_data_copy_run:update_service_account")
+        logger.info(f"[FolderCopy] Service account recorded: {_sa} ({_sa_src})")
+
     logger.info(
         f"[FolderCopy] Run {run_id} finalized: status={overall_status} | "
-        f"total={total} | successful={successful} | failed={failed}"
+        f"total={total} | successful={successful} | failed={failed} | skipped={skipped}"
     )
     return {
         'run_id': run_id,
@@ -730,11 +1194,13 @@ def finalize_data_copy_run(run_id: str, spark) -> dict:
         'total_folders': total,
         'successful_folders': successful,
         'failed_folders': failed,
+        'skipped_folders': skipped,
     }
 
 
 @task.pyspark(conn_id='spark_default')
-def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **context) -> dict:
+def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
+                                   cluster_setup: dict = None, **context) -> dict:
     """Generate HTML report for folder-only data copy run and write to S3."""
     from datetime import datetime
 
@@ -757,16 +1223,44 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
     total_folders     = len(folders)
     validated         = sum(1 for f in folders if f.status == 'VALIDATED')
     failed            = sum(1 for f in folders if (f.status or '') in ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED'))
+    source_not_found  = sum(1 for f in folders if (f.status or '') == 'SOURCE_NOT_FOUND')
+    empty_source      = sum(1 for f in folders if (f.status or '') == 'EMPTY_SOURCE')
+    skipped           = sum(1 for f in folders if (f.status or '') == 'SKIPPED')
     incremental       = sum(1 for f in folders if f.is_incremental)
     total_bytes       = sum(f.dest_size_bytes or 0 for f in folders)
     total_files       = sum(f.dest_file_count or 0 for f in folders)
     total_bytes_copied = sum(f.bytes_copied or 0 for f in folders)
     total_gb          = total_bytes / (1024 ** 3)
 
+    _throughputs = [
+        float(getattr(f, 'throughput_mbps', 0) or 0)
+        for f in folders
+        if float(getattr(f, 'throughput_mbps', 0) or 0) > 0
+    ]
+    avg_throughput = (sum(_throughputs) / len(_throughputs)) if _throughputs else 0.0
+
     run_status = (run_row.status if run_row else 'UNKNOWN')
     excel_path = (run_row.excel_file_path if run_row else '')
     started_at = str(run_row.started_at if run_row else '')
     completed_at = str(run_row.completed_at if run_row else '')
+    dag_run_id = str(getattr(run_row, 'dag_run_id', '') or '') if run_row else ''
+    cluster_type = config.get('cluster_type', 'MapR')
+
+    if isinstance(cluster_setup, dict):
+        sa_user = str(cluster_setup.get('service_account_user_id') or '').strip()
+        sa_source = str(cluster_setup.get('service_account_source') or '').strip()
+    else:
+        sa_user, sa_source = '', ''
+    if not sa_user and run_row is not None:
+        sa_user = str(getattr(run_row, 'service_account_user_id', '') or '').strip()
+        sa_source = str(getattr(run_row, 'service_account_source', '') or '').strip()
+    if not sa_user:
+        sa_user = str(config.get('service_account_user_id') or '').strip()
+        sa_source = 'config:service_account_user_id' if sa_user else 'unknown'
+    sa_display = sa_user or 'not configured'
+    sa_source = sa_source or 'unknown'
+
+    failure_rows = [f for f in folders if (f.status or '') != 'VALIDATED']
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -812,6 +1306,7 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
         .metric {{ font-weight: bold; color: #2980b9; }}
         .pass {{ color: #27ae60; font-weight: bold; }}
         .fail {{ color: #e74c3c; font-weight: bold; }}
+        .neutral-cell {{ color: #bdc3c7; font-weight: bold; }}
         .timestamp {{ color: #95a5a6; font-size: 12px; }}
         .section-divider {{ margin: 40px 0; border-top: 2px dashed #ecf0f1; }}
         .error-cell {{ color: #721c24; font-size: 11px; word-break: break-word; max-width: 300px; }}
@@ -823,7 +1318,11 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
     <div class="timestamp">
         Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
         Run ID: <strong>{run_id}</strong><br>
-        Excel: <strong>{excel_path}</strong><br>
+        DAG Run ID: <strong>{_html_escape(dag_run_id)}</strong><br>
+        Excel: <strong>{_html_escape(str(excel_path))}</strong><br>
+        Cluster Type: <strong>{_html_escape(str(cluster_type))}</strong><br>
+        Service Account: <strong>{_html_escape(sa_display)}</strong>
+        <span style="color:#7f8c8d;">(source: {_html_escape(sa_source)})</span><br>
         Started: <strong>{started_at}</strong> &nbsp; Completed: <strong>{completed_at}</strong>
     </div>
 
@@ -844,6 +1343,22 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
         <div class="summary-card warning">
             <h3>FAILED</h3>
             <p class="value">{failed}</p>
+        </div>
+        <div class="summary-card warning">
+            <h3>SOURCE NOT FOUND</h3>
+            <p class="value">{source_not_found}</p>
+        </div>
+        <div class="summary-card info">
+            <h3>EMPTY SOURCE</h3>
+            <p class="value">{empty_source}</p>
+        </div>
+        <div class="summary-card info">
+            <h3>SKIPPED</h3>
+            <p class="value">{skipped}</p>
+        </div>
+        <div class="summary-card info">
+            <h3>AVG THROUGHPUT (MB/s)</h3>
+            <p class="value">{avg_throughput:.2f}</p>
         </div>
         <div class="summary-card info">
             <h3>INCREMENTAL</h3>
@@ -881,6 +1396,9 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
                 <th>Size Match</th>
                 <th>Bytes Copied (GB)</th>
                 <th>Files Copied</th>
+                <th>Duration</th>
+                <th>MB/s</th>
+                <th>YARN App ID</th>
                 <th>Error</th>
             </tr>
         </thead>
@@ -899,17 +1417,46 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
         src_gb  = (f.source_size_bytes or 0) / (1024 ** 3)
         dest_gb = (f.dest_size_bytes or 0) / (1024 ** 3)
         copied_gb = (f.bytes_copied or 0) / (1024 ** 3)
-        fc_class = 'pass' if f.file_count_match else 'fail'
-        fc_icon  = '✓' if f.file_count_match else '✗'
-        sm_class = 'pass' if f.size_match else 'fail'
-        sm_icon  = '✓' if f.size_match else '✗'
+        if status in ('EMPTY_SOURCE', 'SOURCE_NOT_FOUND', 'SKIPPED'):
+            fc_class = sm_class = 'neutral-cell'
+            fc_icon = sm_icon = '—'
+        else:
+            fc_class = 'pass' if f.file_count_match else 'fail'
+            fc_icon  = '✓' if f.file_count_match else '✗'
+            sm_class = 'pass' if f.size_match else 'fail'
+            sm_icon  = '✓' if f.size_match else '✗'
         incr_lbl = '✓' if f.is_incremental else ''
-        error_cell = f'<span class="error-cell">{(f.error_message or "")[:200]}</span>' if f.error_message else ''
+        error_cell = (
+            f'<span class="error-cell">{_html_escape(str(f.error_message or ""))[:400]}</span>'
+            if f.error_message else ''
+        )
+
+        _dur = float(getattr(f, 'distcp_duration_seconds', 0) or 0)
+        dur_cell = f"{_dur:.1f}s" if _dur else 'N/A'
+        _tput = float(getattr(f, 'throughput_mbps', 0) or 0)
+        tput_cell = f"{_tput:.2f}" if _tput else 'N/A'
+
+        _yarn_raw = str(getattr(f, 'yarn_application_id', '') or '')
+        _yarn_ids = [x for x in _yarn_raw.split(',') if x]
+        if len(_yarn_ids) > 1:
+            _yarn_list = "".join(
+                f"<div style='font-family:monospace;color:#666;font-size:11px;'>{_html_escape(i)}</div>"
+                for i in _yarn_ids
+            )
+            yarn_cell = (
+                f"<details style='font-size:11px;color:#666;'>"
+                f"<summary style='cursor:pointer;color:#2980b9;'>{len(_yarn_ids)} YARN app IDs</summary>"
+                f"{_yarn_list}</details>"
+            )
+        elif _yarn_ids:
+            yarn_cell = f"<small style='font-family:monospace;color:#666;'>{_html_escape(_yarn_ids[0])}</small>"
+        else:
+            yarn_cell = ''
 
         html += f"""
             <tr>
-                <td>{f.source_path}</td>
-                <td>{f.dest_bucket}/{f.dest_path}</td>
+                <td>{_html_escape(str(f.source_path or ''))}</td>
+                <td>{_html_escape(str(f.dest_bucket or ''))}/{_html_escape(str(f.dest_path or ''))}</td>
                 <td><span class="status-badge {badge_cls}">{status}</span></td>
                 <td style="text-align:center">{incr_lbl}</td>
                 <td class="metric">{(f.source_file_count or 0):,}</td>
@@ -920,6 +1467,9 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
                 <td class="{sm_class}">{sm_icon}</td>
                 <td class="metric">{copied_gb:.4f}</td>
                 <td class="metric">{(f.files_copied or 0):,}</td>
+                <td class="metric">{dur_cell}</td>
+                <td class="metric">{tput_cell}</td>
+                <td>{yarn_cell}</td>
                 <td>{error_cell}</td>
             </tr>
 """
@@ -928,6 +1478,73 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
         </tbody>
     </table>
 
+    <div class="section-divider"></div>
+
+    <h2>Performance Metrics</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Source Path</th>
+                <th>Data Volume (GB)</th>
+                <th>DistCp Speed (MB/s)</th>
+                <th>Files/sec</th>
+                <th>Duration</th>
+            </tr>
+        </thead>
+        <tbody>
+"""
+
+    for f in folders:
+        _dur = float(getattr(f, 'distcp_duration_seconds', 0) or 0)
+        data_gb = (f.dest_size_bytes or 0) / (1024 ** 3)
+        speed_mbps = (f.dest_size_bytes or 0) / (1024 ** 2) / (_dur or 1)
+        files_per_sec = (f.dest_file_count or 0) / (_dur or 1)
+        html += f"""
+            <tr>
+                <td>{_html_escape(str(f.source_path or ''))}</td>
+                <td class="metric">{data_gb:.6f}</td>
+                <td class="metric">{speed_mbps:.6f}</td>
+                <td class="metric">{files_per_sec:,.2f}</td>
+                <td class="metric">{_dur:.1f}s ({_dur / 60:.1f}m)</td>
+            </tr>
+"""
+
+    html += """
+        </tbody>
+    </table>
+"""
+
+    if failure_rows:
+        html += """
+    <div class="section-divider"></div>
+
+    <h2>Failures</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Source Path</th>
+                <th>Destination</th>
+                <th>Status</th>
+                <th>Error</th>
+            </tr>
+        </thead>
+        <tbody>
+"""
+        for f in failure_rows:
+            html += f"""
+            <tr>
+                <td>{_html_escape(str(f.source_path or ''))}</td>
+                <td>{_html_escape(str(f.dest_bucket or ''))}/{_html_escape(str(f.dest_path or ''))}</td>
+                <td><span class="status-badge status-failed">{_html_escape(str(f.status or ''))}</span></td>
+                <td class="error-cell">{_html_escape(str(f.error_message or ''))[:400]}</td>
+            </tr>
+"""
+        html += """
+        </tbody>
+    </table>
+"""
+
+    html += """
     <div style="margin-top:50px; padding-top:20px; border-top:1px solid #ecf0f1; color:#95a5a6; font-size:12px;">
         <p>This report was automatically generated by the Folder Data Copy DAG.</p>
     </div>
@@ -950,7 +1567,12 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark, **
     stream.close()
 
     logger.info(f"[FolderCopy] HTML report written to {report_path}")
-    return {'report_path': report_path}
+    return {
+        'report_path': report_path,
+        'overall_status': run_status,
+        'total_folders': total_folders,
+        'successful_folders': validated + empty_source,
+    }
 
 
 @task.pyspark(conn_id='spark_default')
@@ -971,6 +1593,9 @@ def send_data_copy_report_email(report_result: dict, run_id: str, spark) -> dict
 
     recipients  = [r.strip() for r in recipients_raw.split(',') if r.strip()]
     report_path = report_result.get('report_path', '')
+    overall_status = report_result.get('overall_status', 'UNKNOWN')
+    total_folders = report_result.get('total_folders', 0)
+    successful_folders = report_result.get('successful_folders', 0)
 
     try:
         logger.info(f"[FolderCopy] Reading HTML report from S3: {report_path}")
@@ -1001,7 +1626,10 @@ def send_data_copy_report_email(report_result: dict, run_id: str, spark) -> dict
 
         send_email(
             to=recipients,
-            subject=f"Folder Data Copy Report - {run_id}",
+            subject=(
+                f"Folder Data Copy Report - {run_id} - {overall_status} "
+                f"({successful_folders}/{total_folders})"
+            ),
             html_content=f"<p>Please find the Folder Data Copy report for run <strong>{run_id}</strong> attached.</p>",
             files=[tmp.name],
             conn_id=smtp_conn_id,
@@ -1011,7 +1639,40 @@ def send_data_copy_report_email(report_result: dict, run_id: str, spark) -> dict
         return {'sent': True, 'recipients': recipients, 'report_path': report_path}
     except Exception as e:
         logger.error(f"[FolderCopy] Failed to send report email: {str(e)}")
+        if is_permanent_error("send_email", e):
+            permanent_fail("send_data_copy_report_email", e)
         raise Exception(f"Failed to send Folder Data Copy report email: {str(e)}") from e
+
+
+@task
+def check_data_copy_run_outcome(finalize_result: dict) -> dict:
+    """Fail the DAG run when any folder failed, so a red run is visible in the UI."""
+    if not isinstance(finalize_result, dict) or 'run_id' not in finalize_result:
+        logger.warning(
+            f"[check_data_copy_run_outcome] Skipping invalid input: {type(finalize_result)}"
+        )
+        return {}
+
+    run_id = finalize_result['run_id']
+    total = int(finalize_result.get('total_folders', 0) or 0)
+    failed = int(finalize_result.get('failed_folders', 0) or 0)
+
+    if total == 0:
+        raise Exception(
+            f"[FolderCopy] Run {run_id} wrote no folder records to data_copy_status — "
+            f"upstream tasks failed before any folder was processed."
+        )
+
+    if failed > 0:
+        raise Exception(
+            f"[FolderCopy] Run {run_id} finished with {failed}/{total} folder(s) failed. "
+            f"See the data copy report and data_copy_status for per-folder errors."
+        )
+
+    logger.info(
+        f"[FolderCopy] Run {run_id} outcome check passed: {total} folder(s), 0 failed"
+    )
+    return finalize_result
 
 
 # =============================================================================
@@ -1035,6 +1696,7 @@ with DAG(
         )
     },
     render_template_as_native_obj=True,
+    on_failure_callback=_folder_copy_dag_failure_callback,
 ) as dag_folder_copy:
 
     # Pre-flight checks
@@ -1043,7 +1705,8 @@ with DAG(
     # Initialize tracking tables and create a run record
     t_fc_init   = init_folder_copy_tracking_tables()
     t_fc_run_id = create_data_copy_run(
-        excel_file_path="{{ params.excel_file_path }}"
+        excel_file_path="{{ params.excel_file_path }}",
+        dag_run_id="{{ run_id }}"
     )
 
     # Cluster authentication — receives tracking run_id
@@ -1059,7 +1722,7 @@ with DAG(
     # max_active_tis_per_dagrun=3 caps concurrent DistCp YARN jobs
     t_fc_distcp = run_folder_distcp_ssh.override(
         trigger_rule='all_done', max_active_tis_per_dagrun=3
-    ).expand(folder_config=t_fc_excel)
+    ).partial(cluster_setup=t_fc_cluster).expand(folder_config=t_fc_excel)
 
     t_fc_record = record_data_copy_status.override(
         trigger_rule='all_done'
@@ -1075,13 +1738,15 @@ with DAG(
 
     # Finalize run — waits for all per-folder validation to finish (via dependency chain)
     t_fc_final = finalize_data_copy_run.override(trigger_rule='all_done')(
-        run_id=t_fc_run_id
+        run_id=t_fc_run_id,
+        cluster_setup=t_fc_cluster
     )
 
     # Report and email
     t_fc_report = generate_data_copy_html_report.override(trigger_rule='all_done')(
         run_id=t_fc_run_id,
         finalize_result=t_fc_final,
+        cluster_setup=t_fc_cluster,
         params="{{ params }}"
     )
 
@@ -1090,8 +1755,13 @@ with DAG(
         run_id=t_fc_run_id
     )
 
+    # Terminal gate — turns the DAG run red when folders failed
+    t_fc_gate = check_data_copy_run_outcome.override(
+        trigger_rule='all_done', retries=0
+    )(finalize_result=t_fc_final)
+
     # Dependency chain — prereqs → init → run_id → excel → cluster → work
     # Per-folder chain is linear: distcp → record_status → validate → update_validation
-    t_fc_prereq >> t_fc_init >> t_fc_run_id >> t_fc_excel >> t_fc_cluster
-    t_fc_cluster >> t_fc_distcp >> t_fc_record >> t_fc_copy_validate >> t_fc_val_status
-    t_fc_val_status >> t_fc_final >> t_fc_report >> t_fc_email
+    t_fc_prereq >> t_fc_init >> t_fc_run_id >> t_fc_cluster >> t_fc_excel
+    t_fc_excel >> t_fc_distcp >> t_fc_record >> t_fc_copy_validate >> t_fc_val_status
+    t_fc_val_status >> t_fc_final >> t_fc_report >> t_fc_email >> t_fc_gate

@@ -1249,9 +1249,9 @@ init_folder_copy_tracking_tables
     ↓
 create_data_copy_run
     ↓
-parse_folder_copy_excel
-    ↓
 cluster_login_setup  (edge node auth)
+    ↓
+parse_folder_copy_excel
     ↓
 ┌──────────────────────────────────────────────────────────────┐
 │  Dynamic Task Mapping (one instance per Excel row)           │
@@ -1270,7 +1270,13 @@ finalize_data_copy_run
 generate_data_copy_html_report
     ↓
 send_data_copy_report_email
+    ↓
+check_data_copy_run_outcome  (terminal gate — fails the run if any folder failed)
 ```
+
+> `cluster_login_setup` runs **before** `parse_folder_copy_excel` so the resolved
+> `cluster_setup` dict (service account, edge temp dir, DistCp log dir) is available to
+> `run_folder_distcp_ssh`, `finalize_data_copy_run`, and `generate_data_copy_html_report`.
 
 ---
 
@@ -1308,7 +1314,20 @@ send_data_copy_report_email
 
 ---
 
-#### Step 4 - `parse_folder_copy_excel`
+#### Step 4 - `cluster_login_setup`
+
+**Type:** SSH
+**Purpose:** Authenticate with the cluster edge node and set up the session environment
+
+- Runs **before** the Excel parse so `cluster_setup` is available to every downstream task
+- Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
+- Performs cluster authentication using the configured `auth_method` (`mapr`, `kinit`, or `none`)
+- Returns a `cluster_setup` dict containing `temp_dir`, `distcp_log_dir`,
+  `service_account_user_id`, and `service_account_source`
+
+---
+
+#### Step 5 - `parse_folder_copy_excel`
 
 **Type:** PySpark
 **Purpose:** Read and parse the Excel config file from S3
@@ -1321,36 +1340,28 @@ send_data_copy_report_email
 
 ---
 
-#### Step 5 - `cluster_login_setup`
-
-**Type:** SSH
-**Purpose:** Authenticate with the cluster edge node and set up the session environment
-
-- Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
-- Performs cluster authentication using the configured `auth_method` (`mapr`, `kinit`, or `none`)
-- Returns a `cluster_setup` dict consumed by downstream SSH tasks
-
----
-
-#### Step 6 - `run_folder_distcp_ssh`
-
-- Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
-- Performs cluster authentication using the configured `auth_method` (`mapr`, `kinit`, or `none`)
-- Returns a `cluster_setup` dict consumed by downstream SSH tasks
-
----
-
 #### Step 6 - `run_folder_distcp_ssh`
 
 **Type:** SSH (mapped per folder)
 **Purpose:** Copy a single source folder to S3 via Hadoop DistCp
 
 - Always uses `-update` flag — safe for both full and incremental runs
+- `-delete` is added only when **both** `migration_distcp_preserve_delete` and
+  `folder_copy_allow_delete` resolve true (see Variables below); off by default
+- Writes a DistCp log to `{cluster_setup.distcp_log_dir}/distcp_{dest_folder}.log`
+- Checks the source path first: a missing path returns `SOURCE_NOT_FOUND` without running
+  DistCp; a present but empty path creates the S3 prefix and returns `EMPTY_SOURCE`
 - Captures source file count and size before copy
 - Captures S3 file count and size before and after copy
+- Parses DistCp's own `Bytes Copied` / `Files Copied` counters from a delimited
+  `===DISTCP_METRICS_START===` / `===DISTCP_METRICS_END===` block
+- Extracts every YARN application ID from stdout and stderr, deduplicated in order; the
+  last one is the primary `yarn_application_id`
+- Computes `distcp_duration_seconds` and `throughput_mbps`
 - Computes `files_copied` and `bytes_copied` as before/after deltas
 - Sets `file_count_match` (exact) and `size_match` (within 1% tolerance)
-- On failure returns a FAILED result dict — does not raise — so tracking can record it
+- On failure returns a FAILED result dict — does not raise — so tracking can record it;
+  metrics parsed before the failure are retained
 - **Timeout:** 24 hours (`SSH_COMMAND_TIMEOUT`)
 
 ---
@@ -1387,8 +1398,15 @@ send_data_copy_report_email
 **Purpose:** Aggregate folder counts and mark the run as complete
 
 - Queries `data_copy_status` for authoritative counts
+- `successful_folders` counts `VALIDATED` + `EMPTY_SOURCE`; `failed_folders` counts
+  `FAILED`, `VALIDATION_FAILED`, `VALIDATION_SKIPPED`, and `SOURCE_NOT_FOUND`;
+  `skipped_folders` counts `SKIPPED`
 - Sets run status to `COMPLETED` (zero failures) or `COMPLETED_WITH_ERRORS`
-- Updates `data_copy_runs` with totals and `completed_at`
+- Sets run status to `FAILED` when the run wrote **no** folder records at all, or when the
+  stats query itself fails
+- Updates `data_copy_runs` with totals, `skipped_folders`, and `completed_at`
+- Records `service_account_user_id` / `service_account_source` from `cluster_setup` so the
+  identity actually resolved on the edge node reaches tracking
 
 ---
 
@@ -1397,8 +1415,16 @@ send_data_copy_report_email
 **Type:** PySpark
 **Purpose:** Generate an HTML report and write it to S3
 
-- Summary cards: run status, total/validated/failed folders, incremental count, total GB, files, bytes copied
-- Per-folder details table with source path, destination, copy status badge, file/size match indicators, and error snippets
+- Header: DAG run ID, Excel path, cluster type, and the service account with its source
+  (resolved from `cluster_setup` first, then the tracking row, then config)
+- Summary cards: run status, total/validated/failed folders, source-not-found, empty-source,
+  skipped, average throughput (MB/s), incremental count, total GB, files, bytes copied
+- Per-folder details table with source path, destination, copy status badge, file/size match
+  indicators, duration, MB/s, YARN application ID(s), and error snippets
+- `EMPTY_SOURCE`, `SOURCE_NOT_FOUND`, and `SKIPPED` rows render a neutral em dash in the
+  match columns rather than a failure cross
+- Performance Metrics table: data volume, DistCp speed, files/sec, duration per folder
+- Failures table listing every non-`VALIDATED` folder with its status and error
 - Writes to `{report_location}/{run_id}_data_copy_report.html`
 - Returns `report_path` (S3 key); email task reads the report directly from S3
 
@@ -1409,9 +1435,42 @@ send_data_copy_report_email
 **Type:** PySpark
 **Purpose:** Email the HTML report via SMTP
 
-- Subject: `Folder Data Copy Report - {run_id}`
+- Subject: `Folder Data Copy Report - {run_id} - {overall_status} ({successful}/{total})`
 - Skips silently if `migration_email_recipients` variable is empty
 - Uses same SMTP connection (`migration_smtp_conn_id`) as DAG 1 and DAG 2
+- Permanent SMTP errors (bad credentials, missing report) fail immediately instead of
+  consuming retries
+
+---
+
+#### Step 13 - `check_data_copy_run_outcome`
+
+**Type:** Python (terminal gate)
+**Purpose:** Make the Airflow DAG run go red when folders failed
+
+- Runs last, after the report and the email, with `trigger_rule='all_done'` and `retries=0`
+  so it never delays or re-runs the pipeline
+- Because `run_folder_distcp_ssh` returns FAILED instead of raising, without this gate a run
+  where every folder failed would still report SUCCESS
+- Raises if `total_folders == 0` (no folder records were written for the run)
+- Raises if `failed_folders > 0`, naming the failed/total counts
+- Otherwise returns the finalize result unchanged
+- Report and email stay **upstream** of the gate, so they are always produced first
+
+---
+
+### DAG Failure Callback
+
+`_folder_copy_dag_failure_callback` is registered as the DAG's `on_failure_callback` and is
+best-effort recovery for a cancelled or manually-failed run:
+
+- Reads the tracking `run_id` from the `create_data_copy_run` XCom
+- Marks the `data_copy_runs` row `CANCELLED` with `completed_at` when it is still `RUNNING`
+- Regenerates and writes the HTML report using the same builder as
+  `generate_data_copy_html_report`
+- Requires an active Spark session; if there is none it logs and returns
+- Every failure inside the callback is logged and swallowed — nothing propagates into the
+  scheduler
 
 ---
 
@@ -1438,6 +1497,50 @@ COMPLETED_WITH_ERRORS
 | `VALIDATION_FAILED`  | Destination exists but file count or size mismatch |
 | `VALIDATION_SKIPPED` | Copy step failed — validation not attempted        |
 | `FAILED`             | DistCp failed                                      |
+| `SOURCE_NOT_FOUND`   | Source path does not exist — DistCp not attempted  |
+| `EMPTY_SOURCE`       | Source exists but has 0 files — S3 prefix created  |
+| `SKIPPED`            | Folder deliberately not copied                     |
+
+Validation passes `FAILED`, `SOURCE_NOT_FOUND`, `EMPTY_SOURCE`, and `SKIPPED` rows straight
+through without raising, so the mapped chain always completes and every folder is recorded.
+
+---
+
+### Folder Copy Variables
+
+| Variable                            | Default | Description                                                                                                                                                                                                                    |
+| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `folder_copy_allow_delete`          | `false` | Second, folder-copy-specific switch that must **also** be true before DistCp is given `-delete`. Deletion is off by default here because folder copy targets raw directories with no Hive metadata to reconcile against — an over-broad `source_path` or a wrong `dest_folder` would silently delete unrelated S3 objects under the destination prefix. Set to `true` only when the destination prefix is owned exclusively by this copy and you want removed source files mirrored. |
+| `migration_distcp_preserve_delete`  | `true`  | Shared DistCp switch (also used by DAG 1). Folder copy requires this **and** `folder_copy_allow_delete` before passing `-delete`.                                                                                              |
+
+---
+
+### Tracking Columns
+
+Columns added to the folder-copy tracking tables. All additions are applied idempotently at
+run time via `ALTER TABLE ... ADD COLUMN`, so existing tracking databases evolve in place; a
+missing column is reported as a single WARNING after a `DESCRIBE` check.
+
+**`data_copy_runs`**
+
+| Column                    | Type     | Description                                                            |
+| ------------------------- | -------- | ---------------------------------------------------------------------- |
+| `dag_run_id`              | `STRING` | Airflow DAG run ID that produced this tracking run                     |
+| `service_account_user_id` | `STRING` | Service account the copy actually ran as on the edge node              |
+| `service_account_source`  | `STRING` | How that account was resolved (config, active MapR ticket, `.profile`) |
+| `skipped_folders`         | `INT`    | Count of folders with status `SKIPPED`                                 |
+
+**`data_copy_status`**
+
+| Column                    | Type        | Description                                                     |
+| ------------------------- | ----------- | --------------------------------------------------------------- |
+| `yarn_application_id`     | `STRING`    | YARN application ID(s) for the DistCp job, comma-separated       |
+| `distcp_started_at`       | `TIMESTAMP` | When the DistCp step started                                     |
+| `distcp_completed_at`     | `TIMESTAMP` | When the DistCp step finished                                    |
+| `distcp_duration_seconds` | `DOUBLE`    | DistCp wall-clock duration                                       |
+| `distcp_bytes_copied`     | `BIGINT`    | Bytes reported by DistCp's own counters                          |
+| `distcp_files_copied`     | `BIGINT`    | Files reported by DistCp's own counters                          |
+| `throughput_mbps`         | `DOUBLE`    | `distcp_bytes_copied / 1 MiB / distcp_duration_seconds`          |
 
 ---
 
