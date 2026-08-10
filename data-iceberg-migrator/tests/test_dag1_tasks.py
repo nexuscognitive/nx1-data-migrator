@@ -279,56 +279,62 @@ class TestClusterLoginSetup:
 class TestClassifyDiscoveryError:
     """The classifier decides whether a per-table discovery error is a permanent
     source-data condition (skip the table, migrate its siblings) or an unreliable
-    result (abort the database). Both directions of error are costly: a false
-    positive silently skips a table that should have been migrated, a false
-    negative blocks a whole database. Hence the table-driven cases."""
-
-    LOC = 'maprfs:///datalake/sales/orders'
+    result (abort the database). Both directions are costly: a false positive
+    silently skips a table that should have been migrated, a false negative blocks
+    a whole database. It keys off `source_path_exists`, the remote script's direct
+    fs.exists() on the table's LOCATION, rather than the wording of the exception.
+    """
 
     @pytest.mark.parametrize('error', [
-        # Spark AnalysisException — the form reported in WF-343
+        # The form reported in WF-343
         "u'Path does not exist: maprfs:/datalake/sales/orders;'",
-        # Hadoop FileNotFoundException — 'File <uri> does not exist', no 'path' token
         'java.io.FileNotFoundException: File maprfs:///datalake/sales/orders does not exist.',
-        # MapR phrasing
-        'java.io.FileNotFoundException: Requested file maprfs:/datalake/sales/orders does not exist.',
-        # InputFormat path check
         ('org.apache.hadoop.mapred.InvalidInputException: '
          'Input path does not exist: maprfs:/datalake/sales/orders'),
+        # The root is verifiably gone, so the table cannot be migrated whatever
+        # else went wrong on the way; the raw error is still kept in tracking.
+        'java.lang.OutOfMemoryError: GC overhead limit exceeded',
     ])
-    def test_missing_source_path_forms_are_skippable(self, error):
-        assert m._classify_discovery_error(error, self.LOC) == 'SOURCE_PATH_NOT_FOUND'
+    def test_missing_root_location_is_skippable(self, error):
+        assert m._classify_discovery_error(error, False) == 'SOURCE_PATH_NOT_FOUND'
 
     @pytest.mark.parametrize('error', [
-        # Executor loss / shuffle spill: matches 'no such file or directory' but the
-        # path is executor-local scratch, not the table's data. Must stay retryable.
+        # A leaf file under the table root vanished mid-listing (concurrent compaction
+        # or rewrite). The root is intact, so the table is migratable on retry — this
+        # must NOT be recorded as an orphaned metastore entry.
+        ('java.io.FileNotFoundException: File does not exist: '
+         'maprfs:/datalake/sales/orders/part-00000-abc.snappy.parquet\n'
+         "It is possible the underlying files have been updated... 'REFRESH TABLE tableName'"),
+        ('org.apache.spark.SparkException: Job aborted due to stage failure: Task 3 in '
+         'stage 1.0 failed 4 times: java.io.FileNotFoundException: '
+         'maprfs:/datalake/sales/orders/dt=2024-01-01/part-7.parquet (No such file or directory)'),
+        # One partition directory gone, root fine: 99 intact partitions must not be
+        # dropped from the migration.
+        'Path does not exist: maprfs:/datalake/sales/orders/dt=2024-01-01',
+        # A sibling table whose path prefix-extends ours.
+        'Path does not exist: maprfs:/datalake/sales/orders_archive',
+        # Executor-local scratch from a lost executor — transient, keep its retries.
         ('java.io.FileNotFoundException: /tmp/blockmgr-9f2c/0c/shuffle_0_1_0.index '
          '(No such file or directory)'),
-        # ACL problem on the source — permanent, but not a missing path, and it
-        # must not be silently skipped as though the data were gone.
-        ('org.apache.hadoop.security.AccessControlException: Permission denied: '
-         'user=svc_migration, path="maprfs:/datalake/sales/orders"'),
-        # Genuinely unclassifiable
-        'java.lang.OutOfMemoryError: GC overhead limit exceeded',
-        'org.apache.spark.SparkException: Job aborted due to stage failure',
     ])
-    def test_other_errors_are_not_skippable(self, error):
-        assert m._classify_discovery_error(error, self.LOC) == 'FAILED'
+    def test_intact_root_location_is_not_skippable(self, error):
+        assert m._classify_discovery_error(error, True) == 'FAILED'
 
-    def test_unknown_location_is_not_skippable(self):
-        """If DESCRIBE never yielded a location there is nothing to corroborate the
-        error against, so fall back to aborting rather than guessing."""
+    def test_permission_error_is_not_skippable_even_when_root_reads_as_absent(self):
+        """Not being allowed to see the data is not the same as the data being gone;
+        skipping would bury an ACL problem as "source needs cleanup"."""
         assert m._classify_discovery_error(
-            'Path does not exist: maprfs:/datalake/sales/orders', ''
+            'org.apache.hadoop.security.AccessControlException: Permission denied: '
+            'user=svc_migration, path="maprfs:/datalake/sales/orders"',
+            False,
         ) == 'FAILED'
 
-    def test_path_belonging_to_a_different_table_is_not_skippable(self):
+    def test_unknown_existence_is_not_skippable(self):
+        """If the fs lookup itself failed, or DESCRIBE never yielded a location,
+        there is no ground truth — abort rather than guess."""
         assert m._classify_discovery_error(
-            'Path does not exist: maprfs:/datalake/sales/some_other_table', self.LOC
+            'Path does not exist: maprfs:/datalake/sales/orders', None
         ) == 'FAILED'
-
-    def test_empty_error_is_not_skippable(self):
-        assert m._classify_discovery_error('', self.LOC) == 'FAILED'
 
 
 class TestDiscoverTablesViaSshSpark:
@@ -527,6 +533,7 @@ class TestDiscoverTablesViaSshSpark:
             'partition_filter_active': False, 'filtered_row_count': 0,
             'filtered_source_size_bytes': 0, 'filtered_file_count': 0,
             'full_table_row_count': 0, 'full_table_partition_count': 0,
+            'source_path_exists': True,
         }
         record.update(overrides)
         return record
@@ -543,6 +550,21 @@ class TestDiscoverTablesViaSshSpark:
             'dest_bucket': 's3a://bucket',
         })
 
+    def test_generated_remote_script_is_valid_python(self, mock_ssh_hook, sample_run_id):
+        """The discovery script is built as a string and only ever executed on the
+        edge node, so a syntax error there surfaces as an opaque Spark failure in
+        production. Compile it here instead."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        compile(script, 'discover_tables.py', 'exec')
+        # Guard the two fields the driver-side classifier depends on.
+        assert 'source_path_exists = bool(fs.exists(path))' in script
+        assert '"source_path_exists": source_path_exists' in script
+
     def test_orphaned_metastore_entry_does_not_abort_sibling_tables(
         self, mock_ssh_hook, sample_run_id
     ):
@@ -557,6 +579,7 @@ class TestDiscoverTablesViaSshSpark:
                 't_ce_phonepref_ref',
                 error="u'Path does not exist: maprfs:/datalake/sales/t_ce_phonepref_ref;'",
                 error_type='FAILED',
+                source_path_exists=False,
             ),
             self._make_metadata_record('good_two'),
         ]
@@ -994,6 +1017,19 @@ class TestUpdateDistcpStatus:
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
         assert any('FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_skipped_row_gets_no_per_table_update(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """A table skipped at discovery already has its final status; the per-table
+        UPDATE must not run for it and overwrite that with COPIED/FAILED."""
+        sample_distcp_result['distcp_results'][0]['status'] = 'SOURCE_PATH_NOT_FOUND'
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        per_table = [
+            c.args[1] for c in mock_iceberg_retry.call_args_list
+            if "distcp_status = 'COPIED'" in c.args[1] or "distcp_status = 'FAILED'" in c.args[1]
+        ]
+        assert per_table == []
+
     def test_failure_update_preserves_skippable_statuses(
         self, mock_spark, sample_distcp_result, mock_iceberg_retry
     ):
@@ -1425,6 +1461,17 @@ class TestUpdateTableCreateStatus:
         m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
         assert any('TABLE_CREATED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_skipped_row_gets_no_per_table_update(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        sample_table_result['table_results'][0]['status'] = 'SOURCE_PATH_NOT_FOUND'
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        per_table = [
+            c.args[1] for c in mock_iceberg_retry.call_args_list
+            if 'table_create_status =' in c.args[1] and 'source_table =' in c.args[1]
+        ]
+        assert per_table == []
+
     def test_preserves_skippable_statuses(self, mock_spark, sample_table_result, mock_iceberg_retry):
         m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
         sql_calls = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
@@ -1854,7 +1901,9 @@ class TestGenerateHtmlReport:
             s3_files_transferred=0, file_count_match=None,
             distcp_status=None, file_format='UNKNOWN',
             partition_filter=None, filtered_partition_count=None,
-            error_message='Path does not exist: maprfs:/datalake/cap/curated/mktg/target/t_ce_phonepref_ref',
+            source_location='maprfs:/datalake/cap/curated/mktg/target/t_ce_phonepref_ref',
+            error_message="u'Path does not exist: <maprfs>;' It is possible the "
+                          'underlying files have been updated',
         )
 
         def sql_router(sql):
@@ -1877,8 +1926,11 @@ class TestGenerateHtmlReport:
         assert 'status-path-not-found' in html
         assert 'SOURCE_PATH_NOT_FOUND' in html
         # The path is the actionable part — ops needs it to decide between cleaning
-        # up the metastore entry and restoring the data.
+        # up the metastore entry and restoring the data. The location is preferred
+        # over the full Spark exception, and anything rendered is HTML-escaped.
         assert 'maprfs:/datalake/cap/curated/mktg/target/t_ce_phonepref_ref' in html
+        assert 'It is possible the underlying files' not in html
+        assert '<maprfs>' not in html
 
 
 class TestSendMigrationReportEmail:

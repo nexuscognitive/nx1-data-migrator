@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 from datetime import datetime, timedelta
+from html import escape as html_escape  # aliased: generate_html_report binds a local `html`
 from pathlib import Path
 
 from airflow import DAG
@@ -58,29 +59,20 @@ else:
 # of the discovery job itself. Tables carrying these are skipped by every
 # downstream phase and reported as-is; they must never abort the whole database.
 #
-# DAG 2 names the same physical condition DATA_PATH_MISSING (see REASON_LABELS in
-# migration_dag_iceberg.py). The names differ deliberately: there it is a labelled
-# failure reason, here it is a tracking status in the same vocabulary as
-# TABLE_NOT_FOUND/DATABASE_NOT_FOUND, which downstream phases and the report
-# already branch on.
+# NOTE: DAG 2 calls the same physical condition DATA_PATH_MISSING (REASON_LABELS in
+# migration_dag_iceberg.py). The two vocabularies otherwise agree — DAG 2 spells
+# TABLE_NOT_FOUND and DATABASE_NOT_FOUND identically — so this is the one place they
+# diverge, and querying both tracking tables for "source data missing" needs both
+# spellings. Kept distinct only because DAG 1 stores it in overall_status while DAG 2
+# embeds its code in error_message; align them if that ever stops being worth it.
 SKIPPABLE_DISCOVERY_ERRORS = (
     "TABLE_NOT_FOUND",
     "DATABASE_NOT_FOUND",
     "SOURCE_PATH_NOT_FOUND",
 )
 
-# Wording for an absent path. Deliberately broad: Spark says "Path does not
-# exist", MapR-FS raises FileNotFoundException("File <uri> does not exist"), and
-# the InputFormat check says "Input path does not exist". The location check in
-# _classify_discovery_error is what keeps a match this broad honest.
-_MISSING_PATH_MARKERS = (
-    "does not exist",
-    "no such file or directory",
-    "filenotfoundexception",
-)
-
-# An ACL failure names the path in much the same wording, but the data may well
-# be there — skipping the table would bury a permissions problem as "source gone".
+# An ACL failure can make the location read as absent, but "not allowed to see it"
+# is not "not there" — skipping would bury a permissions problem as "source gone".
 _PERMISSION_DENIED_MARKERS = (
     "permission denied",
     "accesscontrolexception",
@@ -103,29 +95,26 @@ _SKIPPABLE_DISCOVERY_MESSAGES = {
 }
 
 
-def _error_names_path(error_lower: str, source_location: str) -> bool:
-    """True when *error_lower* names *source_location*, compared scheme-less so a
-    metastore location of maprfs:///a/b still matches maprfs:/a/b in the error."""
-    path = re.sub(r"^[a-z0-9+.\-]+:/*", "/", (source_location or "").strip().lower())
-    path = re.sub(r"/+", "/", path).rstrip("/")
-    return len(path) > 1 and path in re.sub(r"/+", "/", error_lower)
-
-
-def _classify_discovery_error(error: str, source_location: str) -> str:
+def _classify_discovery_error(error: str, source_path_exists) -> str:
     """Refine the remote script's blanket FAILED into a skippable status when the
-    error says this table's own data path is gone (orphaned metastore entry).
+    table's LOCATION root is verifiably gone (orphaned metastore entry).
 
-    Requiring the error to name the table's location is what separates a missing
-    source from an executor-side path that merely happens to be absent: a lost
-    shuffle spill under /tmp/blockmgr-* matches the wording but is transient and
-    must keep its retries. With no location to corroborate against, abort rather
-    than guess."""
+    Keyed off the remote fs.exists() on the root rather than the wording of the
+    exception, because the wording cannot distinguish the root being gone from a
+    path *under* it being gone. Spark's file index names leaf files, so a
+    concurrent compaction raises FileNotFoundException for a .parquet file inside
+    an intact table — transient, and it must keep its retries. A single missing
+    partition directory is the same shape at higher cost: the other partitions are
+    still migratable, so the table must not be dropped from the run.
+
+    `source_path_exists` is None when the lookup could not be made; that is
+    treated as unknown, not absent, so discovery still aborts rather than guess."""
+    if source_path_exists is not False:
+        return "FAILED"
     err = (error or "").lower()
     if any(marker in err for marker in _PERMISSION_DENIED_MARKERS):
         return "FAILED"
-    if not any(marker in err for marker in _MISSING_PATH_MARKERS):
-        return "FAILED"
-    return "SOURCE_PATH_NOT_FOUND" if _error_names_path(err, source_location) else "FAILED"
+    return "SOURCE_PATH_NOT_FOUND"
 
 
 def _skippable_discovery_message(table: dict) -> str:
@@ -968,6 +957,9 @@ for tbl in missing_tables:
 
 for tbl in table_list:
     loc = None
+    # None means "could not determine" — the driver treats that as unknown rather
+    # than as absent, so a failed fs lookup never reads as an orphaned entry.
+    source_path_exists = None
     table_type = "UNKNOWN"
     input_format = None
     serde_properties = {{}}
@@ -1035,7 +1027,8 @@ for tbl in table_list:
                 )
                 path = spark._jvm.org.apache.hadoop.fs.Path(loc)
 
-                if fs.exists(path):
+                source_path_exists = bool(fs.exists(path))
+                if source_path_exists:
                     content_summary = fs.getContentSummary(path)
                     source_total_size = int(content_summary.getLength())
                     source_file_count = int(content_summary.getFileCount())
@@ -1231,15 +1224,18 @@ for tbl in table_list:
             "full_table_row_count": full_row_count,
             "full_table_partition_count": full_partition_count,
             "partition_file_counts": partition_file_counts,
+            "source_path_exists": source_path_exists,
         }})
         metadata.append(record)
 
     except Exception as e:
         record = _default_metadata_record(tbl)
         record.update({{
-            # Carry the location even on failure: the driver needs it to tell an
-            # orphaned metastore entry from an unrelated read failure.
+            # Carry the location and the direct fs.exists() result even on failure:
+            # together they let the driver tell an orphaned metastore entry from an
+            # unrelated read failure, without parsing the exception text.
             "source_location": loc or "",
+            "source_path_exists": source_path_exists,
             "serde_properties": serde_properties,
             "filtered_partitions": filtered_partitions,
             "partition_filter_active": partition_filter_active,
@@ -1329,7 +1325,7 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
     for t in metadata:
         if t.get("error_type") == "FAILED":
             t["error_type"] = _classify_discovery_error(
-                t.get("error", ""), t.get("source_location", "")
+                t.get("error", ""), t.get("source_path_exists")
             )
 
     logger.info(
@@ -1349,7 +1345,9 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
                 f"  Source database not found: {src_db} (token='{t['source_table']}') — will be skipped in downstream phases"
             )
         elif t.get("error_type") == "SOURCE_PATH_NOT_FOUND":
-            logger.warning(
+            # error, not warning: this is the only line telling an operator a table
+            # went unmigrated on an otherwise green run.
+            logger.error(
                 f"  Source data path missing for {src_db}.{t['source_table']} — orphaned "
                 f"metastore entry, will be skipped in downstream phases | "
                 f"error={t.get('error', '')[:200]}"
@@ -1416,6 +1414,8 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
             overall_status_update = "NULL"
             error_msg_update = "NULL"
 
+        source_location_escaped = (t.get("source_location") or "").replace("'", "''")
+
         parts = t.get("partitions", [])
         if isinstance(parts, str):
             parts = [p for p in parts.split(",") if p]
@@ -1477,7 +1477,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                 SET discovery_status = '{disc_status}',
                     discovery_completed_at = current_timestamp(),
                     discovery_duration_seconds = {discovery_duration},
-                    source_location = '{t['source_location']}',
+                    source_location = '{source_location_escaped}',
                     file_format = '{t['file_format']}',
                     table_type = '{table_type}',
                     source_row_count = {tracking_row_count},
@@ -1532,7 +1532,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
                     '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
-                    '{t['source_location']}', '{t['file_format']}',
+                    '{source_location_escaped}', '{t['file_format']}',
                     {t.get('partition_count', 0)}, {str(t.get('is_partitioned', False)).lower()},
                     '{schema_json}', '{parts_json}', '{t.get('partition_columns', '')}',
                     '{table_type}', {tracking_row_count},
@@ -4126,12 +4126,16 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             badge_class = "status-not-found"
             badge_label = "TABLE_NOT_FOUND"
         # For a missing path the location is the actionable detail — it decides
-        # whether ops drops the metastore entry or restores the data.
-        detail = (
-            f' <span style="color:#6c757d;font-size:11px;">{t.error_message}</span>'
-            if t.overall_status == "SOURCE_PATH_NOT_FOUND" and t.error_message
-            else ""
-        )
+        # whether ops drops the metastore entry or restores the data. Prefer it over
+        # error_message, which is the full (possibly multi-line) Spark exception.
+        detail = ""
+        if t.overall_status == "SOURCE_PATH_NOT_FOUND":
+            reason = t.source_location or t.error_message or ""
+            if reason:
+                detail = (
+                    ' <span style="color:#6c757d;font-size:11px;">'
+                    f"{html_escape(str(reason))}</span>"
+                )
         return f"""
                     <tr>
                         <td>{t.source_database}</td>
