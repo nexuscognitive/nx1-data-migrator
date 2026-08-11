@@ -401,7 +401,7 @@ class TestRunFolderDistcpSsh:
     def test_source_not_found(self, mock_ssh_hook, sample_folder_config):
         hook, client, stdout_mock, _ = mock_ssh_hook
         stdout_mock.read.return_value = (
-            b"SOURCE_EXISTS=false\nSOURCE_NOT_FOUND=true\n"
+            b"SOURCE_TEST_RC=1\nSOURCE_NOT_FOUND=true\n"
             b"===DISTCP_METRICS_START===\nINCREMENTAL=false\n===DISTCP_METRICS_END===\n"
         )
         stdout_mock.channel.recv_exit_status.return_value = 0
@@ -411,6 +411,50 @@ class TestRunFolderDistcpSsh:
         assert 'does not exist' in result['error']
         assert result['source_file_count'] == 0
         assert result['distcp_bytes_copied'] == 0
+
+    @pytest.mark.parametrize("rc", [255, 2])
+    def test_source_test_error_is_failed_not_not_found(self, mock_ssh_hook,
+                                                       sample_folder_config, rc):
+        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+        stdout_mock.read.return_value = (
+            f"SOURCE_TEST_RC={rc}\n"
+            f"SOURCE_TEST_ERROR=Kerberos ticket expired while connecting to namenode\n"
+        ).encode()
+        stdout_mock.channel.recv_exit_status.return_value = rc
+        stderr_mock.read.return_value = b''
+        ti = MagicMock()
+
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_folder_distcp_ssh.function(folder_config=sample_folder_config, ti=ti)
+
+        result = ti.xcom_push.call_args[1]['value']
+        assert result['status'] == 'FAILED'
+        assert f"Source existence check failed (exit {rc})" in result['error']
+        assert 'Kerberos ticket expired' in result['error']
+
+    def test_source_test_rc_zero_proceeds_to_distcp(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = (
+            b"SOURCE_TEST_RC=0\n" + self._success_output(src_files=8, s3_after_files=8)
+        )
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        assert result['status'] == 'COMPLETED'
+        assert result['source_file_count'] == 8
+
+    def test_source_test_command_captures_rc_and_stderr(self, mock_ssh_hook,
+                                                        sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = self._success_output()
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        sent_cmd = client.exec_command.call_args[0][0]
+        assert 'SRC_TEST_ERR=$(hadoop fs -test -d "/data/sales/raw" 2>&1)' in sent_cmd
+        assert 'SRC_TEST_RC=$?' in sent_cmd
+        assert 'echo "SOURCE_TEST_RC=$SRC_TEST_RC"' in sent_cmd
+        assert 'SOURCE_EXISTS' not in sent_cmd
 
     def test_empty_source(self, mock_ssh_hook, sample_folder_config):
         hook, client, stdout_mock, _ = mock_ssh_hook
@@ -894,7 +938,7 @@ class TestGenerateDataCopyHtmlReport:
         )
         assert 'status-badge status-failed' not in html
 
-    @pytest.mark.parametrize("status", ['EMPTY_SOURCE', 'SOURCE_NOT_FOUND', 'FAILED'])
+    @pytest.mark.parametrize("status", ['EMPTY_SOURCE', 'SOURCE_NOT_FOUND'])
     def test_colspan_row_rendered_for_non_copied_statuses(
         self, mock_spark, sample_folder_run_id, sample_folder_finalize_result, status,
     ):
@@ -904,22 +948,50 @@ class TestGenerateDataCopyHtmlReport:
         assert 'colspan="6"' in html
         assert 'colspan="10"' in html
 
-    def test_failed_colspan_row_carries_error_message(
-        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    @pytest.mark.parametrize("status", ['FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED',
+                                        'SKIPPED'])
+    def test_failure_rows_render_as_full_rows(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result, status,
+    ):
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result, status=status,
+        )
+        assert 'colspan="6"' not in html
+        assert 'colspan="10"' not in html
+        assert 'Skipped:' not in html
+
+    @pytest.mark.parametrize("status", ['FAILED', 'VALIDATION_FAILED'])
+    def test_failure_row_shows_badge_metrics_and_reason(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result, status,
     ):
         html = self._render(
             mock_spark, sample_folder_run_id, sample_folder_finalize_result,
-            status='FAILED', error_message='DistCp exit 1: permission denied',
+            status=status, error_message='DistCp exit 1: permission denied',
         )
-        assert 'Skipped: DistCp exit 1: permission denied' in html
+        assert '<span class="status-badge status-failed"' in html
+        assert 'title="DistCp exit 1: permission denied"' in html
+        assert '<div class="status-reason">DistCp exit 1: permission denied</div>' in html
+        assert '<td class="status-cell">' in html
+        assert '✗ FAIL' in html
 
-    def test_failed_colspan_row_falls_back_when_no_error(
+    def test_failure_row_without_error_has_no_reason_div(
         self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
     ):
         html = self._render(
             mock_spark, sample_folder_run_id, sample_folder_finalize_result, status='FAILED',
         )
-        assert 'Skipped: upstream task did not complete' in html
+        assert '<span class="status-badge status-failed">FAILED</span>' in html
+        assert '<div class="status-reason">' not in html
+
+    def test_status_reason_truncated_to_200_chars(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        long_error = 'x' * 500
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+            status='FAILED', error_message=long_error,
+        )
+        assert f'<div class="status-reason">{"x" * 200}</div>' in html
 
     def test_no_failures_section(
         self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,

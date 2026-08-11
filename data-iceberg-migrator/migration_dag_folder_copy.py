@@ -542,13 +542,16 @@ emit_metrics() {{
 }}
 
 echo "=== Source existence check ==="
-SOURCE_EXISTS=true
-hadoop fs -test -d "{source_path}" 2>/dev/null || SOURCE_EXISTS=false
-echo "SOURCE_EXISTS=$SOURCE_EXISTS"
-if [ "$SOURCE_EXISTS" = "false" ]; then
+SRC_TEST_ERR=$(hadoop fs -test -d "{source_path}" 2>&1)
+SRC_TEST_RC=$?
+echo "SOURCE_TEST_RC=$SRC_TEST_RC"
+if [ "$SRC_TEST_RC" -eq 1 ]; then
     echo "SOURCE_NOT_FOUND=true"
     emit_metrics false 0 0 0 0 0 0 0 0
     exit 0
+elif [ "$SRC_TEST_RC" -ne 0 ]; then
+    echo "SOURCE_TEST_ERROR=$SRC_TEST_ERR"
+    exit $SRC_TEST_RC
 fi
 
 INCR=false
@@ -687,7 +690,19 @@ exit 0
             duration = max((completed_at - started_at).total_seconds(), 0.0)
             completed_at_str = completed_at.strftime('%Y-%m-%d %H:%M:%S')
 
-            if 'SOURCE_NOT_FOUND=true' in output or 'SOURCE_EXISTS=false' in output:
+            source_test_rc = None
+            source_test_error = ''
+            for line in output.splitlines():
+                line = line.strip()
+                if line.startswith('SOURCE_TEST_RC='):
+                    try:
+                        source_test_rc = int(line.split('=', 1)[1] or 0)
+                    except ValueError:
+                        source_test_rc = None
+                elif line.startswith('SOURCE_TEST_ERROR='):
+                    source_test_error = line.split('=', 1)[1].strip()
+
+            if source_test_rc == 1:
                 logger.error(f"[FolderDistCp] SOURCE_NOT_FOUND: {source_path}")
                 return {
                     'run_id': run_id,
@@ -760,10 +775,16 @@ exit 0
                 }
 
             if exit_code != 0:
-                error_msg = (
-                    f"DistCp failed for {source_path} -> {s3_dest} "
-                    f"(exit {exit_code}): {error_output[:1000] or output[-1000:]}"
-                )[:2000]
+                if source_test_rc is not None and source_test_rc not in (0, 1):
+                    error_msg = (
+                        f"Source existence check failed (exit {source_test_rc}): "
+                        f"{source_test_error or error_output[:1000] or output[-1000:]}"
+                    )[:2000]
+                else:
+                    error_msg = (
+                        f"DistCp failed for {source_path} -> {s3_dest} "
+                        f"(exit {exit_code}): {error_output[:1000] or output[-1000:]}"
+                    )[:2000]
                 logger.error(f"[FolderDistCp] FAILED: {error_msg}")
                 result = {
                     'run_id': run_id,
@@ -1323,20 +1344,11 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
                     </td>
                 </tr>
 """
-        if status_val == 'SOURCE_NOT_FOUND':
-            return f"""
+        return f"""
                 <tr>
                     <td>{source_cell}</td>
                     <td colspan="{colspan}">
                         <span class="status-badge status-not-found">SOURCE_NOT_FOUND</span>
-                    </td>
-                </tr>
-"""
-        return f"""
-                <tr>
-                    <td>{source_cell}</td>
-                    <td colspan="{colspan}" style="color:#7f8c8d;font-style:italic;font-size:12px;">
-                        Skipped: {_html_escape(str(f.error_message or 'upstream task did not complete'))[:400]}
                     </td>
                 </tr>
 """
@@ -1484,6 +1496,17 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
             color: #95a5a6;
             font-size: 12px;
         }}
+        td.status-cell {{
+            max-width: 320px;
+        }}
+        .status-reason {{
+            margin-top: 6px;
+            color: #4d5656;
+            font-size: 12px;
+            line-height: 1.4;
+            white-space: normal;
+            word-break: break-word;
+        }}
         .section-divider {{
             margin: 40px 0;
             border-top: 2px dashed #ecf0f1;
@@ -1590,11 +1613,17 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
 
     for f in folders:
         status = f.status or ''
-        if status in non_distcp_statuses or status in ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED'):
+        if status in ('EMPTY_SOURCE', 'SOURCE_NOT_FOUND'):
             html += _status_row(f, 6)
             continue
 
         badge_cls = badge_classes.get(status, 'status-warning')
+        _reason = str(f.error_message or '')
+        badge_title_attr = f' title="{_html_escape(_reason)}"' if _reason else ''
+        status_reason_html = (
+            f'\n                        <div class="status-reason">{_html_escape(_reason[:200])}</div>'
+            if _reason else ''
+        )
         _dur = float(getattr(f, 'distcp_duration_seconds', 0) or 0)
         _started = getattr(f, 'started_at', None)
         _completed = getattr(f, 'completed_at', None)
@@ -1629,7 +1658,9 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
                 <tr>
                     <td>{_html_escape(str(f.source_path or ''))}</td>
                     <td>{_html_escape(str(f.dest_bucket or ''))}/{_html_escape(str(f.dest_path or ''))}</td>
-                    <td><span class="status-badge {badge_cls}">{status}</span></td>
+                    <td class="status-cell">
+                        <span class="status-badge {badge_cls}"{badge_title_attr}>{status}</span>{status_reason_html}
+                    </td>
                     <td style="text-align:center">{'✓' if f.is_incremental else ''}</td>
                     <td class="duration">{dur_cell}</td>
                     <td>{yarn_cell}</td>
@@ -1665,7 +1696,7 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
 
     for f in folders:
         status = f.status or ''
-        if status in non_distcp_statuses or status in ('FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED'):
+        if status in ('EMPTY_SOURCE', 'SOURCE_NOT_FOUND'):
             html += _status_row(f, 10)
             continue
 

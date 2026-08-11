@@ -1354,8 +1354,16 @@ send_data_copy_report_email
 - `-delete` is added only when **both** `migration_distcp_preserve_delete` and
   `folder_copy_allow_delete` resolve true (see Variables below); off by default
 - Writes a DistCp log to `{cluster_setup.distcp_log_dir}/distcp_{dest_folder}.log`
-- Checks the source path first: a missing path returns `SOURCE_NOT_FOUND` without running
-  DistCp; a present but empty path creates the S3 prefix and returns `EMPTY_SOURCE`
+- Checks the source path first with `hadoop fs -test -d`, capturing both the exit code and
+  stderr:
+  - exit `1` — the path is genuinely absent: returns `SOURCE_NOT_FOUND` without running DistCp
+  - exit `0` — the path exists: a present but empty path creates the S3 prefix and returns
+    `EMPTY_SOURCE`, otherwise DistCp runs
+  - any other non-zero exit is an **error, not an absence** (expired ticket, unreachable
+    NameNode): the task returns `FAILED` with the message prefixed
+    `Source existence check failed (exit {rc}): ` and the captured stderr. This matters
+    because `finalize_data_copy_run` counts `SOURCE_NOT_FOUND` as successful — an auth or
+    connectivity problem must never be recorded that way
 - Captures source file count and size before copy
 - Captures S3 file count and size before and after copy
 - Parses DistCp's own `Bytes Copied` / `Files Copied` counters from a delimited
@@ -1461,9 +1469,14 @@ Structure, stylesheet and status vocabulary mirror DAG 1's `generate_html_report
   `FAILED`/`VALIDATION_FAILED`/`VALIDATION_SKIPPED` → `status-failed`; `EMPTY_SOURCE` →
   `status-empty`; `SOURCE_NOT_FOUND` → `status-not-found`; `SKIPPED` → `status-skipped`;
   anything else → `status-warning`
-- There is no Failures section and no Error column. Rows that did not complete a copy render
-  as a single colspan cell in both detail tables — an `EMPTY_SOURCE` or `SOURCE_NOT_FOUND`
-  badge, or italic `Skipped: {error_message}` text carrying the failure message
+- There is no Failures section and no Error column. Only `EMPTY_SOURCE` and
+  `SOURCE_NOT_FOUND` collapse to a single colspan badge cell in the two detail tables —
+  nothing ran for those rows
+- Failures render as **full rows**, following DAG 2's report: the status cell carries the
+  `status-failed` badge with the full error in its `title`, and a `div.status-reason`
+  beneath it holding the message truncated to 200 characters. The row keeps all its metric
+  cells, so whatever DistCp reported before failing is still visible. `SKIPPED` rows render
+  the same way
 - Writes to `{report_location}/{run_id}_data_copy_report.html`
 - Returns `report_path` (S3 key); email task reads the report directly from S3
 
