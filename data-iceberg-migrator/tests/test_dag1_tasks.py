@@ -224,6 +224,39 @@ class TestClusterLoginSetup:
         assert 'temp_dir' in result
         assert result['run_id'] == 'run_test'
 
+    def test_returns_distcp_log_dir_and_service_account(self, mock_ssh_hook):
+        """Regression: the resolved SA and cluster-FS log dir must reach the caller."""
+        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+        stdout_mock.read.return_value = (
+            b'CLUSTER_LOGIN_SUCCESS\n'
+            b'MAPR_EFFECTIVE_USER=ETL_CIHA_CU\n'
+            b'SERVICE_ACCOUNT_SOURCE=config:service_account_user_id\n'
+            b'TEMP_DIR=/tmp/migration/run_test\n'
+            b'DISTCP_LOG_DIR=/tmp/ETL_CIHA_CU/distcp_logs/run_test\n'
+        )
+        stderr_mock.read.return_value = b''
+
+        result = m.cluster_login_setup.function(run_id='run_test')
+        assert result['distcp_log_dir'] == '/tmp/ETL_CIHA_CU/distcp_logs/run_test'
+        assert result['service_account_user_id'] == 'ETL_CIHA_CU'
+        assert result['service_account_source'] == 'config:service_account_user_id'
+        # DistCp logs must NOT be written under the local edge temp dir.
+        assert not result['distcp_log_dir'].startswith(result['temp_dir'])
+
+    def test_configured_service_account_is_not_clobbered_by_ticket(self, mock_ssh_hook):
+        """Regression: the generated script must not overwrite a configured SA user."""
+        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+        stdout_mock.read.return_value = b'CLUSTER_LOGIN_SUCCESS\nTEMP_DIR=/tmp/migration/run_test\n'
+        stderr_mock.read.return_value = b''
+
+        m.cluster_login_setup.function(run_id='run_test')
+        script = client.exec_command.call_args[0][0]
+        # The maprlogin-derived value may only be applied when nothing is configured.
+        assert 'if [ -z "$CONFIGURED_SA_USER" ]; then' in script
+        ticket_idx = script.index('TICKET_USER=$(maprlogin print')
+        guard_idx = script.index('if [ -z "$CONFIGURED_SA_USER" ]; then')
+        assert guard_idx < ticket_idx
+
     def test_nonzero_exit_raises(self, mock_ssh_hook):
         hook, client, stdout_mock, stderr_mock = mock_ssh_hook
         stdout_mock.channel.recv_exit_status.return_value = 1

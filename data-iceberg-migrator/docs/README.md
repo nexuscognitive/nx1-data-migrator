@@ -11,7 +11,7 @@ This implementation provides four independent but complementary migration DAGs:
 1. **`source_to_s3_migration`** - Migrates Hive tables from source (MapR-FS/HDP-HDFS) to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
 3. **`folder_only_data_copy`** - Copies raw folders from source cluster (MapR-FS/HDP-HDFS) to S3 via DistCp — no Hive metadata
-4. **`parquet_hms_registration`** - Registers plain parquet files on S3 as external Hive Metastore tables — schema inferred, partitions auto-discovered
+4. **`iceberg_catalog_migration`** - Migrates existing Iceberg tables from a Hadoop catalog to a Hive (HMS) catalog via the `rewrite_table_path` procedure — full snapshot history preserved
 
 ---
 
@@ -32,31 +32,168 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 ### Authentication Variables
 
-| Variable                   | Description                                       | Required For  | Applies To                                        |
-| -------------------------- | ------------------------------------------------- | ------------- | ------------------------------------------------- |
-| `auth_method`              | Authentication method: `mapr`, `kinit`, or `none` | MapR/Kerberos | `source_to_s3_migration`, `folder_only_data_copy` |
-| `mapr_user`                | MapR username used to validate existing ticket    | MapR auth     | `source_to_s3_migration`, `folder_only_data_copy` |
-| `mapr_ticketfile_location` | MapR ticket file path                             | MapR auth     | `source_to_s3_migration`, `folder_only_data_copy` |
-| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.    | HTML reports  | `source_to_s3_migration`                          |
+| Variable                   | Description                                                                                                                                                                                                                  | Required For     | Applies To                                        |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ------------------------------------------------- |
+| `auth_method`              | Authentication method: `mapr`, `kinit`, or `none`                                                                                                                                                                            | MapR/Kerberos    | `source_to_s3_migration`, `folder_only_data_copy` |
+| `service_account_user_id`  | **Recommended.** Tenant service account the DAG runs as on the source cluster. Validates the MapR ticket and builds every user-scoped temp and log path. See [Service account configuration](#service-account-configuration) | All auth methods | `source_to_s3_migration`, `folder_only_data_copy` |
+| `mapr_user`                | Deprecated alias for `service_account_user_id`, kept for backward compatibility. If both are set, `service_account_user_id` wins                                                                                             | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
+| `mapr_ticketfile_location` | MapR ticket file path                                                                                                                                                                                                        | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
+| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.                                                                                                                                                                               | HTML reports     | `source_to_s3_migration`                          |
 
 ### Optional Variables
 
-| Variable                           | Default          | Description                                                                                                                                     | Applies To                                        |
-| ---------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| `cluster_edge_temp_path`           | `/tmp/migration` | Temporary directory on edge node                                                                                                                | `source_to_s3_migration`, `folder_only_data_copy` |
-| `cluster_hive_scratch_dir`         | `/tmp/hive`      | Hive scratch dir for PySpark sessions started on the **source edge node**. Literal path only (no `${USER}`).                                    | `source_to_s3_migration`                          |
-| `migration_tenant_profiles`        | `{}`             | Per-tenant config groups as JSON, selected at trigger time via the `tenant` DAG param                                                           | `source_to_s3_migration`, `folder_only_data_copy` |
-| `s3_endpoint`                      | _(empty)_        | Default S3 endpoint URL (all buckets)                                                                                                           | `source_to_s3_migration`, `folder_only_data_copy` |
-| `s3_access_key`                    | _(empty)_        | Default S3 access key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
-| `s3_secret_key`                    | _(empty)_        | Default S3 secret key (all buckets)                                                                                                             | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_mappers`         | `50`             | Number of DistCp mappers                                                                                                                        | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_bandwidth`       | `100`            | Bandwidth limit per mapper (MB/s)                                                                                                               | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_preserve_delete` | `true`           | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes))                 | `source_to_s3_migration`                          |
-| `migration_include_db_in_path`     | `true`           | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted) | `source_to_s3_migration`                          |
-| `s3_listing_tool`                  | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`                                                                                                        | Currently unused                                  |
-| `migration_smtp_conn_id`           | `smtp_default`   | Airflow SMTP connection ID for email reports                                                                                                    | All DAGs                                          |
-| `migration_email_recipients`       | _(empty)_        | Comma-separated email addresses for reports                                                                                                     | All DAGs                                          |
-| `hdfs_nameservice`                 | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR                                                                                    | `source_to_s3_migration`, `folder_only_data_copy` |
+| Variable                           | Default          | Description                                                                                                                                                                                                      | Applies To                                        |
+| ---------------------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `cluster_edge_temp_path`           | `/tmp/migration` | Temp dir on the edge node's **local disk** for run-scoped files (discovery scripts, path lists). Supports `${USER}`, expanded to the MapR ticket user. Not used for DistCp logs — see `cluster_distcp_log_root`. | `source_to_s3_migration`, `folder_only_data_copy` |
+| `cluster_distcp_log_root`          | `/tmp`           | Root on the **cluster filesystem** (MapR-FS/HDFS) under which per-user, per-run DistCp log directories are created. The user segment comes from `service_account_user_id`.                                       | `source_to_s3_migration`                          |
+| `cluster_edge_discovery_temp_path` | `/tmp`           | Local temp dir on edge node for the Spark discovery scratch folder. Literal path only (no `${USER}`).                                                                                                            | `source_to_s3_migration`                          |
+| `cluster_hive_scratch_dir`         | `/tmp/hive`      | Hive scratch dir for PySpark sessions started on the **source edge node**. Literal path only (no `${USER}`).                                                                                                     | `source_to_s3_migration`                          |
+| `migration_tenant_profiles`        | `{}`             | Per-tenant config groups as JSON, selected at trigger time via the `tenant` DAG param                                                                                                                            | `source_to_s3_migration`, `folder_only_data_copy` |
+| `s3_endpoint`                      | _(empty)_        | Default S3 endpoint URL (all buckets)                                                                                                                                                                            | `source_to_s3_migration`, `folder_only_data_copy` |
+| `s3_access_key`                    | _(empty)_        | Default S3 access key (all buckets)                                                                                                                                                                              | `source_to_s3_migration`, `folder_only_data_copy` |
+| `s3_secret_key`                    | _(empty)_        | Default S3 secret key (all buckets)                                                                                                                                                                              | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_mappers`         | `50`             | Number of DistCp mappers                                                                                                                                                                                         | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_bandwidth`       | `100`            | Bandwidth limit per mapper (MB/s)                                                                                                                                                                                | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_preserve_delete` | `true`           | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes))                                                                                  | `source_to_s3_migration`                          |
+| `migration_include_db_in_path`     | `true`           | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted)                                                                  | `source_to_s3_migration`                          |
+| `s3_listing_tool`                  | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`                                                                                                                                                                         | Currently unused                                  |
+| `migration_smtp_conn_id`           | `smtp_default`   | Airflow SMTP connection ID for email reports                                                                                                                                                                     | All DAGs                                          |
+| `migration_email_recipients`       | _(empty)_        | Comma-separated email addresses for reports                                                                                                                                                                      | All DAGs                                          |
+| `hdfs_nameservice`                 | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR                                                                                                                                                     | `source_to_s3_migration`, `folder_only_data_copy` |
+
+#### Service account configuration
+
+**Set `service_account_user_id` explicitly for every tenant.** It is the single
+value that identifies which account the DAG runs as on the source cluster, and it
+drives all of the following:
+
+- the MapR ticket validation check in `validate_prerequisites` and `cluster_login_setup`
+- the MapR ticket file path, when `mapr_ticketfile_location` contains `${USER}`
+- the DistCp log directory on the cluster filesystem
+- the edge-node temp directory, when `cluster_edge_temp_path` contains `${USER}`
+
+**Resolution order**
+
+| Order | Source                                 | When used                                 |
+| ----- | -------------------------------------- | ----------------------------------------- |
+| 1     | `service_account_user_id` config       | Whenever it is set — always wins          |
+| 2     | `mapr_user` config                     | Legacy deployments that have not migrated |
+| 3     | Active MapR ticket (`maprlogin print`) | Neither is set, and a ticket exists       |
+| 4     | Login shell user (`id -un`)            | Nothing else available                    |
+
+**When it is configured (recommended)**
+
+Paths are deterministic and reviewable before the run. The value appears in the
+`cluster_login_setup` task log as:
+
+    MAPR_EFFECTIVE_USER=`USER_NAME`
+    SERVICE_ACCOUNT_SOURCE=config:service_account_user_id
+
+It is also used to validate the MapR ticket, so if the configured account and the
+ticket on the edge node disagree, the run fails immediately at login with a clear
+message rather than part-way through the copy against the wrong identity.
+
+**When it is not configured (not recommended)**
+
+The DAG falls back to whichever identity the edge node's `.profile` happens to
+provide. This works, but it means the paths a run uses depend on node-local shell
+state rather than on anything visible in Airflow — and if `.profile` is later
+pointed at a different tenant's ticket, the change is silent. The task log emits:
+
+    WARNING: service_account_user_id is not configured. Falling back to ...
+    SERVICE_ACCOUNT_SOURCE=login shell (.profile)
+
+**Where to set it**
+
+Airflow Variable `service_account_user_id`, or environment variable
+`SERVICE_ACCOUNT_USER_ID`. Like all variables here it supports a run-scoped
+override (`service_account_user_id__<run_id>`), so multiple tenants can run
+concurrently from the same DAG without editing it.
+
+#### Edge-node temp paths for service accounts
+
+`cluster_edge_temp_path` supports `${USER}`, `$USER`, `{user}`, and a leading `~`. These expand on the edge node to the **MapR ticket user** (parsed from `maprlogin print`), not the SSH/Linux login user.
+
+Example for a tenant service account:
+
+    cluster_edge_temp_path = /user/${USER}/tmp/migration
+
+The resolved path is echoed as `TEMP_DIR=` and the identity as `MAPR_EFFECTIVE_USER=`
+in the `cluster_login_setup` task log.
+
+`cluster_edge_discovery_temp_path` does **not** support placeholders — the discovery
+directory is created over a plain SSH command and then written to over SFTP, which does
+not expand shell variables. Use a literal path.
+
+#### DistCp log directory on the cluster filesystem
+
+`hadoop distcp -log` writes its logs to the **cluster filesystem** (MapR-FS/HDFS),
+not to the edge node's local disk. This is a common source of confusion, because
+the two look identical at the shell — `/tmp` on the edge node and `/tmp` on
+MapR-FS are different directories with different ownership. `cluster_edge_temp_path`
+controls the local one; `cluster_distcp_log_root` controls the cluster one.
+
+**Resolved path**
+
+    <cluster_distcp_log_root>/<cluster_user>/distcp_logs/<run_id>/distcp_<table>.log
+
+With the defaults and a tenant service account of `sa_user`, a run resolves to:
+
+    /tmp/sa_user/distcp_logs/run_20260806_143022_a1b2c3d4/distcp_transactions.log
+
+Each segment serves a purpose:
+
+| Segment                   | Source                                     | Why                                                                          |
+| ------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `cluster_distcp_log_root` | Airflow Variable / env var, default `/tmp` | Lets you relocate logs if `/tmp` is restricted on your cluster               |
+| `<cluster_user>`          | Derived at runtime (see below)             | Isolates each tenant so accounts never write into another's directory        |
+| `distcp_logs`             | Fixed                                      | Keeps DistCp logs separate from other artifacts under the user directory     |
+| `<run_id>`                | Generated per DAG run                      | Prevents runs from overwriting each other; logs are read back for validation |
+
+**How `<cluster_user>` is determined**
+
+It is the resolved service account — `service_account_user_id` when set, otherwise
+the `.profile` fallback. The resolved value is echoed in the
+`cluster_login_setup` task log as:
+
+    MAPR_EFFECTIVE_USER=<user>
+    SERVICE_ACCOUNT_SOURCE=<where it came from>
+    DISTCP_LOG_DIR=<full path>
+
+**When `service_account_user_id` is configured**
+
+Each tenant resolves to its own directory — `TENANT_1` writes under
+`/tmp/TENANT_1/`, `TENANT_2` under `/tmp/TENANT_2/`. This holds whether
+tenants run on the same edge node or different ones, and the path is known before
+the run starts.
+
+The configured value is used verbatim, including casing, so it must match the
+account name as the cluster reports it. To confirm what a given account is called,
+run this on the edge node as that account:
+
+    maprlogin print 2>/dev/null | sed -n 's/.*user = \([^,]*\),.*/\1/p' | head -1
+
+**When it is not configured**
+
+The path falls back to the `.profile` identity. Multiple tenants sharing one edge
+node under the same login user will then share a log directory — still correct,
+since ownership matches, but per-tenant isolation is lost and the path is not
+predictable from Airflow alone.
+
+**Permissions and retention**
+
+The directory is created with `hadoop fs -mkdir -p` and set to `700`, so only the
+owning service account can read its own DistCp logs. If you need the migration team
+to inspect another tenant's logs, either relax the mode after the run or point
+`cluster_distcp_log_root` at a shared location with group access.
+
+Directory creation runs under `set -e`, so if `cluster_distcp_log_root` is not
+writable by the service account, `cluster_login_setup` fails immediately rather
+than the run failing later at the DistCp step. Logs are **not** deleted at the end
+of a run: the validation steps read them back, which is why the DAG's
+`cleanup_edge` task is left disabled (see
+[Edge-node cleanup](#edge-node-cleanup-currently-disabled)). Include this path in
+your normal cluster retention policy.
 
 #### Hive scratch dir on the edge node
 
@@ -195,14 +332,15 @@ single-tenant setups.
 
 ## DAG Parameter Details
 
-| DAG   | Parameter         | Required | Description                   | Example                                      |
-| ----- | ----------------- | -------- | ----------------------------- | -------------------------------------------- |
-| DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config       | `s3a://config-bucket/migration.xlsx`         |
-| DAG 1 | `tenant`          | No       | Tenant profile key (optional) | `tenant_1`                                   |
-| DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config     | `s3a://config-bucket/iceberg_migration.xlsx` |
-| DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config | `s3a://config-bucket/folder_copy.xlsx`       |
-| DAG 3 | `tenant`          | No       | Tenant profile key (optional) | `tenant_1`                                   |
-| DAG 4 | `excel_file_path` | Yes      | S3 path to parquet HMS config | `s3a://config-bucket/parquet_hms.xlsx`       |
+| DAG   | Parameter             | Required | Description                                                                                                                                             | Example                                              |
+| ----- | --------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| DAG 1 | `excel_file_path`     | Yes      | S3 path to Excel config                                                                                                                                 | `s3a://config-bucket/migration.xlsx`                 |
+| DAG 1 | `tenant`              | No       | Tenant profile key (optional)                                                                                                                           | `tenant_1`                                           |
+| DAG 2 | `excel_file_path`     | Yes      | S3 path to Iceberg config                                                                                                                               | `s3a://config-bucket/iceberg_migration.xlsx`         |
+| DAG 2 | `iceberg_drop_backup` | No       | Drop `<table>_backup_` after a successful **in-place** migration. Default `false` — keep it `false` on any cutover run, the backup is the rollback path | `false`                                              |
+| DAG 3 | `excel_file_path`     | Yes      | S3 path to folder copy config                                                                                                                           | `s3a://config-bucket/folder_copy.xlsx`               |
+| DAG 3 | `tenant`              | No       | Tenant profile key (optional)                                                                                                                           | `tenant_1`                                           |
+| DAG 4 | `excel_file_path`     | Yes      | S3 path to Iceberg catalog migration config                                                                                                             | `s3a://config-bucket/iceberg_rewrite_migration.xlsx` |
 
 ---
 
@@ -380,8 +518,6 @@ generate_html_report
 send_migration_report_email (PySpark: Email report)
 ↓
 finalize_run
-↓
-cleanup_edge (SSH: Cleanup temp files)
 ```
 
 ---
@@ -460,7 +596,9 @@ cleanup_edge (SSH: Cleanup temp files)
   1. **Kerberos authentication** - Assumes a valid Kerberos ticket sourced via the login shell
   2. **Existing MapR ticket** - Validates existing valid ticket with `maprlogin print`
 - Verifies ticket validity with `maprlogin print` or `klist`
-- Creates temporary working directory on edge node (`/tmp/migration/{run_id}`)
+- Resolves the effective cluster identity from `maprlogin print` (falling back to `id -un`) and logs it as `MAPR_EFFECTIVE_USER=`
+- Creates the local working directory on the edge node (`{cluster_edge_temp_path}/{run_id}`, default `/tmp/migration/{run_id}`)
+- Creates the DistCp log directory on the cluster filesystem (`{cluster_distcp_log_root}/{cluster_user}/distcp_logs/{run_id}`, default root `/tmp`) and logs it as `DISTCP_LOG_DIR=`
 - Ensures all subsequent SSH operations can access the source filesystem
 
 ---
@@ -523,7 +661,7 @@ cleanup_edge (SSH: Cleanup temp files)
     - `file_size_match`: True if within 1% tolerance
     - `file_count_match`: True if exact match
   - These metrics help detect incomplete copies even when DistCp reports success
-- Logs written to `{temp_dir}/distcp_{run_id}_{src_db}.log`
+- DistCp logs written to the cluster filesystem at `{cluster_distcp_log_root}/{cluster_user}/distcp_logs/{run_id}/distcp_{table}.log` (partition-filtered copies add a `_part{n}` suffix, one log per partition)
 - **Timeout:** 24 hours per table (configurable via `SSH_COMMAND_TIMEOUT`)
 
 ##### DistCp partition copy modes
@@ -675,13 +813,14 @@ All run sequences are safe — no combination corrupts data:
 **Type:** PySpark  
 **Purpose:** Send HTML migration report via email using SMTP
 
-- Receives HTML content directly from `generate_html_report` task
+- Reads the report back from S3 using the `report_path` returned by `generate_html_report`
 - Extracts email configuration:
   - SMTP connection ID from Airflow variable
   - Recipients list (comma-separated) from Airflow variable
 - Sends email with:
   - Subject: `Migration Report - {run_id}`
-  - Body: Full HTML report (no S3 read required)
+  - Body: a one-line pointer to the run
+  - **Attachment: the full HTML report** — open the attachment, not the body
 - **Skips email if:**
   - No recipients configured (`migration_email_recipients` variable empty)
   - Returns `{'sent': False, 'reason': 'no_recipients'}`
@@ -707,15 +846,20 @@ All run sequences are safe — no combination corrupts data:
 
 ---
 
-#### Step 15 - `cleanup_edge`
+#### Edge-node cleanup (currently disabled)
 
-**Type:** SSH  
-**Purpose:** Clean up temporary files on MapR edge node
+A `cleanup_edge` task exists in the DAG file but is **commented out of the task
+wiring**, so the DAG has 16 active tasks and ends at `finalize_run`.
 
-- Removes temporary directory created in `cluster_login_setup`
-- Cleans up DistCp log files
-- Ensures edge node disk space is freed
-- Failures are ignored
+It is disabled deliberately: the DistCp logs under the run's temp directory are
+read back by the validation steps, so deleting them at the end of the run would
+remove the evidence those checks depend on.
+
+**What this means operationally:** the per-run directories under
+`cluster_edge_temp_path` and the DistCp logs under `cluster_distcp_log_root` are
+**not** removed by the DAG. Include both paths in the cluster's normal retention
+policy, or clear old run directories as part of routine housekeeping. Re-enabling
+automatic cleanup is a possible future enhancement.
 
 ---
 
@@ -779,7 +923,11 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 - Converts existing Hive table to Iceberg format
 - Uses Spark procedure: CALL spark_catalog.system.migrate('{table}')
 - Overwrites table metadata - table becomes Iceberg table
-- Original Hive table is lost (irreversible)
+- **The original Hive table is not dropped.** `system.migrate` renames it to
+  `<table>_backup_`, which is retained unless `iceberg_drop_backup=true` is set on
+  the run. That backup is the rollback path — it still references the same data
+  files, so restoring it reverts the conversion. See
+  [Backups and rollback](#backups-and-rollback) below.
 
 ---
 
@@ -790,6 +938,8 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 - Location: Same as source (metadata changes only)
 - Storage: No data duplication
 - Queries: Must use Iceberg-compatible engine
+- Source table: Renamed to `<table>_backup_` (retained by default)
+- Re-run: Recorded `SKIPPED` with reason `ALREADY_ICEBERG` — never fails
 
 ---
 
@@ -811,6 +961,37 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 - Location: Same as source (metadata layer only)
 - Storage: Minimal duplication (metadata only)
 - Queries: Can query both Hive and Iceberg versions
+
+---
+
+### Backups and rollback
+
+**In-place migration always leaves a backup.** `system.migrate` renames the source
+Hive table to `<table>_backup_` instead of dropping it, and that table still
+references the same data files. It is the rollback path for an in-place cutover.
+
+- **Discovery skips `*_backup_` and `*__BACKUP__`**, so backups are never
+  re-migrated and never appear as extra tables in a later run.
+- **`iceberg_drop_backup`** (DAG param, default `false`; also settable via the
+  Airflow Variable `migration_iceberg_drop_backup`) passes `drop_backup => true`
+  to the procedure. Keep it `false` on any cutover run — setting it `true` is what
+  removes the ability to roll back. Use it only to retire backups after a clean soak.
+- **Stale backups from a previous run** are dropped automatically before
+  re-migrating a table. That drop, and every backup drop the tooling performs, is
+  **metadata-only — never `PURGE`**, because the backup shares data files with the
+  live Iceberg table. A hand-written `DROP TABLE ... PURGE` on a backup would
+  destroy live data.
+- **Rollback has a deadline.** Restoring `<table>_backup_` is clean only _before_
+  writes resume against the Iceberg table. Once new Iceberg files exist at the
+  table's location, the backup no longer describes the current file set and
+  restoring it loses those writes.
+
+**Snapshot migration needs no backup** — it leaves the source Hive table untouched
+and live, so rolling back is just dropping the Iceberg table in the destination
+database (metadata-only).
+
+Strategy rules, phase flow and the full cutover/rollback procedure:
+[Hive_Iceberg_Migration_Rulebook.md](Hive_Iceberg_Migration_Rulebook.md).
 
 ---
 
@@ -842,10 +1023,6 @@ init_iceberg_tracking_tables
 create_iceberg_migration_run
     ↓
 parse_iceberg_excel
-    ↓
-lookup_parent_migration_run (Links to DAG 1)
-    ↓
-update_parent_run_id
     ↓
 ┌───────────────────────────────────────────────┐
 │  Dynamic Task Mapping (per database config)   │
@@ -912,32 +1089,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 3 - `lookup_parent_migration_run`
-
-**Type:** PySpark
-**Purpose:** Find parent MapR-to-S3 migration run ID by querying DAG 1 tracking tables
-
-- Expands table patterns to get concrete table names
-- For each table, queries DAG 1 tracking
-  1. Finds most recent successful MapR-to-S3 migration for this table
-  2. Only considers migrations that reached TABLE_CREATED or COPIED status
-  3. Creates mapping: {database.table: parent_run_id}
-- Determines most common parent run ID
-- Returns lookup result
-
----
-
-#### Step 4 - `update_parent_run_id`
-
-**Type:** PySpark
-**Purpose:** Update iceberg_migration_runs table with parent run link
-
-- Extracts parent run ID from lookup result
-- Updates run record if parent found
-
----
-
-#### Step 5 - `discover_hive_tables`
+#### Step 3 - `discover_hive_tables`
 
 **Type:** PySpark (mapped per database)  
 **Purpose:** Discover Hive tables matching pattern in the source database
@@ -949,7 +1101,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 6 - `migrate_tables_to_iceberg`
+#### Step 4 - `migrate_tables_to_iceberg`
 
 **Type:** PySpark (mapped per database)
 **Purpose:** Migrate Hive tables to Iceberg format using Spark procedures
@@ -961,7 +1113,8 @@ finalize_iceberg_run
     A. **Inplace Migration:**
     - Converts Hive table to Iceberg in-place
     - Same database and table name
-    - Overwrites table metadata (irreversible)
+    - Overwrites table metadata; the source table is renamed to `<table>_backup_`
+      rather than dropped (retained unless `iceberg_drop_backup=true`)
     - Table type changes from Hive external to Iceberg
       B. **Snapshot Migration:**
     - Creates new Iceberg table
@@ -973,7 +1126,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 7 - `update_migration_durations`
+#### Step 5 - `update_migration_durations`
 
 **Type:** PySpark (mapped per database)  
 **Purpose:** Update tracking table with migration durations extracted from XCom
@@ -983,7 +1136,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 8 - `validate_iceberg_tables`
+#### Step 6 - `validate_iceberg_tables`
 
 **Type:** PySpark (mapped per database)  
 **Purpose:** Validate Iceberg tables: comprehensive Hive vs Iceberg comparison
@@ -997,7 +1150,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 9 - `update_iceberg_validation_status`
+#### Step 7 - `update_iceberg_validation_status`
 
 **Type:** PySpark (mapped per database)  
 **Purpose:** Update Iceberg tracking with validation results
@@ -1017,7 +1170,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 10 - `generate_iceberg_html_report`
+#### Step 8 - `generate_iceberg_html_report`
 
 **Type:** PySpark
 **Purpose:** Generate comprehensive HTML migration report
@@ -1035,18 +1188,19 @@ finalize_iceberg_run
 
 ---
 
-#### Step 11 - `send_iceberg_report_email`
+#### Step 9 - `send_iceberg_report_email`
 
 **Type:** PySpark  
 **Purpose:** Send HTML Iceberg migration report via email using SMTP
 
-- Receives HTML content directly from `generate_iceberg_html_report` task
+- Reads the report back from S3 using the `report_path` returned by `generate_iceberg_html_report`
 - Extracts email configuration:
   - SMTP connection ID from Airflow variable
   - Recipients list (comma-separated) from Airflow variable
 - Sends email with:
   - Subject: `Iceberg Migration Report - {run_id}`
-  - Body: Full HTML report (no S3 read required)
+  - Body: a one-line pointer to the run
+  - **Attachment: the full HTML report** — open the attachment, not the body
 - **Skips email if:**
   - No recipients configured (`migration_email_recipients` variable empty)
   - Returns `{'sent': False, 'reason': 'no_recipients'}`
@@ -1055,7 +1209,7 @@ finalize_iceberg_run
 
 ---
 
-#### Step 12 - `finalize_iceberg_run`
+#### Step 10 - `finalize_iceberg_run`
 
 **Type:** PySpark  
 **Purpose:** Aggregate statistics and mark migration run as complete
@@ -1158,9 +1312,9 @@ init_folder_copy_tracking_tables
     ↓
 create_data_copy_run
     ↓
-parse_folder_copy_excel
-    ↓
 cluster_login_setup  (edge node auth)
+    ↓
+parse_folder_copy_excel
     ↓
 ┌──────────────────────────────────────────────────────────────┐
 │  Dynamic Task Mapping (one instance per Excel row)           │
@@ -1180,6 +1334,10 @@ generate_data_copy_html_report
     ↓
 send_data_copy_report_email
 ```
+
+> `cluster_login_setup` runs **before** `parse_folder_copy_excel` so the resolved
+> `cluster_setup` dict (service account, edge temp dir, DistCp log dir) is available to
+> `run_folder_distcp_ssh`, `finalize_data_copy_run`, and `generate_data_copy_html_report`.
 
 ---
 
@@ -1217,35 +1375,36 @@ send_data_copy_report_email
 
 ---
 
-#### Step 4 - `parse_folder_copy_excel`
+#### Step 4 - `cluster_login_setup`
+
+**Type:** SSH
+**Purpose:** Authenticate with the cluster edge node and set up the session environment
+
+- Runs **before** the Excel parse so `cluster_setup` is available to every downstream task
+- Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
+- Performs cluster authentication using the configured `auth_method` (`mapr`, `kinit`, or `none`)
+- Returns a `cluster_setup` dict containing `temp_dir`, `distcp_log_dir`,
+  `service_account_user_id`, and `service_account_source`
+
+---
+
+#### Step 5 - `parse_folder_copy_excel`
 
 **Type:** PySpark
 **Purpose:** Read and parse the Excel config file from S3
 
 - Reads `source_path`, `target_bucket`, `dest_folder` columns
-- Normalises `target_bucket` to `s3a://`
+- Normalises `target_bucket` to `s3a://`, after first stripping a bare `S3:` / `s3:` prefix
+  that is not followed by `//` — otherwise `S3:my-bucket` normalises to the invalid
+  `s3a://S3:my-bucket`
+- Collapses doubled separators and strips trailing slashes from the bucket path, and strips
+  leading and trailing slashes from `dest_folder`
+- When the bucket path already ends with `/{dest_folder}`, the duplicated segment is removed
+  from the bucket so the destination is not written twice
 - Defaults `dest_folder` to `basename(source_path)` if not specified
+- Logs the final destination per row at INFO
 - Returns a list of folder config dicts for dynamic task mapping
 - Raises if no valid rows are found
-
----
-
-#### Step 5 - `cluster_login_setup`
-
-**Type:** SSH
-**Purpose:** Authenticate with the cluster edge node and set up the session environment
-
-- Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
-- Performs cluster authentication using the configured `auth_method` (`mapr`, `kinit`, or `none`)
-- Returns a `cluster_setup` dict consumed by downstream SSH tasks
-
----
-
-#### Step 6 - `run_folder_distcp_ssh`
-
-- Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
-- Performs cluster authentication using the configured `auth_method` (`mapr`, `kinit`, or `none`)
-- Returns a `cluster_setup` dict consumed by downstream SSH tasks
 
 ---
 
@@ -1255,11 +1414,34 @@ send_data_copy_report_email
 **Purpose:** Copy a single source folder to S3 via Hadoop DistCp
 
 - Always uses `-update` flag — safe for both full and incremental runs
+- `-delete` is added only when **both** `migration_distcp_preserve_delete` and
+  `folder_copy_allow_delete` resolve true (see Variables below); off by default
+- Writes a DistCp log to `{cluster_setup.distcp_log_dir}/distcp_{dest_folder}.log`
+- Checks the source path first with `hadoop fs -test -d`, capturing both the exit code and
+  stderr:
+  - exit `1` — the path is genuinely absent: returns `SOURCE_NOT_FOUND` without running DistCp
+  - exit `0` — the path exists: a present but empty path creates the S3 prefix and returns
+    `EMPTY_SOURCE`, otherwise DistCp runs
+  - any other non-zero exit is an **error, not an absence** (expired ticket, unreachable
+    NameNode): the task returns `FAILED` with the message prefixed
+    `Source existence check failed (exit {rc}): ` and the captured stderr. This matters
+    because `finalize_data_copy_run` counts `SOURCE_NOT_FOUND` as successful — an auth or
+    connectivity problem must never be recorded that way
 - Captures source file count and size before copy
 - Captures S3 file count and size before and after copy
+- Parses DistCp's own `Bytes Copied` / `Files Copied` counters from a delimited
+  `===DISTCP_METRICS_START===` / `===DISTCP_METRICS_END===` block
+- Extracts every YARN application ID from stdout and stderr, deduplicated in order; the
+  last one is the primary `yarn_application_id`
+- Computes `distcp_duration_seconds` and `throughput_mbps`
 - Computes `files_copied` and `bytes_copied` as before/after deltas
 - Sets `file_count_match` (exact) and `size_match` (within 1% tolerance)
-- On failure returns a FAILED result dict — does not raise — so tracking can record it
+- On a non-zero DistCp exit code, or any SSH error, the FAILED result dict is pushed to XCom
+  with `key='return_value'` **before** the task raises, so every downstream `all_done` task
+  still receives it — the failure is recorded, reported and emailed, while the task itself
+  goes red and turns the DAG run red. Metrics parsed before the failure are retained
+- `SOURCE_NOT_FOUND` and `EMPTY_SOURCE` are legitimate outcomes: they return their result dict
+  and do **not** raise
 - **Timeout:** 24 hours (`SSH_COMMAND_TIMEOUT`)
 
 ---
@@ -1280,6 +1462,11 @@ send_data_copy_report_email
 - Re-runs `hadoop fs -ls -R` and `hadoop fs -du -s` on the S3 destination
 - Sets `VALIDATED` only if destination exists, file count matches, and size is within 1%
 - Otherwise sets `VALIDATION_FAILED` with a descriptive error
+- For `VALIDATION_SKIPPED` and `VALIDATION_FAILED` the result is pushed to XCom with
+  `key='return_value'` **before** the task raises, so `update_data_copy_validation` and every
+  other downstream `all_done` task still records, reports and emails the outcome
+- `SOURCE_NOT_FOUND`, `EMPTY_SOURCE` and `SKIPPED` rows pass straight through with the
+  matching `validation_status` and do not raise
 
 ---
 
@@ -1296,8 +1483,21 @@ send_data_copy_report_email
 **Purpose:** Aggregate folder counts and mark the run as complete
 
 - Queries `data_copy_status` for authoritative counts
+- Counting matches DAG 1's `finalize_run`: `successful_folders` counts `VALIDATED` +
+  `EMPTY_SOURCE` + `SOURCE_NOT_FOUND`; `failed_folders` counts `FAILED`,
+  `VALIDATION_FAILED` and `VALIDATION_SKIPPED`; `skipped_folders` counts `SKIPPED`
+- `SOURCE_NOT_FOUND` counts as **successful** — a path that is not on the source is a
+  spreadsheet error, not a copy failure, so a run whose only problem is a missing path
+  reports `COMPLETED`. It is surfaced separately by the `not_found_folders` value in the
+  returned dict, the finalize log line, and the SOURCE NOT FOUND card in the report
+- `not_found_folders` is computed for the return value and the log only; there is no
+  tracking column for it
 - Sets run status to `COMPLETED` (zero failures) or `COMPLETED_WITH_ERRORS`
-- Updates `data_copy_runs` with totals and `completed_at`
+- Sets run status to `FAILED` when the run wrote **no** folder records at all, or when the
+  stats query itself fails
+- Updates `data_copy_runs` with totals, `skipped_folders`, and `completed_at`
+- Records `service_account_user_id` / `service_account_source` from `cluster_setup` so the
+  identity actually resolved on the edge node reaches tracking
 
 ---
 
@@ -1306,8 +1506,40 @@ send_data_copy_report_email
 **Type:** PySpark
 **Purpose:** Generate an HTML report and write it to S3
 
-- Summary cards: run status, total/validated/failed folders, incremental count, total GB, files, bytes copied
-- Per-folder details table with source path, destination, copy status badge, file/size match indicators, and error snippets
+Structure, stylesheet and status vocabulary mirror DAG 1's `generate_html_report`.
+
+- Header, four lines only: generated timestamp, tracking run ID, DAG run, and the service
+  account with its source (resolved from `cluster_setup` first, then the tracking row, then
+  config)
+- **Copy Summary** cards: total folders, successful, failed, source not found, empty source,
+  skipped, total data, total files, incremental runs, average throughput (MB/s). `SUCCESSFUL`
+  matches the finalize counting; `FAILED` covers only `FAILED`, `VALIDATION_FAILED` and
+  `VALIDATION_SKIPPED`
+- **Data Validation Summary** cards: size match, file count match, source size, dest size,
+  size delta. Every count and total here covers only folders that actually ran DistCp —
+  `EMPTY_SOURCE`, `SOURCE_NOT_FOUND` and `SKIPPED` rows are excluded
+- **Folder Copy Details**: source path, destination, status badge, incremental, DistCp
+  duration, YARN application ID(s), total duration. The incremental marker is an inline pill
+  on the duration cell. Total Duration is the row's end-to-end time
+  (`completed_at - started_at`), falling back to `distcp_duration_seconds` when either
+  timestamp is missing and clamped to `0.0` if the pair is inverted
+- **Data Validation Results**: source and S3 sizes before/after/transferred, file counts
+  before/after/transferred, and `✓ PASS` / `✗ FAIL` match cells
+- **Performance Metrics**: data volume, DistCp speed, files/second, end-to-end duration.
+  DistCp Speed reads the stored `throughput_mbps` column so it agrees with the AVG
+  THROUGHPUT card, and End-to-End Duration uses the same value as Total Duration above
+- Status badge classes map exactly: `VALIDATED`/`COMPLETED` → `status-completed`;
+  `FAILED`/`VALIDATION_FAILED`/`VALIDATION_SKIPPED` → `status-failed`; `EMPTY_SOURCE` →
+  `status-empty`; `SOURCE_NOT_FOUND` → `status-not-found`; `SKIPPED` → `status-skipped`;
+  anything else → `status-warning`
+- There is no Failures section and no Error column. Only `EMPTY_SOURCE` and
+  `SOURCE_NOT_FOUND` collapse to a single colspan badge cell in the two detail tables —
+  nothing ran for those rows
+- Failures render as **full rows**, following DAG 2's report: the status cell carries the
+  `status-failed` badge with the full error in its `title`, and a `div.status-reason`
+  beneath it holding the message truncated to 200 characters. The row keeps all its metric
+  cells, so whatever DistCp reported before failing is still visible. `SKIPPED` rows render
+  the same way
 - Writes to `{report_location}/{run_id}_data_copy_report.html`
 - Returns `report_path` (S3 key); email task reads the report directly from S3
 
@@ -1318,9 +1550,27 @@ send_data_copy_report_email
 **Type:** PySpark
 **Purpose:** Email the HTML report via SMTP
 
-- Subject: `Folder Data Copy Report - {run_id}`
+- Subject: `Folder Data Copy Report - {run_id} - {overall_status} ({successful}/{total})`
 - Skips silently if `migration_email_recipients` variable is empty
 - Uses same SMTP connection (`migration_smtp_conn_id`) as DAG 1 and DAG 2
+- Permanent SMTP errors (bad credentials, missing report) fail immediately instead of
+  consuming retries
+
+---
+
+### DAG Failure Callback
+
+`_folder_copy_dag_failure_callback` is registered as the DAG's `on_failure_callback` and is
+diagnostic only — Airflow runs DAG-level callbacks in the scheduler, where there is no Spark
+session, so it performs no Spark or SQL work:
+
+- Reads the tracking `run_id` from the `create_data_copy_run` XCom
+- Logs clearly when no tracking `run_id` can be found (the run failed before
+  `create_data_copy_run` wrote a record)
+- Otherwise logs a WARNING naming the `run_id`, stating that the run ended without a report
+  and that `data_copy_runs` still shows `RUNNING` for it
+- Every failure inside the callback is logged and swallowed — nothing propagates into the
+  scheduler
 
 ---
 
@@ -1347,119 +1597,221 @@ COMPLETED_WITH_ERRORS
 | `VALIDATION_FAILED`  | Destination exists but file count or size mismatch |
 | `VALIDATION_SKIPPED` | Copy step failed — validation not attempted        |
 | `FAILED`             | DistCp failed                                      |
+| `SOURCE_NOT_FOUND`   | Source path does not exist — DistCp not attempted  |
+| `EMPTY_SOURCE`       | Source exists but has 0 files — S3 prefix created  |
+| `SKIPPED`            | Folder deliberately not copied                     |
+
+Validation passes `FAILED`, `SOURCE_NOT_FOUND`, `EMPTY_SOURCE`, and `SKIPPED` rows straight
+through without raising, so the mapped chain always completes and every folder is recorded.
 
 ---
 
-## DAG 4: Parquet HMS Registration (`parquet_hms_registration`)
+### Folder Copy Variables
+
+| Variable                           | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ---------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `folder_copy_allow_delete`         | `false` | Second, folder-copy-specific switch that must **also** be true before DistCp is given `-delete`. Deletion is off by default here because folder copy targets raw directories with no Hive metadata to reconcile against — an over-broad `source_path` or a wrong `dest_folder` would silently delete unrelated S3 objects under the destination prefix. Set to `true` only when the destination prefix is owned exclusively by this copy and you want removed source files mirrored. |
+| `migration_distcp_preserve_delete` | `true`  | Shared DistCp switch (also used by DAG 1). Folder copy requires this **and** `folder_copy_allow_delete` before passing `-delete`.                                                                                                                                                                                                                                                                                                                                                    |
+
+---
+
+### Tracking Columns
+
+Columns added to the folder-copy tracking tables. All additions are applied idempotently at
+run time via `ALTER TABLE ... ADD COLUMN`, so existing tracking databases evolve in place; a
+missing column is reported as a single WARNING after a `DESCRIBE` check.
+
+**`data_copy_runs`**
+
+| Column                    | Type     | Description                                                            |
+| ------------------------- | -------- | ---------------------------------------------------------------------- |
+| `dag_run_id`              | `STRING` | Airflow DAG run ID that produced this tracking run                     |
+| `service_account_user_id` | `STRING` | Service account the copy actually ran as on the edge node              |
+| `service_account_source`  | `STRING` | How that account was resolved (config, active MapR ticket, `.profile`) |
+| `skipped_folders`         | `INT`    | Count of folders with status `SKIPPED`                                 |
+
+**`data_copy_status`**
+
+| Column                    | Type        | Description                                                |
+| ------------------------- | ----------- | ---------------------------------------------------------- |
+| `yarn_application_id`     | `STRING`    | YARN application ID(s) for the DistCp job, comma-separated |
+| `distcp_started_at`       | `TIMESTAMP` | When the DistCp step started                               |
+| `distcp_completed_at`     | `TIMESTAMP` | When the DistCp step finished                              |
+| `distcp_duration_seconds` | `DOUBLE`    | DistCp wall-clock duration                                 |
+| `distcp_bytes_copied`     | `BIGINT`    | Bytes reported by DistCp's own counters                    |
+| `distcp_files_copied`     | `BIGINT`    | Files reported by DistCp's own counters                    |
+| `throughput_mbps`         | `DOUBLE`    | `distcp_bytes_copied / 1 MiB / distcp_duration_seconds`    |
+
+---
+
+## DAG 4: Iceberg Catalog Migration (`iceberg_catalog_migration`)
+
+> Full reference: [README_migration_iceberg_catalog.md](README_migration_iceberg_catalog.md)
 
 ### Purpose
 
-Registers plain parquet files already sitting on S3 (e.g. copied by DAG 3 or an
-external migration) as **external Hive Metastore tables**, so they become
-queryable without moving or rewriting any data.
+Migrates **existing Iceberg tables** from a **Hadoop catalog** to a **Hive (HMS)
+catalog**. The Iceberg data and metadata files must already be copied to the
+destination S3 bucket; this DAG rewrites the path references embedded in the
+metadata (via the `rewrite_table_path` stored procedure) and registers the table
+in HMS with `register_table`.
+
+Unlike DAG 2 (which converts _Hive_ tables to Iceberg), DAG 4 is
+Iceberg-to-Iceberg: no data is rewritten and full snapshot history, partition
+transforms, exact schema types, and table properties are preserved.
+
+---
+
+### Prerequisites
+
+- Both **data files** and **metadata files** for every table are already present
+  under `dest_s3_prefix` on S3
+- The destination Spark/Iceberg runtime is **Iceberg 1.4+** (required for
+  `rewrite_table_path`; register-only rows do not invoke the procedure)
+- Both source and destination buckets are reachable from the Spark workers —
+  `rewrite_table_path` reads the source metadata/manifests to know what to
+  rewrite. This DAG does **not** configure S3 credentials itself; it relies on
+  the endpoints/credentials registered through the nx1 portal's object store
+  configuration
+
+---
 
 ### Key Features
 
-- **Schema inference** - column names and types are inferred directly from the
-  parquet files via Spark with `mergeSchema=true`, so the footers of **all**
-  files are unioned — columns added or removed by schema evolution are not
-  silently dropped; no schema input required
-- **Automatic partition discovery** - Hive-style `key=value` directory layouts
-  are detected, the table is created with the matching `PARTITIONED BY` clause,
-  and partitions are registered with `MSCK REPAIR TABLE`. Partition columns are
-  always registered as **STRING** (`partitionColumnTypeInference` is disabled):
-  values keep their exact directory form (`month=01` stays `01`), and string
-  partition keys are what Athena/Glue recommend for metastore interop
-- **Safe by default** - tables that already exist in HMS at a _different_
-  location are recorded as `SKIPPED`, never dropped or replaced; an existing
-  table at the _same_ location (an Airflow retry) is MSCK-repaired and
-  recorded `REGISTERED`
-- **Validation** - row counts (HMS table vs direct parquet read) and partition
-  counts (`SHOW PARTITIONS` vs leaf `key=value` directories on S3) are
-  compared after registration
-- **Tracking & reporting** - run-level and per-table status in Iceberg tracking
+- **Two row categories** — a row is **rewrite** when `source_s3_prefix` differs
+  from `dest_s3_prefix`, and **register-only** when `source_s3_prefix` is blank
+  or equal to `dest_s3_prefix` (metadata already points at the destination, so
+  the rewrite is skipped and the table is registered straight from the dest
+  metadata file)
+- **History preserved** — every snapshot's paths are rewritten, so time travel,
+  partition transforms (`year`, `month`, `bucket`, `truncate`, …), exact schema
+  types, and table properties survive the move
+- **Incremental** — re-copy new/changed data and metadata files to the
+  destination, then re-run; the DAG rewrites whatever is present at the
+  destination. Change detection and syncing are **not** handled by the DAG
+- **Five-way validation** — row count, partition count, schema, path-rewrite
+  verification (no snapshot still references `source_s3_prefix`), and snapshot
+  count
+- **Tracking & reporting** — run-level and per-table status in Iceberg tracking
   tables, HTML report written to S3 and emailed
 
-### Excel Configuration
+---
 
-One row per table to register:
+### Excel Configuration Format
 
-| database   | table        | s3_location                             |
-| ---------- | ------------ | --------------------------------------- |
-| sales_data | transactions | s3a://data-lake/sales_data/transactions |
-| sales_data | orders       | s3://data-lake/sales_data/orders        |
+| Column             | Required    | Description                                                                                                                                   | Example                         |
+| ------------------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| `database`         | **Yes**     | HMS database name (same for source and destination)                                                                                           | `analytics`                     |
+| `table`            | No          | Table name(s) — single, comma-separated, or wildcard; defaults to `*`                                                                         | `orders` or `trans*` or `*`     |
+| `source_s3_prefix` | Conditional | Original source prefix embedded in the pre-copied metadata. **Leave blank** or set equal to `dest_s3_prefix` to mark the row as register-only | `s3a://source-bucket/warehouse` |
+| `dest_s3_prefix`   | **Yes**     | Destination prefix the metadata paths are rewritten to (or where the table already lives, for register-only rows)                             | `s3a://dest-bucket/warehouse`   |
 
-- All three columns are required; rows with missing cells are skipped with a warning
-- `s3_location` accepts `s3://`, `s3n://`, or `s3a://` (normalized to `s3a://`)
-- The target database is created with `CREATE DATABASE IF NOT EXISTS` when missing
-- Duplicate `(database, table)` rows: the first row wins
-- Partition columns are **not** configured — they are discovered from the
-  directory layout. Locations without `key=value` directories are registered as
-  unpartitioned tables.
+Rows are grouped by `(database, source_s3_prefix, dest_s3_prefix)`; multiple rows
+for the same group accumulate their table tokens. Blank `source_s3_prefix` cells
+are mirrored to `dest_s3_prefix` before grouping.
+
+**Excel Sample:**
+
+```
+| database  | table      | source_s3_prefix              | dest_s3_prefix              |
+|-----------|------------|-------------------------------|-----------------------------|
+| analytics | orders     | s3a://source-bucket/warehouse | s3a://dest-bucket/warehouse |  ← rewrite
+| analytics | customers  | s3a://source-bucket/warehouse | s3a://dest-bucket/warehouse |  ← rewrite
+| reporting | *          | s3a://source-bucket/warehouse | s3a://dest-bucket/warehouse |  ← rewrite
+| ops       | inventory  |                               | s3a://dest-bucket/ops       |  ← register-only (blank source)
+| ops       | snapshots  | s3a://dest-bucket/ops         | s3a://dest-bucket/ops       |  ← register-only (source == dest)
+```
+
+---
 
 ### Task Flow
 
 ```
-init_hms_tracking_tables
-        |
-create_hms_registration_run
-        |
-parse_parquet_hms_excel
-        |
-register_parquet_tables          (mapped: one task per Excel row)
-        |
-validate_registered_tables       (mapped, max 3 concurrent)
-        |
-update_hms_validation_status     (mapped)
-        |
-generate_hms_html_report
-        |
-send_hms_report_email
-        |
-finalize_hms_run
+init_tracking_tables
+    ↓
+create_migration_run
+    ↓
+parse_excel
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  Dynamic Task Mapping (one set of tasks per database config)      │
+│  (every mapped task uses trigger_rule = all_done)                 │
+│                                                                   │
+│  validate_data_presence                                           │
+│    ↓                                                              │
+│  update_data_presence_in_tracking                                 │
+│    ↓                                                              │
+│  discover_tables (PySpark)                                        │
+│    ↓                                                              │
+│  update_discovered_tables_in_tracking                             │
+│    ↓                                                              │
+│  rewrite_and_register_tables                                      │
+│    ↓                                                              │
+│  update_rewrite_and_register_in_tracking                          │
+│    ↓                                                              │
+│  validate_dest_tables  (max 3 concurrent)                         │
+│    ↓                                                              │
+│  update_validation_in_tracking                                    │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+generate_html_report
+    ↓
+send_report_email
+    ↓
+finalize_run
 ```
+
+---
 
 ### Task Summaries
 
-| Task                           | Description                                                                                                                                                                                                                                          |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `init_hms_tracking_tables`     | Creates `hms_registration_runs` and `hms_registration_status` Iceberg tracking tables if missing                                                                                                                                                     |
-| `create_hms_registration_run`  | Inserts a `RUNNING` run record; generates the `hms_reg_...` run ID                                                                                                                                                                                   |
-| `parse_parquet_hms_excel`      | Reads the Excel file from S3; emits one config per valid row                                                                                                                                                                                         |
-| `register_parquet_tables`      | Infers schema (merged across all footers), detects partition columns from `key=value` dirs (typed STRING), `CREATE EXTERNAL TABLE` + `MSCK REPAIR TABLE`; existing table at same location → repair + `REGISTERED`, at different location → `SKIPPED` |
-| `validate_registered_tables`   | Compares HMS row count vs direct parquet count, and `SHOW PARTITIONS` count vs leaf `key=value` directories on S3                                                                                                                                    |
-| `update_hms_validation_status` | Writes validation results back to the tracking table (`VALIDATED` / `VALIDATION_FAILED`)                                                                                                                                                             |
-| `generate_hms_html_report`     | Builds the HTML report and writes it to `migration_report_location`                                                                                                                                                                                  |
-| `send_hms_report_email`        | Emails the report via SMTP (skips gracefully when no recipients configured)                                                                                                                                                                          |
-| `finalize_hms_run`             | Aggregates per-table statuses into the run record (`COMPLETED` / `COMPLETED_WITH_FAILURES` / `FAILED`)                                                                                                                                               |
+| Task                                      | Description                                                                                                                                                                                                                                                         |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init_tracking_tables`                    | Creates `rewrite_migration_runs` and `rewrite_migration_table_status` Iceberg tracking tables if missing                                                                                                                                                            |
+| `create_migration_run`                    | Inserts a `RUNNING` run record; generates the `rewrite_run_{YYYYMMDD_HHMMSS}_{uuid8}` run ID                                                                                                                                                                        |
+| `parse_excel`                             | Reads the Excel file from S3 and groups rows by `(database, source_s3_prefix, dest_s3_prefix)` for dynamic task mapping; raises if no valid rows                                                                                                                    |
+| `validate_data_presence`                  | Lists table directories under `dest_s3_prefix`, filters by the row's table tokens, and verifies each path exists, has a `metadata/` subdirectory, and contains files → `CONFIRMED` / `MISSING` / `FAILED`                                                           |
+| `update_data_presence_in_tracking`        | Inserts (or, on rerun, updates) the initial per-table tracking rows with presence status, file count, size, and `overall_status`                                                                                                                                    |
+| `discover_tables`                         | Reads schema, partition spec, row count, and snapshot count from the destination `metadata.json` for each `CONFIRMED` table (not from HMS, which may not have it registered yet)                                                                                    |
+| `update_discovered_tables_in_tracking`    | Writes discovery results — schema/partition JSON, source counts, `DISCOVERED` status — back to the tracking table                                                                                                                                                   |
+| `rewrite_and_register_tables`             | Drops any stale HMS registration (no `PURGE`), then: **register-only** → resolve latest dest `metadata.json` and `register_table`; **rewrite** → temporarily register from the source metadata, `CALL rewrite_table_path`, drop the temp, register the new metadata |
+| `update_rewrite_and_register_in_tracking` | Records create status/duration and overwrites `source_row_count` / `source_partition_count` with post-register counts; `overall_status` is sticky (`FAILED` / `DATA_MISSING` are not overwritten)                                                                   |
+| `validate_dest_tables`                    | Compares row count, partition count, schema, snapshot count, and verifies no snapshot's `manifest_list` still references `source_s3_prefix` (path check skipped for register-only tables)                                                                           |
+| `update_validation_in_tracking`           | Writes validation results and the final `VALIDATED` / `VALIDATION_FAILED` status, with a race-safe catch-all for rows no validator reached                                                                                                                          |
+| `generate_html_report`                    | Builds the HTML report and writes it to `{report_location}/{run_id}_rewrite_report.html`                                                                                                                                                                            |
+| `send_report_email`                       | Emails the report (subject `Iceberg Catalog Migration Report — {run_id}`); skips silently when no recipients configured                                                                                                                                             |
+| `finalize_run`                            | Aggregates per-table statuses into the run record (`COMPLETED` / `COMPLETED_WITH_MISSING` / `COMPLETED_WITH_FAILURES` / `FAILED`)                                                                                                                                   |
+
+---
 
 ### Status Progression
 
-Per table: `REGISTERED` → `VALIDATED` (or `VALIDATION_FAILED`), with terminal
-`SKIPPED` (table already in HMS at a different location) and `FAILED`
-(registration error) states.
-Per run: `RUNNING` → `COMPLETED` / `COMPLETED_WITH_FAILURES` / `FAILED`.
+```
+DATA_CONFIRMED  (metadata and data files found at destination)
+    ↓
+DISCOVERED  (metadata read from destination, tracking record updated)
+    ↓
+TABLE_CREATED  (rewrite_table_path + register_table executed)
+    ↓
+VALIDATED  (row count, partition count, schema, path rewrite, snapshot count all match)
 
-### Notes & Limitations
+DATA_MISSING → skipped in all downstream steps, visible in report
+(Any stage) → FAILED or VALIDATION_FAILED
+```
 
-- **Partition columns are always STRING.** Spark's partition type inference is
-  explicitly disabled (`spark.sql.sources.partitionColumnTypeInference.enabled=false`),
-  so directory values are never coerced (`month=01` and `month=1` stay distinct,
-  leading zeros survive, `dt=2024-01-01` is not turned into a DATE). Query with
-  string predicates (`WHERE year='2024'`) or cast in the query. See the
-  [Athena guidance on string partition keys](https://docs.aws.amazon.com/athena/latest/ug/performance-tuning-data-optimization-techniques.html)
-  and the [Spark partition discovery docs](https://spark.apache.org/docs/latest/sql-data-sources-parquet.html)
-- **Schema evolution is handled at registration** via `mergeSchema=true`: the
-  registered schema is the union of all file footers; files missing
-  later-added columns read those columns as NULL (standard parquet behavior).
-  Genuinely incompatible type changes across files fail the registration loudly
-- Empty partition directories are registered by MSCK and return zero rows when
-  queried; validation counts directories on both sides, so empty partitions do
-  not flag a mismatch
-- Non-Hive-style layouts (no `key=value` directories) are registered as
-  unpartitioned tables
-- No drop/replace support — re-running against a table registered elsewhere
-  records `SKIPPED`
+| Per-table status    | Meaning                                                                      |
+| ------------------- | ---------------------------------------------------------------------------- |
+| `DATA_CONFIRMED`    | Data and metadata files present at destination S3 — tracking row inserted    |
+| `DISCOVERED`        | Metadata read from destination, schema/partition info recorded               |
+| `DATA_MISSING`      | No files or missing `metadata/` directory — skipped                          |
+| `TABLE_CREATED`     | `rewrite_table_path` + `register_table` completed, validation pending        |
+| `VALIDATED`         | All five validation checks passed — migration success                        |
+| `VALIDATION_FAILED` | Row count, partition count, schema, path-rewrite, or snapshot-count mismatch |
+| `FAILED`            | Error at data presence check, discovery, or table creation                   |
+
+**Per-run statuses:** `COMPLETED` · `COMPLETED_WITH_MISSING` (no failures, some
+tables had no data at the destination) · `COMPLETED_WITH_FAILURES` · `FAILED`
+(run-level tracking error).
 
 ---
 
@@ -1597,6 +1949,13 @@ metadata to work from.
 
 1. **migration_tracking.data_copy_runs**: Run-level metadata for folder-only data copy runs.
 2. **migration_tracking.data_copy_status**: Folder-level tracking — one row per source/destination pair per run.
+
+---
+
+### Iceberg Catalog Migration Tracking
+
+1. **migration_tracking.rewrite_migration_runs**: Run-level metadata for Hadoop-catalog-to-HMS Iceberg migrations.
+2. **migration_tracking.rewrite_migration_table_status**: Table-level tracking — data presence, discovery, registration, and validation; partitioned by `source_database`.
 
 ---
 

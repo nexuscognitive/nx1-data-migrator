@@ -293,7 +293,9 @@ def get_config() -> dict:
         # SSH Configuration (for MapR migration)
         'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh', conf_key='ssh_conn_id'),
         'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration', conf_key='edge_temp_path'),
+        'edge_discovery_temp_path': _var('cluster_edge_discovery_temp_path', 'CLUSTER_EDGE_DISCOVERY_TEMP_PATH', '/tmp'),
         'hive_scratch_dir': _var('cluster_hive_scratch_dir', 'CLUSTER_HIVE_SCRATCH_DIR', '/tmp/hive', conf_key='hive_scratch_dir'),
+        'distcp_log_root': _var('cluster_distcp_log_root', 'CLUSTER_DISTCP_LOG_ROOT', '/tmp'),
 
         # S3 Configuration
         'default_s3_bucket': _var('migration_default_s3_bucket', 'MIGRATION_DEFAULT_S3_BUCKET', 's3a://data-lake'),
@@ -323,7 +325,8 @@ def get_config() -> dict:
         'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
-        'mapr_user': _var('mapr_user', 'MAPR_USER', '', conf_key='mapr_user'),
+        'service_account_user_id': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '') or _var('mapr_user', 'MAPR_USER', '')).strip(),
+        'mapr_user': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '') or _var('mapr_user', 'MAPR_USER', '', conf_key='mapr_user')).strip(),
         'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}', conf_key='mapr_ticketfile_location'),
         # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
         'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', ''),
@@ -403,6 +406,15 @@ def _login_shell(cmd: str, cluster_type: str = 'MapR') -> str:
         return f"source ~/.profile 2>/dev/null || true\n{cmd}"
     return f"bash -l <<'__LOGIN_SHELL_EOF__'\n{cmd}\n__LOGIN_SHELL_EOF__\n"
 
+def _edge_path_template(path: str) -> str:
+    if not path:
+        return path
+    p = path.replace('${USER}', '${MIG_USER}').replace('$USER', '${MIG_USER}').replace('{user}', '${MIG_USER}')
+    if p.startswith('~'):
+        p = '/user/${MIG_USER}' + p[1:]
+    p = p.rstrip('/')
+    return p or '/'
+
 
 def _hive_scratch_dir(config: dict) -> str:
     """Resolve the Hive scratch dir for edge-node PySpark sessions.
@@ -427,15 +439,28 @@ def cluster_login(run_id: str) -> dict:
 
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
-    temp_dir = f"{config['edge_temp_path']}/{run_id}"
+    temp_dir = f"{_edge_path_template(config['edge_temp_path'])}/{run_id}"
+    distcp_log_root = str(config.get('distcp_log_root') or '/tmp').rstrip('/') or '/tmp'
 
     auth_method = config.get('auth_method', 'mapr')
-    mapr_user = config.get('mapr_user', '')
-    mapr_ticketfile = config.get('mapr_ticketfile_location', '/tmp/maprticket_${USER}')
+    sa_user = str(config.get('service_account_user_id') or config.get('mapr_user') or '').strip()
+    mapr_user = sa_user
+    mapr_ticketfile = _edge_path_template(config.get('mapr_ticketfile_location', '/tmp/maprticket_${USER}'))
 
     auth_script_parts = []
 
     auth_script_parts.append(f"""
+
+CONFIGURED_SA_USER="{sa_user}"
+if [ -n "$CONFIGURED_SA_USER" ]; then
+    MIG_USER="$CONFIGURED_SA_USER"
+    MIG_USER_SOURCE="config:service_account_user_id"
+else
+    MIG_USER=$(id -un)
+    MIG_USER_SOURCE="login shell (.profile)"
+fi
+export MIG_USER
+
 echo "=== Cluster Authentication ({auth_method}) ==="
 
 if [ "{auth_method}" = "mapr" ]; then
@@ -465,12 +490,33 @@ echo "Authentication successful"
 """)
 
     auth_script_parts.append(f"""
+if [ -z "$CONFIGURED_SA_USER" ]; then
+    TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
+    if [ -n "$TICKET_USER" ]; then
+        MIG_USER="$TICKET_USER"
+        MIG_USER_SOURCE="active MapR ticket"
+    fi
+    export MIG_USER
+    echo "WARNING: service_account_user_id is not configured. Falling back to"
+    echo "WARNING: '$MIG_USER' from $MIG_USER_SOURCE. Set service_account_user_id"
+    echo "WARNING: explicitly so temp and log paths do not depend on .profile."
+fi
+echo "MAPR_EFFECTIVE_USER=$MIG_USER"
+echo "SERVICE_ACCOUNT_SOURCE=$MIG_USER_SOURCE"
+
 echo "=== Creating temp directory ==="
-mkdir -p {temp_dir}
-chmod 755 {temp_dir}
+RESOLVED_TEMP_DIR="{temp_dir}"
+mkdir -p "$RESOLVED_TEMP_DIR"
+chmod 755 "$RESOLVED_TEMP_DIR"
+
+echo "=== Creating DistCp log directory on cluster FS ==="
+RESOLVED_DISTCP_LOG_DIR="{distcp_log_root}/$MIG_USER/distcp_logs/{run_id}"
+hadoop fs -mkdir -p "$RESOLVED_DISTCP_LOG_DIR"
+hadoop fs -chmod 700 "$RESOLVED_DISTCP_LOG_DIR" || true
 
 echo "CLUSTER_LOGIN_SUCCESS"
-echo "TEMP_DIR={temp_dir}"
+echo "TEMP_DIR=$RESOLVED_TEMP_DIR"
+echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 """)
     full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
@@ -497,7 +543,47 @@ echo "TEMP_DIR={temp_dir}"
                 f"Output: {output[-500:]}"
             )
 
-    return {'temp_dir': temp_dir, 'run_id': run_id}
+    resolved_sa_user = sa_user
+    resolved_sa_source = ('config:service_account_user_id' if sa_user else 'login shell (.profile)')
+    resolved = temp_dir
+    resolved_log_dir = f"{distcp_log_root}/{sa_user or 'migration'}/distcp_logs/{run_id}"
+    for line in output.splitlines():
+        if line.startswith("TEMP_DIR="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                resolved = val
+        elif line.startswith("DISTCP_LOG_DIR="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                resolved_log_dir = val
+        elif line.startswith("MAPR_EFFECTIVE_USER="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                resolved_sa_user = val
+        elif line.startswith("SERVICE_ACCOUNT_SOURCE="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                resolved_sa_source = val
+
+    logger.info("=== Service Account ===")
+    logger.info(f"[cluster_login] Service account user : {resolved_sa_user}")
+    logger.info(f"[cluster_login] Resolved from        : {resolved_sa_source}")
+    logger.info(f"[cluster_login] Edge temp dir        : {resolved}")
+    logger.info(f"[cluster_login] DistCp log dir       : {resolved_log_dir}")
+    if not sa_user:
+        logger.warning(
+            "[cluster_login] service_account_user_id is not configured — paths were "
+            "derived from the edge node's .profile identity. Set it explicitly so "
+            "temp and log paths are predictable per tenant."
+        )
+
+    return {
+        'temp_dir': resolved,
+        'run_id': run_id,
+        'distcp_log_dir': resolved_log_dir,
+        'service_account_user_id': resolved_sa_user,
+        'service_account_source': resolved_sa_source,
+    }
 
 
 def _s3a_committer_opts(config: dict) -> str:

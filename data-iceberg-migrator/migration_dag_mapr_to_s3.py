@@ -379,7 +379,9 @@ def init_tracking_tables(spark) -> dict:
             total_tables INT,
             successful_tables INT,
             failed_tables INT,
-            config_json STRING
+            config_json STRING,
+            service_account_user_id STRING,
+            service_account_source STRING
         )
         USING iceberg
         LOCATION '{tracking_loc}/migration_runs'
@@ -476,6 +478,22 @@ def init_tracking_tables(spark) -> dict:
             # Column already exists — expected on every run after the first.
             pass
 
+    for _col_name, _col_type in (
+        ("service_account_user_id", "STRING"),
+        ("service_account_source", "STRING"),
+    ):
+        try:
+            spark.sql(
+                f"ALTER TABLE {tracking_db}.migration_runs "
+                f"ADD COLUMN {_col_name} {_col_type}"
+            )
+            logger.info(
+                f"[init_tracking_tables] Added column {_col_name} to migration_runs"
+            )
+        except Exception:
+            # Column already exists — expected on every run after the first.
+            pass
+
     return {"status": "initialized", "database": tracking_db}
 
 
@@ -490,9 +508,14 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
 
     run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
-    execute_with_iceberg_retry(
-        spark,
-        f"""
+    sa_user = str(config.get("service_account_user_id") or "").strip()
+    sa_source = "config:service_account_user_id" if sa_user else "pending (.profile fallback)"
+    logger.info(
+        f"[create_migration_run] run_id={run_id} | configured service account: "
+        f"{sa_user or '(not configured)'}"
+    )
+
+    spark.sql(f"""
         INSERT INTO {tracking_db}.migration_runs
         VALUES (
             '{run_id}',
@@ -502,7 +525,9 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
             NULL,
             'RUNNING',
             0, 0, 0,
-            '{json.dumps(config).replace("'", "''")}'
+            '{json.dumps(config).replace("'", "''")}',
+            '{sa_user.replace("'", "''")}',
+            '{sa_source}'
         )
         """,
         task_label=f"create_migration_run:{run_id}",
@@ -717,7 +742,12 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
         dest_bucket_slug = f"{dest_bucket_slug}_{pf_slug}"
 
     with ssh.get_conn() as client:
-        temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}"
+        discovery_root = str(config.get("edge_discovery_temp_path") or "/tmp").rstrip("/") or "/tmp"
+        if "$" in discovery_root or discovery_root.startswith("~"):
+            raise ValueError(
+                f"cluster_edge_discovery_temp_path must be a literal path, got: {discovery_root}"
+            )
+        temp_dir = f"{discovery_root}/discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}"
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
 
@@ -1458,6 +1488,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
     tables = discovery["tables"]
     temp_dir = cluster_setup["temp_dir"]
+    distcp_log_dir = cluster_setup.get("distcp_log_dir") or temp_dir
     mappers = config["distcp_mappers"]
     bandwidth = config["distcp_bandwidth"]
     preserve_delete = config.get("distcp_preserve_delete", True)
@@ -1644,7 +1675,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
 run_distcp_with_retry hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
-    -log {temp_dir}/distcp_{tbl}_part{part_idx}.log \\
+    -log {distcp_log_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
 """
 
@@ -1818,7 +1849,7 @@ echo "=== Creating empty partition directories ==="
 echo "=== Running distcp using source path list (delete disabled) ==="
 set +e
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
-    -log {temp_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
+    -log {distcp_log_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
 echo "$DISTCP_OUTPUT"
@@ -1889,7 +1920,7 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 echo "=== Running distcp ==="
 set +e
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
-    -log {temp_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
+    -log {distcp_log_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
 echo "$DISTCP_OUTPUT"
@@ -3475,7 +3506,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 
 
 @task.pyspark(conn_id="spark_default")
-def generate_html_report(run_id: str, spark, **context) -> str:
+def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **context) -> str:
     """Generate comprehensive HTML migration report."""
     from datetime import datetime
 
@@ -3488,6 +3519,22 @@ def generate_html_report(run_id: str, spark, **context) -> str:
         SELECT * FROM {tracking_db}.migration_runs
         WHERE run_id = '{run_id}'
     """).collect()[0]
+
+    # Service account actually used for this run. Prefer the value resolved on the
+    # edge node during cluster_login_setup; fall back to the tracking row, then config.
+    if isinstance(cluster_setup, dict):
+        sa_user = str(cluster_setup.get("service_account_user_id") or "").strip()
+        sa_source = str(cluster_setup.get("service_account_source") or "").strip()
+    else:
+        sa_user, sa_source = "", ""
+    if not sa_user:
+        sa_user = str(getattr(run_info, "service_account_user_id", "") or "").strip()
+        sa_source = str(getattr(run_info, "service_account_source", "") or "").strip()
+    if not sa_user:
+        sa_user = str(config.get("service_account_user_id") or "").strip()
+        sa_source = "config:service_account_user_id" if sa_user else "unknown"
+    sa_display = sa_user or "not configured"
+    sa_source = sa_source or "unknown"
 
     # Get table status
     table_status = spark.sql(f"""
@@ -3686,7 +3733,8 @@ def generate_html_report(run_id: str, spark, **context) -> str:
         <div class="timestamp">
             Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
             Run ID: <strong>{run_id}</strong><br>
-            DAG Run: <strong>{run_info.dag_run_id}</strong>
+            DAG Run: <strong>{run_info.dag_run_id}</strong><br>
+            Service Account: <strong>{sa_display}</strong> <span style="opacity:0.7">({sa_source})</span>
 """
 
     html += f"""
@@ -4234,7 +4282,7 @@ def generate_html_report(run_id: str, spark, **context) -> str:
 
 
 @task.pyspark(conn_id="spark_default")
-def finalize_run(run_id: str, spark) -> dict:
+def finalize_run(run_id: str, spark, cluster_setup: dict = None) -> dict:
     """Finalize migration run - update stats in Iceberg tracking."""
     config = get_config()
     tracking_db = config["tracking_database"]
@@ -4291,6 +4339,21 @@ def finalize_run(run_id: str, spark) -> dict:
         """,
             task_label="finalize_run:update_migration_runs",
         )
+
+        if isinstance(cluster_setup, dict) and cluster_setup.get("service_account_user_id"):
+            _sa = str(cluster_setup["service_account_user_id"]).replace("'", "''")
+            _sa_src = str(cluster_setup.get("service_account_source") or "unknown").replace("'", "''")
+            execute_with_iceberg_retry(
+                spark,
+                f"""
+                UPDATE {tracking_db}.migration_runs
+                SET service_account_user_id = '{_sa}',
+                    service_account_source = '{_sa_src}'
+                WHERE run_id = '{run_id}'
+            """,
+                task_label="finalize_run:update_service_account",
+            )
+            logger.info(f"[finalize_run] Service account recorded: {_sa} ({_sa_src})")
 
         logger.info(
             f"[finalize_run] Run '{run_id}' finalized with status '{final_status}'. "
@@ -4462,7 +4525,9 @@ with DAG(
     t_val_status.operator.trigger_rule = "all_done"
 
     # Report generation
-    t_report = generate_html_report(run_id=t_run_id, params="{{ params }}")
+    t_report = generate_html_report(
+        run_id=t_run_id, cluster_setup=t_cluster, params="{{ params }}"
+    )
     t_report.operator.trigger_rule = "all_done"
 
     # Email report
@@ -4470,7 +4535,7 @@ with DAG(
     t_email.operator.trigger_rule = "all_done"
 
     # Finalize
-    t_final = finalize_run(run_id=t_run_id)
+    t_final = finalize_run(run_id=t_run_id, cluster_setup=t_cluster)
     t_final.operator.trigger_rule = "all_done"
     # t_cleanup = cleanup_edge(cluster_setup=t_cluster, run_id=t_run_id)
     # t_cleanup.operator.trigger_rule = 'all_done'

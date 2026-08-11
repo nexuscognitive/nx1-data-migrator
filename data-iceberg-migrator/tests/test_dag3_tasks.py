@@ -1,5 +1,6 @@
 """DAG 3 Task Tests: folder_only_data_copy pipeline."""
 
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +9,24 @@ import pandas as pd
 import pytest
 
 from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
+
+EXPECTED_SCHEMA_ADDITIONS = (
+    ('data_copy_status', (
+        ('yarn_application_id', 'STRING'),
+        ('distcp_started_at', 'TIMESTAMP'),
+        ('distcp_completed_at', 'TIMESTAMP'),
+        ('distcp_duration_seconds', 'DOUBLE'),
+        ('distcp_bytes_copied', 'BIGINT'),
+        ('distcp_files_copied', 'BIGINT'),
+        ('throughput_mbps', 'DOUBLE'),
+    )),
+    ('data_copy_runs', (
+        ('dag_run_id', 'STRING'),
+        ('service_account_user_id', 'STRING'),
+        ('service_account_source', 'STRING'),
+        ('skipped_folders', 'INT'),
+    )),
+)
 
 
 class TestValidatePrerequisitesFolderCopy:
@@ -38,6 +57,47 @@ class TestInitFolderCopyTrackingTables:
         assert 'data_copy_runs' in sql
         assert 'data_copy_status' in sql
         assert 'using iceberg' in sql
+
+    def test_alter_table_issued_for_every_schema_addition(self, mock_spark):
+        m.init_folder_copy_tracking_tables.function(spark=mock_spark)
+        sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        for table, columns in EXPECTED_SCHEMA_ADDITIONS:
+            for col, col_type in columns:
+                assert f"ALTER TABLE migration_tracking.{table} ADD COLUMN {col} {col_type}" in sql
+
+    def test_warns_once_per_table_when_describe_shows_missing_columns(self, mock_spark):
+        with patch.object(m.logger, 'warning') as warn:
+            m.init_folder_copy_tracking_tables.function(spark=mock_spark)
+        messages = [str(c[0][0]) for c in warn.call_args_list]
+        assert any('data_copy_status' in msg and 'missing' in msg for msg in messages)
+        assert any('data_copy_runs' in msg and 'missing' in msg for msg in messages)
+        assert any('throughput_mbps' in msg for msg in messages)
+
+    def test_no_missing_column_warning_when_describe_lists_everything(self, mock_spark):
+        expected = {c for _t, cols in EXPECTED_SCHEMA_ADDITIONS for c, _ in cols}
+
+        def _sql(stmt, *a, **kw):
+            df = MagicMock()
+            if stmt.strip().startswith('DESCRIBE'):
+                df.collect.return_value = [{'col_name': c} for c in expected]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = _sql
+        with patch.object(m.logger, 'warning') as warn:
+            m.init_folder_copy_tracking_tables.function(spark=mock_spark)
+        assert not [c for c in warn.call_args_list if 'missing' in str(c[0][0])]
+
+    def test_alter_table_already_exists_error_is_swallowed(self, mock_spark):
+        def _sql(stmt, *a, **kw):
+            if stmt.strip().startswith('ALTER TABLE'):
+                raise Exception("AnalysisException: Cannot add column, name already exists")
+            return MagicMock()
+
+        mock_spark.sql.side_effect = _sql
+        result = m.init_folder_copy_tracking_tables.function(spark=mock_spark)
+        assert result == {'status': 'initialized', 'database': 'migration_tracking'}
 
 
 class TestCreateDataCopyRun:
@@ -137,6 +197,51 @@ class TestParseFolderCopyExcel:
         configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
         assert configs[0]['dest_folder'] == 'temp'
 
+    def test_strips_bare_s3_scheme_prefix(self, mock_spark, sample_folder_run_id):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '/data/sales', 'target_bucket': 'S3:nx1poc-bucket/raw',
+             'dest_folder': 'sales'},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
+        assert configs[0]['dest_bucket'] == 's3a://nx1poc-bucket/raw'
+
+    def test_strips_trailing_slash_from_bucket(self, mock_spark, sample_folder_run_id):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '/data/sales', 'target_bucket': 's3a://bkt/raw/',
+             'dest_folder': 'sales'},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
+        assert configs[0]['dest_bucket'] == 's3a://bkt/raw'
+        assert configs[0]['dest_folder'] == 'sales'
+
+    def test_collapses_doubled_separators(self, mock_spark, sample_folder_run_id):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '/data/sales', 'target_bucket': 's3a://bkt//raw//zone',
+             'dest_folder': 'sales'},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
+        assert configs[0]['dest_bucket'] == 's3a://bkt/raw/zone'
+
+    def test_does_not_duplicate_dest_folder_already_in_bucket(self, mock_spark, sample_folder_run_id):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '/data/sales', 'target_bucket': 's3a://bkt/raw/sales',
+             'dest_folder': 'sales'},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
+        c = configs[0]
+        assert c['dest_bucket'] == 's3a://bkt/raw'
+        assert f"{c['dest_bucket']}/{c['dest_folder']}" == 's3a://bkt/raw/sales'
+
+    def test_dest_folder_leading_slash_is_stripped(self, mock_spark, sample_folder_run_id):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '/data/sales', 'target_bucket': 's3a://bkt',
+             'dest_folder': '/raw/sales'},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
+        c = configs[0]
+        assert c['dest_folder'] == 'raw/sales'
+        assert f"{c['dest_bucket']}/{c['dest_folder']}" == 's3a://bkt/raw/sales'
+
     def test_endpoint_emitted_when_present(self, mock_spark, sample_folder_run_id):
         setup_spark_excel(mock_spark, make_excel_bytes([
             {'source_path': '/data/sales', 'target_bucket': 's3a://bkt', 'dest_folder': 'sales',
@@ -213,7 +318,18 @@ class TestRunFolderDistcpSsh:
 
         with pytest.raises(Exception, match="DistCp failed"):
             m.run_folder_distcp_ssh.function(folder_config=sample_folder_config, ti=ti)
-        assert ti.xcom_push.call_args[1]['value']['status'] == 'FAILED'
+
+        result = ti.xcom_push.call_args[1]['value']
+        assert ti.xcom_push.call_args[1]['key'] == 'return_value'
+        assert result['status'] == 'FAILED'
+        assert 'DistCp failed' in result['error']
+        for key in ('distcp_duration_seconds', 'distcp_bytes_copied',
+                    'distcp_files_copied', 'throughput_mbps'):
+            assert key in result
+        assert result['distcp_bytes_copied'] == 0
+        assert result['distcp_files_copied'] == 0
+        assert result['throughput_mbps'] == 0.0
+        assert result['yarn_application_id'] is None
 
     def test_ssh_exception_pushes_xcom_and_raises(self, mock_ssh_hook, sample_folder_config):
         hook, _, _, _ = mock_ssh_hook
@@ -222,7 +338,228 @@ class TestRunFolderDistcpSsh:
 
         with pytest.raises(Exception, match="SSH timeout"):
             m.run_folder_distcp_ssh.function(folder_config=sample_folder_config, ti=ti)
-        assert 'SSH timeout' in ti.xcom_push.call_args[1]['value']['error']
+
+        result = ti.xcom_push.call_args[1]['value']
+        assert result['status'] == 'FAILED'
+        assert 'SSH timeout' in result['error']
+        assert result['yarn_application_ids'] == []
+
+    def test_yarn_ids_extracted_from_stdout_and_stderr_deduped(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+        stdout_mock.read.return_value = (
+            b"Submitted application_1700000000000_0001\n"
+            b"Retry: application_1700000000000_0001\n"
+            b"Submitted application_1700000000000_0002\n"
+            + self._success_output()
+        )
+        stdout_mock.channel.recv_exit_status.return_value = 0
+        stderr_mock.read.return_value = b"tracking application_1700000000000_0003\n"
+
+        result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        assert result['yarn_application_ids'] == [
+            'application_1700000000000_0001',
+            'application_1700000000000_0002',
+            'application_1700000000000_0003',
+        ]
+        assert result['yarn_application_id'] == 'application_1700000000000_0003'
+
+    def test_yarn_ids_empty_when_none_present(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = self._success_output()
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        assert result['yarn_application_ids'] == []
+        assert result['yarn_application_id'] is None
+
+    def test_metrics_block_parsed_and_malformed_value_defaults(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = '\n'.join([
+            "noise before block",
+            "===DISTCP_METRICS_START===",
+            "INCREMENTAL=true",
+            "SRC_FILE_COUNT=10",
+            "SRC_TOTAL_SIZE=1048576",
+            "S3_FILE_COUNT_BEFORE=0",
+            "S3_TOTAL_SIZE_BEFORE=0",
+            "S3_FILE_COUNT_AFTER=10",
+            "S3_TOTAL_SIZE_AFTER=1048576",
+            "BYTES_COPIED=not_a_number",
+            "FILES_COPIED=10",
+            "===DISTCP_METRICS_END===",
+        ]).encode()
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        assert result['status'] == 'COMPLETED'
+        assert result['is_incremental'] is True
+        assert result['source_file_count'] == 10
+        assert result['dest_size_bytes'] == 1048576
+        assert result['distcp_bytes_copied'] == 0
+        assert result['distcp_files_copied'] == 10
+
+    def test_source_not_found(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = (
+            b"SOURCE_TEST_RC=1\nSOURCE_NOT_FOUND=true\n"
+            b"===DISTCP_METRICS_START===\nINCREMENTAL=false\n===DISTCP_METRICS_END===\n"
+        )
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        assert result['status'] == 'SOURCE_NOT_FOUND'
+        assert 'does not exist' in result['error']
+        assert result['source_file_count'] == 0
+        assert result['distcp_bytes_copied'] == 0
+
+    @pytest.mark.parametrize("rc", [255, 2])
+    def test_source_test_error_is_failed_not_not_found(self, mock_ssh_hook,
+                                                       sample_folder_config, rc):
+        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+        stdout_mock.read.return_value = (
+            f"SOURCE_TEST_RC={rc}\n"
+            f"SOURCE_TEST_ERROR=Kerberos ticket expired while connecting to namenode\n"
+        ).encode()
+        stdout_mock.channel.recv_exit_status.return_value = rc
+        stderr_mock.read.return_value = b''
+        ti = MagicMock()
+
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_folder_distcp_ssh.function(folder_config=sample_folder_config, ti=ti)
+
+        result = ti.xcom_push.call_args[1]['value']
+        assert result['status'] == 'FAILED'
+        assert f"Source existence check failed (exit {rc})" in result['error']
+        assert 'Kerberos ticket expired' in result['error']
+
+    def test_source_test_rc_zero_proceeds_to_distcp(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = (
+            b"SOURCE_TEST_RC=0\n" + self._success_output(src_files=8, s3_after_files=8)
+        )
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        assert result['status'] == 'COMPLETED'
+        assert result['source_file_count'] == 8
+
+    def test_source_test_command_captures_rc_and_stderr(self, mock_ssh_hook,
+                                                        sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = self._success_output()
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        sent_cmd = client.exec_command.call_args[0][0]
+        assert 'SRC_TEST_ERR=$(hadoop fs -test -d "/data/sales/raw" 2>&1)' in sent_cmd
+        assert 'SRC_TEST_RC=$?' in sent_cmd
+        assert 'echo "SOURCE_TEST_RC=$SRC_TEST_RC"' in sent_cmd
+        assert 'SOURCE_EXISTS' not in sent_cmd
+
+    def test_empty_source(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = '\n'.join([
+            "SOURCE_EXISTS=true",
+            "EMPTY_SOURCE=true",
+            "===DISTCP_METRICS_START===",
+            "INCREMENTAL=false",
+            "SRC_FILE_COUNT=0",
+            "SRC_TOTAL_SIZE=0",
+            "S3_FILE_COUNT_BEFORE=0",
+            "S3_TOTAL_SIZE_BEFORE=0",
+            "S3_FILE_COUNT_AFTER=0",
+            "S3_TOTAL_SIZE_AFTER=0",
+            "BYTES_COPIED=0",
+            "FILES_COPIED=0",
+            "===DISTCP_METRICS_END===",
+        ]).encode()
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        assert result['status'] == 'EMPTY_SOURCE'
+        assert result['error'] is None
+        assert result['files_copied'] == 0
+
+    def test_distcp_log_flag_uses_cluster_setup_log_dir(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = self._success_output()
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        m.run_folder_distcp_ssh.function(
+            folder_config=sample_folder_config,
+            cluster_setup={'distcp_log_dir': '/tmp/logs/run1', 'temp_dir': '/tmp/run1'},
+        )
+        sent_cmd = client.exec_command.call_args[0][0]
+        assert '-log /tmp/logs/run1/distcp_raw.log' in sent_cmd
+        assert client.exec_command.call_args[1]['get_pty'] is True
+
+    def test_delete_flag_absent_by_default(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = self._success_output()
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        assert ' -delete ' not in client.exec_command.call_args[0][0]
+
+    def test_failed_distcp_retains_parsed_metrics(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+        stdout_mock.read.return_value = '\n'.join([
+            "===DISTCP_METRICS_START===",
+            "INCREMENTAL=false",
+            "SRC_FILE_COUNT=10",
+            "SRC_TOTAL_SIZE=2097152",
+            "S3_FILE_COUNT_BEFORE=0",
+            "S3_TOTAL_SIZE_BEFORE=0",
+            "S3_FILE_COUNT_AFTER=4",
+            "S3_TOTAL_SIZE_AFTER=1048576",
+            "BYTES_COPIED=1048576",
+            "FILES_COPIED=4",
+            "===DISTCP_METRICS_END===",
+        ]).encode()
+        stdout_mock.channel.recv_exit_status.return_value = 1
+        stderr_mock.read.return_value = b'partial failure'
+        ti = MagicMock()
+
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_folder_distcp_ssh.function(folder_config=sample_folder_config, ti=ti)
+
+        result = ti.xcom_push.call_args[1]['value']
+        assert result['status'] == 'FAILED'
+        assert result['distcp_bytes_copied'] == 1048576
+        assert result['distcp_files_copied'] == 4
+        assert result['source_file_count'] == 10
+        assert result['dest_file_count'] == 4
+        assert result['bytes_copied'] == 1048576
+
+    def test_throughput_matches_bytes_over_duration(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = '\n'.join([
+            "===DISTCP_METRICS_START===",
+            "INCREMENTAL=false",
+            "SRC_FILE_COUNT=4",
+            "SRC_TOTAL_SIZE=4194304",
+            "S3_FILE_COUNT_BEFORE=0",
+            "S3_TOTAL_SIZE_BEFORE=0",
+            "S3_FILE_COUNT_AFTER=4",
+            "S3_TOTAL_SIZE_AFTER=4194304",
+            "BYTES_COPIED=4194304",
+            "FILES_COPIED=4",
+            "===DISTCP_METRICS_END===",
+        ]).encode()
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        duration = result['distcp_duration_seconds']
+        expected = (4194304 / 1048576.0 / duration) if duration > 0 else 0.0
+        assert result['throughput_mbps'] == pytest.approx(expected)
+
+    def test_throughput_zero_when_no_bytes_copied(self, mock_ssh_hook, sample_folder_config):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        stdout_mock.read.return_value = b"SOURCE_EXISTS=false\nSOURCE_NOT_FOUND=true\n"
+        stdout_mock.channel.recv_exit_status.return_value = 0
+
+        result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
+        assert result['throughput_mbps'] == 0.0
 
 
 class TestRecordDataCopyStatus:
@@ -241,6 +578,28 @@ class TestRecordDataCopyStatus:
         }
         m.record_data_copy_status.function(distcp_result=failed, spark=mock_spark)
         assert 'FAILED' in mock_iceberg_retry.call_args[0][1]
+
+    def test_persists_new_metric_columns(self, mock_spark, sample_folder_distcp_result, mock_iceberg_retry):
+        enriched = {
+            **sample_folder_distcp_result,
+            'yarn_application_ids': ['application_1_1', 'application_1_2'],
+            'yarn_application_id': 'application_1_2',
+            'distcp_duration_seconds': 12.5,
+            'distcp_bytes_copied': 1048576,
+            'distcp_files_copied': 7,
+            'throughput_mbps': 0.08,
+        }
+        m.record_data_copy_status.function(distcp_result=enriched, spark=mock_spark)
+        sql = mock_iceberg_retry.call_args[0][1]
+        assert 'yarn_application_id' in sql
+        assert 'application_1_1,application_1_2' in sql
+        assert '12.5' in sql
+        assert 'throughput_mbps' in sql
+
+    def test_returns_empty_dict_for_invalid_input(self, mock_spark, mock_iceberg_retry):
+        assert m.record_data_copy_status.function(distcp_result=None, spark=mock_spark) == {}
+        assert m.record_data_copy_status.function(distcp_result={'x': 1}, spark=mock_spark) == {}
+        mock_iceberg_retry.assert_not_called()
 
 
 class TestValidateDataCopy:
@@ -262,6 +621,7 @@ class TestValidateDataCopy:
 
         with pytest.raises(Exception, match="VALIDATION_FAILED"):
             m.validate_data_copy.function(copy_status=sample_folder_distcp_result, ti=ti)
+        assert ti.xcom_push.call_args[1]['key'] == 'return_value'
         assert ti.xcom_push.call_args[1]['value']['validation_status'] == 'VALIDATION_FAILED'
 
     def test_failed_on_file_count_mismatch(self, mock_ssh_hook, sample_folder_distcp_result):
@@ -272,7 +632,33 @@ class TestValidateDataCopy:
 
         with pytest.raises(Exception, match="file count or size mismatch"):
             m.validate_data_copy.function(copy_status=sample_folder_distcp_result, ti=ti)
-        assert ti.xcom_push.call_args[1]['value']['file_count_match'] is False
+        result = ti.xcom_push.call_args[1]['value']
+        assert result['validation_status'] == 'VALIDATION_FAILED'
+        assert result['file_count_match'] is False
+        assert 'file count or size mismatch' in result['validation_error']
+
+    def test_upstream_failed_pushes_xcom_and_raises(self, mock_ssh_hook,
+                                                    sample_folder_distcp_result):
+        ti = MagicMock()
+        copy_status = {**sample_folder_distcp_result, 'status': 'FAILED'}
+        with pytest.raises(Exception, match="upstream copy FAILED"):
+            m.validate_data_copy.function(copy_status=copy_status, ti=ti)
+        assert ti.xcom_push.call_args[1]['value']['validation_status'] == 'VALIDATION_SKIPPED'
+
+    @pytest.mark.parametrize("upstream,expected", [
+        ('SOURCE_NOT_FOUND', 'SOURCE_NOT_FOUND'),
+        ('EMPTY_SOURCE', 'EMPTY_SOURCE'),
+        ('SKIPPED', 'SKIPPED'),
+    ])
+    def test_passthrough_statuses_do_not_raise(self, mock_ssh_hook, sample_folder_distcp_result,
+                                               upstream, expected):
+        copy_status = {**sample_folder_distcp_result, 'status': upstream}
+        result = m.validate_data_copy.function(copy_status=copy_status, ti=MagicMock())
+        assert result['validation_status'] == expected
+
+    def test_returns_empty_dict_for_invalid_input(self):
+        assert m.validate_data_copy.function(copy_status=None) == {}
+        assert m.validate_data_copy.function(copy_status={'source_path': '/x'}) == {}
 
 
 class TestUpdateDataCopyValidation:
@@ -296,13 +682,19 @@ class TestUpdateDataCopyValidation:
         assert 'VALIDATION_FAILED' in sql
         assert 'Destination missing' in sql
 
+    def test_returns_empty_dict_for_invalid_input(self, mock_spark, mock_iceberg_retry):
+        assert m.update_data_copy_validation.function(validation_result=None, spark=mock_spark) == {}
+        mock_iceberg_retry.assert_not_called()
+
 
 class TestFinalizeDataCopyRun:
 
-    def _make_stats_row(self, total=2, successful=2, failed=0):
+    def _make_stats_row(self, total=2, successful=2, failed=0, skipped=0, not_found=0):
         row = MagicMock()
         row.__getitem__ = lambda self, k: {
-            'total_folders': total, 'successful_folders': successful, 'failed_folders': failed,
+            'total_folders': total, 'successful_folders': successful,
+            'failed_folders': failed, 'skipped_folders': skipped,
+            'not_found_folders': not_found,
         }[k]
         return row
 
@@ -317,6 +709,85 @@ class TestFinalizeDataCopyRun:
         result = m.finalize_data_copy_run.function(run_id=sample_folder_run_id, spark=mock_spark)
         assert result['status'] == 'COMPLETED_WITH_ERRORS'
         assert result['failed_folders'] == 1
+
+    def test_counts_new_statuses_and_writes_skipped(self, mock_spark, sample_folder_run_id,
+                                                    mock_iceberg_retry):
+        row = MagicMock()
+        row.__getitem__ = lambda self, k: {
+            'total_folders': 5, 'successful_folders': 3,
+            'failed_folders': 1, 'skipped_folders': 1, 'not_found_folders': 0,
+        }[k]
+        mock_spark.sql.return_value.collect.return_value = [row]
+        result = m.finalize_data_copy_run.function(run_id=sample_folder_run_id, spark=mock_spark)
+        query = mock_spark.sql.call_args[0][0]
+        assert 'EMPTY_SOURCE' in query
+        assert 'SOURCE_NOT_FOUND' in query
+        assert result['skipped_folders'] == 1
+        assert 'skipped_folders    = 1' in mock_iceberg_retry.call_args[0][1]
+
+    def test_source_not_found_counts_as_successful_and_stays_completed(
+        self, mock_spark, sample_folder_run_id, mock_iceberg_retry,
+    ):
+        mock_spark.sql.return_value.collect.return_value = [
+            self._make_stats_row(total=3, successful=3, failed=0, skipped=0, not_found=1)
+        ]
+        result = m.finalize_data_copy_run.function(run_id=sample_folder_run_id, spark=mock_spark)
+        assert result['status'] == 'COMPLETED'
+        assert result['successful_folders'] == 3
+        assert result['failed_folders'] == 0
+        assert result['not_found_folders'] == 1
+
+    def test_stats_query_counts_source_not_found_as_successful(
+        self, mock_spark, sample_folder_run_id, mock_iceberg_retry,
+    ):
+        mock_spark.sql.return_value.collect.return_value = [self._make_stats_row()]
+        m.finalize_data_copy_run.function(run_id=sample_folder_run_id, spark=mock_spark)
+        query = mock_spark.sql.call_args[0][0]
+        assert "'VALIDATED', 'EMPTY_SOURCE', 'SOURCE_NOT_FOUND'" in query
+        assert "'FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED'" in query
+
+    def test_failed_when_no_folder_records(self, mock_spark, sample_folder_run_id, mock_iceberg_retry):
+        mock_spark.sql.return_value.collect.return_value = []
+        result = m.finalize_data_copy_run.function(run_id=sample_folder_run_id, spark=mock_spark)
+        assert result['status'] == 'FAILED'
+        assert result['total_folders'] == 0
+
+    def test_failed_when_total_folders_is_zero(self, mock_spark, sample_folder_run_id,
+                                               mock_iceberg_retry):
+        mock_spark.sql.return_value.collect.return_value = [self._make_stats_row(0, 0, 0)]
+        result = m.finalize_data_copy_run.function(run_id=sample_folder_run_id, spark=mock_spark)
+        assert result['status'] == 'FAILED'
+
+    def test_failed_when_stats_query_raises(self, mock_spark, sample_folder_run_id,
+                                            mock_iceberg_retry):
+        mock_spark.sql.side_effect = Exception("table not found")
+        result = m.finalize_data_copy_run.function(run_id=sample_folder_run_id, spark=mock_spark)
+        assert result['status'] == 'FAILED'
+        assert 'FAILED' in mock_iceberg_retry.call_args[0][1]
+
+    def test_writes_service_account_when_cluster_setup_supplies_one(
+        self, mock_spark, sample_folder_run_id, mock_iceberg_retry,
+    ):
+        mock_spark.sql.return_value.collect.return_value = [self._make_stats_row(2, 2, 0)]
+        m.finalize_data_copy_run.function(
+            run_id=sample_folder_run_id, spark=mock_spark,
+            cluster_setup={
+                'service_account_user_id': 'svc_migration',
+                'service_account_source': 'active MapR ticket',
+            },
+        )
+        assert mock_iceberg_retry.call_count == 2
+        sql = mock_iceberg_retry.call_args_list[1][0][1]
+        assert "service_account_user_id = 'svc_migration'" in sql
+        assert "service_account_source  = 'active MapR ticket'" in sql
+
+    def test_skips_service_account_update_when_absent(self, mock_spark, sample_folder_run_id,
+                                                      mock_iceberg_retry):
+        mock_spark.sql.return_value.collect.return_value = [self._make_stats_row(2, 2, 0)]
+        m.finalize_data_copy_run.function(
+            run_id=sample_folder_run_id, spark=mock_spark, cluster_setup={'temp_dir': '/tmp/x'},
+        )
+        assert mock_iceberg_retry.call_count == 1
 
 
 class TestGenerateDataCopyHtmlReport:
@@ -346,6 +817,377 @@ class TestGenerateDataCopyHtmlReport:
         )
         assert result['report_path'].endswith('.html')
         assert 'data_copy_report' in result['report_path']
+
+    def _report_rows(self, run_id, sa_user='', sa_source='', status='VALIDATED'):
+        run_row = SimpleNamespace(
+            run_id=run_id, status='COMPLETED',
+            excel_file_path='s3a://bucket/fc.xlsx',
+            started_at='2025-01-01 12:00:00', completed_at='2025-01-01 12:10:00',
+            dag_run_id='manual__2025-01-01T12:00:00',
+            service_account_user_id=sa_user, service_account_source=sa_source,
+        )
+        folder_row = SimpleNamespace(
+            run_id=run_id, source_path='/data/sales/raw',
+            dest_bucket='s3a://test-bucket', dest_path='raw',
+            status=status, is_incremental=False,
+            source_file_count=0, dest_file_count=0, file_count_match=False,
+            source_size_bytes=0, dest_size_bytes=0, size_match=False,
+            bytes_copied=0, files_copied=0, error_message=None,
+            distcp_duration_seconds=0.0, throughput_mbps=0.0, yarn_application_id='',
+        )
+        return run_row, folder_row
+
+    def _written_html(self, mock_spark):
+        fs = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        return fs.create.return_value.write.call_args[0][0].decode('utf-8')
+
+    def test_cluster_setup_service_account_wins_over_run_row(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        run_row, folder_row = self._report_rows(
+            sample_folder_run_id, sa_user='row_user', sa_source='row_source',
+        )
+        mock_spark.sql.side_effect = [
+            MagicMock(collect=MagicMock(return_value=[run_row])),
+            MagicMock(collect=MagicMock(return_value=[folder_row])),
+        ]
+        m.generate_data_copy_html_report.function(
+            run_id=sample_folder_run_id,
+            finalize_result=sample_folder_finalize_result,
+            spark=mock_spark,
+            cluster_setup={
+                'service_account_user_id': 'edge_user',
+                'service_account_source': 'active MapR ticket',
+            },
+        )
+        html = self._written_html(mock_spark)
+        assert 'edge_user' in html
+        assert 'active MapR ticket' in html
+        assert 'row_user' not in html
+
+    def test_falls_back_to_run_row_service_account(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        run_row, folder_row = self._report_rows(
+            sample_folder_run_id, sa_user='row_user', sa_source='row_source',
+        )
+        mock_spark.sql.side_effect = [
+            MagicMock(collect=MagicMock(return_value=[run_row])),
+            MagicMock(collect=MagicMock(return_value=[folder_row])),
+        ]
+        m.generate_data_copy_html_report.function(
+            run_id=sample_folder_run_id,
+            finalize_result=sample_folder_finalize_result,
+            spark=mock_spark,
+        )
+        html = self._written_html(mock_spark)
+        assert 'row_user' in html
+        assert 'row_source' in html
+
+    def test_not_configured_when_no_service_account_anywhere(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        run_row, folder_row = self._report_rows(sample_folder_run_id)
+        mock_spark.sql.side_effect = [
+            MagicMock(collect=MagicMock(return_value=[run_row])),
+            MagicMock(collect=MagicMock(return_value=[folder_row])),
+        ]
+        m.generate_data_copy_html_report.function(
+            run_id=sample_folder_run_id,
+            finalize_result=sample_folder_finalize_result,
+            spark=mock_spark,
+        )
+        html = self._written_html(mock_spark)
+        assert 'not configured' in html
+        assert 'unknown' in html
+
+    def _render(self, mock_spark, run_id, finalize_result, status='VALIDATED',
+                error_message=None):
+        run_row, folder_row = self._report_rows(run_id, status=status)
+        folder_row.error_message = error_message
+        mock_spark.sql.side_effect = [
+            MagicMock(collect=MagicMock(return_value=[run_row])),
+            MagicMock(collect=MagicMock(return_value=[folder_row])),
+        ]
+        m.generate_data_copy_html_report.function(
+            run_id=run_id, finalize_result=finalize_result, spark=mock_spark,
+        )
+        return self._written_html(mock_spark)
+
+    @pytest.mark.parametrize("status,badge_cls", [
+        ('VALIDATED', 'status-completed'),
+        ('COMPLETED', 'status-completed'),
+        ('EMPTY_SOURCE', 'status-empty'),
+        ('SOURCE_NOT_FOUND', 'status-not-found'),
+        ('WEIRD_STATUS', 'status-warning'),
+    ])
+    def test_status_badge_class_mapping(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+        status, badge_cls,
+    ):
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result, status=status,
+        )
+        assert f'<span class="status-badge {badge_cls}">' in html
+
+    def test_plain_skipped_is_not_rendered_as_failed(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result, status='SKIPPED',
+        )
+        assert 'status-badge status-failed' not in html
+
+    @pytest.mark.parametrize("status", ['EMPTY_SOURCE', 'SOURCE_NOT_FOUND'])
+    def test_colspan_row_rendered_for_non_copied_statuses(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result, status,
+    ):
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result, status=status,
+        )
+        assert 'colspan="6"' in html
+        assert 'colspan="10"' in html
+
+    @pytest.mark.parametrize("status", ['FAILED', 'VALIDATION_FAILED', 'VALIDATION_SKIPPED',
+                                        'SKIPPED'])
+    def test_failure_rows_render_as_full_rows(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result, status,
+    ):
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result, status=status,
+        )
+        assert 'colspan="6"' not in html
+        assert 'colspan="10"' not in html
+        assert 'Skipped:' not in html
+
+    @pytest.mark.parametrize("status", ['FAILED', 'VALIDATION_FAILED'])
+    def test_failure_row_shows_badge_metrics_and_reason(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result, status,
+    ):
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+            status=status, error_message='DistCp exit 1: permission denied',
+        )
+        assert '<span class="status-badge status-failed"' in html
+        assert 'title="DistCp exit 1: permission denied"' in html
+        assert '<div class="status-reason">DistCp exit 1: permission denied</div>' in html
+        assert '<td class="status-cell">' in html
+        assert '✗ FAIL' in html
+
+    def test_failure_row_without_error_has_no_reason_div(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result, status='FAILED',
+        )
+        assert '<span class="status-badge status-failed">FAILED</span>' in html
+        assert '<div class="status-reason">' not in html
+
+    def test_status_reason_truncated_to_200_chars(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        long_error = 'x' * 500
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+            status='FAILED', error_message=long_error,
+        )
+        assert f'<div class="status-reason">{"x" * 200}</div>' in html
+
+    def test_no_failures_section(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        html = self._render(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result, status='FAILED',
+        )
+        assert '<h2>Failures</h2>' not in html
+        assert 'neutral-cell' not in html
+        assert '<th>Error</th>' not in html
+
+    def test_expected_section_headings_in_order(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        html = self._render(mock_spark, sample_folder_run_id, sample_folder_finalize_result)
+        headings = [
+            '<h2>Copy Summary</h2>',
+            '<h2>Data Validation Summary</h2>',
+            '<h2>Folder Copy Details</h2>',
+            '<h2>Data Validation Results</h2>',
+            '<h2>Performance Metrics</h2>',
+        ]
+        positions = [html.find(h) for h in headings]
+        assert all(p != -1 for p in positions)
+        assert positions == sorted(positions)
+
+    @pytest.mark.parametrize("status", ['EMPTY_SOURCE', 'SOURCE_NOT_FOUND', 'SKIPPED'])
+    def test_validation_summary_excludes_non_distcp_rows(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result, status,
+    ):
+        run_row, folder_row = self._report_rows(sample_folder_run_id, status=status)
+        folder_row.source_size_bytes = 5 * 1024 ** 3
+        folder_row.dest_size_bytes = 0
+        mock_spark.sql.side_effect = [
+            MagicMock(collect=MagicMock(return_value=[run_row])),
+            MagicMock(collect=MagicMock(return_value=[folder_row])),
+        ]
+        m.generate_data_copy_html_report.function(
+            run_id=sample_folder_run_id,
+            finalize_result=sample_folder_finalize_result,
+            spark=mock_spark,
+        )
+        html = self._written_html(mock_spark)
+        assert '<h3>SIZE MATCH</h3>\n            <p class="value">0 / 0</p>' in html
+        assert '<h3>SOURCE SIZE</h3>\n            <p class="value">0.000000 GB</p>' in html
+
+    def test_validation_summary_counts_copied_rows(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        run_row, folder_row = self._report_rows(sample_folder_run_id, status='VALIDATED')
+        folder_row.size_match = True
+        folder_row.file_count_match = True
+        folder_row.source_size_bytes = 1024 ** 3
+        folder_row.dest_size_bytes = 1024 ** 3
+        mock_spark.sql.side_effect = [
+            MagicMock(collect=MagicMock(return_value=[run_row])),
+            MagicMock(collect=MagicMock(return_value=[folder_row])),
+        ]
+        m.generate_data_copy_html_report.function(
+            run_id=sample_folder_run_id,
+            finalize_result=sample_folder_finalize_result,
+            spark=mock_spark,
+        )
+        html = self._written_html(mock_spark)
+        assert '<h3>SIZE MATCH</h3>\n            <p class="value">1 / 1</p>' in html
+        assert '✓ PASS' in html
+
+    def _render_row(self, mock_spark, run_id, finalize_result, **row_overrides):
+        run_row, folder_row = self._report_rows(run_id, status='VALIDATED')
+        for key, val in row_overrides.items():
+            setattr(folder_row, key, val)
+        mock_spark.sql.side_effect = [
+            MagicMock(collect=MagicMock(return_value=[run_row])),
+            MagicMock(collect=MagicMock(return_value=[folder_row])),
+        ]
+        m.generate_data_copy_html_report.function(
+            run_id=run_id, finalize_result=finalize_result, spark=mock_spark,
+        )
+        return self._written_html(mock_spark)
+
+    def test_total_duration_uses_started_and_completed(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        html = self._render_row(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+            distcp_duration_seconds=10.0,
+            started_at=datetime(2025, 1, 1, 12, 0, 0),
+            completed_at=datetime(2025, 1, 1, 12, 5, 0),
+        )
+        assert '<td class="metric">300.0s</td>' in html
+        assert '<td class="duration">10.0s</td>' in html
+        assert '300.0s (5.0m)' in html
+
+    @pytest.mark.parametrize("started,completed", [
+        (None, datetime(2025, 1, 1, 12, 5, 0)),
+        (datetime(2025, 1, 1, 12, 0, 0), None),
+        (None, None),
+    ])
+    def test_total_duration_falls_back_when_timestamp_missing(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+        started, completed,
+    ):
+        html = self._render_row(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+            distcp_duration_seconds=12.0, started_at=started, completed_at=completed,
+        )
+        assert '<td class="metric">12.0s</td>' in html
+        assert '12.0s (0.2m)' in html
+
+    def test_total_duration_clamps_inverted_timestamps(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        html = self._render_row(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+            distcp_duration_seconds=9.0,
+            started_at=datetime(2025, 1, 1, 12, 5, 0),
+            completed_at=datetime(2025, 1, 1, 12, 0, 0),
+        )
+        assert '<td class="metric">0.0s</td>' in html
+        assert '0.0s (0.0m)' in html
+
+    def test_performance_speed_uses_stored_throughput(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        html = self._render_row(
+            mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+            throughput_mbps=7.5, distcp_duration_seconds=10.0,
+            dest_size_bytes=1024 ** 3, dest_file_count=20,
+        )
+        assert '<td class="metric">7.500000 MB/s</td>' in html
+        assert '102.400000 MB/s' not in html
+
+    def test_incremental_pill_appears_in_duration_cell(
+        self, mock_spark, sample_folder_run_id, sample_folder_finalize_result,
+    ):
+        run_row, folder_row = self._report_rows(sample_folder_run_id, status='VALIDATED')
+        folder_row.is_incremental = True
+        folder_row.distcp_duration_seconds = 42.9
+        mock_spark.sql.side_effect = [
+            MagicMock(collect=MagicMock(return_value=[run_row])),
+            MagicMock(collect=MagicMock(return_value=[folder_row])),
+        ]
+        m.generate_data_copy_html_report.function(
+            run_id=sample_folder_run_id,
+            finalize_result=sample_folder_finalize_result,
+            spark=mock_spark,
+        )
+        html = self._written_html(mock_spark)
+        assert '42.9s <span style=\'background-color: #fff3cd;' in html
+        assert 'INCREMENTAL</span>' in html
+        assert '42.9s (0.7m)' in html
+
+
+class TestFolderCopyDagFailureCallback:
+
+    def _context(self, run_id_xcom=None, has_ti=True):
+        dag_run = MagicMock()
+        dag_run.run_id = 'manual__2025-01-01T12:00:00'
+        if has_ti:
+            ti = MagicMock()
+            ti.xcom_pull.return_value = run_id_xcom
+            dag_run.get_task_instance.return_value = ti
+        else:
+            dag_run.get_task_instance.return_value = None
+        return {'dag_run': dag_run, 'task_instance': MagicMock(task_id='run_folder_distcp_ssh')}
+
+    def test_logs_run_id_when_found(self, mock_iceberg_retry):
+        ctx = self._context(run_id_xcom='folder_run_20250101_120000_abcd1234')
+        with patch.object(m.logger, 'warning') as warn:
+            m._folder_copy_dag_failure_callback(ctx)
+        messages = [str(c[0][0]) for c in warn.call_args_list]
+        assert any('folder_run_20250101_120000_abcd1234' in msg for msg in messages)
+        assert any('RUNNING' in msg for msg in messages)
+        mock_iceberg_retry.assert_not_called()
+
+    def test_logs_when_run_id_missing(self, mock_iceberg_retry):
+        with patch.object(m.logger, 'warning') as warn:
+            m._folder_copy_dag_failure_callback(self._context(has_ti=False))
+        messages = [str(c[0][0]) for c in warn.call_args_list]
+        assert any('no tracking run_id' in msg for msg in messages)
+        mock_iceberg_retry.assert_not_called()
+
+    def test_swallows_xcom_lookup_error(self, mock_iceberg_retry):
+        dag_run = MagicMock()
+        dag_run.get_task_instance.side_effect = Exception("no such task")
+        with patch.object(m.logger, 'warning') as warn:
+            m._folder_copy_dag_failure_callback(
+                {'dag_run': dag_run, 'task_instance': MagicMock()}
+            )
+        messages = [str(c[0][0]) for c in warn.call_args_list]
+        assert any('could not read the tracking run_id XCom' in msg for msg in messages)
+        mock_iceberg_retry.assert_not_called()
+
+    def test_swallows_broken_context(self, mock_iceberg_retry):
+        m._folder_copy_dag_failure_callback(None)
+        mock_iceberg_retry.assert_not_called()
 
 
 class TestSendDataCopyReportEmail:
