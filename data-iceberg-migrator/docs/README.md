@@ -257,7 +257,7 @@ through to the global Variable, so `tenant_2` above uses
 
 Accepted keys in a profile: `ssh_conn_id`, `mapr_user`,
 `mapr_ticketfile_location`, `auth_method`, `edge_temp_path`,
-`hive_scratch_dir`.
+`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`.
 
 **Resolution order** for these settings:
 

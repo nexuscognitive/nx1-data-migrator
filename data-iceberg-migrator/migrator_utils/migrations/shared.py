@@ -207,6 +207,8 @@ TENANT_PROFILE_KEYS = frozenset({
     'auth_method',
     'edge_temp_path',
     'hive_scratch_dir',
+    'service_account_user_id',
+    'hdfs_nameservice',
 })
 
 
@@ -290,6 +292,7 @@ def get_config() -> dict:
                 or 'data-migration'
 
     config = {
+        'tenant': _tenant or None,
         # SSH Configuration (for MapR migration)
         'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh', conf_key='ssh_conn_id'),
         'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration', conf_key='edge_temp_path'),
@@ -325,11 +328,11 @@ def get_config() -> dict:
         'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
-        'service_account_user_id': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '') or _var('mapr_user', 'MAPR_USER', '')).strip(),
-        'mapr_user': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '') or _var('mapr_user', 'MAPR_USER', '', conf_key='mapr_user')).strip(),
+        'service_account_user_id': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id') or _var('mapr_user', 'MAPR_USER', '', conf_key='mapr_user')).strip(),
+        'mapr_user': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id') or _var('mapr_user', 'MAPR_USER', '', conf_key='mapr_user')).strip(),
         'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}', conf_key='mapr_ticketfile_location'),
         # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
-        'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', ''),
+        'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', '', conf_key='hdfs_nameservice'),
 
         # Listing tool
         's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
@@ -441,6 +444,12 @@ def cluster_login(run_id: str) -> dict:
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
     temp_dir = f"{_edge_path_template(config['edge_temp_path'])}/{run_id}"
     distcp_log_root = str(config.get('distcp_log_root') or '/tmp').rstrip('/') or '/tmp'
+
+    logger.info(
+        f"[cluster_login] run_id={run_id} tenant={config.get('tenant') or 'default'} "
+        f"ssh_conn_id={config['ssh_conn_id']} edge_temp_path={config['edge_temp_path']} "
+        f"mapr_ticketfile_location={config.get('mapr_ticketfile_location', '')}"
+    )
 
     auth_method = config.get('auth_method', 'mapr')
     sa_user = str(config.get('service_account_user_id') or config.get('mapr_user') or '').strip()
