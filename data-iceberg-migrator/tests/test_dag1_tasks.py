@@ -488,6 +488,74 @@ class TestRecordDiscoveredTables:
         # The captured source partition schema is persisted as JSON
         assert '"name": "dt"' in insert_sql and '"type": "date"' in insert_sql
 
+    def test_insert_covers_empty_partition_names_column(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        """Regression: empty_partition_names was added to the tracking table's
+        CREATE TABLE DDL but initially forgotten from this explicit-column-list
+        INSERT, which broke record_discovered_tables in production with
+        INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_FIND_DATA."""
+        self._setup_count(mock_spark, 0)
+        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        insert_sql = next(
+            c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
+        )
+        assert 'empty_partition_names' in insert_sql
+
+    def test_insert_column_list_matches_values_count(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        """Generic guard: the explicit column list and the VALUES tuple in the
+        discovery INSERT must always have the same number of entries, or Iceberg
+        rejects the write. This catches any future column added to one but not
+        the other, not just empty_partition_names specifically."""
+        import re as _re
+
+        def _split_top_level(s):
+            """Split a SQL VALUES body on top-level commas, respecting single-quoted
+            string literals (where '' is an escaped quote) and nested parens —
+            values here include JSON blobs full of internal commas."""
+            parts, depth, in_str, buf = [], 0, False, []
+            i = 0
+            while i < len(s):
+                ch = s[i]
+                if in_str:
+                    if ch == "'" and s[i:i + 2] == "''":
+                        buf.append("''")
+                        i += 2
+                        continue
+                    if ch == "'":
+                        in_str = False
+                    buf.append(ch)
+                elif ch == "'":
+                    in_str = True
+                    buf.append(ch)
+                elif ch == '(':
+                    depth += 1
+                    buf.append(ch)
+                elif ch == ')':
+                    depth -= 1
+                    buf.append(ch)
+                elif ch == ',' and depth == 0:
+                    parts.append(''.join(buf))
+                    buf = []
+                else:
+                    buf.append(ch)
+                i += 1
+            if buf:
+                parts.append(''.join(buf))
+            return [p for p in parts if p.strip()]
+
+        self._setup_count(mock_spark, 0)
+        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        insert_sql = next(
+            c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
+        )
+        cols_block = _re.search(r'INSERT INTO [\w.]+ \((.*?)\)\s*VALUES\s*\(', insert_sql, _re.S).group(1)
+        values_block = _re.search(r'VALUES\s*\((.*)\)\s*$', insert_sql.strip(), _re.S).group(1)
+        col_count = len([c for c in cols_block.split(',') if c.strip()])
+        value_count = len(_split_top_level(values_block))
+        assert col_count == value_count, (
+            f"column list has {col_count} entries but VALUES has {value_count} — "
+            f"they must match or Iceberg will reject the insert"
+        )
+
     def test_updates_existing_record(self, mock_spark, sample_discovery, mock_iceberg_retry):
         self._setup_count(mock_spark, 1)
         m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
@@ -816,6 +884,28 @@ class TestUpdateDistcpStatus:
         sample_distcp_result['distcp_results'][0]['error'] = 'Network error'
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
         assert any('FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
+
+    def test_empty_partition_names_written_to_tracking_update(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """Empty partition names captured by run_distcp_ssh must be persisted
+        into the tracking table's empty_partition_names column."""
+        sample_distcp_result['distcp_results'][0]['empty_partitions'] = [
+            'dt=2024-01-02', 'dt=2024-01-03',
+        ]
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert 'dt=2024-01-02' in sql_calls and 'dt=2024-01-03' in sql_calls
+        assert 'empty_partition_names' in sql_calls
+
+    def test_no_empty_partitions_writes_null_to_tracking_update(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """When nothing is empty, empty_partition_names must be set to NULL."""
+        sample_distcp_result['distcp_results'][0]['empty_partitions'] = []
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        sql_calls = [str(c) for c in mock_iceberg_retry.call_args_list]
+        assert any('empty_partition_names = NULL' in c for c in sql_calls)
 
     def test_normalizes_zero_row_completed_to_empty_source(
         self, mock_spark, sample_distcp_result, mock_iceberg_retry
@@ -1598,6 +1688,71 @@ class TestGenerateHtmlReport:
         assert result['report_path'].endswith('.html')
         assert sample_run_id in result['report_path']
         assert mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value.create.called
+
+    def test_html_report_shows_empty_partition_names(self, mock_spark, sample_run_id):
+        """Empty partition names persisted in the tracking table must render
+        somewhere in the generated HTML report."""
+        run_row = SimpleNamespace(dag_run_id='dag_run_test')
+        tbl_row = SimpleNamespace(
+            source_database='sales_data', source_table='transactions',
+            overall_status='VALIDATED', discovery_duration_seconds=12.0,
+            distcp_duration_seconds=300.0, distcp_bytes_copied=10 * 1024 * 1024,
+            distcp_files_copied=5, distcp_is_incremental=False,
+            table_create_duration_seconds=8.0, validation_duration_seconds=5.0,
+            validation_status='COMPLETED', row_count_match=True,
+            partition_count_match=True, schema_match=True,
+            source_row_count=1000, dest_hive_row_count=1000,
+            source_partition_count=2, dest_partition_count=2,
+            source_total_size_bytes=10 * 1024 * 1024, s3_total_size_bytes_before=0,
+            s3_total_size_bytes_after=10 * 1024 * 1024, s3_bytes_transferred=10 * 1024 * 1024,
+            file_size_match=True, source_file_count=5,
+            s3_file_count_before=0, s3_file_count_after=5,
+            s3_files_transferred=5, file_count_match=True,
+            distcp_status='COMPLETED',
+            file_format='PARQUET',
+            partition_filter="dt>='2024-01-01'",
+            filtered_partition_count=3,
+            empty_partition_names='dt=2024-01-02, dt=2024-01-03',
+        )
+        vs_row = MagicMock()
+        vs_row.__getitem__ = lambda self, k: 1
+        vs_row.total_tables_validated = 1
+        vs_row.tables_passed_validation = 1
+        vs_row.tables_failed_validation = 0
+        vs_row.total_row_count_mismatches = 0
+        vs_row.total_partition_count_mismatches = 0
+        vs_row.total_schema_mismatches = 0
+
+        def sql_router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'migration_runs' in sl and 'where' in sl:
+                df.collect.return_value = [run_row]
+            elif 'order by' in sl:
+                df.collect.return_value = [tbl_row]
+            elif 'sum(case when row_count_match' in sl:
+                df.collect.return_value = [vs_row]
+            elif 'sum(case when file_size_match' in sl:
+                fm_row = MagicMock()
+                fm_row.tables_size_match = 1
+                fm_row.tables_size_mismatch = 0
+                fm_row.tables_file_count_match = 1
+                fm_row.tables_file_count_mismatch = 0
+                fm_row.total_source_bytes = 10 * 1024 * 1024
+                fm_row.total_dest_bytes = 10 * 1024 * 1024
+                df.collect.return_value = [fm_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = sql_router
+        m.generate_html_report.function(run_id=sample_run_id, spark=mock_spark)
+
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        written_bytes = fs_mock.create.return_value.write.call_args[0][0]
+        html = written_bytes.decode('utf-8')
+        assert 'dt=2024-01-02' in html
+        assert 'dt=2024-01-03' in html
 
 
 class TestSendMigrationReportEmail:
