@@ -246,27 +246,24 @@ def get_config() -> dict:
         * Anywhere else an empty value means unset. Airflow reports a Variable
           set to '' as present, so a Variable cleared in the UI rather than
           deleted would otherwise mask the env file.
+
+        A lookup failure is not caught. ``default_var=None`` already covers the
+        missing-key case, so the only thing left to swallow would be a genuine
+        Airflow fault — and resolving a bucket or credential to its hardcoded
+        default because the metadata DB hiccuped is how data ends up in the wrong
+        place. Better to fail the task.
         """
         if _run_id:
-            try:
-                scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
-                if scoped is not None:
-                    return scoped
-            except Exception:
-                pass
+            scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
+            if scoped is not None:
+                return scoped
         if _portal_run:
-            try:
-                portal_default = Variable.get(f"nx1_{base_key}", default_var=None)
-                if portal_default:
-                    return portal_default
-            except Exception:
-                pass
-        try:
-            plain = Variable.get(base_key, default_var=None)
-            if plain:
-                return plain
-        except Exception:
-            pass
+            portal_default = Variable.get(f"nx1_{base_key}", default_var=None)
+            if portal_default:
+                return portal_default
+        plain = Variable.get(base_key, default_var=None)
+        if plain:
+            return plain
         return os.getenv(env_var) or default
 
 
