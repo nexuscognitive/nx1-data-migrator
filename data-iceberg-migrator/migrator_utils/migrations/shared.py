@@ -16,7 +16,12 @@ from airflow.models import Variable
 
 logger = logging.getLogger(__name__)
 
+# dag_run.conf['triggered_by'] value the portal sends. Gates access to the
+# nx1_-prefixed Airflow Variables the portal owns.
+PORTAL_TRIGGER = "portal"
+
 __all__ = [
+    "PORTAL_TRIGGER",
     "SSH_COMMAND_TIMEOUT",
     "_login_shell",
     "apply_bucket_credentials",
@@ -211,15 +216,54 @@ def get_config() -> dict:
         _run_id = None
         _dag_run_conf = {}
 
+    # The portal stamps every run it triggers. DAGs deployed and launched by hand
+    # carry no stamp, which is what keeps them out of the nx1_ namespace below.
+    _portal_run = (
+        str(_dag_run_conf.get('triggered_by', '')).strip().lower() == PORTAL_TRIGGER
+    )
+
     def _var(base_key: str, env_var: str, default: str) -> str:
+        """Resolve one config value, highest-precedence tier first.
+
+        1. ``<base_key>__<run_id>``  — per-run override written by the portal
+        2. ``nx1_<base_key>``        — tenant default owned by the portal's
+                                       Infrastructure Config page. **Portal-
+                                       triggered runs only** — see _portal_run.
+        3. ``<base_key>``            — plain Variable, hand-set in the Airflow UI
+        4. ``env_var``               — env.shared / env.<dag_stem> / process env
+        5. ``default``
+
+        Tier 2 is deliberately invisible to a hand-launched DAG: the portal owns
+        that namespace, so a manual deploy keeps resolving from its own env file
+        and plain Variables even when an admin has saved credentials in the portal.
+
+        A blank value counts as unset at **every** tier. Airflow reports an empty
+        Variable as present, so a Variable cleared in the UI rather than deleted
+        would otherwise mask the env file, and the portal writes empty strings for
+        optional fields the user left alone. Truthiness is what lets both fall
+        through instead of resolving to ''.
+        """
         if _run_id:
             try:
                 scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
-                if scoped is not None:
+                if scoped:
                     return scoped
             except Exception:
                 pass
-        return Variable.get(base_key, default_var=os.getenv(env_var, default))
+        if _portal_run:
+            try:
+                portal_default = Variable.get(f"nx1_{base_key}", default_var=None)
+                if portal_default:
+                    return portal_default
+            except Exception:
+                pass
+        try:
+            plain = Variable.get(base_key, default_var=None)
+            if plain:
+                return plain
+        except Exception:
+            pass
+        return os.getenv(env_var) or default
 
 
     dag_owner = _var('migration_dag_owner', 'MIGRATION_DAG_OWNER', '') \

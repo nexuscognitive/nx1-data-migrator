@@ -32,6 +32,130 @@ class TestGetConfig:
         assert cfg['ssh_conn_id'] == 'fallback'
 
 
+class TestVarPrecedence:
+    """Resolution order in get_config._var.
+
+    Portal-triggered run: run-scoped → nx1_ → plain → env → default.
+    Hand-launched run:     run-scoped → plain → env → default (nx1_ is skipped).
+    """
+
+    @staticmethod
+    def _variables(mapping: dict):
+        """Patch Variable.get so only *mapping* keys exist."""
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    @staticmethod
+    def _context(run_id='data_migration_1', triggered_by=None):
+        """Patch the task context, optionally stamped as a portal-triggered run."""
+        conf = {'triggered_by': triggered_by} if triggered_by else {}
+        dag_run = type('DagRun', (), {'conf': conf})()
+        return patch(
+            'airflow.operators.python.get_current_context',
+            return_value={'run_id': run_id, 'dag_run': dag_run},
+        )
+
+    def _portal(self, mapping, run_id='data_migration_1'):
+        return self._context(run_id, m.PORTAL_TRIGGER), self._variables(mapping)
+
+    # -- portal-triggered runs may read the nx1_ namespace -------------------
+
+    def test_nx1_variable_wins_over_plain_variable(self):
+        ctx, vars_ = self._portal({
+            'nx1_s3_access_key': 'FROM_PORTAL',
+            's3_access_key': 'FROM_AIRFLOW_UI',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_PORTAL'
+
+    def test_nx1_variable_wins_over_env_file(self):
+        ctx, vars_ = self._portal({'nx1_s3_access_key': 'FROM_PORTAL'})
+        with ctx, vars_, patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_PORTAL'
+
+    def test_empty_nx1_variable_falls_through_to_plain(self):
+        ctx, vars_ = self._portal({
+            'nx1_s3_access_key': '',
+            's3_access_key': 'FROM_AIRFLOW_UI',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
+
+    def test_run_scoped_variable_wins_over_nx1_variable(self):
+        ctx, vars_ = self._portal({
+            's3_access_key__data_migration_1': 'PER_RUN',
+            'nx1_s3_access_key': 'FROM_PORTAL',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'PER_RUN'
+
+    def test_empty_run_scoped_variable_falls_through_to_nx1(self):
+        """A blank optional override must not mask the portal's global default."""
+        ctx, vars_ = self._portal({
+            's3_access_key__data_migration_1': '',
+            'nx1_s3_access_key': 'FROM_PORTAL',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_PORTAL'
+
+    # -- hand-launched runs must not see the portal's namespace --------------
+
+    def test_manual_run_ignores_nx1_variable_and_uses_env_file(self):
+        """A DAG deployed by hand keeps its env file even when the portal has globals."""
+        with self._context(triggered_by=None), \
+                self._variables({'nx1_s3_access_key': 'FROM_PORTAL'}), \
+                patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_ENV'
+
+    def test_manual_run_ignores_nx1_variable_and_uses_plain_variable(self):
+        with self._context(triggered_by=None), self._variables({
+            'nx1_s3_access_key': 'FROM_PORTAL',
+            's3_access_key': 'FROM_AIRFLOW_UI',
+        }):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
+
+    def test_unrecognised_trigger_marker_is_treated_as_manual(self):
+        with self._context(triggered_by='cron'), \
+                self._variables({'nx1_s3_access_key': 'FROM_PORTAL'}), \
+                patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_ENV'
+
+    # -- lower tiers, unaffected by the marker ------------------------------
+
+    def test_plain_variable_used_when_no_nx1_variable(self):
+        with self._variables({'s3_access_key': 'FROM_AIRFLOW_UI'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
+
+    def test_env_file_used_when_no_variable_set(self):
+        with self._variables({}), patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_ENV'
+
+    def test_empty_plain_variable_falls_through_to_env_file(self):
+        """A Variable cleared in the Airflow UI must not mask the env file."""
+        with self._variables({'s3_access_key': ''}), \
+                patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_ENV'
+
+    def test_empty_env_var_falls_through_to_default(self):
+        with self._variables({}), \
+                patch.dict('os.environ', {'MIGRATION_DEFAULT_S3_BUCKET': ''}):
+            cfg = m.get_config()
+        assert cfg['default_s3_bucket'] == 's3a://data-lake'
+
+
 class TestTrackDuration:
 
     def test_adds_duration_and_preserves_result(self):

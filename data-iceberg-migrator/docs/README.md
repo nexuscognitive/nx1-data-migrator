@@ -19,6 +19,28 @@ This implementation provides four independent but complementary migration DAGs:
 
 The DAGs rely on Airflow Variables for configuration. Set these before running:
 
+### How each value is resolved
+
+Every variable below goes through `get_config._var`, which takes the first
+non-empty match:
+
+| # | Source | Reachable by |
+| - | ------ | ------------ |
+| 1 | `<variable>__<run_id>` — per-run override | the NX1 portal, its only writer |
+| 2 | `nx1_<variable>` — tenant default from the portal's Infrastructure Config page | **portal-triggered runs only** |
+| 3 | `<variable>` — plain Variable, set by hand in the Airflow UI | everyone |
+| 4 | the env var listed in the tables below (`env.shared` / `env.<dag_stem>`) | everyone |
+| 5 | the documented default | everyone |
+
+An **empty** value counts as unset at every tier, so a Variable cleared in the
+Airflow UI falls through to the env file instead of resolving to `''`.
+
+Tier 2 is gated on `dag_run.conf['triggered_by'] == 'portal'`, which the portal
+sets on runs it triggers. A DAG you deploy with `deploy.py` and launch yourself
+carries no such marker, so it never reads the portal's `nx1_*` Variables and
+keeps using your `env.shared` / `env.<dag_stem>` values and plain Variables —
+even when an admin has saved credentials in the portal.
+
 ### Required Variables
 
 | Variable                      | Description                                     | Example                              | Applies To                                        |
@@ -252,8 +274,13 @@ Equivalent env vars (fallback):
 #### Credential resolution order per row
 
 1. **Endpoint provided in Excel** → credentials looked up via `<ep-hostname>_access_key` / `_secret_key` Variable (or env var), endpoint used as-is
-2. **No endpoint in Excel** → global `s3_access_key` / `s3_secret_key` / `s3_endpoint` from Airflow Variables
+2. **No endpoint in Excel** → `s3_access_key` / `s3_secret_key` / `s3_endpoint` as resolved by
+   [the tier order above](#how-each-value-is-resolved) — for a portal-triggered run that includes
+   the portal's `nx1_s3_*` tenant defaults; for a hand-launched run it does not
 3. Hadoop's own credential chain (e.g. IAM instance role) as final fallback
+
+> Note: the `<ep-hostname>_access_key` lookup in step 1 is **not** namespaced and
+> is read on every run, portal-triggered or not.
 
 Rows without an `endpoint` value are unaffected — no changes required for
 single-tenant setups.
