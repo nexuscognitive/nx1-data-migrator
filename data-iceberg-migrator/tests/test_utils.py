@@ -95,15 +95,29 @@ class TestVarPrecedence:
             cfg = m.get_config()
         assert cfg['s3_access_key'] == 'PER_RUN'
 
-    def test_empty_run_scoped_variable_falls_through_to_nx1(self):
-        """A blank optional override must not mask the portal's global default."""
-        ctx, vars_ = self._portal({
-            's3_access_key__data_migration_1': '',
-            'nx1_s3_access_key': 'FROM_PORTAL',
-        })
+    def test_absent_run_scoped_variable_falls_through_to_nx1(self):
+        """A blank S3 override is not written at all, so the global applies."""
+        ctx, vars_ = self._portal({'nx1_s3_access_key': 'FROM_PORTAL'})
         with ctx, vars_:
             cfg = m.get_config()
         assert cfg['s3_access_key'] == 'FROM_PORTAL'
+
+    def test_empty_run_scoped_variable_is_authoritative(self):
+        """Tier 1 resolves on presence: an operator who cleared a field meant it.
+
+        The portal writes a run-scoped Variable for every field the user filled
+        in, and skips only the S3 credentials when blank (where blank means
+        "inherit"). So a run-scoped '' elsewhere is deliberate — here, send no
+        report email — and must not fall through to the tenant mailing list.
+        """
+        ctx, vars_ = self._portal({
+            'migration_email_recipients__data_migration_1': '',
+            'nx1_migration_email_recipients': 'tenant@example.com',
+            'migration_email_recipients': 'tenant@example.com',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['email_recipients'] == ''
 
     # -- hand-launched runs must not see the portal's namespace --------------
 

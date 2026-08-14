@@ -21,8 +21,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 ### How each value is resolved
 
-Every variable below goes through `get_config._var`, which takes the first
-non-empty match:
+Every variable below goes through `get_config._var`, which takes the first match:
 
 | # | Source | Reachable by |
 | - | ------ | ------------ |
@@ -32,8 +31,15 @@ non-empty match:
 | 4 | the env var listed in the tables below (`env.shared` / `env.<dag_stem>`) | everyone |
 | 5 | the documented default | everyone |
 
-An **empty** value counts as unset at every tier, so a Variable cleared in the
-Airflow UI falls through to the env file instead of resolving to `''`.
+Tier 1 matches on **presence**; tiers 2–5 match on the first **non-empty** value.
+
+So a Variable you clear in the Airflow UI falls through to the env file rather
+than resolving to `''`. A run-scoped Variable is different: the portal writes one
+only for a field you filled in — it skips the S3 credentials when you leave them
+blank, which is how a blank override inherits the tenant default — so a
+run-scoped `''` is a deliberate empty value and is used as-is. That is what lets
+a portal run clear `migration_email_recipients` to suppress the report email
+without picking the tenant mailing list back up.
 
 Tier 2 is gated on `dag_run.conf['triggered_by'] == 'portal'`, which the portal
 sets on runs it triggers. A DAG you deploy with `deploy.py` and launch yourself

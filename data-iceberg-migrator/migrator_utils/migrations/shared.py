@@ -237,16 +237,20 @@ def get_config() -> dict:
         that namespace, so a manual deploy keeps resolving from its own env file
         and plain Variables even when an admin has saved credentials in the portal.
 
-        A blank value counts as unset at **every** tier. Airflow reports an empty
-        Variable as present, so a Variable cleared in the UI rather than deleted
-        would otherwise mask the env file, and the portal writes empty strings for
-        optional fields the user left alone. Truthiness is what lets both fall
-        through instead of resolving to ''.
+        Tier 1 resolves on **presence**, tiers 2-4 on **truthiness**:
+
+        * The portal writes a run-scoped Variable only for a field the user
+          actually filled in, so an empty one is a deliberate "no value" — an
+          operator who cleared the report mailing list wants no mail, not the
+          tenant list. Falling through would override that.
+        * Anywhere else an empty value means unset. Airflow reports a Variable
+          set to '' as present, so a Variable cleared in the UI rather than
+          deleted would otherwise mask the env file.
         """
         if _run_id:
             try:
                 scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
-                if scoped:
+                if scoped is not None:
                     return scoped
             except Exception:
                 pass
