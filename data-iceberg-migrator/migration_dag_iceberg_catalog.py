@@ -1,5 +1,5 @@
 """
-DAG 5: Iceberg Catalog Migration
+DAG 4: Iceberg Catalog Migration
 
 Iceberg-to-Iceberg migration using the rewrite_table_path procedure.
 Use this DAG when data AND metadata have already been copied to the destination
@@ -70,7 +70,7 @@ default_args = {
 
 
 # =============================================================================
-# DAG 5: ICEBERG REWRITE TABLE PATH MIGRATION TASKS
+# DAG 4: ICEBERG REWRITE TABLE PATH MIGRATION TASKS
 # =============================================================================
 
 @task.pyspark(conn_id='spark_default')
@@ -1581,7 +1581,7 @@ def finalize_run(run_id: str, spark) -> dict:
 
 
 # =============================================================================
-# DAG 5 DEFINITION
+# DAG 4 DEFINITION
 # =============================================================================
 
 with DAG(
