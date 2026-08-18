@@ -202,7 +202,6 @@ def normalize_s3(path: str) -> str:
 
 TENANT_PROFILE_KEYS = frozenset({
     'ssh_conn_id',
-    'mapr_user',
     'mapr_ticketfile_location',
     'auth_method',
     'edge_temp_path',
@@ -328,8 +327,7 @@ def get_config() -> dict:
         'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
-        'service_account_user_id': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id') or _var('mapr_user', 'MAPR_USER', '', conf_key='mapr_user')).strip(),
-        'mapr_user': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id') or _var('mapr_user', 'MAPR_USER', '', conf_key='mapr_user')).strip(),
+        'service_account_user_id': _var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id').strip(),
         'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}', conf_key='mapr_ticketfile_location'),
         # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
         'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', '', conf_key='hdfs_nameservice'),
@@ -388,7 +386,7 @@ def get_config() -> dict:
     logger.info(
         f"[get_config] run_id={_run_id!r} tenant={_tenant or None!r} "
         f"ssh_conn_id={config['ssh_conn_id']!r} "
-        f"mapr_user={config['mapr_user']!r} edge_temp_path={config['edge_temp_path']!r} "
+        f"service_account_user_id={config['service_account_user_id']!r} edge_temp_path={config['edge_temp_path']!r} "
         f"dag_owner={dag_owner!r}"
     )
     return config
@@ -452,8 +450,7 @@ def cluster_login(run_id: str) -> dict:
     )
 
     auth_method = config.get('auth_method', 'mapr')
-    sa_user = str(config.get('service_account_user_id') or config.get('mapr_user') or '').strip()
-    mapr_user = sa_user
+    sa_user = str(config.get('service_account_user_id') or '').strip()
     mapr_ticketfile = _edge_path_template(config.get('mapr_ticketfile_location', '/tmp/maprticket_${USER}'))
 
     auth_script_parts = []
@@ -476,7 +473,7 @@ if [ "{auth_method}" = "mapr" ]; then
     MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}"
     export MAPR_TICKETFILE_LOCATION
 
-    if maprlogin print 2>/dev/null | grep -q "{mapr_user}"; then
+    if maprlogin print 2>/dev/null | grep -q "{sa_user}"; then
         echo "Using existing valid MapR ticket"
     else
         echo "ERROR: No valid MapR ticket found"

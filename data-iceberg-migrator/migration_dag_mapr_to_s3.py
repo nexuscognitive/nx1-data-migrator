@@ -157,7 +157,7 @@ def validate_prerequisites(run_id: str) -> dict:
     }
 
     auth_method = config.get("auth_method", "mapr")
-    mapr_user = config.get("mapr_user", "")
+    mapr_user = config.get("service_account_user_id", "")
 
     logger.info("=" * 60)
     logger.info("STARTING PRE-DAG VALIDATION")

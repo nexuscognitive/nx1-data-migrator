@@ -25,7 +25,6 @@ MOCK_VARIABLES = {
     'migration_tracking_location':  's3a://test-bucket/tracking',
     'migration_report_location':    's3a://test-bucket/reports',
     'auth_method':                  'none',
-    'mapr_user':                    '',
     'mapr_ticketfile_location':     '/tmp/maprticket',
     'cluster_type':                 'HDP',
     'hdfs_nameservice':             '',

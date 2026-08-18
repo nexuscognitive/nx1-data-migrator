@@ -36,7 +36,6 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ------------------------------------------------- |
 | `auth_method`              | Authentication method: `mapr`, `kinit`, or `none`                                                                                                                                                                            | MapR/Kerberos    | `source_to_s3_migration`, `folder_only_data_copy` |
 | `service_account_user_id`  | **Recommended.** Tenant service account the DAG runs as on the source cluster. Validates the MapR ticket and builds every user-scoped temp and log path. See [Service account configuration](#service-account-configuration) | All auth methods | `source_to_s3_migration`, `folder_only_data_copy` |
-| `mapr_user`                | Deprecated alias for `service_account_user_id`, kept for backward compatibility. If both are set, `service_account_user_id` wins                                                                                             | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
 | `mapr_ticketfile_location` | MapR ticket file path                                                                                                                                                                                                        | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
 | `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.                                                                                                                                                                               | HTML reports     | `source_to_s3_migration`                          |
 
@@ -74,12 +73,11 @@ drives all of the following:
 
 **Resolution order**
 
-| Order | Source                                 | When used                                 |
-| ----- | -------------------------------------- | ----------------------------------------- |
-| 1     | `service_account_user_id` config       | Whenever it is set — always wins          |
-| 2     | `mapr_user` config                     | Legacy deployments that have not migrated |
-| 3     | Active MapR ticket (`maprlogin print`) | Neither is set, and a ticket exists       |
-| 4     | Login shell user (`id -un`)            | Nothing else available                    |
+| Order | Source                                 | When used                           |
+| ----- | -------------------------------------- | ----------------------------------- |
+| 1     | `service_account_user_id` config       | Whenever it is set — always wins    |
+| 3     | Active MapR ticket (`maprlogin print`) | Neither is set, and a ticket exists |
+| 4     | Login shell user (`id -un`)            | Nothing else available              |
 
 **When it is configured (recommended)**
 
@@ -232,12 +230,12 @@ tenant or environment name:
 {
   "tenant_1": {
     "ssh_conn_id": "cluster_edge_ssh_tenant_1",
-    "mapr_user": "mapr_tenant_1",
+    "service_account_user_id": "mapr_tenant_1",
     "edge_temp_path": "/user/svc_tenant_1/tmp/migration"
   },
   "tenant_2": {
     "ssh_conn_id": "cluster_edge_ssh_tenant_2",
-    "mapr_user": "mapr_tenant_2"
+    "service_account_user_id": "mapr_tenant_2"
   }
 }
 ```
@@ -255,7 +253,7 @@ Only include the keys that actually differ per tenant. Anything omitted falls
 through to the global Variable, so `tenant_2` above uses
 `cluster_edge_temp_path` as normal.
 
-Accepted keys in a profile: `ssh_conn_id`, `mapr_user`,
+Accepted keys in a profile: `ssh_conn_id`,
 `mapr_ticketfile_location`, `auth_method`, `edge_temp_path`,
 `hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`.
 
@@ -533,7 +531,7 @@ finalize_run
 - Runs four sequential checks:
   1. **SSH Connectivity** - Verifies SSH connection works with a simple echo command
   2. **Cluster Authentication** - Verifies a valid ticket/TGT exists before attempting any cluster operations:
-     - `mapr`: `maprlogin print | grep -q <mapr_user>` — confirms a valid MapR ticket for the configured user
+     - `mapr`: `maprlogin print | grep -q <service_account_user_id>` — confirms a valid MapR ticket for the configured user
      - `kinit`: `klist -s` — confirms a valid Kerberos TGT in the ccache (populated by the login shell)
      - `none`: skipped (auto-passes)
   3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`. The Hive scratch dir is overridden to `cluster_hive_scratch_dir` so the check passes under a tenant service account
