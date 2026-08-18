@@ -36,7 +36,6 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ------------------------------------------------- |
 | `auth_method`              | Authentication method: `mapr`, `kinit`, or `none`                                                                                                                                                                            | MapR/Kerberos    | `source_to_s3_migration`, `folder_only_data_copy` |
 | `service_account_user_id`  | **Recommended.** Tenant service account the DAG runs as on the source cluster. Validates the MapR ticket and builds every user-scoped temp and log path. See [Service account configuration](#service-account-configuration) | All auth methods | `source_to_s3_migration`, `folder_only_data_copy` |
-| `mapr_user`                | Deprecated alias for `service_account_user_id`, kept for backward compatibility. If both are set, `service_account_user_id` wins                                                                                             | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
 | `mapr_ticketfile_location` | MapR ticket file path                                                                                                                                                                                                        | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
 | `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.                                                                                                                                                                               | HTML reports     | `source_to_s3_migration`                          |
 
@@ -48,6 +47,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | `cluster_distcp_log_root`          | `/tmp`           | Root on the **cluster filesystem** (MapR-FS/HDFS) under which per-user, per-run DistCp log directories are created. The user segment comes from `service_account_user_id`.                                       | `source_to_s3_migration`                          |
 | `cluster_edge_discovery_temp_path` | `/tmp`           | Local temp dir on edge node for the Spark discovery scratch folder. Literal path only (no `${USER}`).                                                                                                            | `source_to_s3_migration`                          |
 | `cluster_hive_scratch_dir`         | `/tmp/hive`      | Hive scratch dir for PySpark sessions started on the **source edge node**. Literal path only (no `${USER}`).                                                                                                     | `source_to_s3_migration`                          |
+| `migration_tenant_profiles`        | `{}`             | Per-tenant config groups as JSON, selected at trigger time via the `tenant` DAG param                                                                                                                            | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_endpoint`                      | _(empty)_        | Default S3 endpoint URL (all buckets)                                                                                                                                                                            | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_access_key`                    | _(empty)_        | Default S3 access key (all buckets)                                                                                                                                                                              | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_secret_key`                    | _(empty)_        | Default S3 secret key (all buckets)                                                                                                                                                                              | `source_to_s3_migration`, `folder_only_data_copy` |
@@ -73,12 +73,11 @@ drives all of the following:
 
 **Resolution order**
 
-| Order | Source                                 | When used                                 |
-| ----- | -------------------------------------- | ----------------------------------------- |
-| 1     | `service_account_user_id` config       | Whenever it is set — always wins          |
-| 2     | `mapr_user` config                     | Legacy deployments that have not migrated |
-| 3     | Active MapR ticket (`maprlogin print`) | Neither is set, and a ticket exists       |
-| 4     | Login shell user (`id -un`)            | Nothing else available                    |
+| Order | Source                                 | When used                           |
+| ----- | -------------------------------------- | ----------------------------------- |
+| 1     | `service_account_user_id` config       | Whenever it is set — always wins    |
+| 3     | Active MapR ticket (`maprlogin print`) | Neither is set, and a ticket exists |
+| 4     | Login shell user (`id -un`)            | Nothing else available              |
 
 **When it is configured (recommended)**
 
@@ -208,13 +207,73 @@ there — discovery aborts in `validate_prerequisites` with:
 over SSH on the source edge node (`validate_prerequisites` and
 `discover_tables_via_spark_ssh`), overriding whatever `hive-site.xml` sets.
 
-The default `/tmp/hive` is world-writable on both MapR-FS and the local filesystem
-and works for every service account. Only change it if `/tmp/hive` is restricted on
-your cluster.
+The default `/tmp/hive` is Hive's own default scratch root. Hive creates a per-user
+subdirectory beneath it (`/tmp/hive/<user>`), so each tenant service account gets
+its own writable space without further setup. Only override this if `/tmp` is
+restricted on your cluster.
 
 Placeholders are **not** supported. The value is baked into a Python script that
 is written over SFTP, which does not expand shell variables, so a `${USER}` here
 would be created as a literal directory of that name. Use a literal path.
+
+#### Per-run configuration via tenant profiles
+
+The edge node, service account and temp paths differ per tenant. Rather than
+editing the global Variables between runs — which repoints any run already in
+flight, and makes it impossible to migrate two tenants at once — keep one
+Variable holding all tenants and pick one at trigger time.
+
+**Airflow Variable `migration_tenant_profiles`** — a JSON object keyed by
+tenant or environment name:
+
+```json
+{
+  "tenant_1": {
+    "ssh_conn_id": "cluster_edge_ssh_tenant_1",
+    "service_account_user_id": "mapr_tenant_1",
+    "edge_temp_path": "/user/svc_tenant_1/tmp/migration"
+  },
+  "tenant_2": {
+    "ssh_conn_id": "cluster_edge_ssh_tenant_2",
+    "service_account_user_id": "mapr_tenant_2"
+  }
+}
+```
+
+**Trigger with just the tenant name:**
+
+```json
+{
+  "excel_file_path": "s3a://config-bucket/tenant_1.xlsx",
+  "tenant": "tenant_1"
+}
+```
+
+Only include the keys that actually differ per tenant. Anything omitted falls
+through to the global Variable, so `tenant_2` above uses
+`cluster_edge_temp_path` as normal.
+
+Accepted keys in a profile: `ssh_conn_id`,
+`mapr_ticketfile_location`, `auth_method`, `edge_temp_path`,
+`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`.
+
+**Resolution order** for these settings:
+
+1. Key supplied directly in the trigger config (e.g. `{"ssh_conn_id": "..."}`)
+2. Tenant profile, when `tenant` is set
+3. Run-scoped Variable `<variable_name>__<run_id>`
+4. Global Variable
+5. Environment variable
+6. Built-in default
+
+An unknown `tenant`, malformed JSON, or an unrecognised key inside a profile
+**fails the run** rather than falling back to the global Variables — a typo
+must not silently migrate a tenant against another tenant's edge node. The
+resolved tenant and connection are logged by every task on the `[get_config]`
+line, and the full config is recorded in the `migration_runs` tracking row.
+
+Leaving `tenant` blank resolves exactly as before, so single-tenant setups need
+no change.
 
 ### Multi-Tenant S3 Credentials (endpoint-based overrides)
 
@@ -271,13 +330,15 @@ single-tenant setups.
 
 ## DAG Parameter Details
 
-| DAG   | Parameter         | Required | Description                                 | Example                                              |
-| ----- | ----------------- | -------- | ------------------------------------------- | ---------------------------------------------------- |
-| DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config                     | `s3a://config-bucket/migration.xlsx`                 |
-| DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config                   | `s3a://config-bucket/iceberg_migration.xlsx`         |
-| DAG 2 | `iceberg_drop_backup` | No   | Drop `<table>_backup_` after a successful **in-place** migration. Default `false` — keep it `false` on any cutover run, the backup is the rollback path | `false`                                              |
-| DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config               | `s3a://config-bucket/folder_copy.xlsx`               |
-| DAG 4 | `excel_file_path` | Yes      | S3 path to Iceberg catalog migration config | `s3a://config-bucket/iceberg_rewrite_migration.xlsx` |
+| DAG   | Parameter             | Required | Description                                                                                                                                             | Example                                              |
+| ----- | --------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| DAG 1 | `excel_file_path`     | Yes      | S3 path to Excel config                                                                                                                                 | `s3a://config-bucket/migration.xlsx`                 |
+| DAG 1 | `tenant`              | No       | Tenant profile key (optional)                                                                                                                           | `tenant_1`                                           |
+| DAG 2 | `excel_file_path`     | Yes      | S3 path to Iceberg config                                                                                                                               | `s3a://config-bucket/iceberg_migration.xlsx`         |
+| DAG 2 | `iceberg_drop_backup` | No       | Drop `<table>_backup_` after a successful **in-place** migration. Default `false` — keep it `false` on any cutover run, the backup is the rollback path | `false`                                              |
+| DAG 3 | `excel_file_path`     | Yes      | S3 path to folder copy config                                                                                                                           | `s3a://config-bucket/folder_copy.xlsx`               |
+| DAG 3 | `tenant`              | No       | Tenant profile key (optional)                                                                                                                           | `tenant_1`                                           |
+| DAG 4 | `excel_file_path`     | Yes      | S3 path to Iceberg catalog migration config                                                                                                             | `s3a://config-bucket/iceberg_rewrite_migration.xlsx` |
 
 ---
 
@@ -470,7 +531,7 @@ finalize_run
 - Runs four sequential checks:
   1. **SSH Connectivity** - Verifies SSH connection works with a simple echo command
   2. **Cluster Authentication** - Verifies a valid ticket/TGT exists before attempting any cluster operations:
-     - `mapr`: `maprlogin print | grep -q <mapr_user>` — confirms a valid MapR ticket for the configured user
+     - `mapr`: `maprlogin print | grep -q <service_account_user_id>` — confirms a valid MapR ticket for the configured user
      - `kinit`: `klist -s` — confirms a valid Kerberos TGT in the ccache (populated by the login shell)
      - `none`: skipped (auto-passes)
   3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`. The Hive scratch dir is overridden to `cluster_hive_scratch_dir` so the check passes under a tenant service account
@@ -918,7 +979,7 @@ references the same data files. It is the rollback path for an in-place cutover.
   **metadata-only — never `PURGE`**, because the backup shares data files with the
   live Iceberg table. A hand-written `DROP TABLE ... PURGE` on a backup would
   destroy live data.
-- **Rollback has a deadline.** Restoring `<table>_backup_` is clean only *before*
+- **Rollback has a deadline.** Restoring `<table>_backup_` is clean only _before_
   writes resume against the Iceberg table. Once new Iceberg files exist at the
   table's location, the backup no longer describes the current file set and
   restoring it loses those writes.
@@ -1545,10 +1606,10 @@ through without raising, so the mapped chain always completes and every folder i
 
 ### Folder Copy Variables
 
-| Variable                            | Default | Description                                                                                                                                                                                                                    |
-| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `folder_copy_allow_delete`          | `false` | Second, folder-copy-specific switch that must **also** be true before DistCp is given `-delete`. Deletion is off by default here because folder copy targets raw directories with no Hive metadata to reconcile against — an over-broad `source_path` or a wrong `dest_folder` would silently delete unrelated S3 objects under the destination prefix. Set to `true` only when the destination prefix is owned exclusively by this copy and you want removed source files mirrored. |
-| `migration_distcp_preserve_delete`  | `true`  | Shared DistCp switch (also used by DAG 1). Folder copy requires this **and** `folder_copy_allow_delete` before passing `-delete`.                                                                                              |
+| Variable                           | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ---------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `folder_copy_allow_delete`         | `false` | Second, folder-copy-specific switch that must **also** be true before DistCp is given `-delete`. Deletion is off by default here because folder copy targets raw directories with no Hive metadata to reconcile against — an over-broad `source_path` or a wrong `dest_folder` would silently delete unrelated S3 objects under the destination prefix. Set to `true` only when the destination prefix is owned exclusively by this copy and you want removed source files mirrored. |
+| `migration_distcp_preserve_delete` | `true`  | Shared DistCp switch (also used by DAG 1). Folder copy requires this **and** `folder_copy_allow_delete` before passing `-delete`.                                                                                                                                                                                                                                                                                                                                                    |
 
 ---
 
@@ -1569,15 +1630,15 @@ missing column is reported as a single WARNING after a `DESCRIBE` check.
 
 **`data_copy_status`**
 
-| Column                    | Type        | Description                                                     |
-| ------------------------- | ----------- | --------------------------------------------------------------- |
-| `yarn_application_id`     | `STRING`    | YARN application ID(s) for the DistCp job, comma-separated       |
-| `distcp_started_at`       | `TIMESTAMP` | When the DistCp step started                                     |
-| `distcp_completed_at`     | `TIMESTAMP` | When the DistCp step finished                                    |
-| `distcp_duration_seconds` | `DOUBLE`    | DistCp wall-clock duration                                       |
-| `distcp_bytes_copied`     | `BIGINT`    | Bytes reported by DistCp's own counters                          |
-| `distcp_files_copied`     | `BIGINT`    | Files reported by DistCp's own counters                          |
-| `throughput_mbps`         | `DOUBLE`    | `distcp_bytes_copied / 1 MiB / distcp_duration_seconds`          |
+| Column                    | Type        | Description                                                |
+| ------------------------- | ----------- | ---------------------------------------------------------- |
+| `yarn_application_id`     | `STRING`    | YARN application ID(s) for the DistCp job, comma-separated |
+| `distcp_started_at`       | `TIMESTAMP` | When the DistCp step started                               |
+| `distcp_completed_at`     | `TIMESTAMP` | When the DistCp step finished                              |
+| `distcp_duration_seconds` | `DOUBLE`    | DistCp wall-clock duration                                 |
+| `distcp_bytes_copied`     | `BIGINT`    | Bytes reported by DistCp's own counters                    |
+| `distcp_files_copied`     | `BIGINT`    | Files reported by DistCp's own counters                    |
+| `throughput_mbps`         | `DOUBLE`    | `distcp_bytes_copied / 1 MiB / distcp_duration_seconds`    |
 
 ---
 

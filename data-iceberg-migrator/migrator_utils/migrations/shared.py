@@ -5,6 +5,7 @@ Contains configuration, S3 helpers, retry logic, and constants
 used across mapr_to_s3, iceberg, folder_copy, and s3_metadata DAGs.
 """
 
+import json
 import logging
 import math
 import os
@@ -199,6 +200,59 @@ def normalize_s3(path: str) -> str:
 # SHARED CONFIGURATION
 # =============================================================================
 
+TENANT_PROFILE_KEYS = frozenset({
+    'ssh_conn_id',
+    'mapr_ticketfile_location',
+    'auth_method',
+    'edge_temp_path',
+    'hive_scratch_dir',
+    'service_account_user_id',
+    'hdfs_nameservice',
+})
+
+
+def _load_tenant_profile(tenant: str) -> dict:
+    """ Load one tenant's settings from the `migration_tenant_profiles` Variable """
+    raw = Variable.get(
+        'migration_tenant_profiles',
+        default_var=os.getenv('MIGRATION_TENANT_PROFILES', '{}'),
+    )
+    try:
+        profiles = raw if isinstance(raw, dict) else json.loads(raw or '{}')
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Airflow Variable 'migration_tenant_profiles' is not valid JSON: {exc}"
+        ) from exc
+
+    if not isinstance(profiles, dict):
+        raise ValueError(
+            "Airflow Variable 'migration_tenant_profiles' must be a JSON object "
+            "keyed by tenant name."
+        )
+
+    if tenant not in profiles:
+        known = ', '.join(sorted(profiles)) or '<none defined>'
+        raise ValueError(
+            f"tenant={tenant!r} not found in 'migration_tenant_profiles'. "
+            f"Known tenants: {known}"
+        )
+
+    profile = profiles[tenant] or {}
+    if not isinstance(profile, dict):
+        raise ValueError(
+            f"Profile for tenant={tenant!r} must be a JSON object, got {type(profile).__name__}."
+        )
+
+    unknown = set(profile) - TENANT_PROFILE_KEYS
+    if unknown:
+        raise ValueError(
+            f"Profile for tenant={tenant!r} has unsupported key(s): "
+            f"{', '.join(sorted(unknown))}. Allowed: {', '.join(sorted(TENANT_PROFILE_KEYS))}."
+        )
+
+    logger.info(f"[get_config] Loaded tenant profile {tenant!r}: {sorted(profile)}")
+    return profile
+
 def get_config() -> dict:
     """Shared configuration for all migration DAGs."""
     try:
@@ -211,7 +265,16 @@ def get_config() -> dict:
         _run_id = None
         _dag_run_conf = {}
 
-    def _var(base_key: str, env_var: str, default: str) -> str:
+    _tenant = str(_dag_run_conf.get('tenant') or '').strip()
+    _profile = _load_tenant_profile(_tenant) if _tenant else {}
+
+    def _var(base_key: str, env_var: str, default: str, conf_key: str = None) -> str:
+        if conf_key:
+            for _source in (_dag_run_conf, _profile):
+                if conf_key in _source:
+                    _val = _source.get(conf_key)
+                    if _val is not None and str(_val).strip():
+                        return str(_val).strip()
         if _run_id:
             try:
                 scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
@@ -228,11 +291,12 @@ def get_config() -> dict:
                 or 'data-migration'
 
     config = {
+        'tenant': _tenant or None,
         # SSH Configuration (for MapR migration)
-        'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh'),
-        'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration'),
+        'ssh_conn_id': _var('cluster_ssh_conn_id','CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh', conf_key='ssh_conn_id'),
+        'edge_temp_path': _var('cluster_edge_temp_path', 'CLUSTER_EDGE_TEMP_PATH', '/tmp/migration', conf_key='edge_temp_path'),
         'edge_discovery_temp_path': _var('cluster_edge_discovery_temp_path', 'CLUSTER_EDGE_DISCOVERY_TEMP_PATH', '/tmp'),
-        'hive_scratch_dir': _var('cluster_hive_scratch_dir', 'CLUSTER_HIVE_SCRATCH_DIR', '/tmp/hive'),
+        'hive_scratch_dir': _var('cluster_hive_scratch_dir', 'CLUSTER_HIVE_SCRATCH_DIR', '/tmp/hive', conf_key='hive_scratch_dir'),
         'distcp_log_root': _var('cluster_distcp_log_root', 'CLUSTER_DISTCP_LOG_ROOT', '/tmp'),
 
         # S3 Configuration
@@ -262,12 +326,11 @@ def get_config() -> dict:
         # Cluster type for display/reporting purposes ('MapR' or 'HDP')
         'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
-        'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr'),  # 'mapr' or 'kinit'
-        'service_account_user_id': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '') or _var('mapr_user', 'MAPR_USER', '')).strip(),
-        'mapr_user': (_var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '') or _var('mapr_user', 'MAPR_USER', '')).strip(),
-        'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}'),
+        'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
+        'service_account_user_id': _var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id').strip(),
+        'mapr_ticketfile_location': _var('mapr_ticketfile_location', 'MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}', conf_key='mapr_ticketfile_location'),
         # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
-        'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', ''),
+        'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', '', conf_key='hdfs_nameservice'),
 
         # Listing tool
         's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
@@ -320,7 +383,12 @@ def get_config() -> dict:
         except Exception:
             pass
 
-    logger.debug(f"[get_config] dag_owner={dag_owner!r} run_id={_run_id!r}")
+    logger.info(
+        f"[get_config] run_id={_run_id!r} tenant={_tenant or None!r} "
+        f"ssh_conn_id={config['ssh_conn_id']!r} "
+        f"service_account_user_id={config['service_account_user_id']!r} edge_temp_path={config['edge_temp_path']!r} "
+        f"dag_owner={dag_owner!r}"
+    )
     return config
 
 # SSH timeout: 24 hours
@@ -375,9 +443,14 @@ def cluster_login(run_id: str) -> dict:
     temp_dir = f"{_edge_path_template(config['edge_temp_path'])}/{run_id}"
     distcp_log_root = str(config.get('distcp_log_root') or '/tmp').rstrip('/') or '/tmp'
 
+    logger.info(
+        f"[cluster_login] run_id={run_id} tenant={config.get('tenant') or 'default'} "
+        f"ssh_conn_id={config['ssh_conn_id']} edge_temp_path={config['edge_temp_path']} "
+        f"mapr_ticketfile_location={config.get('mapr_ticketfile_location', '')}"
+    )
+
     auth_method = config.get('auth_method', 'mapr')
-    sa_user = str(config.get('service_account_user_id') or config.get('mapr_user') or '').strip()
-    mapr_user = sa_user
+    sa_user = str(config.get('service_account_user_id') or '').strip()
     mapr_ticketfile = _edge_path_template(config.get('mapr_ticketfile_location', '/tmp/maprticket_${USER}'))
 
     auth_script_parts = []
@@ -400,7 +473,7 @@ if [ "{auth_method}" = "mapr" ]; then
     MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}"
     export MAPR_TICKETFILE_LOCATION
 
-    if maprlogin print 2>/dev/null | grep -q "{mapr_user}"; then
+    if maprlogin print 2>/dev/null | grep -q "{sa_user}"; then
         echo "Using existing valid MapR ticket"
     else
         echo "ERROR: No valid MapR ticket found"
