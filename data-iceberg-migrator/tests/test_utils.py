@@ -185,20 +185,29 @@ class TestVarPrecedence:
         assert cfg['s3_access_key'] == ''
 
     def test_portal_run_falls_to_hardcoded_default_for_an_owned_key(self):
-        ctx, vars_ = self._portal({})
-        with ctx, vars_:
+        """Nothing in the nx1_ namespace means unset for a portal run — even
+        with a plain Variable AND an env value both sitting there ready to
+        catch it, an owned key must not fall through to either.
+        """
+        ctx, vars_ = self._portal({'cluster_ssh_conn_id': 'FROM_AIRFLOW_UI'})
+        with ctx, vars_, patch.dict('os.environ', {'CLUSTER_SSH_CONN_ID': 'FROM_ENV'}):
             cfg = m.get_config()
         assert cfg['ssh_conn_id'] == 'cluster_edge_ssh'
 
     def test_portal_run_reads_env_file_for_a_key_nobody_owns(self):
-        """Unowned keys are deployment baseline, shared by both origins."""
-        ctx, vars_ = self._portal({})
+        """Unowned keys are deployment baseline, shared by both origins — a
+        portal run must ignore an nx1_ value sitting right there for one.
+        """
+        ctx, vars_ = self._portal({'nx1_cluster_type': 'FROM_PORTAL'})
         with ctx, vars_, patch.dict('os.environ', {'CLUSTER_TYPE': 'HDP'}):
             cfg = m.get_config()
         assert cfg['cluster_type'] == 'HDP'
 
     def test_portal_run_reads_plain_variable_for_a_key_nobody_owns(self):
-        ctx, vars_ = self._portal({'hdfs_nameservice': 'ns1'})
+        ctx, vars_ = self._portal({
+            'nx1_hdfs_nameservice': 'FROM_PORTAL',
+            'hdfs_nameservice': 'ns1',
+        })
         with ctx, vars_:
             cfg = m.get_config()
         assert cfg['hdfs_nameservice'] == 'ns1'
