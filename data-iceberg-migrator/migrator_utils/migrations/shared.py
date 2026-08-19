@@ -248,6 +248,10 @@ def get_config() -> dict:
     except Exception:
         _run_id = None
         _dag_run_conf = {}
+        logger.warning(
+            "[get_config] Task context unavailable — resolving this run as "
+            "hand-launched (manual), not portal-triggered."
+        )
 
     # The portal stamps every run it triggers. DAGs deployed and launched by hand
     # carry no stamp, which is what keeps them out of the nx1_ namespace below.

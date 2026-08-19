@@ -60,10 +60,11 @@ class TestDagOwnerIsNotReadFromVariables:
 
     def test_resolve_dag_owner_ignores_the_variable(self):
         import importlib
-        with patch('airflow.models.Variable.get', return_value='portal_user'):
+        with patch('airflow.models.Variable.get', return_value='portal_user') as mock_get:
             for name in self._MODULES:
                 mod = importlib.import_module(name)
                 assert mod._resolve_dag_owner() == 'data-migration', name
+        mock_get.assert_not_called()
 
     def test_resolve_dag_owner_keeps_the_literal_deploy_py_rewrites(self):
         """deploy.py swaps `return 'data-migration'` for the --owner value."""
