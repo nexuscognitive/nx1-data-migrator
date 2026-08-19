@@ -77,18 +77,19 @@ class TestVarPrecedence:
             cfg = m.get_config()
         assert cfg['s3_access_key'] == 'FROM_PORTAL'
 
-    def test_empty_nx1_variable_falls_through_to_plain(self):
+    def test_empty_nx1_variable_falls_to_default_not_to_plain(self):
+        """Cleared in the portal means unset for portal runs, not "use the manual value"."""
         ctx, vars_ = self._portal({
             'nx1_s3_access_key': '',
             's3_access_key': 'FROM_AIRFLOW_UI',
         })
         with ctx, vars_:
             cfg = m.get_config()
-        assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
+        assert cfg['s3_access_key'] == ''
 
     def test_run_scoped_variable_wins_over_nx1_variable(self):
         ctx, vars_ = self._portal({
-            's3_access_key__data_migration_1': 'PER_RUN',
+            'nx1_s3_access_key__data_migration_1': 'PER_RUN',
             'nx1_s3_access_key': 'FROM_PORTAL',
         })
         with ctx, vars_:
@@ -111,9 +112,8 @@ class TestVarPrecedence:
         report email — and must not fall through to the tenant mailing list.
         """
         ctx, vars_ = self._portal({
-            'migration_email_recipients__data_migration_1': '',
+            'nx1_migration_email_recipients__data_migration_1': '',
             'nx1_migration_email_recipients': 'tenant@example.com',
-            'migration_email_recipients': 'tenant@example.com',
         })
         with ctx, vars_:
             cfg = m.get_config()
@@ -168,6 +168,78 @@ class TestVarPrecedence:
                 patch.dict('os.environ', {'MIGRATION_DEFAULT_S3_BUCKET': ''}):
             cfg = m.get_config()
         assert cfg['default_s3_bucket'] == 's3a://data-lake'
+
+    # -- portal runs are sealed off from the manual namespace ----------------
+
+    def test_portal_run_ignores_plain_variable_for_an_owned_key(self):
+        """The page is the whole truth: no plain value can be in effect behind it."""
+        ctx, vars_ = self._portal({'s3_access_key': 'FROM_AIRFLOW_UI'})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == ''
+
+    def test_portal_run_ignores_env_file_for_an_owned_key(self):
+        ctx, vars_ = self._portal({})
+        with ctx, vars_, patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == ''
+
+    def test_portal_run_falls_to_hardcoded_default_for_an_owned_key(self):
+        ctx, vars_ = self._portal({})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'cluster_edge_ssh'
+
+    def test_portal_run_reads_env_file_for_a_key_nobody_owns(self):
+        """Unowned keys are deployment baseline, shared by both origins."""
+        ctx, vars_ = self._portal({})
+        with ctx, vars_, patch.dict('os.environ', {'CLUSTER_TYPE': 'HDP'}):
+            cfg = m.get_config()
+        assert cfg['cluster_type'] == 'HDP'
+
+    def test_portal_run_reads_plain_variable_for_a_key_nobody_owns(self):
+        ctx, vars_ = self._portal({'hdfs_nameservice': 'ns1'})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['hdfs_nameservice'] == 'ns1'
+
+    def test_manual_run_ignores_the_prefixed_run_scoped_variable(self):
+        with self._context(triggered_by=None), self._variables({
+            'nx1_s3_access_key__data_migration_1': 'PER_RUN',
+            's3_access_key': 'FROM_AIRFLOW_UI',
+        }):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
+
+    # The portal writes these; no DAG in either repo reads them. auth_method
+    # 'kinit' only checks for an existing TGT. They stay in PORTAL_OWNED_KEYS so
+    # that isolation is already correct if a DAG ever starts reading one.
+    _WRITTEN_BUT_NEVER_READ = frozenset({
+        'kinit_keytab', 'kinit_password', 'kinit_principal',
+    })
+
+    def test_every_owned_key_is_read_by_get_config(self):
+        """A key in the frozenset that no _var call reads is dead weight.
+
+        One key at a time: service_account_user_id and mapr_user resolve through
+        one `or` chain, so seeding both at once hides whichever loses.
+        """
+        for key in sorted(m.PORTAL_OWNED_KEYS - self._WRITTEN_BUT_NEVER_READ):
+            ctx, vars_ = self._portal({f'nx1_{key}': f'value_of_{key}'})
+            with ctx, vars_:
+                cfg = m.get_config()
+            assert f'value_of_{key}' in {str(v) for v in cfg.values()}, \
+                f'in PORTAL_OWNED_KEYS but never read by get_config: {key}'
+
+    def test_the_unread_keys_are_still_unread(self):
+        """Fails when a DAG starts reading one, as a prompt to drop the exemption."""
+        for key in sorted(self._WRITTEN_BUT_NEVER_READ):
+            ctx, vars_ = self._portal({f'nx1_{key}': f'value_of_{key}'})
+            with ctx, vars_:
+                cfg = m.get_config()
+            assert f'value_of_{key}' not in {str(v) for v in cfg.values()}, (
+                f'{key} is now read — remove it from _WRITTEN_BUT_NEVER_READ'
+            )
 
 
 class TestTrackDuration:

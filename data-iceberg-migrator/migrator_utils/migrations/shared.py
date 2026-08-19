@@ -20,8 +20,41 @@ logger = logging.getLogger(__name__)
 # nx1_-prefixed Airflow Variables the portal owns.
 PORTAL_TRIGGER = "portal"
 
+# Config keys the portal owns. A portal-triggered run resolves these only from
+# the nx1_ namespace; a hand-launched run only from plain Variables and env
+# files. Neither can see the other's value. Anything not listed here is
+# deployment baseline and resolves the same way for both — see _var.
+PORTAL_OWNED_KEYS = frozenset({
+    'auth_method',
+    'cluster_edge_temp_path',
+    'cluster_ssh_conn_id',
+    'kinit_keytab',
+    'kinit_password',
+    'kinit_principal',
+    'mapr_ticketfile_location',
+    'mapr_user',
+    'migration_dag_owner',
+    'migration_default_s3_bucket',
+    'migration_distcp_bandwidth',
+    'migration_distcp_mappers',
+    'migration_email_recipients',
+    'migration_report_location',
+    'migration_smtp_conn_id',
+    'migration_spark_conn_id',
+    'migration_tracking_database',
+    'migration_tracking_location',
+    's3_access_key',
+    's3_endpoint',
+    's3_secret_key',
+    # Not written by the portal, but owned: get_config resolves it and
+    # mapr_user through one `or` chain, so leaving it unowned would let a plain
+    # value set by hand outrank the nx1_ mapr_user a portal run just resolved.
+    'service_account_user_id',
+})
+
 __all__ = [
     "PORTAL_TRIGGER",
+    "PORTAL_OWNED_KEYS",
     "SSH_COMMAND_TIMEOUT",
     "_login_shell",
     "apply_bucket_credentials",
@@ -223,21 +256,24 @@ def get_config() -> dict:
     )
 
     def _var(base_key: str, env_var: str, default: str) -> str:
-        """Resolve one config value, highest-precedence tier first.
+        """Resolve one config value from the tier chain its origin allows.
 
-        1. ``<base_key>__<run_id>``  — per-run override written by the portal
-        2. ``nx1_<base_key>``        — tenant default owned by the portal's
-                                       Infrastructure Config page. **Portal-
-                                       triggered runs only** — see _portal_run.
-        3. ``<base_key>``            — plain Variable, hand-set in the Airflow UI
-        4. ``env_var``               — env.shared / env.<dag_stem> / process env
-        5. ``default``
+        The chain depends on two things: whether this run carries the portal's
+        marker, and whether the key is in PORTAL_OWNED_KEYS.
 
-        Tier 2 is deliberately invisible to a hand-launched DAG: the portal owns
-        that namespace, so a manual deploy keeps resolving from its own env file
-        and plain Variables even when an admin has saved credentials in the portal.
+                              portal-marked run            hand-launched run
+        portal-owned key      nx1_<key>__<run_id>          <key>
+                              nx1_<key>                    env_var
+                              default                      default
 
-        Tier 1 resolves on **presence**, tiers 2-4 on **truthiness**:
+        anything else         <key> / env_var / default    <key> / env_var / default
+
+        The two columns share no name, so neither origin can read or write what
+        the other resolves. Keys nobody owns are deployment baseline and stay
+        common to both. Portal-owned but never written by the portal — see
+        service_account_user_id — is simply absent for a portal run.
+
+        Tier 1 matches on **presence**, every other tier on **truthiness**:
 
         * The portal writes a run-scoped Variable only for a field the user
           actually filled in, so an empty one is a deliberate "no value" — an
@@ -250,17 +286,16 @@ def get_config() -> dict:
         A lookup failure is not caught. ``default_var=None`` already covers the
         missing-key case, so the only thing left to swallow would be a genuine
         Airflow fault — and resolving a bucket or credential to its hardcoded
-        default because the metadata DB hiccuped is how data ends up in the wrong
-        place. Better to fail the task.
+        default because the metadata DB hiccuped is how data ends up in the
+        wrong place. Better to fail the task.
         """
-        if _run_id:
-            scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
-            if scoped is not None:
-                return scoped
-        if _portal_run:
-            portal_default = Variable.get(f"nx1_{base_key}", default_var=None)
-            if portal_default:
-                return portal_default
+        if base_key in PORTAL_OWNED_KEYS and _portal_run:
+            if _run_id:
+                scoped = Variable.get(f"nx1_{base_key}__{_run_id}", default_var=None)
+                if scoped is not None:
+                    return scoped
+            return Variable.get(f"nx1_{base_key}", default_var=None) or default
+
         plain = Variable.get(base_key, default_var=None)
         if plain:
             return plain
