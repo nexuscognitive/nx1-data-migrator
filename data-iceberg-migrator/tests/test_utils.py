@@ -400,6 +400,88 @@ class TestBuildS3Opts:
 
 
 # ---------------------------------------------------------------------------
+# _endpoint_credentials / config['portal_run']
+# ---------------------------------------------------------------------------
+class TestEndpointCredentials:
+    """Credentials for an Excel row that names its own S3 endpoint."""
+
+    _HOST = 's3.tenant-a.example.com'
+
+    @staticmethod
+    def _variables(mapping: dict):
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    def test_manual_run_uses_the_per_host_variable(self):
+        cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
+        with self._variables({f'{self._HOST}_access_key': 'PER_HOST'}):
+            access, _ = m._endpoint_credentials(self._HOST, cfg)
+        assert access == 'PER_HOST'
+
+    def test_manual_run_falls_back_to_the_global(self):
+        cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
+        with self._variables({}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('GLOBAL', 'GLOBALSEC')
+
+    def test_portal_run_ignores_the_plain_per_host_variable(self):
+        """A wizard override must not be silently outranked by a hand-set value."""
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({f'{self._HOST}_access_key': 'PER_HOST'}):
+            access, _ = m._endpoint_credentials(self._HOST, cfg)
+        assert access == 'FROM_WIZARD'
+
+    def test_portal_run_uses_the_prefixed_per_host_variable(self):
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({f'nx1_{self._HOST}_access_key': 'PER_HOST_PORTAL'}):
+            access, _ = m._endpoint_credentials(self._HOST, cfg)
+        assert access == 'PER_HOST_PORTAL'
+
+    def test_manual_run_reads_the_per_host_env_var(self):
+        cfg = {'portal_run': False, 's3_access_key': '', 's3_secret_key': ''}
+        with self._variables({}), patch.dict(
+            'os.environ', {'S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY': 'FROM_ENV'}
+        ):
+            access, _ = m._endpoint_credentials(self._HOST, cfg)
+        assert access == 'FROM_ENV'
+
+    def test_portal_run_ignores_the_per_host_env_var(self):
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({}), patch.dict(
+            'os.environ', {'S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY': 'FROM_ENV'}
+        ):
+            access, _ = m._endpoint_credentials(self._HOST, cfg)
+        assert access == 'FROM_WIZARD'
+
+    def test_build_s3_opts_uses_the_helper(self):
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({f'{self._HOST}_access_key': 'PER_HOST'}):
+            opts = m.build_s3_opts('s3a://bucket-a', cfg, f'https://{self._HOST}')
+        assert 'PER_HOST' not in opts
+        assert 'FROM_WIZARD' in opts
+
+
+class TestPortalRunFlagInConfig:
+
+    def test_config_reports_a_portal_run(self):
+        conf = {'triggered_by': m.PORTAL_TRIGGER}
+        dag_run = type('DagRun', (), {'conf': conf})()
+        with patch('airflow.operators.python.get_current_context',
+                   return_value={'run_id': 'data_migration_1', 'dag_run': dag_run}):
+            cfg = m.get_config()
+        assert cfg['portal_run'] is True
+
+    def test_config_reports_a_manual_run(self):
+        dag_run = type('DagRun', (), {'conf': {}})()
+        with patch('airflow.operators.python.get_current_context',
+                   return_value={'run_id': 'manual__2026', 'dag_run': dag_run}):
+            cfg = m.get_config()
+        assert cfg['portal_run'] is False
+
+
+# ---------------------------------------------------------------------------
 # configure_spark_s3
 # ---------------------------------------------------------------------------
 class TestConfigureSparkS3:

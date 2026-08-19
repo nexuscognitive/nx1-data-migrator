@@ -388,6 +388,10 @@ def get_config() -> dict:
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
         'owner': dag_owner,
+
+        # build_s3_opts and validate_bucket_endpoint_pairs resolve per-endpoint
+        # credentials outside _var and need to know which namespace to read.
+        'portal_run': _portal_run,
     }
 
     if dag_owner and dag_owner != 'data-migration':
@@ -616,6 +620,29 @@ def _s3a_committer_opts(config: dict) -> str:
     return ""
 
 
+def _endpoint_credentials(ep_hostname: str, config: dict) -> tuple[str, str]:
+    """Credentials for a row that names its own S3 endpoint.
+
+    These key names are built from a hostname at run time, so they cannot live
+    in PORTAL_OWNED_KEYS — the origin is checked here instead. A hand-launched
+    run reads the per-host Variable then the per-host env var; a portal run
+    reads only nx1_<host>_*, so a per-host value set in the Airflow UI can no
+    longer outrank the credential the portal supplied for this run. Both fall
+    back to the resolved global.
+    """
+    if config.get('portal_run'):
+        access_key = Variable.get(f'nx1_{ep_hostname}_access_key', default_var='')
+        secret_key = Variable.get(f'nx1_{ep_hostname}_secret_key', default_var='')
+    else:
+        env_slug = ep_hostname.upper().replace('.', '_').replace('-', '_')
+        access_key = Variable.get(f'{ep_hostname}_access_key',
+                                  default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
+        secret_key = Variable.get(f'{ep_hostname}_secret_key',
+                                  default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
+    return (access_key or config.get('s3_access_key') or '',
+            secret_key or config.get('s3_secret_key') or '')
+
+
 def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -> str:
     """Build per-bucket Hadoop S3A JVM options scoped to the destination bucket name.
 
@@ -638,10 +665,15 @@ def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -
       Slug = hostname of dest_endpoint, lowercased, e.g. "s3.tenant-a.example.com"
       Hyphens and dots are kept in the Airflow Variable name; env var uses underscores.
 
-      Airflow Variable                          Environment variable
+      Airflow Variable (manual)                 Airflow Variable (portal run)
       ----------------------------------------- -------------------------------------------
-      s3.tenant-a.example.com_access_key        S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY  (masked)
-      s3.tenant-a.example.com_secret_key        S3_TENANT_A_EXAMPLE_COM_SECRET_KEY  (masked)
+      s3.tenant-a.example.com_access_key        nx1_s3.tenant-a.example.com_access_key
+      s3.tenant-a.example.com_secret_key        nx1_s3.tenant-a.example.com_secret_key
+
+      A hand-launched run falls through further, to an env var, when neither
+      Variable above is set: S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY / _SECRET_KEY
+      for this slug. A portal run has no env var fallback — nx1_<host>_*
+      resolves straight to the global instead.
     """
     from urllib.parse import urlparse
 
@@ -660,14 +692,8 @@ def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -
     if endpoint and bucket_name:
         ep_hostname = urlparse(endpoint).hostname or urlparse(endpoint).netloc or endpoint
         ep_hostname = ep_hostname.lower().strip()
-        env_slug = ep_hostname.upper().replace('.', '_').replace('-', '_')
 
-        access_key = (Variable.get(f'{ep_hostname}_access_key',
-                                   default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
-                      or config.get('s3_access_key') or '')
-        secret_key = (Variable.get(f'{ep_hostname}_secret_key',
-                                   default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
-                      or config.get('s3_secret_key') or '')
+        access_key, secret_key = _endpoint_credentials(ep_hostname, config)
 
         s3_opts = f" -Dfs.s3a.bucket.{bucket_name}.endpoint={endpoint}"
         if access_key:
@@ -736,18 +762,8 @@ def validate_bucket_endpoint_pairs(grouped: dict, config: dict) -> None:
             or endpoint_val
         )
         ep_hostname = ep_hostname.lower().strip()
-        env_slug = ep_hostname.upper().replace('.', '_').replace('-', '_')
 
-        access_key = (
-            Variable.get(f'{ep_hostname}_access_key',
-                         default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
-            or config.get('s3_access_key') or ''
-        )
-        secret_key = (
-            Variable.get(f'{ep_hostname}_secret_key',
-                         default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
-            or config.get('s3_secret_key') or ''
-        )
+        access_key, secret_key = _endpoint_credentials(ep_hostname, config)
 
         try:
             s3 = boto3.client(
