@@ -250,6 +250,23 @@ class TestVarPrecedence:
                 f'{key} is now read — remove it from _WRITTEN_BUT_NEVER_READ'
             )
 
+    def test_s3_listing_tool_resolves_through_var(self):
+        ctx, vars_ = self._portal({})
+        with ctx, vars_, patch.dict('os.environ', {'S3_LISTING_TOOL': 'aws'}):
+            cfg = m.get_config()
+        assert cfg['s3_listing_tool'] == 'aws'
+
+    def test_folder_copy_allow_delete_resolves_through_var(self):
+        ctx, vars_ = self._portal({})
+        with ctx, vars_, patch.dict('os.environ', {'FOLDER_COPY_ALLOW_DELETE': 'true'}):
+            cfg = m.get_config()
+        assert cfg['folder_copy_allow_delete'] == 'true'
+
+    def test_folder_copy_allow_delete_defaults_to_false(self):
+        with self._variables({}):
+            cfg = m.get_config()
+        assert cfg['folder_copy_allow_delete'] == 'false'
+
 
 class TestTrackDuration:
 

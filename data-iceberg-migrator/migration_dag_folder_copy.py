@@ -493,16 +493,9 @@ def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **con
     )
     log_name = re.sub(r'[^A-Za-z0-9_.-]', '_', str(dest_folder or 'folder')).strip('_') or 'folder'
 
-    allow_delete_raw = config.get('folder_copy_allow_delete')
-    if allow_delete_raw is None:
-        try:
-            from airflow.models import Variable
-            allow_delete_raw = Variable.get('folder_copy_allow_delete', default_var=None)
-        except Exception:
-            allow_delete_raw = None
-    if allow_delete_raw is None:
-        allow_delete_raw = os.environ.get('FOLDER_COPY_ALLOW_DELETE')
-    allow_delete = str(allow_delete_raw).strip().lower() in ('true', '1', 'yes', 'on')
+    allow_delete = str(config.get('folder_copy_allow_delete')).strip().lower() in (
+        'true', '1', 'yes', 'on'
+    )
 
     delete_flag = ''
     if config.get('distcp_preserve_delete') is True and allow_delete:

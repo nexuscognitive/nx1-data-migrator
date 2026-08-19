@@ -350,7 +350,10 @@ def get_config() -> dict:
         'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', ''),
 
         # Listing tool
-        's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
+        's3_listing_tool': _var('s3_listing_tool', 'S3_LISTING_TOOL', 'hadoop'),
+        'folder_copy_allow_delete': _var(
+            'folder_copy_allow_delete', 'FOLDER_COPY_ALLOW_DELETE', 'false'
+        ),
 
         # S3 source credentials
         's3_source_endpoint': _var('s3_source_endpoint', 'S3_SOURCE_ENDPOINT', ''),
