@@ -250,19 +250,27 @@ class TestVarPrecedence:
                 f'{key} is now read — remove it from _WRITTEN_BUT_NEVER_READ'
             )
 
-    def test_s3_listing_tool_resolves_through_var(self):
-        ctx, vars_ = self._portal({})
+    def test_s3_listing_tool_empty_variable_falls_through_to_env(self):
+        """When Variable is set to '', _var treats it as unset and consults env."""
+        ctx, vars_ = self._portal({'s3_listing_tool': ''})
         with ctx, vars_, patch.dict('os.environ', {'S3_LISTING_TOOL': 'aws'}):
             cfg = m.get_config()
         assert cfg['s3_listing_tool'] == 'aws'
 
-    def test_folder_copy_allow_delete_resolves_through_var(self):
-        ctx, vars_ = self._portal({})
+    def test_folder_copy_allow_delete_empty_variable_falls_through_to_env(self):
+        """When Variable is set to '', _var treats it as unset and consults env.
+
+        This is the destructive-delete flag: old code treated empty as authoritative,
+        new code treats empty as unset. This is consistent with _var semantics
+        (empty means the operator cleared it, don't use manual-run values).
+        """
+        ctx, vars_ = self._portal({'folder_copy_allow_delete': ''})
         with ctx, vars_, patch.dict('os.environ', {'FOLDER_COPY_ALLOW_DELETE': 'true'}):
             cfg = m.get_config()
         assert cfg['folder_copy_allow_delete'] == 'true'
 
     def test_folder_copy_allow_delete_defaults_to_false(self):
+        """When neither Variable nor env are set, default is 'false'."""
         with self._variables({}):
             cfg = m.get_config()
         assert cfg['folder_copy_allow_delete'] == 'false'
