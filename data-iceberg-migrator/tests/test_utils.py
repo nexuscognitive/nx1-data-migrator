@@ -1031,8 +1031,19 @@ class TestMaprTicketCheckIdentity:
         script = self._captured_script(
             {**self._BASE, 'service_account_user_id': 'svc_migration'}
         )
-        assert 'grep -q "$MIG_USER"' in script
-        assert 'CONFIGURED_SA_USER="svc_migration"' in script
+        assert 'grep -qF -- "$MIG_USER"' in script
+        assert 'CONFIGURED_SA_USER=svc_migration' in script
+
+    def test_a_shell_metacharacter_in_the_identity_cannot_break_out(self):
+        """The identity is operator-supplied and lands in a script run over SSH
+        on the edge node, so it is quoted rather than interpolated into a quoted
+        assignment."""
+        payload = 'x";id > /tmp/pwn;#'
+        script = self._captured_script(
+            {**self._BASE, 'service_account_user_id': payload}
+        )
+        assert f"CONFIGURED_SA_USER='{payload}'" in script
+        assert 'id > /tmp/pwn' not in script.replace(f"'{payload}'", '')
 
     def test_an_empty_identity_never_greps_for_nothing(self):
         script = self._captured_script({**self._BASE, 'service_account_user_id': ''})
@@ -1040,4 +1051,4 @@ class TestMaprTicketCheckIdentity:
             "an empty pattern matches any maprlogin output, so the missing-ticket "
             "branch could never fire"
         )
-        assert 'grep -q "$MIG_USER"' in script
+        assert 'grep -qF -- "$MIG_USER"' in script

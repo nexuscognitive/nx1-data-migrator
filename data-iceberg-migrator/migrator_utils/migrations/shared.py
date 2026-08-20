@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import random
+import shlex
 import time
 from functools import wraps
 
@@ -521,7 +522,7 @@ def cluster_login(run_id: str) -> dict:
 
     auth_script_parts.append(f"""
 
-CONFIGURED_SA_USER="{sa_user}"
+CONFIGURED_SA_USER={shlex.quote(sa_user)}
 if [ -n "$CONFIGURED_SA_USER" ]; then
     MIG_USER="$CONFIGURED_SA_USER"
     MIG_USER_SOURCE="config:service_account_user_id"
@@ -537,7 +538,7 @@ if [ "{auth_method}" = "mapr" ]; then
     MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}"
     export MAPR_TICKETFILE_LOCATION
 
-    if maprlogin print 2>/dev/null | grep -q "$MIG_USER"; then
+    if maprlogin print 2>/dev/null | grep -qF -- "$MIG_USER"; then
         echo "Using existing valid MapR ticket"
     else
         echo "ERROR: No valid MapR ticket found"
