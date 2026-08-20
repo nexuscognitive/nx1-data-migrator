@@ -216,30 +216,33 @@ def _load_tenant_profile(tenant: str, portal_run: bool) -> dict:
     nothing written to `nx1_migration_tenant_profiles` yet simply gets an
     empty profile, same as any other never-written portal field.
     """
+    var_name = (
+        'nx1_migration_tenant_profiles' if portal_run else 'migration_tenant_profiles'
+    )
     if portal_run:
-        raw = Variable.get('nx1_migration_tenant_profiles', default_var='{}')
+        raw = Variable.get(var_name, default_var='{}')
     else:
         raw = Variable.get(
-            'migration_tenant_profiles',
+            var_name,
             default_var=os.getenv('MIGRATION_TENANT_PROFILES', '{}'),
         )
     try:
         profiles = raw if isinstance(raw, dict) else json.loads(raw or '{}')
     except (ValueError, TypeError) as exc:
         raise ValueError(
-            f"Airflow Variable 'migration_tenant_profiles' is not valid JSON: {exc}"
+            f"Airflow Variable {var_name!r} is not valid JSON: {exc}"
         ) from exc
 
     if not isinstance(profiles, dict):
         raise ValueError(
-            "Airflow Variable 'migration_tenant_profiles' must be a JSON object "
+            f"Airflow Variable {var_name!r} must be a JSON object "
             "keyed by tenant name."
         )
 
     if tenant not in profiles:
         known = ', '.join(sorted(profiles)) or '<none defined>'
         raise ValueError(
-            f"tenant={tenant!r} not found in 'migration_tenant_profiles'. "
+            f"tenant={tenant!r} not found in {var_name!r}. "
             f"Known tenants: {known}"
         )
 
@@ -284,7 +287,7 @@ def get_config() -> dict:
     _tenant = str(_dag_run_conf.get('tenant') or '').strip()
     _profile = _load_tenant_profile(_tenant, _portal_run) if _tenant else {}
 
-    def _var(base_key: str, env_var: str, default: str, conf_key: str = None) -> str:
+    def _var(base_key: str, env_var: str, default: str, conf_key: str | None = None) -> str:
         """Resolve one config value from the tier chain its origin allows.
 
         A ``conf_key`` value, when the caller passes one, outranks everything
@@ -677,8 +680,8 @@ def _endpoint_credentials(ep_hostname: str, config: dict) -> tuple[str, str]:
     in PORTAL_OWNED_KEYS — the origin is checked here instead. A hand-launched
     run reads the per-host Variable then the per-host env var; a portal run
     reads only nx1_<host>_*, so a per-host value set in the Airflow UI can no
-    longer outrank the credential the portal supplied for this run. Both fall
-    back to the resolved global.
+    longer outrank the credential the portal supplied for this run. Either
+    origin falls back to the resolved global pair.
     """
     if config.get('portal_run'):
         access_key = Variable.get(f'nx1_{ep_hostname}_access_key', default_var='')
@@ -689,8 +692,12 @@ def _endpoint_credentials(ep_hostname: str, config: dict) -> tuple[str, str]:
                                   default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
         secret_key = Variable.get(f'{ep_hostname}_secret_key',
                                   default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
-    return (access_key or config.get('s3_access_key') or '',
-            secret_key or config.get('s3_secret_key') or '')
+    # Both-or-neither: falling back one half at a time would sign with this
+    # host's access key and the tenant's global secret, which S3 rejects as
+    # SignatureDoesNotMatch rather than as a missing credential.
+    if access_key and secret_key:
+        return access_key, secret_key
+    return (config.get('s3_access_key') or '', config.get('s3_secret_key') or '')
 
 
 def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -> str:

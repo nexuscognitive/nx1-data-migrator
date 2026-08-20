@@ -316,7 +316,27 @@ class TestLoadTenantProfileOrigin:
         """
         with self._variables({'migration_tenant_profiles': _ACME_PLAIN_PROFILE}), \
                 patch.dict('os.environ', {'MIGRATION_TENANT_PROFILES': _ACME_PLAIN_PROFILE}), \
-                pytest.raises(ValueError, match="not found in 'migration_tenant_profiles'"):
+                pytest.raises(
+                    ValueError, match="not found in 'nx1_migration_tenant_profiles'"
+                ):
+            m._load_tenant_profile('acme', portal_run=True)
+
+    def test_a_portal_run_error_names_the_prefixed_variable(self):
+        """An operator debugging a portal run must be pointed at the Variable
+        that run actually read, not at the one the split made unreadable
+        from it."""
+        with self._variables({'nx1_migration_tenant_profiles': 'not json at all'}), \
+                pytest.raises(ValueError, match="'nx1_migration_tenant_profiles' is not valid JSON"):
+            m._load_tenant_profile('acme', portal_run=True)
+
+    def test_a_hand_launched_error_names_the_plain_variable(self):
+        with self._variables({'migration_tenant_profiles': 'not json at all'}), \
+                pytest.raises(ValueError, match="'migration_tenant_profiles' is not valid JSON"):
+            m._load_tenant_profile('acme', portal_run=False)
+
+    def test_a_portal_run_non_object_error_names_the_prefixed_variable(self):
+        with self._variables({'nx1_migration_tenant_profiles': '[1, 2, 3]'}), \
+                pytest.raises(ValueError, match="'nx1_migration_tenant_profiles' must be a JSON object"):
             m._load_tenant_profile('acme', portal_run=True)
 
 
@@ -564,7 +584,9 @@ class TestBuildS3Opts:
         def fake_var(key, default_var=''):
             mapping = {
                 's3.tenant-a.example.com_access_key': 'AK_A',
+                's3.tenant-a.example.com_secret_key': 'SK_A',
                 's3.tenant-b.example.com_access_key': 'AK_B',
+                's3.tenant-b.example.com_secret_key': 'SK_B',
             }
             return mapping.get(key, default_var)
         with patch('airflow.models.Variable.get', side_effect=fake_var):
@@ -608,9 +630,10 @@ class TestEndpointCredentials:
 
     def test_manual_run_uses_the_per_host_variable(self):
         cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
-        with self._variables({f'{self._HOST}_access_key': 'PER_HOST'}):
-            access, _ = m._endpoint_credentials(self._HOST, cfg)
-        assert access == 'PER_HOST'
+        with self._variables({f'{self._HOST}_access_key': 'PER_HOST',
+                              f'{self._HOST}_secret_key': 'PER_HOST_SEC'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('PER_HOST', 'PER_HOST_SEC')
 
     def test_manual_run_falls_back_to_the_global(self):
         cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
@@ -627,17 +650,19 @@ class TestEndpointCredentials:
 
     def test_portal_run_uses_the_prefixed_per_host_variable(self):
         cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
-        with self._variables({f'nx1_{self._HOST}_access_key': 'PER_HOST_PORTAL'}):
-            access, _ = m._endpoint_credentials(self._HOST, cfg)
-        assert access == 'PER_HOST_PORTAL'
+        with self._variables({f'nx1_{self._HOST}_access_key': 'PER_HOST_PORTAL',
+                              f'nx1_{self._HOST}_secret_key': 'PER_HOST_PORTAL_SEC'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('PER_HOST_PORTAL', 'PER_HOST_PORTAL_SEC')
 
     def test_manual_run_reads_the_per_host_env_var(self):
         cfg = {'portal_run': False, 's3_access_key': '', 's3_secret_key': ''}
         with self._variables({}), patch.dict(
-            'os.environ', {'S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY': 'FROM_ENV'}
+            'os.environ', {'S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY': 'FROM_ENV',
+                           'S3_TENANT_A_EXAMPLE_COM_SECRET_KEY': 'FROM_ENV_SEC'}
         ):
-            access, _ = m._endpoint_credentials(self._HOST, cfg)
-        assert access == 'FROM_ENV'
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('FROM_ENV', 'FROM_ENV_SEC')
 
     def test_portal_run_ignores_the_per_host_env_var(self):
         cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
@@ -646,6 +671,28 @@ class TestEndpointCredentials:
         ):
             access, _ = m._endpoint_credentials(self._HOST, cfg)
         assert access == 'FROM_WIZARD'
+
+    def test_half_a_per_host_pair_falls_back_to_the_whole_global_pair(self):
+        """Rollout copies per-host credentials one key at a time, so the
+        half-configured state is reachable by hand. Pairing this host's access
+        key with the tenant's global secret fails inside distcp as
+        SignatureDoesNotMatch, which names neither key."""
+        cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
+        with self._variables({f'{self._HOST}_access_key': 'PER_HOST'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('GLOBAL', 'GLOBALSEC')
+
+    def test_a_per_host_secret_alone_falls_back_too(self):
+        cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
+        with self._variables({f'{self._HOST}_secret_key': 'PER_HOST_SEC'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('GLOBAL', 'GLOBALSEC')
+
+    def test_half_a_prefixed_pair_falls_back_for_a_portal_run(self):
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({f'nx1_{self._HOST}_access_key': 'PER_HOST_PORTAL'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('FROM_WIZARD', 'WIZSEC')
 
     def test_build_s3_opts_uses_the_helper(self):
         cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
