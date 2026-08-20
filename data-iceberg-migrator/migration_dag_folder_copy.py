@@ -1888,7 +1888,15 @@ with DAG(
             default='s3a://config-bucket/folder_copy.xlsx',
             type='string',
             description='S3 path to Excel config file (columns: source_path, target_bucket, dest_folder)'
-        )
+        ),
+        'tenant': Param(
+            default=None,
+            type=['null', 'string'],
+            description=(
+                'Tenant/environment key from the migration_tenant_profiles Variable '
+                '(e.g. tenant_1, tenant_2). Blank = use the global cluster_* Variables.'
+            )
+        ),
     },
     render_template_as_native_obj=True,
     on_failure_callback=_folder_copy_dag_failure_callback,

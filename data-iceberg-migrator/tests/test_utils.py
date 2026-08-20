@@ -223,8 +223,12 @@ class TestVarPrecedence:
     # The portal writes these; no DAG in either repo reads them. auth_method
     # 'kinit' only checks for an existing TGT. They stay in PORTAL_OWNED_KEYS so
     # that isolation is already correct if a DAG ever starts reading one.
+    # mapr_user lost its reader on main ("fix: remove mapr_user variable") —
+    # migration_dag_mapr_to_s3 now reads service_account_user_id instead. The
+    # portal still has a MapR User field writing nx1_mapr_user, so the key stays
+    # owned; nothing consumes it until that field is repointed.
     _WRITTEN_BUT_NEVER_READ = frozenset({
-        'kinit_keytab', 'kinit_password', 'kinit_principal',
+        'kinit_keytab', 'kinit_password', 'kinit_principal', 'mapr_user',
     })
 
     def test_every_owned_key_is_read_by_get_config(self):

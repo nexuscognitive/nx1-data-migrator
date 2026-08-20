@@ -157,11 +157,17 @@ def validate_prerequisites(run_id: str) -> dict:
     }
 
     auth_method = config.get("auth_method", "mapr")
-    mapr_user = config.get("mapr_user", "")
+    mapr_user = config.get("service_account_user_id", "")
 
     logger.info("=" * 60)
     logger.info("STARTING PRE-DAG VALIDATION")
     logger.info("=" * 60)
+
+    logger.info(
+        f"[validate_prerequisites] tenant={config.get('tenant') or 'default'} "
+        f"ssh_conn_id={config['ssh_conn_id']} mapr_user={mapr_user} "
+        f"auth_method={auth_method} mapr_ticketfile_location={config.get('mapr_ticketfile_location', '')}"
+    )
 
     try:
         ssh = SSHHook(ssh_conn_id=config["ssh_conn_id"])
@@ -529,7 +535,8 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
             '{sa_user.replace("'", "''")}',
             '{sa_source}'
         )
-    """)
+        """
+    )
 
     return run_id
 
@@ -3732,7 +3739,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
             Run ID: <strong>{run_id}</strong><br>
             DAG Run: <strong>{run_info.dag_run_id}</strong><br>
-            Service Account: <strong>{sa_display}</strong> <span style="opacity:0.7">({sa_source})</span>
+            Tenant: <strong>{config.get('tenant') or 'default'}</strong><br>
+            Service Account: <strong>{sa_display}</strong> <span style="opacity:0.7">({sa_source})</span><br>
+            Mapr Ticket File: <strong>{config.get('mapr_ticketfile_location', '')}</strong><br>
 """
 
     html += f"""
@@ -4474,7 +4483,15 @@ with DAG(
             default="s3a://config-bucket/migration.xlsx",
             type="string",
             description="S3 path to Excel config file",
-        )
+        ),
+        "tenant": Param(
+            default=None,
+            type=["null", "string"],
+            description=(
+                "Tenant/environment key from the migration_tenant_profiles Variable "
+                "(e.g. tenant_1, tenant_2). Blank = use the global cluster_* Variables."
+            ),
+        ),
     },
     render_template_as_native_obj=True,
 ) as dag_mapr_to_s3:
