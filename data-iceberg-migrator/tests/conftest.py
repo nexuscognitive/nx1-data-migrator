@@ -34,12 +34,6 @@ MOCK_VARIABLES = {
     's3_listing_tool':              'hadoop',
     'migration_smtp_conn_id':       'smtp_default',
     'migration_email_recipients':   'user@example.com',
-    's3_source_endpoint':  '',
-    's3_source_access_key': 'AKIASRC',
-    's3_source_secret_key': 'srcsecret',
-    's3_dest_endpoint':    '',
-    's3_dest_access_key':  'AKIADST',
-    's3_dest_secret_key':  'dstsecret',
 }
 
 

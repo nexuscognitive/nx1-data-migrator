@@ -29,9 +29,6 @@ PORTAL_OWNED_KEYS = frozenset({
     'auth_method',
     'cluster_edge_temp_path',
     'cluster_ssh_conn_id',
-    'kinit_keytab',
-    'kinit_password',
-    'kinit_principal',
     'mapr_ticketfile_location',
     'mapr_user',
     'migration_dag_owner',
@@ -58,12 +55,10 @@ __all__ = [
     "PORTAL_OWNED_KEYS",
     "SSH_COMMAND_TIMEOUT",
     "_login_shell",
-    "apply_bucket_credentials",
     "build_s3_opts",
     "cell_str",
     "cluster_login",
     "compute_dest_path",
-    "configure_spark_s3",
     "execute_with_iceberg_retry",
     "get_config",
     "hive_type_to_spark_ddl",
@@ -163,48 +158,6 @@ def execute_with_iceberg_retry(spark, sql: str, max_retries: int = 6, task_label
 
     if not status:
         raise last_exception
-
-# =============================================================================
-# HELPER: configure dual-S3 credentials on a Spark session
-# =============================================================================
-
-def configure_spark_s3(spark, config: dict):
-    """ Configure Spark with per-bucket S3A credentials for source and destination. """
-    src_endpoint   = config.get('s3_source_endpoint')   or config.get('s3_endpoint', '')
-    src_access_key = config.get('s3_source_access_key') or config.get('s3_access_key', '')
-    src_secret_key = config.get('s3_source_secret_key') or config.get('s3_secret_key', '')
-
-    dest_endpoint   = config.get('s3_dest_endpoint')   or config.get('s3_endpoint', '')
-    dest_access_key = config.get('s3_dest_access_key') or config.get('s3_access_key', '')
-    dest_secret_key = config.get('s3_dest_secret_key') or config.get('s3_secret_key', '')
-
-    if src_endpoint:
-        spark.conf.set("fs.s3a.endpoint", src_endpoint)
-    if src_access_key:
-        spark.conf.set("fs.s3a.access.key", src_access_key)
-    if src_secret_key:
-        spark.conf.set("fs.s3a.secret.key", src_secret_key)
-
-    config['_src_endpoint']    = src_endpoint
-    config['_src_access_key']  = src_access_key
-    config['_src_secret_key']  = src_secret_key
-    config['_dest_endpoint']   = dest_endpoint
-    config['_dest_access_key'] = dest_access_key
-    config['_dest_secret_key'] = dest_secret_key
-
-
-def apply_bucket_credentials(spark, bucket_url: str, endpoint: str, access_key: str, secret_key: str):
-    """Apply per-bucket S3A credentials given an s3a://bucket-name/... URL."""
-    if not bucket_url.startswith('s3a://') or not (access_key or endpoint):
-        return
-    bucket_name = bucket_url.split('/')[2]
-    if endpoint:
-        spark.conf.set(f"fs.s3a.bucket.{bucket_name}.endpoint", endpoint)
-    if access_key:
-        spark.conf.set(f"fs.s3a.bucket.{bucket_name}.access.key", access_key)
-    if secret_key:
-        spark.conf.set(f"fs.s3a.bucket.{bucket_name}.secret.key", secret_key)
-
 
 def compute_dest_path(source_location: str, dest_database: str, table_name: str,
                       dest_bucket: str, source_s3_prefix: str, dest_s3_prefix: str) -> str:
@@ -449,16 +402,6 @@ def get_config() -> dict:
         'folder_copy_allow_delete': _var(
             'folder_copy_allow_delete', 'FOLDER_COPY_ALLOW_DELETE', 'false'
         ),
-
-        # S3 source credentials
-        's3_source_endpoint': _var('s3_source_endpoint', 'S3_SOURCE_ENDPOINT', ''),
-        's3_source_access_key': _var('s3_source_access_key', 'S3_SOURCE_ACCESS_KEY', ''),
-        's3_source_secret_key': _var('s3_source_secret_key', 'S3_SOURCE_SECRET_KEY', ''),
-
-        # S3 destination credentials
-        's3_dest_endpoint': _var('s3_dest_endpoint','S3_DEST_ENDPOINT', ''),
-        's3_dest_access_key': _var('s3_dest_access_key', 'S3_DEST_ACCESS_KEY', ''),
-        's3_dest_secret_key': _var('s3_dest_secret_key', 'S3_DEST_SECRET_KEY', ''),
 
         # Email / SMTP Configuration
         'smtp_conn_id': _var('migration_smtp_conn_id', 'MIGRATION_SMTP_CONN_ID', 'smtp_default'),

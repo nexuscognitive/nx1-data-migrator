@@ -221,15 +221,12 @@ class TestVarPrecedence:
             cfg = m.get_config()
         assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
 
-    # The portal writes these; no DAG in either repo reads them. auth_method
-    # 'kinit' only checks for an existing TGT. They stay in PORTAL_OWNED_KEYS so
-    # that isolation is already correct if a DAG ever starts reading one.
     # mapr_user lost its reader on main ("fix: remove mapr_user variable") —
     # migration_dag_mapr_to_s3 now reads service_account_user_id instead. The
     # portal still has a MapR User field writing nx1_mapr_user, so the key stays
     # owned; nothing consumes it until that field is repointed.
     _WRITTEN_BUT_NEVER_READ = frozenset({
-        'kinit_keytab', 'kinit_password', 'kinit_principal', 'mapr_user',
+        'mapr_user',
     })
 
     def test_every_owned_key_is_read_by_get_config(self):
@@ -692,64 +689,6 @@ class TestPortalRunFlagInConfig:
                    return_value={'run_id': 'manual__2026', 'dag_run': dag_run}):
             cfg = m.get_config()
         assert cfg['portal_run'] is False
-
-
-# ---------------------------------------------------------------------------
-# configure_spark_s3
-# ---------------------------------------------------------------------------
-class TestConfigureSparkS3:
-
-    def test_sets_source_and_dest_credentials(self, mock_spark):
-        config = {
-            's3_source_endpoint': 'https://src.example.com',
-            's3_source_access_key': 'SRC_AK',
-            's3_source_secret_key': 'SRC_SK',
-            's3_dest_endpoint': 'https://dst.example.com',
-            's3_dest_access_key': 'DST_AK',
-            's3_dest_secret_key': 'DST_SK',
-        }
-        m.configure_spark_s3(mock_spark, config)
-        mock_spark.conf.set.assert_any_call('fs.s3a.endpoint', 'https://src.example.com')
-        mock_spark.conf.set.assert_any_call('fs.s3a.access.key', 'SRC_AK')
-        mock_spark.conf.set.assert_any_call('fs.s3a.secret.key', 'SRC_SK')
-        assert config['_dest_endpoint'] == 'https://dst.example.com'
-        assert config['_dest_access_key'] == 'DST_AK'
-
-    def test_falls_back_to_global_keys(self, mock_spark):
-        config = {
-            's3_endpoint': 'https://global.example.com',
-            's3_access_key': 'GLOBAL_AK',
-            's3_secret_key': 'GLOBAL_SK',
-        }
-        m.configure_spark_s3(mock_spark, config)
-        mock_spark.conf.set.assert_any_call('fs.s3a.endpoint', 'https://global.example.com')
-        assert config['_src_endpoint'] == 'https://global.example.com'
-        assert config['_dest_endpoint'] == 'https://global.example.com'
-
-    def test_skips_empty_values(self, mock_spark):
-        config = {}
-        m.configure_spark_s3(mock_spark, config)
-        mock_spark.conf.set.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# apply_bucket_credentials
-# ---------------------------------------------------------------------------
-class TestApplyBucketCredentials:
-
-    def test_sets_per_bucket_credentials(self, mock_spark):
-        m.apply_bucket_credentials(mock_spark, 's3a://my-bucket/path', 'https://ep.com', 'AK', 'SK')
-        mock_spark.conf.set.assert_any_call('fs.s3a.bucket.my-bucket.endpoint', 'https://ep.com')
-        mock_spark.conf.set.assert_any_call('fs.s3a.bucket.my-bucket.access.key', 'AK')
-        mock_spark.conf.set.assert_any_call('fs.s3a.bucket.my-bucket.secret.key', 'SK')
-
-    def test_skips_non_s3a_url(self, mock_spark):
-        m.apply_bucket_credentials(mock_spark, '/local/path', 'https://ep.com', 'AK', 'SK')
-        mock_spark.conf.set.assert_not_called()
-
-    def test_skips_when_no_credentials_or_endpoint(self, mock_spark):
-        m.apply_bucket_credentials(mock_spark, 's3a://bucket/path', '', '', '')
-        mock_spark.conf.set.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
