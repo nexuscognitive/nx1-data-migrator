@@ -5,6 +5,7 @@ Tests for shared utility functions:
   - execute_with_iceberg_retry()
 """
 
+import json
 import time
 from unittest.mock import MagicMock, patch
 
@@ -278,6 +279,189 @@ class TestVarPrecedence:
         with self._variables({}):
             cfg = m.get_config()
         assert cfg['folder_copy_allow_delete'] == 'false'
+
+
+# ---------------------------------------------------------------------------
+# _load_tenant_profile — origin split for the migration_tenant_profiles Variable
+# ---------------------------------------------------------------------------
+_ACME_NX1_PROFILE = json.dumps({'acme': {'ssh_conn_id': 'FROM_NX1_PROFILE'}})
+_ACME_PLAIN_PROFILE = json.dumps({'acme': {'ssh_conn_id': 'FROM_PLAIN_PROFILE'}})
+
+
+class TestLoadTenantProfileOrigin:
+    """_load_tenant_profile mirrors the origin split _var applies to
+    PORTAL_OWNED_KEYS (and that _endpoint_credentials applies to per-host
+    creds): a portal-marked run and a hand-launched run each read a
+    differently-named Variable, and neither sees the other's value.
+    """
+
+    @staticmethod
+    def _variables(mapping: dict):
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    _BOTH_SET = {
+        'nx1_migration_tenant_profiles': _ACME_NX1_PROFILE,
+        'migration_tenant_profiles': _ACME_PLAIN_PROFILE,
+    }
+
+    def test_portal_run_reads_the_prefixed_profile(self):
+        with self._variables(self._BOTH_SET):
+            profile = m._load_tenant_profile('acme', portal_run=True)
+        assert profile == {'ssh_conn_id': 'FROM_NX1_PROFILE'}
+
+    def test_portal_run_ignores_a_plain_variable_that_is_set(self):
+        """A plain migration_tenant_profiles sitting there for the same
+        tenant must not reach a portal run, even though one is set."""
+        with self._variables(self._BOTH_SET):
+            profile = m._load_tenant_profile('acme', portal_run=True)
+        assert profile['ssh_conn_id'] != 'FROM_PLAIN_PROFILE'
+
+    def test_hand_launched_run_reads_the_plain_profile(self):
+        with self._variables(self._BOTH_SET):
+            profile = m._load_tenant_profile('acme', portal_run=False)
+        assert profile == {'ssh_conn_id': 'FROM_PLAIN_PROFILE'}
+
+    def test_hand_launched_run_ignores_the_prefixed_variable(self):
+        with self._variables(self._BOTH_SET):
+            profile = m._load_tenant_profile('acme', portal_run=False)
+        assert profile['ssh_conn_id'] != 'FROM_NX1_PROFILE'
+
+    def test_portal_run_with_nothing_written_yet_gets_an_empty_profile(self):
+        """Before the portal ever writes nx1_migration_tenant_profiles, a
+        portal run must not fall back to the plain Variable or its env file
+        — unset means the profile contributes nothing, same as any other
+        portal-owned field nobody has written yet.
+        """
+        with self._variables({'migration_tenant_profiles': _ACME_PLAIN_PROFILE}), \
+                patch.dict('os.environ', {'MIGRATION_TENANT_PROFILES': _ACME_PLAIN_PROFILE}), \
+                pytest.raises(ValueError, match="not found in 'migration_tenant_profiles'"):
+            m._load_tenant_profile('acme', portal_run=True)
+
+
+class TestTenantProfileConfKeyPrecedence:
+    """Integration: the conf_key tier in get_config._var checks dag_run.conf
+    before the tenant profile, for either run origin — unaffected by which
+    Variable the profile itself came from.
+    """
+
+    @staticmethod
+    def _variables(mapping: dict):
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    @staticmethod
+    def _context(run_id: str, conf: dict):
+        dag_run = type('DagRun', (), {'conf': conf})()
+        return patch(
+            'airflow.operators.python.get_current_context',
+            return_value={'run_id': run_id, 'dag_run': dag_run},
+        )
+
+    _BOTH_SET = {
+        'nx1_migration_tenant_profiles': _ACME_NX1_PROFILE,
+        'migration_tenant_profiles': _ACME_PLAIN_PROFILE,
+    }
+
+    def test_dag_run_conf_wins_over_the_portal_profile(self):
+        """Invariant, not a regression guard for this fix: the conf_key loop already
+        checked dag_run.conf before the profile, for either origin, prior to this
+        change. Passes identically if the origin split in _load_tenant_profile is
+        reverted — it pins that the ordering itself stays correct, nothing more.
+        """
+        conf = {'triggered_by': m.PORTAL_TRIGGER, 'tenant': 'acme', 'ssh_conn_id': 'FROM_CONF'}
+        with self._context('data_migration_1', conf), self._variables(self._BOTH_SET):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_CONF'
+
+    def test_dag_run_conf_wins_over_the_manual_profile(self):
+        """Invariant, not a regression guard for this fix — see the portal-side
+        version above for why this one also can't fail if the fix is reverted.
+        """
+        conf = {'tenant': 'acme', 'ssh_conn_id': 'FROM_CONF'}
+        with self._context('manual__2026', conf), self._variables(self._BOTH_SET):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_CONF'
+
+    def test_portal_profile_feeds_config_when_conf_is_silent(self):
+        conf = {'triggered_by': m.PORTAL_TRIGGER, 'tenant': 'acme'}
+        with self._context('data_migration_1', conf), self._variables(self._BOTH_SET):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_NX1_PROFILE'
+
+    def test_manual_profile_feeds_config_when_conf_is_silent(self):
+        """Invariant, not a regression guard for this fix: a hand-launched run read
+        the plain Variable before this change existed too, so this can't fail on a
+        revert — it documents that the wiring into get_config's output still works.
+        """
+        conf = {'tenant': 'acme'}
+        with self._context('manual__2026', conf), self._variables(self._BOTH_SET):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_PLAIN_PROFILE'
+
+
+class TestTenantProfileFallsThroughByOrigin:
+    """Each direction of the crossing, proven through get_config() by asserting a
+    resolved value — not just that the loader picked the right Variable.
+
+    Both scenarios give the *other* origin's Variable a real, distinct value the
+    run must not pick up, and give the run's *own* Variable a tenant entry with no
+    override for the tested field, so the profile legitimately contributes nothing
+    and resolution must fall to the Variable tier below it. Asserting a third,
+    lower-tier sentinel value (not either profile's) is what makes these fail with
+    a value mismatch rather than passing by accident.
+    """
+
+    @staticmethod
+    def _variables(mapping: dict):
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    @staticmethod
+    def _context(run_id: str, conf: dict):
+        dag_run = type('DagRun', (), {'conf': conf})()
+        return patch(
+            'airflow.operators.python.get_current_context',
+            return_value={'run_id': run_id, 'dag_run': dag_run},
+        )
+
+    def test_portal_run_with_only_a_plain_profile_falls_through_to_the_tier_below(self):
+        """Portal run; migration_tenant_profiles (plain) is set for 'acme' and
+        nx1_migration_tenant_profiles has 'acme' but no override — the profile
+        must contribute nothing, so ssh_conn_id resolves from the nx1_ Variable
+        tier below the profile, not from the plain decoy.
+        """
+        conf = {'triggered_by': m.PORTAL_TRIGGER, 'tenant': 'acme'}
+        variables = {
+            'nx1_migration_tenant_profiles': json.dumps({'acme': {}}),
+            'migration_tenant_profiles': _ACME_PLAIN_PROFILE,
+            'nx1_cluster_ssh_conn_id': 'FROM_PORTAL_TIER_BELOW',
+        }
+        with self._context('data_migration_1', conf), self._variables(variables):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_PORTAL_TIER_BELOW'
+
+    def test_hand_launched_run_with_only_a_prefixed_profile_falls_through_to_the_tier_below(self):
+        """Hand-launched run; nx1_migration_tenant_profiles is set for 'acme' and
+        the plain migration_tenant_profiles has 'acme' but no override — the
+        profile must contribute nothing, so ssh_conn_id resolves from the plain
+        Variable tier below the profile, not from the nx1_ decoy.
+        """
+        conf = {'tenant': 'acme'}
+        variables = {
+            'nx1_migration_tenant_profiles': _ACME_NX1_PROFILE,
+            'migration_tenant_profiles': json.dumps({'acme': {}}),
+            'cluster_ssh_conn_id': 'FROM_MANUAL_TIER_BELOW',
+        }
+        with self._context('manual__2026', conf), self._variables(variables):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_MANUAL_TIER_BELOW'
 
 
 class TestTrackDuration:

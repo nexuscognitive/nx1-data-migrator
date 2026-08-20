@@ -249,12 +249,28 @@ TENANT_PROFILE_KEYS = frozenset({
 })
 
 
-def _load_tenant_profile(tenant: str) -> dict:
-    """ Load one tenant's settings from the `migration_tenant_profiles` Variable """
-    raw = Variable.get(
-        'migration_tenant_profiles',
-        default_var=os.getenv('MIGRATION_TENANT_PROFILES', '{}'),
-    )
+def _load_tenant_profile(tenant: str, portal_run: bool) -> dict:
+    """ Load one tenant's settings, from the Variable the run's origin owns.
+
+    A portal-marked run reads ``nx1_migration_tenant_profiles``; a
+    hand-launched run reads the plain ``migration_tenant_profiles``, exactly
+    as before this split existed. Neither falls back to the other — this
+    mirrors the origin rule ``_var`` applies to PORTAL_OWNED_KEYS, checked
+    here directly because this Variable is read outside `_var`'s tier chain
+    (see `_endpoint_credentials` for the other case that does the same).
+
+    The env fallback stays hand-launched-only too: the portal never had an
+    env file to fall back to for anything it owns, so a portal run with
+    nothing written to `nx1_migration_tenant_profiles` yet simply gets an
+    empty profile, same as any other never-written portal field.
+    """
+    if portal_run:
+        raw = Variable.get('nx1_migration_tenant_profiles', default_var='{}')
+    else:
+        raw = Variable.get(
+            'migration_tenant_profiles',
+            default_var=os.getenv('MIGRATION_TENANT_PROFILES', '{}'),
+        )
     try:
         profiles = raw if isinstance(raw, dict) else json.loads(raw or '{}')
     except (ValueError, TypeError) as exc:
@@ -314,7 +330,7 @@ def get_config() -> dict:
     )
 
     _tenant = str(_dag_run_conf.get('tenant') or '').strip()
-    _profile = _load_tenant_profile(_tenant) if _tenant else {}
+    _profile = _load_tenant_profile(_tenant, _portal_run) if _tenant else {}
 
     def _var(base_key: str, env_var: str, default: str, conf_key: str = None) -> str:
         """Resolve one config value from the tier chain its origin allows.
@@ -338,11 +354,12 @@ def get_config() -> dict:
         common to both. Portal-owned but never written by the portal — see
         service_account_user_id — is simply absent for a portal run.
 
-        Note the tenant profile is read from the plain, unprefixed
-        ``migration_tenant_profiles`` Variable, so for the keys that pass a
-        conf_key it sits *above* the portal's namespace and is visible to both
-        origins. That is a crossing the origin rule does not cover — see the
-        note in the PR.
+        The tenant profile itself is origin-split too: a portal-marked run
+        reads ``nx1_migration_tenant_profiles``, a hand-launched run reads
+        the plain ``migration_tenant_profiles`` (see `_load_tenant_profile`).
+        So for the keys that pass a conf_key, the profile sits *above* the
+        Variable tiers below but still inside the same namespace its origin
+        owns — it can no longer cross between origins.
 
         Tier 1 matches on **presence**, every other tier on **truthiness**:
 
