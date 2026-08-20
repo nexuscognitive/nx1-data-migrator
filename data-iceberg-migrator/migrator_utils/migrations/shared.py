@@ -30,7 +30,6 @@ PORTAL_OWNED_KEYS = frozenset({
     'cluster_edge_temp_path',
     'cluster_ssh_conn_id',
     'mapr_ticketfile_location',
-    'mapr_user',
     'migration_dag_owner',
     'migration_default_s3_bucket',
     'migration_distcp_bandwidth',

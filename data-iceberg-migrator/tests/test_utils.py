@@ -221,36 +221,18 @@ class TestVarPrecedence:
             cfg = m.get_config()
         assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
 
-    # mapr_user lost its reader on main ("fix: remove mapr_user variable") —
-    # migration_dag_mapr_to_s3 now reads service_account_user_id instead. The
-    # portal still has a MapR User field writing nx1_mapr_user, so the key stays
-    # owned; nothing consumes it until that field is repointed.
-    _WRITTEN_BUT_NEVER_READ = frozenset({
-        'mapr_user',
-    })
-
     def test_every_owned_key_is_read_by_get_config(self):
         """A key in the frozenset that no _var call reads is dead weight.
 
         One key at a time: service_account_user_id and mapr_user resolve through
         one `or` chain, so seeding both at once hides whichever loses.
         """
-        for key in sorted(m.PORTAL_OWNED_KEYS - self._WRITTEN_BUT_NEVER_READ):
+        for key in sorted(m.PORTAL_OWNED_KEYS):
             ctx, vars_ = self._portal({f'nx1_{key}': f'value_of_{key}'})
             with ctx, vars_:
                 cfg = m.get_config()
             assert f'value_of_{key}' in {str(v) for v in cfg.values()}, \
                 f'in PORTAL_OWNED_KEYS but never read by get_config: {key}'
-
-    def test_the_unread_keys_are_still_unread(self):
-        """Fails when a DAG starts reading one, as a prompt to drop the exemption."""
-        for key in sorted(self._WRITTEN_BUT_NEVER_READ):
-            ctx, vars_ = self._portal({f'nx1_{key}': f'value_of_{key}'})
-            with ctx, vars_:
-                cfg = m.get_config()
-            assert f'value_of_{key}' not in {str(v) for v in cfg.values()}, (
-                f'{key} is now read — remove it from _WRITTEN_BUT_NEVER_READ'
-            )
 
     def test_s3_listing_tool_empty_variable_falls_through_to_env(self):
         """When Variable is set to '', _var treats it as unset and consults env."""
