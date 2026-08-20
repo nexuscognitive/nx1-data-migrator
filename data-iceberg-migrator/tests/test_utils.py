@@ -983,3 +983,61 @@ class TestHiveTypeToSparkDdl:
     def test_no_colon_struct_field_returned_unchanged(self):
         # Malformed but must not crash
         assert self._conv("struct<malformed>") == "struct<malformed>"
+
+
+class TestMaprTicketCheckIdentity:
+    """The MapR ticket check must never grep for an empty pattern.
+
+    cluster_login built `grep -q "{sa_user}"` from the interpolated config
+    value, so an identity that resolves empty produced `grep -q ""` — which
+    matches any `maprlogin print` output and makes the "no valid MapR ticket"
+    branch unable to fire. The script already resolves $MIG_USER (the
+    configured identity, else the login shell's user), so the check greps that.
+    """
+
+    @staticmethod
+    def _captured_script(config: dict) -> str:
+        import sys
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        stdout, stderr = MagicMock(), MagicMock()
+        stdout.read.return_value = b"CLUSTER_LOGIN_SUCCESS\nTEMP_DIR=/tmp/x\n"
+        stderr.read.return_value = b""
+        stdout.channel.recv_exit_status.return_value = 0
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+        conn = MagicMock()
+        conn.__enter__.return_value = client
+        conn.__exit__.return_value = False
+        hook = MagicMock()
+        hook.get_conn.return_value = conn
+
+        ssh_module = sys.modules["airflow.providers.ssh.hooks.ssh"]
+        with patch.object(ssh_module, "SSHHook", MagicMock(return_value=hook)), \
+                patch.object(m, "get_config", lambda: config):
+            m.cluster_login("run_test")
+        return client.exec_command.call_args[0][0]
+
+    _BASE = {
+        'ssh_conn_id': 'ssh1',
+        'edge_temp_path': '/tmp/migration',
+        'auth_method': 'mapr',
+        'mapr_ticketfile_location': '/tmp/maprticket_x',
+        'distcp_log_root': '/tmp/logs',
+        'cluster_type': 'MapR',
+    }
+
+    def test_greps_the_shell_resolved_identity(self):
+        script = self._captured_script(
+            {**self._BASE, 'service_account_user_id': 'svc_migration'}
+        )
+        assert 'grep -q "$MIG_USER"' in script
+        assert 'CONFIGURED_SA_USER="svc_migration"' in script
+
+    def test_an_empty_identity_never_greps_for_nothing(self):
+        script = self._captured_script({**self._BASE, 'service_account_user_id': ''})
+        assert 'grep -q ""' not in script, (
+            "an empty pattern matches any maprlogin output, so the missing-ticket "
+            "branch could never fire"
+        )
+        assert 'grep -q "$MIG_USER"' in script

@@ -200,10 +200,12 @@ def validate_prerequisites(run_id: str) -> dict:
             )
             if auth_method == "mapr":
                 inner_cmd = f"""
-if maprlogin print 2>/dev/null | grep -q "{mapr_user}"; then
+EXPECTED_USER="{mapr_user}"
+if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
+if maprlogin print 2>/dev/null | grep -q "$EXPECTED_USER"; then
     echo "CLUSTER_AUTH_OK"
 else
-    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '{mapr_user}'. Run maprlogin on the edge node."
+    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '$EXPECTED_USER'. Run maprlogin on the edge node."
     exit 1
 fi
 """

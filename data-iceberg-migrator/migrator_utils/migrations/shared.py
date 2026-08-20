@@ -537,7 +537,7 @@ if [ "{auth_method}" = "mapr" ]; then
     MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}"
     export MAPR_TICKETFILE_LOCATION
 
-    if maprlogin print 2>/dev/null | grep -q "{sa_user}"; then
+    if maprlogin print 2>/dev/null | grep -q "$MIG_USER"; then
         echo "Using existing valid MapR ticket"
     else
         echo "ERROR: No valid MapR ticket found"
