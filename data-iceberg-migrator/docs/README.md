@@ -21,27 +21,22 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 ### How each value is resolved
 
-Values resolve by taking the first match (`get_config._var` for all but a
-handful that read their Variable directly, on the same order):
+First match wins:
 
 | # | Source | Applies to |
 | - | ------ | ---------- |
-| 1 | the key in `dag_run.conf` when you trigger the run | the seven keys listed under [tenant profiles](#per-run-configuration-via-tenant-profiles) |
-| 2 | the same key in the tenant profile named by `dag_run.conf["tenant"]` | same seven keys |
-| 3 | `<variable>` — plain Airflow Variable, set in the Airflow UI | every variable |
-| 4 | the env var named in the tables below (`env.shared` / `env.<dag_stem>`) | every variable |
+| 1 | the key in `dag_run.conf` at trigger time | the seven [tenant-profile keys](#per-run-configuration-via-tenant-profiles) |
+| 2 | the same key in the profile named by `conf["tenant"]` | same seven |
+| 3 | `<variable>` — plain Airflow Variable | every variable |
+| 4 | the env var named in the tables below | every variable |
 | 5 | the documented default | every variable |
 
-**An empty Variable counts as unset.** Clearing `migration_distcp_mappers` in the
-Airflow UI falls through to the env file and then to the default rather than
-resolving to `''`. To change a value, write the new one — do not blank the field.
+**An empty Variable counts as unset** and falls through to the env file, so
+change a value by writing the new one rather than blanking the field.
 
-> **Does your Airflow also serve the NX1 Portal?** Then read
-> [Runs triggered by the NX1 Portal](#runs-triggered-by-the-nx1-portal) as well.
-> Everything the portal writes lives under separate `nx1_`-prefixed names that
-> the chain above never reads, so a portal admin cannot change what your runs
-> resolve. If you never use the portal, you can ignore that section and every
-> `nx1_` name in this document.
+> Using the NX1 Portal too? It writes only `nx1_`-prefixed names, which this
+> chain never reads — see [Runs triggered by the NX1 Portal](#runs-triggered-by-the-nx1-portal).
+> Otherwise ignore every `nx1_` name in this document.
 
 ### Required Variables
 
@@ -289,7 +284,7 @@ Accepted keys in a profile: `ssh_conn_id`,
 4. Environment variable
 5. Built-in default
 
-(A portal-triggered run resolves steps 3–5 differently; see
+(A portal-triggered run resolves steps 3–5 differently — see
 [Runs triggered by the NX1 Portal](#runs-triggered-by-the-nx1-portal).)
 
 An unknown `tenant`, malformed JSON, or an unrecognised key inside a profile
@@ -345,10 +340,9 @@ Equivalent env vars (fallback):
    as resolved by [the chain above](#how-each-value-is-resolved)
 3. Hadoop's own credential chain (e.g. IAM instance role) as final fallback
 
-> A portal-triggered run looks up `nx1_<ep-hostname>_access_key` / `_secret_key`
-> instead, and reads neither the unprefixed Variables nor the env vars. Set both
-> forms if the same endpoint has to serve both kinds of run. See
-> [Runs triggered by the NX1 Portal](#runs-triggered-by-the-nx1-portal).
+> A portal-triggered run reads `nx1_<ep-hostname>_access_key` / `_secret_key`
+> instead — not the unprefixed names or the env vars. Set both forms if one
+> endpoint serves both kinds of run.
 
 Rows without an `endpoint` value are unaffected — no changes required for
 single-tenant setups.
@@ -364,55 +358,34 @@ single-tenant setups.
 
 ### Runs triggered by the NX1 Portal
 
-Skip this section if you only launch these DAGs yourself — nothing in it changes
-how your runs behave. It matters if your Airflow also serves the NX1 Portal, or
-if you administer both.
+Only relevant if your Airflow also serves the NX1 Portal. Nothing here changes
+how a run you launch yourself behaves.
 
-The portal keeps its configuration under `nx1_`-prefixed Variable names and reads
-them only on runs it triggered itself. It marks those runs by setting
-`dag_run.conf["triggered_by"] = "portal"`. A DAG deployed with `deploy.py` and
-launched by hand carries no such marker.
-
-For a portal-triggered run, a value the portal owns resolves:
+The portal marks its own runs with `dag_run.conf["triggered_by"] = "portal"`. On
+those runs, a variable the portal owns resolves:
 
 | # | Source |
 | - | ------ |
-| 1 | `nx1_<variable>__<run_id>` — this run's own override, written by the wizard |
-| 2 | `nx1_<variable>` — tenant default from the portal's Infrastructure Config page |
+| 1 | `nx1_<variable>__<run_id>` — this run's override from the wizard |
+| 2 | `nx1_<variable>` — tenant default from the Infrastructure Config page |
 | 3 | the documented default |
 
-Note what is absent: plain Variables and the `env.shared` / `env.<dag_stem>`
-files. **The two chains never meet**, in either direction:
+**The two chains never meet.** Your runs never read `nx1_*`, and portal runs
+never read plain Variables or env files — not even as a fallback, so a portal
+field nobody has filled in resolves to the built-in default, not to your value.
+Tier 1 matches on presence, so a run-scoped empty string means "leave this
+empty" (that is how a portal run suppresses the report email).
 
-- Your runs never read `nx1_*`, so credentials an admin saved in the portal
-  cannot reach them.
-- Portal runs never read your plain Variables or env files — not even as a
-  fallback. A portal field nobody has filled in yet resolves to the built-in
-  default, not to the value you set in the Airflow UI.
+`PORTAL_OWNED_KEYS` in `migrator_utils/migrations/shared.py` is the list.
+Anything outside it — `cluster_type`, `hdfs_nameservice`,
+`cluster_hive_scratch_dir`, `migration_include_db_in_path`, `s3_listing_tool`,
+`migration_distcp_preserve_delete` — is deployment baseline and resolves the
+same way for both. `migration_tenant_profiles` and the per-endpoint credentials
+split by origin too, each under its own `nx1_` name.
 
-Tier 1 matches on **presence**: a run-scoped Variable written as an empty string
-is a deliberate "leave this empty" and is used as-is, which is how a portal run
-suppresses the report email. Tiers 2 and 3 match on the first non-empty value,
-as your own chain does.
-
-Which variables the portal owns is fixed by `PORTAL_OWNED_KEYS` in
-`migrator_utils/migrations/shared.py`. Anything outside that set — including
-`cluster_type`, `hdfs_nameservice`, `cluster_hive_scratch_dir`,
-`migration_include_db_in_path`, `s3_listing_tool` and
-`migration_distcp_preserve_delete` — is deployment baseline and resolves through
-the plain chain for both kinds of run.
-
-Two settings live outside `_var` and split by origin on their own:
-
-- **`migration_tenant_profiles`** is read as `nx1_migration_tenant_profiles` on a
-  portal run. Neither name falls back to the other, so a portal run sees only
-  the profiles saved through the portal.
-- **Per-endpoint S3 credentials**, as described above.
-
-The isolation rests on that `triggered_by` marker, which the trigger asserts
-about itself. Airflow has no per-Variable access control, so this separates the
-two configurations — it is not a security boundary against someone who can
-already trigger DAGs or edit Variables in your Airflow.
+The marker is self-asserted and Airflow has no per-Variable access control, so
+this separates the two configurations — it is not a security boundary against
+anyone who can already trigger DAGs or edit Variables here.
 
 ---
 
