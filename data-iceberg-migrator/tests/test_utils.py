@@ -234,31 +234,6 @@ class TestVarPrecedence:
             assert f'value_of_{key}' in {str(v) for v in cfg.values()}, \
                 f'in PORTAL_OWNED_KEYS but never read by get_config: {key}'
 
-    def test_s3_listing_tool_empty_variable_falls_through_to_env(self):
-        """When Variable is set to '', _var treats it as unset and consults env."""
-        ctx, vars_ = self._portal({'s3_listing_tool': ''})
-        with ctx, vars_, patch.dict('os.environ', {'S3_LISTING_TOOL': 'aws'}):
-            cfg = m.get_config()
-        assert cfg['s3_listing_tool'] == 'aws'
-
-    def test_folder_copy_allow_delete_empty_variable_falls_through_to_env(self):
-        """When Variable is set to '', _var treats it as unset and consults env.
-
-        This is the destructive-delete flag: old code treated empty as authoritative,
-        new code treats empty as unset. This is consistent with _var semantics
-        (empty means the operator cleared it, don't use manual-run values).
-        """
-        ctx, vars_ = self._portal({'folder_copy_allow_delete': ''})
-        with ctx, vars_, patch.dict('os.environ', {'FOLDER_COPY_ALLOW_DELETE': 'true'}):
-            cfg = m.get_config()
-        assert cfg['folder_copy_allow_delete'] == 'true'
-
-    def test_folder_copy_allow_delete_defaults_to_false(self):
-        """When neither Variable nor env are set, default is 'false'."""
-        with self._variables({}):
-            cfg = m.get_config()
-        assert cfg['folder_copy_allow_delete'] == 'false'
-
 
 # ---------------------------------------------------------------------------
 # _load_tenant_profile — origin split for the migration_tenant_profiles Variable

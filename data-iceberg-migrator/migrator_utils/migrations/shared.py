@@ -401,10 +401,7 @@ def get_config() -> dict:
         'hdfs_nameservice': _var('hdfs_nameservice', 'HDFS_NAMESERVICE', '', conf_key='hdfs_nameservice'),
 
         # Listing tool
-        's3_listing_tool': _var('s3_listing_tool', 'S3_LISTING_TOOL', 'hadoop'),
-        'folder_copy_allow_delete': _var(
-            'folder_copy_allow_delete', 'FOLDER_COPY_ALLOW_DELETE', 'false'
-        ),
+        's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
 
         # Email / SMTP Configuration
         'smtp_conn_id': _var('migration_smtp_conn_id', 'MIGRATION_SMTP_CONN_ID', 'smtp_default'),
