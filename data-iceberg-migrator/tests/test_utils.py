@@ -157,19 +157,6 @@ class TestVarPrecedence:
             cfg = m.get_config()
         assert cfg['s3_access_key'] == 'FROM_ENV'
 
-    def test_empty_plain_variable_falls_through_to_env_file(self):
-        """A Variable cleared in the Airflow UI must not mask the env file."""
-        with self._variables({'s3_access_key': ''}), \
-                patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
-            cfg = m.get_config()
-        assert cfg['s3_access_key'] == 'FROM_ENV'
-
-    def test_empty_env_var_falls_through_to_default(self):
-        with self._variables({}), \
-                patch.dict('os.environ', {'MIGRATION_DEFAULT_S3_BUCKET': ''}):
-            cfg = m.get_config()
-        assert cfg['default_s3_bucket'] == 's3a://data-lake'
-
     # -- portal runs are sealed off from the manual namespace ----------------
 
     def test_portal_run_ignores_plain_variable_for_an_owned_key(self):

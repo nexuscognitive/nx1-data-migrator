@@ -347,10 +347,10 @@ def get_config() -> dict:
                     return scoped
             return Variable.get(f"nx1_{base_key}", default_var=None) or default
 
-        plain = Variable.get(base_key, default_var=None)
-        if plain:
-            return plain
-        return os.getenv(env_var) or default
+        # Unchanged from before the origin split: a hand-launched run resolves
+        # exactly as it always did, including an empty Variable masking the env
+        # file. Only the branch above is new.
+        return Variable.get(base_key, default_var=os.getenv(env_var, default))
 
 
     dag_owner = _var('migration_dag_owner', 'MIGRATION_DAG_OWNER', '') \

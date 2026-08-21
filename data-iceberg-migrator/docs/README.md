@@ -31,9 +31,6 @@ First match wins:
 | 4 | the env var named in the tables below | every variable |
 | 5 | the documented default | every variable |
 
-**An empty Variable counts as unset** and falls through to the env file, so
-change a value by writing the new one rather than blanking the field.
-
 > Using the NX1 Portal too? It writes only `nx1_`-prefixed names, which this
 > chain never reads — see [Runs triggered by the NX1 Portal](#runs-triggered-by-the-nx1-portal).
 > Otherwise ignore every `nx1_` name in this document.
