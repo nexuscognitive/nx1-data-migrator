@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import random
+import shlex
 import time
 from functools import wraps
 
@@ -17,15 +18,47 @@ from airflow.models import Variable
 
 logger = logging.getLogger(__name__)
 
+# dag_run.conf['triggered_by'] value the portal sends. Gates access to the
+# nx1_-prefixed Airflow Variables the portal owns.
+PORTAL_TRIGGER = "portal"
+
+# Config keys the portal owns. A portal-triggered run resolves these only from
+# the nx1_ namespace; a hand-launched run only from plain Variables and env
+# files. Neither can see the other's value. Anything not listed here is
+# deployment baseline and resolves the same way for both — see _var.
+PORTAL_OWNED_KEYS = frozenset({
+    'auth_method',
+    'cluster_edge_temp_path',
+    'cluster_ssh_conn_id',
+    'mapr_ticketfile_location',
+    'migration_dag_owner',
+    'migration_default_s3_bucket',
+    'migration_distcp_bandwidth',
+    'migration_distcp_mappers',
+    'migration_email_recipients',
+    'migration_report_location',
+    'migration_smtp_conn_id',
+    'migration_spark_conn_id',
+    'migration_tracking_database',
+    'migration_tracking_location',
+    's3_access_key',
+    's3_endpoint',
+    's3_secret_key',
+    # Owned, though the portal has no field for it: it is the live identity key
+    # now that mapr_user has no reader, so an unowned plain value set by hand
+    # would reach a portal run.
+    'service_account_user_id',
+})
+
 __all__ = [
+    "PORTAL_TRIGGER",
+    "PORTAL_OWNED_KEYS",
     "SSH_COMMAND_TIMEOUT",
     "_login_shell",
-    "apply_bucket_credentials",
     "build_s3_opts",
     "cell_str",
     "cluster_login",
     "compute_dest_path",
-    "configure_spark_s3",
     "execute_with_iceberg_retry",
     "get_config",
     "hive_type_to_spark_ddl",
@@ -126,48 +159,6 @@ def execute_with_iceberg_retry(spark, sql: str, max_retries: int = 6, task_label
     if not status:
         raise last_exception
 
-# =============================================================================
-# HELPER: configure dual-S3 credentials on a Spark session
-# =============================================================================
-
-def configure_spark_s3(spark, config: dict):
-    """ Configure Spark with per-bucket S3A credentials for source and destination. """
-    src_endpoint   = config.get('s3_source_endpoint')   or config.get('s3_endpoint', '')
-    src_access_key = config.get('s3_source_access_key') or config.get('s3_access_key', '')
-    src_secret_key = config.get('s3_source_secret_key') or config.get('s3_secret_key', '')
-
-    dest_endpoint   = config.get('s3_dest_endpoint')   or config.get('s3_endpoint', '')
-    dest_access_key = config.get('s3_dest_access_key') or config.get('s3_access_key', '')
-    dest_secret_key = config.get('s3_dest_secret_key') or config.get('s3_secret_key', '')
-
-    if src_endpoint:
-        spark.conf.set("fs.s3a.endpoint", src_endpoint)
-    if src_access_key:
-        spark.conf.set("fs.s3a.access.key", src_access_key)
-    if src_secret_key:
-        spark.conf.set("fs.s3a.secret.key", src_secret_key)
-
-    config['_src_endpoint']    = src_endpoint
-    config['_src_access_key']  = src_access_key
-    config['_src_secret_key']  = src_secret_key
-    config['_dest_endpoint']   = dest_endpoint
-    config['_dest_access_key'] = dest_access_key
-    config['_dest_secret_key'] = dest_secret_key
-
-
-def apply_bucket_credentials(spark, bucket_url: str, endpoint: str, access_key: str, secret_key: str):
-    """Apply per-bucket S3A credentials given an s3a://bucket-name/... URL."""
-    if not bucket_url.startswith('s3a://') or not (access_key or endpoint):
-        return
-    bucket_name = bucket_url.split('/')[2]
-    if endpoint:
-        spark.conf.set(f"fs.s3a.bucket.{bucket_name}.endpoint", endpoint)
-    if access_key:
-        spark.conf.set(f"fs.s3a.bucket.{bucket_name}.access.key", access_key)
-    if secret_key:
-        spark.conf.set(f"fs.s3a.bucket.{bucket_name}.secret.key", secret_key)
-
-
 def compute_dest_path(source_location: str, dest_database: str, table_name: str,
                       dest_bucket: str, source_s3_prefix: str, dest_s3_prefix: str) -> str:
     """ Compute the destination S3 path for a table. """
@@ -211,29 +202,48 @@ TENANT_PROFILE_KEYS = frozenset({
 })
 
 
-def _load_tenant_profile(tenant: str) -> dict:
-    """ Load one tenant's settings from the `migration_tenant_profiles` Variable """
-    raw = Variable.get(
-        'migration_tenant_profiles',
-        default_var=os.getenv('MIGRATION_TENANT_PROFILES', '{}'),
+def _load_tenant_profile(tenant: str, portal_run: bool) -> dict:
+    """ Load one tenant's settings, from the Variable the run's origin owns.
+
+    A portal-marked run reads ``nx1_migration_tenant_profiles``; a
+    hand-launched run reads the plain ``migration_tenant_profiles``, exactly
+    as before this split existed. Neither falls back to the other — this
+    mirrors the origin rule ``_var`` applies to PORTAL_OWNED_KEYS, checked
+    here directly because this Variable is read outside `_var`'s tier chain
+    (see `_endpoint_credentials` for the other case that does the same).
+
+    The env fallback stays hand-launched-only too: the portal never had an
+    env file to fall back to for anything it owns, so a portal run with
+    nothing written to `nx1_migration_tenant_profiles` yet simply gets an
+    empty profile, same as any other never-written portal field.
+    """
+    var_name = (
+        'nx1_migration_tenant_profiles' if portal_run else 'migration_tenant_profiles'
     )
+    if portal_run:
+        raw = Variable.get(var_name, default_var='{}')
+    else:
+        raw = Variable.get(
+            var_name,
+            default_var=os.getenv('MIGRATION_TENANT_PROFILES', '{}'),
+        )
     try:
         profiles = raw if isinstance(raw, dict) else json.loads(raw or '{}')
     except (ValueError, TypeError) as exc:
         raise ValueError(
-            f"Airflow Variable 'migration_tenant_profiles' is not valid JSON: {exc}"
+            f"Airflow Variable {var_name!r} is not valid JSON: {exc}"
         ) from exc
 
     if not isinstance(profiles, dict):
         raise ValueError(
-            "Airflow Variable 'migration_tenant_profiles' must be a JSON object "
+            f"Airflow Variable {var_name!r} must be a JSON object "
             "keyed by tenant name."
         )
 
     if tenant not in profiles:
         known = ', '.join(sorted(profiles)) or '<none defined>'
         raise ValueError(
-            f"tenant={tenant!r} not found in 'migration_tenant_profiles'. "
+            f"tenant={tenant!r} not found in {var_name!r}. "
             f"Known tenants: {known}"
         )
 
@@ -264,24 +274,82 @@ def get_config() -> dict:
     except Exception:
         _run_id = None
         _dag_run_conf = {}
+        logger.warning(
+            "[get_config] Task context unavailable — resolving this run as "
+            "hand-launched (manual), not portal-triggered."
+        )
+
+    # The portal stamps every run it triggers. DAGs deployed and launched by hand
+    # carry no stamp, which is what keeps them out of the nx1_ namespace below.
+    _portal_run = (
+        str(_dag_run_conf.get('triggered_by', '')).strip().lower() == PORTAL_TRIGGER
+    )
 
     _tenant = str(_dag_run_conf.get('tenant') or '').strip()
-    _profile = _load_tenant_profile(_tenant) if _tenant else {}
+    _profile = _load_tenant_profile(_tenant, _portal_run) if _tenant else {}
 
-    def _var(base_key: str, env_var: str, default: str, conf_key: str = None) -> str:
+    def _var(base_key: str, env_var: str, default: str, conf_key: str | None = None) -> str:
+        """Resolve one config value from the tier chain its origin allows.
+
+        A ``conf_key`` value, when the caller passes one, outranks everything
+        below: it comes from this run's own ``dag_run.conf`` or from the tenant
+        profile named by ``conf['tenant']``.
+
+        Below that, the chain depends on two things: whether this run carries
+        the portal's marker, and whether the key is in PORTAL_OWNED_KEYS.
+
+                              portal-marked run            hand-launched run
+        portal-owned key      nx1_<key>__<run_id>          <key>
+                              nx1_<key>                    env_var
+                              default                      default
+
+        anything else         <key> / env_var / default    <key> / env_var / default
+
+        The two columns share no name, so neither origin can read or write what
+        the other resolves. Keys nobody owns are deployment baseline and stay
+        common to both. Portal-owned but never written by the portal — see
+        service_account_user_id — is simply absent for a portal run.
+
+        The tenant profile itself is origin-split too: a portal-marked run
+        reads ``nx1_migration_tenant_profiles``, a hand-launched run reads
+        the plain ``migration_tenant_profiles`` (see `_load_tenant_profile`).
+        So for the keys that pass a conf_key, the profile sits *above* the
+        Variable tiers below but still inside the same namespace its origin
+        owns — it can no longer cross between origins.
+
+        Tier 1 matches on **presence**, every other tier on **truthiness**:
+
+        * The portal writes a run-scoped Variable only for a field the user
+          actually filled in, so an empty one is a deliberate "no value" — an
+          operator who cleared the report mailing list wants no mail, not the
+          tenant list. Falling through would override that.
+        * Anywhere else an empty value means unset. Airflow reports a Variable
+          set to '' as present, so a Variable cleared in the UI rather than
+          deleted would otherwise mask the env file.
+
+        A lookup failure is not caught. ``default_var=None`` already covers the
+        missing-key case, so the only thing left to swallow would be a genuine
+        Airflow fault — and resolving a bucket or credential to its hardcoded
+        default because the metadata DB hiccuped is how data ends up in the
+        wrong place. Better to fail the task.
+        """
         if conf_key:
             for _source in (_dag_run_conf, _profile):
                 if conf_key in _source:
                     _val = _source.get(conf_key)
                     if _val is not None and str(_val).strip():
                         return str(_val).strip()
-        if _run_id:
-            try:
-                scoped = Variable.get(f"{base_key}__{_run_id}", default_var=None)
+
+        if base_key in PORTAL_OWNED_KEYS and _portal_run:
+            if _run_id:
+                scoped = Variable.get(f"nx1_{base_key}__{_run_id}", default_var=None)
                 if scoped is not None:
                     return scoped
-            except Exception:
-                pass
+            return Variable.get(f"nx1_{base_key}", default_var=None) or default
+
+        # Unchanged from before the origin split: a hand-launched run resolves
+        # exactly as it always did, including an empty Variable masking the env
+        # file. Only the branch above is new.
         return Variable.get(base_key, default_var=os.getenv(env_var, default))
 
 
@@ -335,16 +403,6 @@ def get_config() -> dict:
         # Listing tool
         's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
 
-        # S3 source credentials
-        's3_source_endpoint': _var('s3_source_endpoint', 'S3_SOURCE_ENDPOINT', ''),
-        's3_source_access_key': _var('s3_source_access_key', 'S3_SOURCE_ACCESS_KEY', ''),
-        's3_source_secret_key': _var('s3_source_secret_key', 'S3_SOURCE_SECRET_KEY', ''),
-
-        # S3 destination credentials
-        's3_dest_endpoint': _var('s3_dest_endpoint','S3_DEST_ENDPOINT', ''),
-        's3_dest_access_key': _var('s3_dest_access_key', 'S3_DEST_ACCESS_KEY', ''),
-        's3_dest_secret_key': _var('s3_dest_secret_key', 'S3_DEST_SECRET_KEY', ''),
-
         # Email / SMTP Configuration
         'smtp_conn_id': _var('migration_smtp_conn_id', 'MIGRATION_SMTP_CONN_ID', 'smtp_default'),
         'email_recipients': _var('migration_email_recipients', 'MIGRATION_EMAIL_RECIPIENTS', ''),
@@ -371,6 +429,10 @@ def get_config() -> dict:
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
         'owner': dag_owner,
+
+        # build_s3_opts and validate_bucket_endpoint_pairs resolve per-endpoint
+        # credentials outside _var and need to know which namespace to read.
+        'portal_run': _portal_run,
     }
 
     if dag_owner and dag_owner != 'data-migration':
@@ -457,7 +519,7 @@ def cluster_login(run_id: str) -> dict:
 
     auth_script_parts.append(f"""
 
-CONFIGURED_SA_USER="{sa_user}"
+CONFIGURED_SA_USER={shlex.quote(sa_user)}
 if [ -n "$CONFIGURED_SA_USER" ]; then
     MIG_USER="$CONFIGURED_SA_USER"
     MIG_USER_SOURCE="config:service_account_user_id"
@@ -473,7 +535,7 @@ if [ "{auth_method}" = "mapr" ]; then
     MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}"
     export MAPR_TICKETFILE_LOCATION
 
-    if maprlogin print 2>/dev/null | grep -q "{sa_user}"; then
+    if maprlogin print 2>/dev/null | grep -qF -- "$MIG_USER"; then
         echo "Using existing valid MapR ticket"
     else
         echo "ERROR: No valid MapR ticket found"
@@ -609,6 +671,33 @@ def _s3a_committer_opts(config: dict) -> str:
     return ""
 
 
+def _endpoint_credentials(ep_hostname: str, config: dict) -> tuple[str, str]:
+    """Credentials for a row that names its own S3 endpoint.
+
+    These key names are built from a hostname at run time, so they cannot live
+    in PORTAL_OWNED_KEYS — the origin is checked here instead. A hand-launched
+    run reads the per-host Variable then the per-host env var; a portal run
+    reads only nx1_<host>_*, so a per-host value set in the Airflow UI can no
+    longer outrank the credential the portal supplied for this run. Either
+    origin falls back to the resolved global pair.
+    """
+    if config.get('portal_run'):
+        access_key = Variable.get(f'nx1_{ep_hostname}_access_key', default_var='')
+        secret_key = Variable.get(f'nx1_{ep_hostname}_secret_key', default_var='')
+    else:
+        env_slug = ep_hostname.upper().replace('.', '_').replace('-', '_')
+        access_key = Variable.get(f'{ep_hostname}_access_key',
+                                  default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
+        secret_key = Variable.get(f'{ep_hostname}_secret_key',
+                                  default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
+    # Both-or-neither: falling back one half at a time would sign with this
+    # host's access key and the tenant's global secret, which S3 rejects as
+    # SignatureDoesNotMatch rather than as a missing credential.
+    if access_key and secret_key:
+        return access_key, secret_key
+    return (config.get('s3_access_key') or '', config.get('s3_secret_key') or '')
+
+
 def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -> str:
     """Build per-bucket Hadoop S3A JVM options scoped to the destination bucket name.
 
@@ -631,10 +720,15 @@ def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -
       Slug = hostname of dest_endpoint, lowercased, e.g. "s3.tenant-a.example.com"
       Hyphens and dots are kept in the Airflow Variable name; env var uses underscores.
 
-      Airflow Variable                          Environment variable
+      Airflow Variable (manual)                 Airflow Variable (portal run)
       ----------------------------------------- -------------------------------------------
-      s3.tenant-a.example.com_access_key        S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY  (masked)
-      s3.tenant-a.example.com_secret_key        S3_TENANT_A_EXAMPLE_COM_SECRET_KEY  (masked)
+      s3.tenant-a.example.com_access_key        nx1_s3.tenant-a.example.com_access_key
+      s3.tenant-a.example.com_secret_key        nx1_s3.tenant-a.example.com_secret_key
+
+      A hand-launched run falls through further, to an env var, when neither
+      Variable above is set: S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY / _SECRET_KEY
+      for this slug. A portal run has no env var fallback — nx1_<host>_*
+      resolves straight to the global instead.
     """
     from urllib.parse import urlparse
 
@@ -653,14 +747,8 @@ def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -
     if endpoint and bucket_name:
         ep_hostname = urlparse(endpoint).hostname or urlparse(endpoint).netloc or endpoint
         ep_hostname = ep_hostname.lower().strip()
-        env_slug = ep_hostname.upper().replace('.', '_').replace('-', '_')
 
-        access_key = (Variable.get(f'{ep_hostname}_access_key',
-                                   default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
-                      or config.get('s3_access_key') or '')
-        secret_key = (Variable.get(f'{ep_hostname}_secret_key',
-                                   default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
-                      or config.get('s3_secret_key') or '')
+        access_key, secret_key = _endpoint_credentials(ep_hostname, config)
 
         s3_opts = f" -Dfs.s3a.bucket.{bucket_name}.endpoint={endpoint}"
         if access_key:
@@ -729,18 +817,8 @@ def validate_bucket_endpoint_pairs(grouped: dict, config: dict) -> None:
             or endpoint_val
         )
         ep_hostname = ep_hostname.lower().strip()
-        env_slug = ep_hostname.upper().replace('.', '_').replace('-', '_')
 
-        access_key = (
-            Variable.get(f'{ep_hostname}_access_key',
-                         default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
-            or config.get('s3_access_key') or ''
-        )
-        secret_key = (
-            Variable.get(f'{ep_hostname}_secret_key',
-                         default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
-            or config.get('s3_secret_key') or ''
-        )
+        access_key, secret_key = _endpoint_credentials(ep_hostname, config)
 
         try:
             s3 = boto3.client(

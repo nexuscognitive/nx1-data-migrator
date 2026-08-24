@@ -110,14 +110,14 @@ def _skippable_discovery_message(table: dict) -> str:
 
 
 def _resolve_dag_owner() -> str:
-    """Read portal username from Airflow Variable at DAG parse/trigger time."""
-    try:
-        from airflow.models import Variable
-        owner = Variable.get('migration_dag_owner', default_var='')
-        if owner:
-            return owner
-    except Exception:
-        pass
+    """Owner shown in the Airflow UI, fixed at DAG parse time.
+
+    Not read from an Airflow Variable: parse time has no run, so it cannot tell
+    a portal-triggered run from a hand-launched one, and reading the portal's
+    value here pinned every manual run to the last portal user. deploy.py
+    rewrites this literal via --owner. The per-run owner comes from
+    dag_run.conf and is resolved in get_config().
+    """
     return 'data-migration'
 
 default_args = {
@@ -255,10 +255,12 @@ def validate_prerequisites(run_id: str) -> dict:
             )
             if auth_method == "mapr":
                 inner_cmd = f"""
-if maprlogin print 2>/dev/null | grep -q "{mapr_user}"; then
+EXPECTED_USER={shlex.quote(mapr_user)}
+if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
+if maprlogin print 2>/dev/null | grep -qF -- "$EXPECTED_USER"; then
     echo "CLUSTER_AUTH_OK"
 else
-    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '{mapr_user}'. Run maprlogin on the edge node."
+    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '$EXPECTED_USER'. Run maprlogin on the edge node."
     exit 1
 fi
 """

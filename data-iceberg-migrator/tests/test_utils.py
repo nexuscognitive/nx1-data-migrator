@@ -5,6 +5,7 @@ Tests for shared utility functions:
   - execute_with_iceberg_retry()
 """
 
+import json
 import time
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,398 @@ class TestGetConfig:
         with patch('airflow.models.Variable.get', return_value='fallback'):
             cfg = m.get_config()
         assert cfg['ssh_conn_id'] == 'fallback'
+
+
+class TestVarPrecedence:
+    """Resolution order in get_config._var.
+
+    Portal-triggered run: run-scoped → nx1_ → plain → env → default.
+    Hand-launched run:     run-scoped → plain → env → default (nx1_ is skipped).
+    """
+
+    @staticmethod
+    def _variables(mapping: dict):
+        """Patch Variable.get so only *mapping* keys exist."""
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    @staticmethod
+    def _context(run_id='data_migration_1', triggered_by=None):
+        """Patch the task context, optionally stamped as a portal-triggered run."""
+        conf = {'triggered_by': triggered_by} if triggered_by else {}
+        dag_run = type('DagRun', (), {'conf': conf})()
+        return patch(
+            'airflow.operators.python.get_current_context',
+            return_value={'run_id': run_id, 'dag_run': dag_run},
+        )
+
+    def _portal(self, mapping, run_id='data_migration_1'):
+        return self._context(run_id, m.PORTAL_TRIGGER), self._variables(mapping)
+
+    # -- portal-triggered runs may read the nx1_ namespace -------------------
+
+    def test_nx1_variable_wins_over_plain_variable(self):
+        ctx, vars_ = self._portal({
+            'nx1_s3_access_key': 'FROM_PORTAL',
+            's3_access_key': 'FROM_AIRFLOW_UI',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_PORTAL'
+
+    def test_nx1_variable_wins_over_env_file(self):
+        ctx, vars_ = self._portal({'nx1_s3_access_key': 'FROM_PORTAL'})
+        with ctx, vars_, patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_PORTAL'
+
+    def test_empty_nx1_variable_falls_to_default_not_to_plain(self):
+        """Cleared in the portal means unset for portal runs, not "use the manual value"."""
+        ctx, vars_ = self._portal({
+            'nx1_s3_access_key': '',
+            's3_access_key': 'FROM_AIRFLOW_UI',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == ''
+
+    def test_run_scoped_variable_wins_over_nx1_variable(self):
+        ctx, vars_ = self._portal({
+            'nx1_s3_access_key__data_migration_1': 'PER_RUN',
+            'nx1_s3_access_key': 'FROM_PORTAL',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'PER_RUN'
+
+    def test_absent_run_scoped_variable_falls_through_to_nx1(self):
+        """A blank S3 override is not written at all, so the global applies."""
+        ctx, vars_ = self._portal({'nx1_s3_access_key': 'FROM_PORTAL'})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_PORTAL'
+
+    def test_empty_run_scoped_variable_is_authoritative(self):
+        """Tier 1 resolves on presence: an operator who cleared a field meant it.
+
+        The portal writes a run-scoped Variable for every field the user filled
+        in, and skips only the S3 credentials when blank (where blank means
+        "inherit"). So a run-scoped '' elsewhere is deliberate — here, send no
+        report email — and must not fall through to the tenant mailing list.
+        """
+        ctx, vars_ = self._portal({
+            'nx1_migration_email_recipients__data_migration_1': '',
+            'nx1_migration_email_recipients': 'tenant@example.com',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['email_recipients'] == ''
+
+    # -- hand-launched runs must not see the portal's namespace --------------
+
+    def test_manual_run_ignores_nx1_variable_and_uses_env_file(self):
+        """A DAG deployed by hand keeps its env file even when the portal has globals."""
+        with self._context(triggered_by=None), \
+                self._variables({'nx1_s3_access_key': 'FROM_PORTAL'}), \
+                patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_ENV'
+
+    def test_manual_run_ignores_nx1_variable_and_uses_plain_variable(self):
+        with self._context(triggered_by=None), self._variables({
+            'nx1_s3_access_key': 'FROM_PORTAL',
+            's3_access_key': 'FROM_AIRFLOW_UI',
+        }):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
+
+    def test_unrecognised_trigger_marker_is_treated_as_manual(self):
+        with self._context(triggered_by='cron'), \
+                self._variables({'nx1_s3_access_key': 'FROM_PORTAL'}), \
+                patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_ENV'
+
+    # -- lower tiers, unaffected by the marker ------------------------------
+
+    def test_plain_variable_used_when_no_nx1_variable(self):
+        with self._variables({'s3_access_key': 'FROM_AIRFLOW_UI'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
+
+    def test_env_file_used_when_no_variable_set(self):
+        with self._variables({}), patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_ENV'
+
+    # -- portal runs are sealed off from the manual namespace ----------------
+
+    def test_portal_run_ignores_plain_variable_for_an_owned_key(self):
+        """The page is the whole truth: no plain value can be in effect behind it."""
+        ctx, vars_ = self._portal({'s3_access_key': 'FROM_AIRFLOW_UI'})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == ''
+
+    def test_portal_run_ignores_env_file_for_an_owned_key(self):
+        ctx, vars_ = self._portal({})
+        with ctx, vars_, patch.dict('os.environ', {'S3_ACCESS_KEY': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == ''
+
+    def test_portal_run_falls_to_hardcoded_default_for_an_owned_key(self):
+        """Nothing in the nx1_ namespace means unset for a portal run — even
+        with a plain Variable AND an env value both sitting there ready to
+        catch it, an owned key must not fall through to either.
+        """
+        ctx, vars_ = self._portal({'cluster_ssh_conn_id': 'FROM_AIRFLOW_UI'})
+        with ctx, vars_, patch.dict('os.environ', {'CLUSTER_SSH_CONN_ID': 'FROM_ENV'}):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'cluster_edge_ssh'
+
+    def test_portal_run_reads_env_file_for_a_key_nobody_owns(self):
+        """Unowned keys are deployment baseline, shared by both origins — a
+        portal run must ignore an nx1_ value sitting right there for one.
+        """
+        ctx, vars_ = self._portal({'nx1_cluster_type': 'FROM_PORTAL'})
+        with ctx, vars_, patch.dict('os.environ', {'CLUSTER_TYPE': 'HDP'}):
+            cfg = m.get_config()
+        assert cfg['cluster_type'] == 'HDP'
+
+    def test_portal_run_reads_plain_variable_for_a_key_nobody_owns(self):
+        ctx, vars_ = self._portal({
+            'nx1_hdfs_nameservice': 'FROM_PORTAL',
+            'hdfs_nameservice': 'ns1',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['hdfs_nameservice'] == 'ns1'
+
+    def test_manual_run_ignores_the_prefixed_run_scoped_variable(self):
+        with self._context(triggered_by=None), self._variables({
+            'nx1_s3_access_key__data_migration_1': 'PER_RUN',
+            's3_access_key': 'FROM_AIRFLOW_UI',
+        }):
+            cfg = m.get_config()
+        assert cfg['s3_access_key'] == 'FROM_AIRFLOW_UI'
+
+    def test_every_owned_key_is_read_by_get_config(self):
+        """A key in the frozenset that no _var call reads is dead weight.
+
+        One key at a time: service_account_user_id and mapr_user resolve through
+        one `or` chain, so seeding both at once hides whichever loses.
+        """
+        for key in sorted(m.PORTAL_OWNED_KEYS):
+            ctx, vars_ = self._portal({f'nx1_{key}': f'value_of_{key}'})
+            with ctx, vars_:
+                cfg = m.get_config()
+            assert f'value_of_{key}' in {str(v) for v in cfg.values()}, \
+                f'in PORTAL_OWNED_KEYS but never read by get_config: {key}'
+
+
+# ---------------------------------------------------------------------------
+# _load_tenant_profile — origin split for the migration_tenant_profiles Variable
+# ---------------------------------------------------------------------------
+_ACME_NX1_PROFILE = json.dumps({'acme': {'ssh_conn_id': 'FROM_NX1_PROFILE'}})
+_ACME_PLAIN_PROFILE = json.dumps({'acme': {'ssh_conn_id': 'FROM_PLAIN_PROFILE'}})
+
+
+class TestLoadTenantProfileOrigin:
+    """_load_tenant_profile mirrors the origin split _var applies to
+    PORTAL_OWNED_KEYS (and that _endpoint_credentials applies to per-host
+    creds): a portal-marked run and a hand-launched run each read a
+    differently-named Variable, and neither sees the other's value.
+    """
+
+    @staticmethod
+    def _variables(mapping: dict):
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    _BOTH_SET = {
+        'nx1_migration_tenant_profiles': _ACME_NX1_PROFILE,
+        'migration_tenant_profiles': _ACME_PLAIN_PROFILE,
+    }
+
+    def test_portal_run_reads_the_prefixed_profile(self):
+        with self._variables(self._BOTH_SET):
+            profile = m._load_tenant_profile('acme', portal_run=True)
+        assert profile == {'ssh_conn_id': 'FROM_NX1_PROFILE'}
+
+    def test_portal_run_ignores_a_plain_variable_that_is_set(self):
+        """A plain migration_tenant_profiles sitting there for the same
+        tenant must not reach a portal run, even though one is set."""
+        with self._variables(self._BOTH_SET):
+            profile = m._load_tenant_profile('acme', portal_run=True)
+        assert profile['ssh_conn_id'] != 'FROM_PLAIN_PROFILE'
+
+    def test_hand_launched_run_reads_the_plain_profile(self):
+        with self._variables(self._BOTH_SET):
+            profile = m._load_tenant_profile('acme', portal_run=False)
+        assert profile == {'ssh_conn_id': 'FROM_PLAIN_PROFILE'}
+
+    def test_hand_launched_run_ignores_the_prefixed_variable(self):
+        with self._variables(self._BOTH_SET):
+            profile = m._load_tenant_profile('acme', portal_run=False)
+        assert profile['ssh_conn_id'] != 'FROM_NX1_PROFILE'
+
+    def test_portal_run_with_nothing_written_yet_gets_an_empty_profile(self):
+        """Before the portal ever writes nx1_migration_tenant_profiles, a
+        portal run must not fall back to the plain Variable or its env file
+        — unset means the profile contributes nothing, same as any other
+        portal-owned field nobody has written yet.
+        """
+        with self._variables({'migration_tenant_profiles': _ACME_PLAIN_PROFILE}), \
+                patch.dict('os.environ', {'MIGRATION_TENANT_PROFILES': _ACME_PLAIN_PROFILE}), \
+                pytest.raises(
+                    ValueError, match="not found in 'nx1_migration_tenant_profiles'"
+                ):
+            m._load_tenant_profile('acme', portal_run=True)
+
+    def test_a_portal_run_error_names_the_prefixed_variable(self):
+        """An operator debugging a portal run must be pointed at the Variable
+        that run actually read, not at the one the split made unreadable
+        from it."""
+        with self._variables({'nx1_migration_tenant_profiles': 'not json at all'}), \
+                pytest.raises(ValueError, match="'nx1_migration_tenant_profiles' is not valid JSON"):
+            m._load_tenant_profile('acme', portal_run=True)
+
+    def test_a_hand_launched_error_names_the_plain_variable(self):
+        with self._variables({'migration_tenant_profiles': 'not json at all'}), \
+                pytest.raises(ValueError, match="'migration_tenant_profiles' is not valid JSON"):
+            m._load_tenant_profile('acme', portal_run=False)
+
+    def test_a_portal_run_non_object_error_names_the_prefixed_variable(self):
+        with self._variables({'nx1_migration_tenant_profiles': '[1, 2, 3]'}), \
+                pytest.raises(ValueError, match="'nx1_migration_tenant_profiles' must be a JSON object"):
+            m._load_tenant_profile('acme', portal_run=True)
+
+
+class TestTenantProfileConfKeyPrecedence:
+    """Integration: the conf_key tier in get_config._var checks dag_run.conf
+    before the tenant profile, for either run origin — unaffected by which
+    Variable the profile itself came from.
+    """
+
+    @staticmethod
+    def _variables(mapping: dict):
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    @staticmethod
+    def _context(run_id: str, conf: dict):
+        dag_run = type('DagRun', (), {'conf': conf})()
+        return patch(
+            'airflow.operators.python.get_current_context',
+            return_value={'run_id': run_id, 'dag_run': dag_run},
+        )
+
+    _BOTH_SET = {
+        'nx1_migration_tenant_profiles': _ACME_NX1_PROFILE,
+        'migration_tenant_profiles': _ACME_PLAIN_PROFILE,
+    }
+
+    def test_dag_run_conf_wins_over_the_portal_profile(self):
+        """Invariant, not a regression guard for this fix: the conf_key loop already
+        checked dag_run.conf before the profile, for either origin, prior to this
+        change. Passes identically if the origin split in _load_tenant_profile is
+        reverted — it pins that the ordering itself stays correct, nothing more.
+        """
+        conf = {'triggered_by': m.PORTAL_TRIGGER, 'tenant': 'acme', 'ssh_conn_id': 'FROM_CONF'}
+        with self._context('data_migration_1', conf), self._variables(self._BOTH_SET):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_CONF'
+
+    def test_dag_run_conf_wins_over_the_manual_profile(self):
+        """Invariant, not a regression guard for this fix — see the portal-side
+        version above for why this one also can't fail if the fix is reverted.
+        """
+        conf = {'tenant': 'acme', 'ssh_conn_id': 'FROM_CONF'}
+        with self._context('manual__2026', conf), self._variables(self._BOTH_SET):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_CONF'
+
+    def test_portal_profile_feeds_config_when_conf_is_silent(self):
+        conf = {'triggered_by': m.PORTAL_TRIGGER, 'tenant': 'acme'}
+        with self._context('data_migration_1', conf), self._variables(self._BOTH_SET):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_NX1_PROFILE'
+
+    def test_manual_profile_feeds_config_when_conf_is_silent(self):
+        """Invariant, not a regression guard for this fix: a hand-launched run read
+        the plain Variable before this change existed too, so this can't fail on a
+        revert — it documents that the wiring into get_config's output still works.
+        """
+        conf = {'tenant': 'acme'}
+        with self._context('manual__2026', conf), self._variables(self._BOTH_SET):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_PLAIN_PROFILE'
+
+
+class TestTenantProfileFallsThroughByOrigin:
+    """Each direction of the crossing, proven through get_config() by asserting a
+    resolved value — not just that the loader picked the right Variable.
+
+    Both scenarios give the *other* origin's Variable a real, distinct value the
+    run must not pick up, and give the run's *own* Variable a tenant entry with no
+    override for the tested field, so the profile legitimately contributes nothing
+    and resolution must fall to the Variable tier below it. Asserting a third,
+    lower-tier sentinel value (not either profile's) is what makes these fail with
+    a value mismatch rather than passing by accident.
+    """
+
+    @staticmethod
+    def _variables(mapping: dict):
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    @staticmethod
+    def _context(run_id: str, conf: dict):
+        dag_run = type('DagRun', (), {'conf': conf})()
+        return patch(
+            'airflow.operators.python.get_current_context',
+            return_value={'run_id': run_id, 'dag_run': dag_run},
+        )
+
+    def test_portal_run_with_only_a_plain_profile_falls_through_to_the_tier_below(self):
+        """Portal run; migration_tenant_profiles (plain) is set for 'acme' and
+        nx1_migration_tenant_profiles has 'acme' but no override — the profile
+        must contribute nothing, so ssh_conn_id resolves from the nx1_ Variable
+        tier below the profile, not from the plain decoy.
+        """
+        conf = {'triggered_by': m.PORTAL_TRIGGER, 'tenant': 'acme'}
+        variables = {
+            'nx1_migration_tenant_profiles': json.dumps({'acme': {}}),
+            'migration_tenant_profiles': _ACME_PLAIN_PROFILE,
+            'nx1_cluster_ssh_conn_id': 'FROM_PORTAL_TIER_BELOW',
+        }
+        with self._context('data_migration_1', conf), self._variables(variables):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_PORTAL_TIER_BELOW'
+
+    def test_hand_launched_run_with_only_a_prefixed_profile_falls_through_to_the_tier_below(self):
+        """Hand-launched run; nx1_migration_tenant_profiles is set for 'acme' and
+        the plain migration_tenant_profiles has 'acme' but no override — the
+        profile must contribute nothing, so ssh_conn_id resolves from the plain
+        Variable tier below the profile, not from the nx1_ decoy.
+        """
+        conf = {'tenant': 'acme'}
+        variables = {
+            'nx1_migration_tenant_profiles': _ACME_NX1_PROFILE,
+            'migration_tenant_profiles': json.dumps({'acme': {}}),
+            'cluster_ssh_conn_id': 'FROM_MANUAL_TIER_BELOW',
+        }
+        with self._context('manual__2026', conf), self._variables(variables):
+            cfg = m.get_config()
+        assert cfg['ssh_conn_id'] == 'FROM_MANUAL_TIER_BELOW'
 
 
 class TestTrackDuration:
@@ -153,7 +546,9 @@ class TestBuildS3Opts:
         def fake_var(key, default_var=''):
             mapping = {
                 's3.tenant-a.example.com_access_key': 'AK_A',
+                's3.tenant-a.example.com_secret_key': 'SK_A',
                 's3.tenant-b.example.com_access_key': 'AK_B',
+                's3.tenant-b.example.com_secret_key': 'SK_B',
             }
             return mapping.get(key, default_var)
         with patch('airflow.models.Variable.get', side_effect=fake_var):
@@ -181,61 +576,110 @@ class TestBuildS3Opts:
 
 
 # ---------------------------------------------------------------------------
-# configure_spark_s3
+# _endpoint_credentials / config['portal_run']
 # ---------------------------------------------------------------------------
-class TestConfigureSparkS3:
+class TestEndpointCredentials:
+    """Credentials for an Excel row that names its own S3 endpoint."""
 
-    def test_sets_source_and_dest_credentials(self, mock_spark):
-        config = {
-            's3_source_endpoint': 'https://src.example.com',
-            's3_source_access_key': 'SRC_AK',
-            's3_source_secret_key': 'SRC_SK',
-            's3_dest_endpoint': 'https://dst.example.com',
-            's3_dest_access_key': 'DST_AK',
-            's3_dest_secret_key': 'DST_SK',
-        }
-        m.configure_spark_s3(mock_spark, config)
-        mock_spark.conf.set.assert_any_call('fs.s3a.endpoint', 'https://src.example.com')
-        mock_spark.conf.set.assert_any_call('fs.s3a.access.key', 'SRC_AK')
-        mock_spark.conf.set.assert_any_call('fs.s3a.secret.key', 'SRC_SK')
-        assert config['_dest_endpoint'] == 'https://dst.example.com'
-        assert config['_dest_access_key'] == 'DST_AK'
+    _HOST = 's3.tenant-a.example.com'
 
-    def test_falls_back_to_global_keys(self, mock_spark):
-        config = {
-            's3_endpoint': 'https://global.example.com',
-            's3_access_key': 'GLOBAL_AK',
-            's3_secret_key': 'GLOBAL_SK',
-        }
-        m.configure_spark_s3(mock_spark, config)
-        mock_spark.conf.set.assert_any_call('fs.s3a.endpoint', 'https://global.example.com')
-        assert config['_src_endpoint'] == 'https://global.example.com'
-        assert config['_dest_endpoint'] == 'https://global.example.com'
+    @staticmethod
+    def _variables(mapping: dict):
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
 
-    def test_skips_empty_values(self, mock_spark):
-        config = {}
-        m.configure_spark_s3(mock_spark, config)
-        mock_spark.conf.set.assert_not_called()
+    def test_manual_run_uses_the_per_host_variable(self):
+        cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
+        with self._variables({f'{self._HOST}_access_key': 'PER_HOST',
+                              f'{self._HOST}_secret_key': 'PER_HOST_SEC'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('PER_HOST', 'PER_HOST_SEC')
+
+    def test_manual_run_falls_back_to_the_global(self):
+        cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
+        with self._variables({}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('GLOBAL', 'GLOBALSEC')
+
+    def test_portal_run_ignores_the_plain_per_host_variable(self):
+        """A wizard override must not be silently outranked by a hand-set value."""
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({f'{self._HOST}_access_key': 'PER_HOST'}):
+            access, _ = m._endpoint_credentials(self._HOST, cfg)
+        assert access == 'FROM_WIZARD'
+
+    def test_portal_run_uses_the_prefixed_per_host_variable(self):
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({f'nx1_{self._HOST}_access_key': 'PER_HOST_PORTAL',
+                              f'nx1_{self._HOST}_secret_key': 'PER_HOST_PORTAL_SEC'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('PER_HOST_PORTAL', 'PER_HOST_PORTAL_SEC')
+
+    def test_manual_run_reads_the_per_host_env_var(self):
+        cfg = {'portal_run': False, 's3_access_key': '', 's3_secret_key': ''}
+        with self._variables({}), patch.dict(
+            'os.environ', {'S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY': 'FROM_ENV',
+                           'S3_TENANT_A_EXAMPLE_COM_SECRET_KEY': 'FROM_ENV_SEC'}
+        ):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('FROM_ENV', 'FROM_ENV_SEC')
+
+    def test_portal_run_ignores_the_per_host_env_var(self):
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({}), patch.dict(
+            'os.environ', {'S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY': 'FROM_ENV'}
+        ):
+            access, _ = m._endpoint_credentials(self._HOST, cfg)
+        assert access == 'FROM_WIZARD'
+
+    def test_half_a_per_host_pair_falls_back_to_the_whole_global_pair(self):
+        """Rollout copies per-host credentials one key at a time, so the
+        half-configured state is reachable by hand. Pairing this host's access
+        key with the tenant's global secret fails inside distcp as
+        SignatureDoesNotMatch, which names neither key."""
+        cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
+        with self._variables({f'{self._HOST}_access_key': 'PER_HOST'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('GLOBAL', 'GLOBALSEC')
+
+    def test_a_per_host_secret_alone_falls_back_too(self):
+        cfg = {'portal_run': False, 's3_access_key': 'GLOBAL', 's3_secret_key': 'GLOBALSEC'}
+        with self._variables({f'{self._HOST}_secret_key': 'PER_HOST_SEC'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('GLOBAL', 'GLOBALSEC')
+
+    def test_half_a_prefixed_pair_falls_back_for_a_portal_run(self):
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({f'nx1_{self._HOST}_access_key': 'PER_HOST_PORTAL'}):
+            access, secret = m._endpoint_credentials(self._HOST, cfg)
+        assert (access, secret) == ('FROM_WIZARD', 'WIZSEC')
+
+    def test_build_s3_opts_uses_the_helper(self):
+        cfg = {'portal_run': True, 's3_access_key': 'FROM_WIZARD', 's3_secret_key': 'WIZSEC'}
+        with self._variables({f'{self._HOST}_access_key': 'PER_HOST'}):
+            opts = m.build_s3_opts('s3a://bucket-a', cfg, f'https://{self._HOST}')
+        assert 'PER_HOST' not in opts
+        assert 'FROM_WIZARD' in opts
 
 
-# ---------------------------------------------------------------------------
-# apply_bucket_credentials
-# ---------------------------------------------------------------------------
-class TestApplyBucketCredentials:
+class TestPortalRunFlagInConfig:
 
-    def test_sets_per_bucket_credentials(self, mock_spark):
-        m.apply_bucket_credentials(mock_spark, 's3a://my-bucket/path', 'https://ep.com', 'AK', 'SK')
-        mock_spark.conf.set.assert_any_call('fs.s3a.bucket.my-bucket.endpoint', 'https://ep.com')
-        mock_spark.conf.set.assert_any_call('fs.s3a.bucket.my-bucket.access.key', 'AK')
-        mock_spark.conf.set.assert_any_call('fs.s3a.bucket.my-bucket.secret.key', 'SK')
+    def test_config_reports_a_portal_run(self):
+        conf = {'triggered_by': m.PORTAL_TRIGGER}
+        dag_run = type('DagRun', (), {'conf': conf})()
+        with patch('airflow.operators.python.get_current_context',
+                   return_value={'run_id': 'data_migration_1', 'dag_run': dag_run}):
+            cfg = m.get_config()
+        assert cfg['portal_run'] is True
 
-    def test_skips_non_s3a_url(self, mock_spark):
-        m.apply_bucket_credentials(mock_spark, '/local/path', 'https://ep.com', 'AK', 'SK')
-        mock_spark.conf.set.assert_not_called()
-
-    def test_skips_when_no_credentials_or_endpoint(self, mock_spark):
-        m.apply_bucket_credentials(mock_spark, 's3a://bucket/path', '', '', '')
-        mock_spark.conf.set.assert_not_called()
+    def test_config_reports_a_manual_run(self):
+        dag_run = type('DagRun', (), {'conf': {}})()
+        with patch('airflow.operators.python.get_current_context',
+                   return_value={'run_id': 'manual__2026', 'dag_run': dag_run}):
+            cfg = m.get_config()
+        assert cfg['portal_run'] is False
 
 
 # ---------------------------------------------------------------------------
@@ -501,3 +945,72 @@ class TestHiveTypeToSparkDdl:
     def test_no_colon_struct_field_returned_unchanged(self):
         # Malformed but must not crash
         assert self._conv("struct<malformed>") == "struct<malformed>"
+
+
+class TestMaprTicketCheckIdentity:
+    """The MapR ticket check must never grep for an empty pattern.
+
+    cluster_login built `grep -q "{sa_user}"` from the interpolated config
+    value, so an identity that resolves empty produced `grep -q ""` — which
+    matches any `maprlogin print` output and makes the "no valid MapR ticket"
+    branch unable to fire. The script already resolves $MIG_USER (the
+    configured identity, else the login shell's user), so the check greps that.
+    """
+
+    @staticmethod
+    def _captured_script(config: dict) -> str:
+        import sys
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        stdout, stderr = MagicMock(), MagicMock()
+        stdout.read.return_value = b"CLUSTER_LOGIN_SUCCESS\nTEMP_DIR=/tmp/x\n"
+        stderr.read.return_value = b""
+        stdout.channel.recv_exit_status.return_value = 0
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+        conn = MagicMock()
+        conn.__enter__.return_value = client
+        conn.__exit__.return_value = False
+        hook = MagicMock()
+        hook.get_conn.return_value = conn
+
+        ssh_module = sys.modules["airflow.providers.ssh.hooks.ssh"]
+        with patch.object(ssh_module, "SSHHook", MagicMock(return_value=hook)), \
+                patch.object(m, "get_config", lambda: config):
+            m.cluster_login("run_test")
+        return client.exec_command.call_args[0][0]
+
+    _BASE = {
+        'ssh_conn_id': 'ssh1',
+        'edge_temp_path': '/tmp/migration',
+        'auth_method': 'mapr',
+        'mapr_ticketfile_location': '/tmp/maprticket_x',
+        'distcp_log_root': '/tmp/logs',
+        'cluster_type': 'MapR',
+    }
+
+    def test_greps_the_shell_resolved_identity(self):
+        script = self._captured_script(
+            {**self._BASE, 'service_account_user_id': 'svc_migration'}
+        )
+        assert 'grep -qF -- "$MIG_USER"' in script
+        assert 'CONFIGURED_SA_USER=svc_migration' in script
+
+    def test_a_shell_metacharacter_in_the_identity_cannot_break_out(self):
+        """The identity is operator-supplied and lands in a script run over SSH
+        on the edge node, so it is quoted rather than interpolated into a quoted
+        assignment."""
+        payload = 'x";id > /tmp/pwn;#'
+        script = self._captured_script(
+            {**self._BASE, 'service_account_user_id': payload}
+        )
+        assert f"CONFIGURED_SA_USER='{payload}'" in script
+        assert 'id > /tmp/pwn' not in script.replace(f"'{payload}'", '')
+
+    def test_an_empty_identity_never_greps_for_nothing(self):
+        script = self._captured_script({**self._BASE, 'service_account_user_id': ''})
+        assert 'grep -q ""' not in script, (
+            "an empty pattern matches any maprlogin output, so the missing-ticket "
+            "branch could never fire"
+        )
+        assert 'grep -qF -- "$MIG_USER"' in script

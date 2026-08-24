@@ -44,14 +44,14 @@ else:
     logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
 
 def _resolve_dag_owner() -> str:
-    """Read portal username from Airflow Variable at DAG parse/trigger time."""
-    try:
-        from airflow.models import Variable
-        owner = Variable.get('migration_dag_owner', default_var='')
-        if owner:
-            return owner
-    except Exception:
-        pass
+    """Owner shown in the Airflow UI, fixed at DAG parse time.
+
+    Not read from an Airflow Variable: parse time has no run, so it cannot tell
+    a portal-triggered run from a hand-launched one, and reading the portal's
+    value here pinned every manual run to the last portal user. deploy.py
+    rewrites this literal via --owner. The per-run owner comes from
+    dag_run.conf and is resolved in get_config().
+    """
     return 'data-migration'
 
 default_args = {

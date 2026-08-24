@@ -19,6 +19,22 @@ This implementation provides four independent but complementary migration DAGs:
 
 The DAGs rely on Airflow Variables for configuration. Set these before running:
 
+### How each value is resolved
+
+First match wins:
+
+| # | Source | Applies to |
+| - | ------ | ---------- |
+| 1 | the key in `dag_run.conf` at trigger time | the seven [tenant-profile keys](#per-run-configuration-via-tenant-profiles) |
+| 2 | the same key in the profile named by `conf["tenant"]` | same seven |
+| 3 | `<variable>` — plain Airflow Variable | every variable |
+| 4 | the env var named in the tables below | every variable |
+| 5 | the documented default | every variable |
+
+> Using the NX1 Portal too? It writes only `nx1_`-prefixed names, which this
+> chain never reads — see [Runs triggered by the NX1 Portal](#runs-triggered-by-the-nx1-portal).
+> Otherwise ignore every `nx1_` name in this document.
+
 ### Required Variables
 
 | Variable                      | Description                                     | Example                              | Applies To                                        |
@@ -261,10 +277,12 @@ Accepted keys in a profile: `ssh_conn_id`,
 
 1. Key supplied directly in the trigger config (e.g. `{"ssh_conn_id": "..."}`)
 2. Tenant profile, when `tenant` is set
-3. Run-scoped Variable `<variable_name>__<run_id>`
-4. Global Variable
-5. Environment variable
-6. Built-in default
+3. Global Variable
+4. Environment variable
+5. Built-in default
+
+(A portal-triggered run resolves steps 3–5 differently — see
+[Runs triggered by the NX1 Portal](#runs-triggered-by-the-nx1-portal).)
 
 An unknown `tenant`, malformed JSON, or an unrecognised key inside a profile
 **fails the run** rather than falling back to the global Variables — a typo
@@ -310,9 +328,18 @@ Equivalent env vars (fallback):
 
 #### Credential resolution order per row
 
-1. **Endpoint provided in Excel** → credentials looked up via `<ep-hostname>_access_key` / `_secret_key` Variable (or env var), endpoint used as-is
-2. **No endpoint in Excel** → global `s3_access_key` / `s3_secret_key` / `s3_endpoint` from Airflow Variables
+1. **Endpoint provided in Excel** → `<ep-hostname>_access_key` / `_secret_key`
+   Variable, then the env-var equivalents; the endpoint is used as-is.
+   **Both halves or neither:** if only one is set, the row falls back to the
+   global pair rather than pairing this endpoint's access key with the global
+   secret, which S3 rejects as `SignatureDoesNotMatch` without naming either key.
+2. **No endpoint in Excel** → `s3_access_key` / `s3_secret_key` / `s3_endpoint`
+   as resolved by [the chain above](#how-each-value-is-resolved)
 3. Hadoop's own credential chain (e.g. IAM instance role) as final fallback
+
+> A portal-triggered run reads `nx1_<ep-hostname>_access_key` / `_secret_key`
+> instead — not the unprefixed names or the env vars. Set both forms if one
+> endpoint serves both kinds of run.
 
 Rows without an `endpoint` value are unaffected — no changes required for
 single-tenant setups.
@@ -325,6 +352,37 @@ single-tenant setups.
 > **Security note:** Create `_access_key` and `_secret_key` Variables with
 > **"Mask Variable value"** checked in the Airflow UI so secrets are never
 > exposed in task logs.
+
+### Runs triggered by the NX1 Portal
+
+Only relevant if your Airflow also serves the NX1 Portal. Nothing here changes
+how a run you launch yourself behaves.
+
+The portal marks its own runs with `dag_run.conf["triggered_by"] = "portal"`. On
+those runs, a variable the portal owns resolves:
+
+| # | Source |
+| - | ------ |
+| 1 | `nx1_<variable>__<run_id>` — this run's override from the wizard |
+| 2 | `nx1_<variable>` — tenant default from the Infrastructure Config page |
+| 3 | the documented default |
+
+**The two chains never meet.** Your runs never read `nx1_*`, and portal runs
+never read plain Variables or env files — not even as a fallback, so a portal
+field nobody has filled in resolves to the built-in default, not to your value.
+Tier 1 matches on presence, so a run-scoped empty string means "leave this
+empty" (that is how a portal run suppresses the report email).
+
+`PORTAL_OWNED_KEYS` in `migrator_utils/migrations/shared.py` is the list.
+Anything outside it — `cluster_type`, `hdfs_nameservice`,
+`cluster_hive_scratch_dir`, `migration_include_db_in_path`, `s3_listing_tool`,
+`migration_distcp_preserve_delete` — is deployment baseline and resolves the
+same way for both. `migration_tenant_profiles` and the per-endpoint credentials
+split by origin too, each under its own `nx1_` name.
+
+The marker is self-asserted and Airflow has no per-Variable access control, so
+this separates the two configurations — it is not a security boundary against
+anyone who can already trigger DAGs or edit Variables here.
 
 ---
 
@@ -1668,9 +1726,10 @@ transforms, exact schema types, and table properties are preserved.
   `rewrite_table_path`; register-only rows do not invoke the procedure)
 - Both source and destination buckets are reachable from the Spark workers —
   `rewrite_table_path` reads the source metadata/manifests to know what to
-  rewrite. This DAG does **not** configure S3 credentials itself; it relies on
-  the endpoints/credentials registered through the nx1 portal's object store
-  configuration
+  rewrite. This DAG does **not** configure S3 credentials itself — it relies on
+  whatever credentials the destination Spark runtime already has for both
+  buckets, whether that is its own Hadoop/S3A configuration, an instance role,
+  or an object-store configuration provisioned for it
 
 ---
 

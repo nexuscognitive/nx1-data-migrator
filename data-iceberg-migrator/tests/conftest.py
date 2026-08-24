@@ -34,12 +34,6 @@ MOCK_VARIABLES = {
     's3_listing_tool':              'hadoop',
     'migration_smtp_conn_id':       'smtp_default',
     'migration_email_recipients':   'user@example.com',
-    's3_source_endpoint':  '',
-    's3_source_access_key': 'AKIASRC',
-    's3_source_secret_key': 'srcsecret',
-    's3_dest_endpoint':    '',
-    's3_dest_access_key':  'AKIADST',
-    's3_dest_secret_key':  'dstsecret',
 }
 
 
@@ -134,6 +128,13 @@ def _make_airflow_stubs():
         "airflow.models.Variable":              variable_mock,
         "airflow.models.param":                 MagicMock(Param=_FakeParam),
         "airflow.models.param.Param":           _FakeParam,
+        # Default: no task context, so get_config() resolves run_id to None exactly
+        # as it does at DAG parse time. Tests needing a run-scoped Variable patch
+        # get_current_context to return a context dict.
+        "airflow.operators":                    MagicMock(),
+        "airflow.operators.python":             MagicMock(
+            get_current_context=MagicMock(side_effect=RuntimeError("no task context"))
+        ),
         "airflow.providers":                    MagicMock(),
         "airflow.providers.ssh":                MagicMock(),
         "airflow.providers.ssh.hooks":          MagicMock(),
