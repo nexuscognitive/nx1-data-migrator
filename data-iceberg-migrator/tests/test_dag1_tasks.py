@@ -9,6 +9,25 @@ import pytest
 from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
 
 
+def assert_each_overall_status_case_preserves_skippable(calls):
+    """Every statement rewriting `overall_status` through a CASE must carry the
+    preserve guard, expanded rather than left as a literal placeholder.
+
+    Asserted per statement, not on the joined SQL: several of these UPDATEs fire in
+    one task, so a joined assertion stays green if any *one* keeps the guard.
+    Returns the matched task labels so callers can pin which UPDATEs they hit."""
+    guarded = [
+        (c.kwargs.get('task_label'), c.args[1])
+        for c in calls
+        if 'overall_status = CASE' in c.args[1]
+    ]
+    assert guarded, 'no overall_status CASE statement was emitted'
+    for label, sql in guarded:
+        assert m._PRESERVE_SKIPPABLE_STATUS_SQL in sql, f'guard missing from {label}'
+        assert '_PRESERVE_SKIPPABLE_STATUS_SQL' not in sql, f'unexpanded in {label}'
+    return [label for label, _ in guarded]
+
+
 class TestValidatePrerequisites:
 
     def test_all_checks_pass(self, mock_ssh_hook):
@@ -276,6 +295,47 @@ class TestClusterLoginSetup:
             m.cluster_login_setup.function(run_id='run_test')
 
 
+class TestClassifyDiscoveryError:
+    """Skip the table and migrate its siblings, or abort the whole database? Decided
+    on the remote fs.exists(), never on the wording of the exception."""
+
+    def test_missing_root_location_is_skippable(self):
+        assert m._classify_discovery_error(
+            "u'Path does not exist: maprfs:/datalake/sales/orders;'", False
+        ) == 'SOURCE_PATH_NOT_FOUND'
+
+    def test_intact_root_location_is_not_skippable(self):
+        # A leaf file vanishing mid-listing (compaction, or one missing partition)
+        # is indistinguishable from a gone root in the text; only fs.exists() tells
+        # them apart, and this table is still migratable on retry.
+        assert m._classify_discovery_error(
+            'java.io.FileNotFoundException: File does not exist: '
+            'maprfs:/datalake/sales/orders/part-00000-abc.snappy.parquet', True
+        ) == 'FAILED'
+
+    def test_root_gone_wins_over_an_unrelated_error(self):
+        # Unmigratable whatever else failed on the way; the raw error still lands
+        # in tracking.
+        assert m._classify_discovery_error(
+            'java.lang.OutOfMemoryError: GC overhead limit exceeded', False
+        ) == 'SOURCE_PATH_NOT_FOUND'
+
+    def test_permission_error_is_not_skippable_even_when_root_reads_as_absent(self):
+        # An ACL problem normally throws, leaving None; pins the guard in case a
+        # filesystem returns False instead.
+        assert m._classify_discovery_error(
+            'org.apache.hadoop.security.AccessControlException: Permission denied: '
+            'user=svc_migration, path="maprfs:/datalake/sales/orders"',
+            False,
+        ) == 'FAILED'
+
+    def test_unknown_existence_is_not_skippable(self):
+        """No ground truth — abort rather than guess."""
+        assert m._classify_discovery_error(
+            'Path does not exist: maprfs:/datalake/sales/orders', None
+        ) == 'FAILED'
+
+
 class TestDiscoverTablesViaSshSpark:
 
     def _make_discovery_output(self, metadata_json):
@@ -457,6 +517,123 @@ class TestDiscoverTablesViaSshSpark:
         assert len(result['tables']) == 1
         assert result['tables'][0]['error_type'] == 'DATABASE_NOT_FOUND'
 
+    def _make_metadata_record(self, table, **overrides):
+        record = {
+            'source_database': 'sales', 'source_table': table,
+            'dest_database': 'sales_s3', 'dest_bucket': 's3a://bucket',
+            'source_location': f'maprfs:/datalake/sales/{table}',
+            's3_location': f's3a://bucket/sales_s3/{table}',
+            'file_format': 'PARQUET', 'schema': [], 'partitions': [],
+            'partition_columns': '', 'partition_count': 0, 'row_count': 0,
+            'is_partitioned': False, 'unregistered_partitions': False,
+            'table_type': 'EXTERNAL', 'source_total_size_bytes': 0,
+            'source_file_count': 0, 'serde_properties': {},
+            'partition_filter': None, 'filtered_partitions': [],
+            'partition_filter_active': False, 'filtered_row_count': 0,
+            'filtered_source_size_bytes': 0, 'filtered_file_count': 0,
+            'full_table_row_count': 0, 'full_table_partition_count': 0,
+            'source_path_exists': True,
+        }
+        record.update(overrides)
+        return record
+
+    def _run_discovery(self, client, metadata, sample_run_id, tokens):
+        import json
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata))), MagicMock()),
+        ]
+        return m.discover_tables_via_spark_ssh.function.__wrapped__(db_config={
+            'run_id': sample_run_id, 'source_database': 'sales',
+            'table_tokens': tokens, 'dest_database': 'sales_s3',
+            'dest_bucket': 's3a://bucket',
+        })
+
+    def test_generated_remote_script_is_valid_python(self, mock_ssh_hook, sample_run_id):
+        """The script only ever runs on the edge node, where a syntax error surfaces
+        as an opaque Spark failure. Compile it here instead."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        compile(script, 'discover_tables.py', 'exec')
+        # Guard the two fields the driver-side classifier depends on.
+        probe = 'source_path_exists = bool(fs.exists(path))'
+        assert probe in script
+        assert '"source_path_exists": source_path_exists' in script
+        # Load-bearing ordering, ~150 lines apart in one template: reversed, the
+        # blanket handler only ever sees None and every orphan aborts its database
+        # again — WF-343 restored with the rest of this suite green.
+        assert script.index(probe) < script.index('spark.table("{0}.{1}"')
+
+    def test_orphaned_metastore_entry_does_not_abort_sibling_tables(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """WF-343: an orphaned metastore entry is a source-data condition, not a
+        discovery failure — skip it and migrate its healthy siblings."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record('good_one'),
+            self._make_metadata_record(
+                't_ce_phonepref_ref',
+                error="u'Path does not exist: maprfs:/datalake/sales/t_ce_phonepref_ref;'",
+                error_type='FAILED',
+                source_path_exists=False,
+            ),
+            self._make_metadata_record('good_two'),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id,
+            ['good_one', 't_ce_phonepref_ref', 'good_two'],
+        )
+
+        by_table = {t['source_table']: t for t in result['tables']}
+        assert set(by_table) == {'good_one', 't_ce_phonepref_ref', 'good_two'}
+        assert by_table['t_ce_phonepref_ref']['error_type'] == 'SOURCE_PATH_NOT_FOUND'
+        assert by_table['good_one'].get('error_type') is None
+        assert by_table['good_two'].get('error_type') is None
+
+    def test_orphan_that_never_threw_is_still_classified(self, mock_ssh_hook, sample_run_id):
+        """A TEXTFILE/Avro orphan never throws — its schema comes from the catalog —
+        so it emits as a success record and would reach DistCp with 0 files and be
+        reported EMPTY_SOURCE, which finalize_run counts as successful."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record('good_one'),
+            self._make_metadata_record(
+                'textfile_orphan', file_format='TEXTFILE', source_path_exists=False,
+            ),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['good_one', 'textfile_orphan'],
+        )
+
+        by_table = {t['source_table']: t for t in result['tables']}
+        assert by_table['textfile_orphan']['error_type'] == 'SOURCE_PATH_NOT_FOUND'
+        # The reason must be concrete: it is what lands in tracking and the report.
+        assert 'maprfs:/datalake/sales/textfile_orphan' in by_table['textfile_orphan']['error']
+        assert by_table['good_one'].get('error_type') is None
+
+    def test_genuine_discovery_failure_still_aborts_batch(self, mock_ssh_hook, sample_run_id):
+        """The abort remains when the metadata is unreliable: proceeding would
+        silently under-migrate."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record('good_one'),
+            self._make_metadata_record(
+                'flaky',
+                error='java.lang.OutOfMemoryError: GC overhead limit exceeded',
+                error_type='FAILED',
+            ),
+        ]
+
+        with pytest.raises(Exception, match="Discovery failed for"):
+            self._run_discovery(client, metadata, sample_run_id, ['good_one', 'flaky'])
+
 
 class TestRecordDiscoveredTables:
 
@@ -523,6 +700,26 @@ class TestRecordDiscoveredTables:
         assert "'DATABASE_NOT_FOUND'" in all_sql
         assert 'does not exist' in all_sql
 
+    def test_writes_source_path_not_found_status(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        self._setup_count(mock_spark, 0)
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'source_location': "maprfs:/data/sales_data/o'brien",
+                'error': "Path does not exist: maprfs:/data/sales_data/o'brien",
+                'error_type': 'SOURCE_PATH_NOT_FOUND',
+            }],
+        }
+        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
+        assert "'SOURCE_PATH_NOT_FOUND'" in all_sql
+        assert 'Path does not exist' in all_sql
+        # A quote in the location must not break out of the SQL literal. Failure rows
+        # only started carrying a location in this change, so nothing pinned this.
+        assert "o''brien" in all_sql
+        assert "o'brien'" not in all_sql
+
 
 class TestRunDistcpSsh:
 
@@ -568,6 +765,24 @@ class TestRunDistcpSsh:
             ti=MagicMock(),
         )
         assert result['distcp_results'][0]['status'] == 'TABLE_NOT_FOUND'
+        client.exec_command.assert_not_called()
+
+    def test_skips_source_path_not_found_without_ssh(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': 'Path does not exist: maprfs:/data/sales_data/transactions',
+                'error_type': 'SOURCE_PATH_NOT_FOUND',
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'SOURCE_PATH_NOT_FOUND'
         client.exec_command.assert_not_called()
 
     def test_skips_database_not_found_without_ssh(self, mock_ssh_hook, sample_discovery):
@@ -817,6 +1032,45 @@ class TestUpdateDistcpStatus:
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
         assert any('FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_skipped_row_gets_no_per_table_update(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """A table skipped at discovery already has its final status; the per-table
+        UPDATE must not run for it and overwrite that with COPIED/FAILED."""
+        sample_distcp_result['distcp_results'][0]['status'] = 'SOURCE_PATH_NOT_FOUND'
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        # Key on the per-table UPDATE's own task_label. Matching on the emitted
+        # distcp_status would be vacuous: the UPDATE writes r['status'] verbatim, so
+        # a skipped row that slipped through would write SOURCE_PATH_NOT_FOUND, not
+        # COPIED/FAILED, and any such filter matches nothing either way.
+        labels = [c.kwargs.get('task_label') for c in mock_iceberg_retry.call_args_list]
+        assert 'update_distcp_status:transactions' not in labels
+
+    def test_failure_update_preserves_skippable_statuses(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """The guard is f-string interpolated, so assert it reaches the statement
+        that needs it."""
+        sample_distcp_result['distcp_results'][0]['status'] = 'FAILED'
+        sample_distcp_result['distcp_results'][0]['error'] = 'Network error'
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert 'update_distcp_status:failure_patch:transactions' in labels
+
+    def test_catchall_preserves_skippable_statuses(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """The catchall for tables distcp never reported on carries its own copy of
+        the guard, and the failure-patch test above cannot reach it."""
+        sample_distcp_result['distcp_results'] = []
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert any(label.startswith('update_distcp:catchall:') for label in labels)
+
     def test_normalizes_zero_row_completed_to_empty_source(
         self, mock_spark, sample_distcp_result, mock_iceberg_retry
     ):
@@ -946,6 +1200,19 @@ class TestCreateHiveTables:
         )
         assert result['table_results'][0]['status'] == 'COMPLETED'
         assert result['table_results'][0]['existed'] is False
+
+    def test_skips_source_path_not_found(self, mock_spark, sample_distcp_result):
+        sample_distcp_result['tables'][0].update({
+            'error': 'Path does not exist: maprfs:/data/sales_data/transactions',
+            'error_type': 'SOURCE_PATH_NOT_FOUND',
+        })
+        result = m.create_hive_tables.function.__wrapped__(
+            distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['table_results'][0]['status'] == 'SOURCE_PATH_NOT_FOUND'
+        assert result['table_results'][0]['action'] == 'skipped_not_found'
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).upper()
+        assert 'CREATE EXTERNAL TABLE' not in all_sql
 
     def test_partition_column_type_from_partition_schema(self, mock_spark, sample_distcp_result):
         """A date partition column must be emitted as `dt` date in PARTITIONED BY,
@@ -1221,6 +1488,41 @@ class TestUpdateTableCreateStatus:
         m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
         assert any('TABLE_CREATED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_skipped_row_gets_no_per_table_update(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        sample_table_result['table_results'][0]['status'] = 'SOURCE_PATH_NOT_FOUND'
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        per_table = [
+            c.args[1] for c in mock_iceberg_retry.call_args_list
+            if 'table_create_status =' in c.args[1] and 'source_table =' in c.args[1]
+        ]
+        assert per_table == []
+
+    def test_preserves_skippable_statuses(self, mock_spark, sample_table_result, mock_iceberg_retry):
+        sample_table_result['table_results'][0].update({
+            'status': 'FAILED', 'error': 'forced failure for test',
+        })
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        # Both the per-table UPDATE and its failure patch rewrite overall_status.
+        assert 'update_table_create_status:transactions' in labels
+        assert 'update_table_create_status:failure_patch:transactions' in labels
+
+    def test_catchall_preserves_skippable_statuses(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        sample_table_result['table_results'] = []
+        m.update_table_create_status.function(table_result=sample_table_result, spark=mock_spark)
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert any(
+            label.startswith('update_table_create_status:catchall:') for label in labels
+        )
+
     def test_catchall_preserves_empty_source_overall_status(
         self, mock_spark, sample_table_result, mock_iceberg_retry
     ):
@@ -1319,6 +1621,19 @@ class TestValidateDestinationTables:
         )
         assert result['validation_results'][0]['row_count_match'] is True
         assert result['validation_results'][0]['schema_match'] is True
+
+    def test_skips_source_path_not_found(self, mock_spark, sample_table_result):
+        mock_spark.sql.side_effect = self._make_router(1000)
+        self._setup_dest_schema(mock_spark)
+        sample_table_result['tables'][0].update({
+            'error': 'Path does not exist: maprfs:/data/sales_data/transactions',
+            'error_type': 'SOURCE_PATH_NOT_FOUND',
+        })
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['validation_results'][0]['status'] == 'SOURCE_PATH_NOT_FOUND'
+        assert 'Path does not exist' in result['validation_results'][0]['error']
 
     def test_detects_row_count_mismatch(self, mock_spark, sample_table_result):
         mock_spark.sql.side_effect = self._make_router(500)
@@ -1511,6 +1826,36 @@ class TestUpdateValidationStatus:
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
         assert any('VALIDATED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_preserves_skippable_statuses(self, mock_spark, sample_validation_result, mock_iceberg_retry):
+        m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert 'update_validation_status:transactions' in labels
+        # This task alone also guards error_message, so a skipped table keeps the
+        # reason it was skipped instead of picking up a validation verdict.
+        per_table = next(
+            c.args[1] for c in mock_iceberg_retry.call_args_list
+            if c.kwargs.get('task_label') == 'update_validation_status:transactions'
+        )
+        assert (
+            f"WHEN overall_status IN ({m._SKIPPABLE_STATUS_SQL_IN}) THEN error_message"
+            in per_table
+        )
+        assert '_SKIPPABLE_STATUS_SQL_IN' not in per_table
+
+    def test_catchall_preserves_skippable_statuses(
+        self, mock_spark, sample_validation_result, mock_iceberg_retry
+    ):
+        sample_validation_result['validation_results'] = []
+        m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
+        labels = assert_each_overall_status_case_preserves_skippable(
+            mock_iceberg_retry.call_args_list
+        )
+        assert any(
+            label.startswith('update_validation_status:catchall:') for label in labels
+        )
+
     def test_sets_validation_failed_on_mismatch(self, mock_spark, sample_validation_result, mock_iceberg_retry):
         sample_validation_result['validation_results'][0]['row_count_match'] = False
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
@@ -1600,6 +1945,59 @@ class TestGenerateHtmlReport:
         assert mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value.create.called
 
 
+    def test_source_path_not_found_gets_its_own_card_and_badge(self, mock_spark, sample_run_id):
+        """An orphaned metastore entry must be visible in the report as its own
+        condition, not folded into TABLE_NOT_FOUND — ops needs to know the source
+        needs cleanup rather than that the table was never there."""
+        run_row = SimpleNamespace(dag_run_id='dag_run_test')
+        tbl_row = SimpleNamespace(
+            source_database='cap_curated_mktg', source_table='t_ce_phonepref_ref',
+            overall_status='SOURCE_PATH_NOT_FOUND', discovery_duration_seconds=1.0,
+            distcp_duration_seconds=None, distcp_bytes_copied=0,
+            distcp_files_copied=0, distcp_is_incremental=False,
+            table_create_duration_seconds=None, validation_duration_seconds=None,
+            validation_status=None, row_count_match=None,
+            partition_count_match=None, schema_match=None,
+            source_row_count=0, dest_hive_row_count=0,
+            source_partition_count=0, dest_partition_count=0,
+            source_total_size_bytes=0, s3_total_size_bytes_before=0,
+            s3_total_size_bytes_after=0, s3_bytes_transferred=0,
+            file_size_match=None, source_file_count=0,
+            s3_file_count_before=0, s3_file_count_after=0,
+            s3_files_transferred=0, file_count_match=None,
+            distcp_status=None, file_format='UNKNOWN',
+            partition_filter=None, filtered_partition_count=None,
+            source_location='maprfs:/datalake/cap/curated/mktg/target/<t_ce_phonepref_ref>',
+            error_message="u'Path does not exist;' It is possible the "
+                          'underlying files have been updated',
+        )
+
+        def sql_router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'migration_runs' in sl and 'where' in sl:
+                df.collect.return_value = [run_row]
+            elif 'order by' in sl:
+                df.collect.return_value = [tbl_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = sql_router
+        m.generate_html_report.function(run_id=sample_run_id, spark=mock_spark)
+
+        stream = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value.create.return_value
+        html = stream.write.call_args[0][0].decode('utf-8')
+        assert 'SOURCE PATH MISSING' in html
+        assert 'status-path-not-found' in html
+        assert 'SOURCE_PATH_NOT_FOUND' in html
+        # The location is rendered in place of the full Spark exception, and escaped —
+        # the metacharacters live in source_location because that is the field shown.
+        assert 'maprfs:/datalake/cap/curated/mktg/target/&lt;t_ce_phonepref_ref&gt;' in html
+        assert '<t_ce_phonepref_ref>' not in html
+        assert 'It is possible the underlying files' not in html
+
+
 class TestSendMigrationReportEmail:
 
     def test_skips_when_no_recipients(self, mock_spark, sample_run_id):
@@ -1642,3 +2040,46 @@ class TestFinalizeRun:
         m.finalize_run.function(run_id=sample_run_id, spark=mock_spark)
         sql_calls = [str(c) for c in mock_spark.sql.call_args_list]
         assert any('COMPLETED' in c for c in sql_calls)
+
+    def _run_with_stats(self, mock_spark, run_id, **counts):
+        """Returns the raw SQL strings. `c.args[0]`, not `str(c)`: a mock call's repr
+        escapes newlines, so splitlines() yields one line and per-line assertions
+        silently degrade to matching the whole statement."""
+        stats_row = MagicMock()
+        stats_row.__getitem__ = lambda self, k: counts[k]
+        df = MagicMock()
+        df.collect.return_value = [stats_row]
+        mock_spark.sql.return_value = df
+        m.finalize_run.function(run_id=run_id, spark=mock_spark)
+        return [c.args[0] for c in mock_spark.sql.call_args_list if c.args]
+
+    def test_not_found_rollup_counts_every_skippable_status(self, mock_spark, sample_run_id):
+        """Pin the `not_found` rollup specifically: asserting the names appear anywhere
+        is vacuous, since the `successful` rollup above satisfies that on its own."""
+        sqls = self._run_with_stats(
+            mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=1
+        )
+        not_found_expr = next(
+            line for sql in sqls for line in sql.splitlines() if 'as not_found' in line
+        )
+        assert '_SKIPPABLE_STATUS_SQL_IN' not in not_found_expr
+        for status in m.SKIPPABLE_DISCOVERY_ERRORS:
+            assert status in not_found_expr
+
+    def test_skipped_table_downgrades_run_to_completed_with_missing(
+        self, mock_spark, sample_run_id
+    ):
+        """A run whose only anomaly is a skipped table must not finish bare COMPLETED.
+        failed=0 matters: any other value short-circuits to COMPLETED_WITH_FAILURES
+        and the branch under test never runs."""
+        sqls = ' '.join(self._run_with_stats(
+            mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=1
+        ))
+        assert "status = 'COMPLETED_WITH_MISSING'" in sqls
+
+    def test_clean_run_still_completes(self, mock_spark, sample_run_id):
+        sqls = ' '.join(self._run_with_stats(
+            mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=0
+        ))
+        assert "status = 'COMPLETED'" in sqls
+        assert 'COMPLETED_WITH_MISSING' not in sqls
