@@ -1159,3 +1159,106 @@ class TestRepairPartialTextSwap:
         mock_spark.sql.side_effect = self._router(set())
         assert m._repair_partial_text_swap(
             mock_spark, 'db', 'logs', 's3a://bucket/db/logs') == 'UNRECOVERABLE'
+
+
+class TestMigrateTextTableInplace:
+
+    def _router(self, *, staging_rows=10, src_cols=(('id', 'varchar(20)'),), dest_cols=None,
+                fail_on=None):
+        """COUNT(*) answers the row gate; DESCRIBE answers the schema gate."""
+        dest_cols = (('id', 'string'),) if dest_cols is None else dest_cols
+        def router(sql):
+            sl = sql.lower()
+            if fail_on and fail_on in sl:
+                raise RuntimeError('boom')
+            df = MagicMock()
+            if 'count(*)' in sl:
+                row = MagicMock()
+                row.__getitem__ = lambda self, k: staging_rows
+                df.collect.return_value = [row]
+            elif sl.strip().startswith('describe '):
+                cols = dest_cols if '__ice_staging' in sl else src_cols
+                df.collect.return_value = [
+                    MagicMock(col_name=n, data_type=t) for n, t in cols
+                ]
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        return router
+
+    def _call(self, spark, **kw):
+        params = dict(location='s3a://bucket/db/logs', partition_columns=[],
+                      hive_count=10, drop_backup=False)
+        params.update(kw)
+        return m._migrate_text_table_inplace(spark, 'db', 'logs', **params)
+
+    def test_sql_order_is_copy_then_two_renames(self, mock_spark):
+        mock_spark.sql.side_effect = self._router()
+        self._call(mock_spark)
+        issued = [str(c.args[0]) for c in mock_spark.sql.call_args_list]
+        ctas = next(i for i, s in enumerate(issued) if 'CREATE TABLE' in s)
+        to_backup = next(i for i, s in enumerate(issued)
+                         if 'RENAME TO db.logs_backup_' in s)
+        to_final = next(i for i, s in enumerate(issued)
+                        if 'db.logs__ice_staging RENAME TO db.logs' in s)
+        assert ctas < to_backup < to_final
+
+    def test_ctas_carries_location_and_fanout(self, mock_spark):
+        mock_spark.sql.side_effect = self._router()
+        self._call(mock_spark)
+        create = next(str(c.args[0]) for c in mock_spark.sql.call_args_list
+                      if 'CREATE TABLE' in str(c.args[0]))
+        assert "LOCATION 's3a://bucket/db/logs_iceberg'" in create
+        assert "'write.spark.fanout.enabled'='true'" in create
+        assert 'USING iceberg' in create
+        assert 'PARTITIONED BY' not in create
+
+    def test_partitioned_ctas_includes_partition_columns(self, mock_spark):
+        mock_spark.sql.side_effect = self._router()
+        self._call(mock_spark, partition_columns=['dt', 'region'])
+        create = next(str(c.args[0]) for c in mock_spark.sql.call_args_list
+                      if 'CREATE TABLE' in str(c.args[0]))
+        assert 'PARTITIONED BY (dt, region)' in create
+
+    def test_non_s3_location_omits_the_clause(self, mock_spark):
+        mock_spark.sql.side_effect = self._router()
+        self._call(mock_spark, location='maprfs:///data/logs')
+        create = next(str(c.args[0]) for c in mock_spark.sql.call_args_list
+                      if 'CREATE TABLE' in str(c.args[0]))
+        assert 'LOCATION' not in create
+
+    def test_row_mismatch_purges_staging_and_does_not_rename(self, mock_spark):
+        mock_spark.sql.side_effect = self._router(staging_rows=9)
+        with pytest.raises(m.TextCtasError, match='9 rows'):
+            self._call(mock_spark, hive_count=10)
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'DROP TABLE IF EXISTS db.logs__ice_staging PURGE' in issued
+        assert 'RENAME TO' not in issued
+
+    def test_schema_mismatch_purges_staging_and_does_not_rename(self, mock_spark):
+        mock_spark.sql.side_effect = self._router(dest_cols=(('id', 'bigint'),))
+        with pytest.raises(m.TextCtasError, match='does not match the source schema'):
+            self._call(mock_spark)
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'DROP TABLE IF EXISTS db.logs__ice_staging PURGE' in issued
+        assert 'RENAME TO' not in issued
+
+    def test_drop_backup_drops_without_purge(self, mock_spark):
+        mock_spark.sql.side_effect = self._router()
+        self._call(mock_spark, drop_backup=True)
+        drop = next(str(c.args[0]) for c in mock_spark.sql.call_args_list
+                    if 'DROP TABLE IF EXISTS db.logs_backup_' in str(c.args[0]))
+        assert 'PURGE' not in drop
+
+    def test_backup_kept_by_default(self, mock_spark):
+        mock_spark.sql.side_effect = self._router()
+        self._call(mock_spark)
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'DROP TABLE IF EXISTS db.logs_backup_' not in issued
+
+    def test_failed_backup_drop_does_not_raise(self, mock_spark):
+        """Step 4 is cleanup — the swap already committed."""
+        mock_spark.sql.side_effect = self._router(fail_on='drop table if exists db.logs_backup_')
+        result = self._call(mock_spark, drop_backup=True)
+        assert result['backup_table'] == 'db.logs_backup_'

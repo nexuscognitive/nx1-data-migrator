@@ -805,6 +805,90 @@ def _repair_partial_text_swap(spark, db: str, tbl: str, expected_location: str |
     return 'ROLLED_BACK'
 
 
+class TextCtasError(Exception):
+    """Failure inside the in-place text CTAS path.
+
+    Never classified permanent: the Airflow retry is what rolls a partial swap back.
+    """
+
+
+def _migrate_text_table_inplace(
+    spark, db: str, tbl: str, *,
+    location: str | None,
+    partition_columns: list,
+    hive_count: int,
+    drop_backup: bool,
+) -> dict:
+    """Copy a Hive text table into Iceberg and give the copy the original name.
+
+    Assumes _repair_partial_text_swap has already returned a clean state. The copy
+    is verified while the source is still live, so a bad copy leaves the original
+    untouched.
+    """
+    staging_table = f"{db}.{_ice_staging_name(tbl)}"
+    backup_table = f"{db}.{tbl}{ICEBERG_BACKUP_SUFFIXES[0]}"
+    partition_clause = (
+        f"PARTITIONED BY ({', '.join(partition_columns)})" if partition_columns else ""
+    )
+    target_location = _ctas_target_location(location)
+    location_clause = f"LOCATION '{target_location}'" if target_location else ""
+
+    logger.info(
+        f"[IcebergMigrate] {db}.{tbl}: text table — copying into {staging_table} "
+        f"{partition_clause or '(unpartitioned)'} at "
+        f"{target_location or 'the catalog default location'}"
+    )
+    spark.sql(f"""
+        CREATE TABLE {staging_table}
+        USING iceberg
+        {partition_clause}
+        {location_clause}
+        TBLPROPERTIES ('write.spark.fanout.enabled'='true')
+        AS SELECT * FROM {db}.{tbl}
+    """)
+
+    try:
+        staging_count = spark.sql(f"SELECT COUNT(*) as c FROM {staging_table}").collect()[0]['c']
+        if staging_count != hive_count:
+            raise TextCtasError(
+                f"The copy of {db}.{tbl} has {staging_count} rows but the source had {hive_count} "
+                f"when the run started — writers must be frozen for the duration of the copy. "
+                f"The original table is untouched."
+            )
+        schema_match, schema_diffs = _compare_table_schemas(spark, f"{db}.{tbl}", staging_table)
+        if not schema_match:
+            raise TextCtasError(
+                f"The copy of {db}.{tbl} does not match the source schema: "
+                f"{'; '.join(schema_diffs[:5])}. The original table is untouched."
+            )
+    except Exception:
+        spark.sql(f"DROP TABLE IF EXISTS {staging_table} PURGE")
+        raise
+
+    spark.sql(f"ALTER TABLE {db}.{tbl} RENAME TO {backup_table}")
+    spark.sql(f"ALTER TABLE {staging_table} RENAME TO {db}.{tbl}")
+    logger.info(
+        f"[IcebergMigrate] {db}.{tbl} is now Iceberg; the text table is preserved as {backup_table}"
+    )
+
+    if drop_backup:
+        try:
+            # Metadata only — the backup still owns the original text files.
+            spark.sql(f"DROP TABLE IF EXISTS {backup_table}")
+            logger.info(
+                f"[IcebergMigrate] Dropped {backup_table} (metadata only; its text files "
+                f"remain on S3 and must be cleaned up manually)"
+            )
+        except Exception as e:
+            logger.warning(f"[IcebergMigrate] Could not drop {backup_table}: {e!r}")
+
+    return {
+        'staging_table': staging_table,
+        'backup_table': backup_table,
+        'location': target_location,
+    }
+
+
 @task.pyspark(conn_id='spark_default')
 @track_duration
 def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context) -> dict:
