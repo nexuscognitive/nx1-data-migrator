@@ -1086,3 +1086,76 @@ class TestCompareTableSchemas:
         )
         match, diffs = m._compare_table_schemas(mock_spark, 'db.logs', 'db.logs__ice_staging')
         assert match is True
+
+
+class TestRepairPartialTextSwap:
+
+    def _router(self, existing, backup_location='s3a://bucket/db/logs'):
+        """SHOW TABLES answers existence; DESCRIBE FORMATTED answers Location."""
+        def router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'show tables' in sl:
+                name = sql.split("LIKE '")[1].rstrip("'").strip()
+                df.count.return_value = 1 if name in existing else 0
+            elif 'describe formatted' in sl:
+                df.collect.return_value = [
+                    MagicMock(col_name='Location', data_type=backup_location)
+                ]
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        return router
+
+    def test_clean_state_is_ready(self, mock_spark):
+        mock_spark.sql.side_effect = self._router({'logs'})
+        assert m._repair_partial_text_swap(
+            mock_spark, 'db', 'logs', 's3a://bucket/db/logs') == 'READY'
+
+    def test_leftover_staging_is_purged(self, mock_spark):
+        mock_spark.sql.side_effect = self._router({'logs', 'logs__ice_staging'})
+        state = m._repair_partial_text_swap(mock_spark, 'db', 'logs', 's3a://bucket/db/logs')
+        assert state == 'STAGING_CLEARED'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'drop table if exists db.logs__ice_staging purge' in issued
+
+    def test_live_table_with_backup_is_a_conflict(self, mock_spark):
+        """A backup beside a live TEXT table is not provably ours — never drop it."""
+        mock_spark.sql.side_effect = self._router({'logs', 'logs_backup_'})
+        state = m._repair_partial_text_swap(mock_spark, 'db', 'logs', 's3a://bucket/db/logs')
+        assert state == 'BACKUP_CONFLICT'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'drop table' not in issued
+        assert 'rename to' not in issued
+
+    def test_missing_table_with_matching_backup_rolls_back(self, mock_spark):
+        mock_spark.sql.side_effect = self._router({'logs_backup_'})
+        state = m._repair_partial_text_swap(mock_spark, 'db', 'logs', 's3a://bucket/db/logs')
+        assert state == 'ROLLED_BACK'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'ALTER TABLE db.logs_backup_ RENAME TO db.logs' in issued
+
+    def test_rollback_also_purges_staging(self, mock_spark):
+        mock_spark.sql.side_effect = self._router({'logs_backup_', 'logs__ice_staging'})
+        state = m._repair_partial_text_swap(mock_spark, 'db', 'logs', 's3a://bucket/db/logs')
+        assert state == 'ROLLED_BACK'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'drop table if exists db.logs__ice_staging purge' in issued
+
+    def test_backup_at_a_different_location_is_a_conflict(self, mock_spark):
+        mock_spark.sql.side_effect = self._router(
+            {'logs_backup_'}, backup_location='s3a://bucket/other/thing')
+        state = m._repair_partial_text_swap(mock_spark, 'db', 'logs', 's3a://bucket/db/logs')
+        assert state == 'BACKUP_CONFLICT'
+        assert 'RENAME TO' not in ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+
+    def test_unknown_expected_location_is_a_conflict(self, mock_spark):
+        """Without a location from discovery the guard cannot be evaluated."""
+        mock_spark.sql.side_effect = self._router({'logs_backup_'})
+        assert m._repair_partial_text_swap(mock_spark, 'db', 'logs', None) == 'BACKUP_CONFLICT'
+
+    def test_missing_table_and_no_backup_is_unrecoverable(self, mock_spark):
+        mock_spark.sql.side_effect = self._router(set())
+        assert m._repair_partial_text_swap(
+            mock_spark, 'db', 'logs', 's3a://bucket/db/logs') == 'UNRECOVERABLE'

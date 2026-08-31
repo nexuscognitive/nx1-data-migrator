@@ -742,6 +742,69 @@ def _drop_stale_inplace_backup(spark, db: str, tbl: str):
     return None
 
 
+def _table_location(spark, db: str, tbl: str) -> str | None:
+    """Location from DESCRIBE FORMATTED, or None if it cannot be read."""
+    try:
+        rows = spark.sql(f"DESCRIBE FORMATTED {db}.{tbl}").collect()
+    except Exception as e:
+        logger.warning(f"[IcebergMigrate] Could not read the location of {db}.{tbl}: {e!r}")
+        return None
+    for r in rows:
+        if (r.col_name or '').strip() == 'Location':
+            return (r.data_type or '').strip() or None
+    return None
+
+
+def _backup_matches_location(spark, db: str, backup: str, expected_location: str | None) -> bool:
+    """True only when the backup can be positively confirmed as the table we renamed."""
+    if not expected_location:
+        return False
+    actual = _table_location(spark, db, backup)
+    if not actual:
+        return False
+    a, e = actual.strip().rstrip('/'), expected_location.strip().rstrip('/')
+    return a == e or normalize_s3(a) == normalize_s3(e)
+
+
+def _repair_partial_text_swap(spark, db: str, tbl: str, expected_location: str | None) -> str:
+    """Return an interrupted in-place CTAS to a clean pre-copy state, or refuse to touch it.
+
+    Any partial swap is undone rather than resumed: restarting the copy costs time,
+    resuming risks promoting a copy that nothing verified. Returns READY,
+    STAGING_CLEARED, ROLLED_BACK, BACKUP_CONFLICT or UNRECOVERABLE.
+    """
+    staging = _ice_staging_name(tbl)
+    backup = f"{tbl}{ICEBERG_BACKUP_SUFFIXES[0]}"
+    live = _table_exists(spark, db, tbl)
+    has_backup = _table_exists(spark, db, backup)
+    has_staging = _table_exists(spark, db, staging)
+
+    if live:
+        if has_backup:
+            return 'BACKUP_CONFLICT'
+        if has_staging:
+            # Written by an attempt that never committed, referenced by nothing else.
+            spark.sql(f"DROP TABLE IF EXISTS {db}.{staging} PURGE")
+            logger.warning(
+                f"[IcebergMigrate] Dropped staging table left by a previous attempt: {db}.{staging}"
+            )
+            return 'STAGING_CLEARED'
+        return 'READY'
+
+    if not has_backup:
+        return 'UNRECOVERABLE'
+    if not _backup_matches_location(spark, db, backup, expected_location):
+        return 'BACKUP_CONFLICT'
+    if has_staging:
+        spark.sql(f"DROP TABLE IF EXISTS {db}.{staging} PURGE")
+    spark.sql(f"ALTER TABLE {db}.{backup} RENAME TO {db}.{tbl}")
+    logger.warning(
+        f"[IcebergMigrate] Rolled back an interrupted in-place copy: restored {db}.{tbl} "
+        f"from {db}.{backup}"
+    )
+    return 'ROLLED_BACK'
+
+
 @task.pyspark(conn_id='spark_default')
 @track_duration
 def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context) -> dict:
