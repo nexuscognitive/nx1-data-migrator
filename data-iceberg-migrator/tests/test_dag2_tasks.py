@@ -962,3 +962,17 @@ class TestFinalizeIcebergRun:
         mock_spark.sql.side_effect = router
         result = m.finalize_iceberg_run.function(run_id=sample_iceberg_run_id, spark=mock_spark)
         assert result['status'] == 'COMPLETED'
+
+
+class TestInplaceTextCtasFlag:
+
+    def test_defaults_to_true(self):
+        assert m.get_config()['iceberg_inplace_text_ctas'] is True
+
+    def test_env_var_disables_it(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_ICEBERG_INPLACE_TEXT_CTAS', 'false')
+        assert m.get_config()['iceberg_inplace_text_ctas'] is False
+
+    def test_other_falsey_spellings_disable_it(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_ICEBERG_INPLACE_TEXT_CTAS', 'no')
+        assert m.get_config()['iceberg_inplace_text_ctas'] is False

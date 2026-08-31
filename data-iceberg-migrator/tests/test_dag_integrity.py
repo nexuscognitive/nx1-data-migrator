@@ -25,6 +25,9 @@ class TestIcebergDagIntegrity:
     def test_excel_param_defined(self):
         assert 'excel_file_path' in m2.dag_iceberg.params
 
+    def test_inplace_text_ctas_param_defined(self):
+        assert 'iceberg_inplace_text_ctas' in m2.dag_iceberg.params
+
 
 class TestFolderCopyDagIntegrity:
 

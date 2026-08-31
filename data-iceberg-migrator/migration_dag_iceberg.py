@@ -2158,6 +2158,11 @@ with DAG(
             type='boolean',
             description='Drop the <table>_backup_ table after successful in-place migration',
         ),
+        'iceberg_inplace_text_ctas': Param(
+            default=True,
+            type='boolean',
+            description='Migrate text-format tables in place via CTAS + name swap instead of skipping them',
+        ),
     },
     render_template_as_native_obj=True,
 ) as dag_iceberg:
