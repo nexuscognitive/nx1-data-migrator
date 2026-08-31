@@ -43,6 +43,12 @@ PROJECTS = {
                 "owner_marker": "return 'data-migration'",
                 "owner_replacement": "return '{owner}'",
             },
+            "iceberg_catalog": {
+                "file": "migration_dag_iceberg_catalog.py",
+                "dag_id": "iceberg_catalog_migration",
+                "owner_marker": "return 'data-migration'",
+                "owner_replacement": "return '{owner}'",
+            },
         },
         "shared_utils": [
             ("migrator_utils/__init__.py", "migrator_utils/__init__.py"),
