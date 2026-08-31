@@ -636,6 +636,57 @@ def _ctas_target_location(location: str | None) -> str | None:
     return normalize_s3(loc).rstrip('/') + '_iceberg'
 
 
+def _normalize_type_for_iceberg(hive_type: str) -> str:
+    """Normalize a Hive column type to its Iceberg-equivalent representation.
+
+    Iceberg has neither TINYINT/SMALLINT (both become IntegerType, shown as 'int')
+    nor CHAR/VARCHAR (both become StringType, shown as 'string'). Without the
+    char/varchar mapping, a faithful copy of a text table declared with varchar(n)
+    reads as a schema mismatch.
+    """
+    t = (hive_type or '').strip().lower()
+    if t in ('tinyint', 'smallint'):
+        return 'int'
+    if t in ('char', 'varchar') or t.startswith('char(') or t.startswith('varchar('):
+        return 'string'
+    return t
+
+
+def _describe_columns(spark, table: str) -> dict:
+    """{column: type} from DESCRIBE, skipping the section headers Hive emits.
+
+    Partition columns appear twice in Hive's output; the dict collapses them.
+    """
+    return {
+        row.col_name: row.data_type
+        for row in spark.sql(f"DESCRIBE {table}").collect()
+        if row.col_name and not row.col_name.startswith('#')
+    }
+
+
+def _compare_table_schemas(spark, source_table: str, dest_table: str):
+    """(match, diffs) comparing column names and Iceberg-normalized types."""
+    src_cols = _describe_columns(spark, source_table)
+    dest_cols = _describe_columns(spark, dest_table)
+    diffs = []
+    for col_name, col_type in src_cols.items():
+        if col_name not in dest_cols:
+            diffs.append(f"Missing column in Iceberg: {col_name}")
+        elif _normalize_type_for_iceberg(dest_cols[col_name]) != _normalize_type_for_iceberg(col_type):
+            diffs.append(
+                f"Type mismatch for {col_name}: Hive {col_type} vs Iceberg {dest_cols[col_name]}"
+            )
+        elif dest_cols[col_name] != col_type:
+            logger.info(
+                f"[IcebergSchema] Type promoted (expected): {col_name} "
+                f"Hive={col_type} -> Iceberg={dest_cols[col_name]} in {source_table}"
+            )
+    for col_name in dest_cols:
+        if col_name not in src_cols:
+            diffs.append(f"Extra column in Iceberg: {col_name}")
+    return (not diffs), diffs
+
+
 def _table_exists(spark, db: str, tbl: str) -> bool:
     """True if {db}.{tbl} exists in the metastore."""
     try:
@@ -1223,59 +1274,7 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
         tbl_val_start = _dt.utcnow()
 
         try:
-            # Schema comparison between source Hive and destination Iceberg
-            src_hive_schema_df = spark.sql(f"DESCRIBE {src_db}.{tbl}")
-            src_hive_schema = [
-                {'name': row.col_name, 'type': row.data_type}
-                for row in src_hive_schema_df.collect()
-                if row.col_name and not row.col_name.startswith('#')
-            ]
-
-            dest_iceberg_schema_df = spark.sql(f"DESCRIBE {dest_tbl}")
-            dest_iceberg_schema = [
-                {'name': row.col_name, 'type': row.data_type}
-                for row in dest_iceberg_schema_df.collect()
-                if row.col_name and not row.col_name.startswith('#')
-            ]
-
-            # Compare schemas
-            schema_match = True
-            schema_diffs = []
-
-            def _normalize_type_for_iceberg(hive_type: str) -> str:
-                """Normalize a Hive column type to its Iceberg-equivalent representation.
-
-                Iceberg's type system does not have TINYINT (8-bit) or SMALLINT (16-bit).
-                Both are promoted to Iceberg IntegerType, which DESCRIBE shows as 'int'.
-                This normalization prevents false-positive schema-mismatch failures when
-                validating Hive tables that use these narrow integer types as partition cols.
-                """
-                t = hive_type.strip().lower()
-                if t in ('tinyint', 'smallint'):
-                    return 'int'
-                return t
-
-            src_cols = {c['name']: c['type'] for c in src_hive_schema}
-            dest_cols = {c['name']: c['type'] for c in dest_iceberg_schema}
-
-            for col_name, col_type in src_cols.items():
-                if col_name not in dest_cols:
-                    schema_match = False
-                    schema_diffs.append(f"Missing column in Iceberg: {col_name}")
-                elif _normalize_type_for_iceberg(dest_cols[col_name]) != _normalize_type_for_iceberg(col_type):
-                    schema_match = False
-                    schema_diffs.append(f"Type mismatch for {col_name}: Hive {col_type} vs Iceberg {dest_cols[col_name]}")
-                elif dest_cols[col_name] != col_type:
-                    # Types are Iceberg-compatible (e.g. smallint promoted to int) — log but do not flag as failure
-                    logger.info(
-                        f"[IcebergValidation] Type promoted (expected): {col_name} Hive={col_type} -> Iceberg={dest_cols[col_name]} "
-                        f"in {src_db}.{tbl}"
-                    )
-
-            for col_name in dest_cols:
-                if col_name not in src_cols:
-                    schema_match = False
-                    schema_diffs.append(f"Extra column in Iceberg: {col_name}")
+            schema_match, schema_diffs = _compare_table_schemas(spark, f"{src_db}.{tbl}", dest_tbl)
 
             row_ok = r.get('counts_match', False)
             part_ok = r.get('partition_match', False)

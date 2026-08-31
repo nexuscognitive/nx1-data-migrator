@@ -1012,3 +1012,77 @@ class TestCtasTargetLocation:
     def test_empty_returns_none(self):
         assert m._ctas_target_location('') is None
         assert m._ctas_target_location(None) is None
+
+
+class TestSchemaNormalization:
+
+    def test_narrow_ints_promote_to_int(self):
+        assert m._normalize_type_for_iceberg('tinyint') == 'int'
+        assert m._normalize_type_for_iceberg('SMALLINT') == 'int'
+
+    def test_char_and_varchar_become_string(self):
+        assert m._normalize_type_for_iceberg('varchar(20)') == 'string'
+        assert m._normalize_type_for_iceberg('CHAR(3)') == 'string'
+        assert m._normalize_type_for_iceberg('varchar') == 'string'
+
+    def test_other_types_pass_through_lowercased(self):
+        assert m._normalize_type_for_iceberg('  BIGINT ') == 'bigint'
+        assert m._normalize_type_for_iceberg('decimal(10,2)') == 'decimal(10,2)'
+
+
+class TestCompareTableSchemas:
+
+    def _schema_router(self, src_cols, dest_cols):
+        def router(sql):
+            df = MagicMock()
+            cols = dest_cols if '__ice_staging' in sql else src_cols
+            df.collect.return_value = [
+                MagicMock(col_name=n, data_type=t) for n, t in cols
+            ]
+            return df
+        return router
+
+    def test_varchar_source_matches_string_copy(self, mock_spark):
+        """The whole point: Iceberg has no varchar, so this must not be a mismatch."""
+        mock_spark.sql.side_effect = self._schema_router(
+            [('id', 'bigint'), ('name', 'varchar(20)')],
+            [('id', 'bigint'), ('name', 'string')],
+        )
+        match, diffs = m._compare_table_schemas(mock_spark, 'db.logs', 'db.logs__ice_staging')
+        assert match is True
+        assert diffs == []
+
+    def test_missing_column_is_a_diff(self, mock_spark):
+        mock_spark.sql.side_effect = self._schema_router(
+            [('id', 'bigint'), ('name', 'string')],
+            [('id', 'bigint')],
+        )
+        match, diffs = m._compare_table_schemas(mock_spark, 'db.logs', 'db.logs__ice_staging')
+        assert match is False
+        assert 'Missing column in Iceberg: name' in diffs
+
+    def test_extra_column_is_a_diff(self, mock_spark):
+        mock_spark.sql.side_effect = self._schema_router(
+            [('id', 'bigint')],
+            [('id', 'bigint'), ('surprise', 'string')],
+        )
+        match, diffs = m._compare_table_schemas(mock_spark, 'db.logs', 'db.logs__ice_staging')
+        assert match is False
+        assert 'Extra column in Iceberg: surprise' in diffs
+
+    def test_real_type_mismatch_is_a_diff(self, mock_spark):
+        mock_spark.sql.side_effect = self._schema_router(
+            [('id', 'bigint')],
+            [('id', 'string')],
+        )
+        match, diffs = m._compare_table_schemas(mock_spark, 'db.logs', 'db.logs__ice_staging')
+        assert match is False
+        assert any('Type mismatch for id' in d for d in diffs)
+
+    def test_section_headers_are_ignored(self, mock_spark):
+        mock_spark.sql.side_effect = self._schema_router(
+            [('id', 'bigint'), ('# Partition Information', ''), ('dt', 'string')],
+            [('id', 'bigint'), ('dt', 'string')],
+        )
+        match, diffs = m._compare_table_schemas(mock_spark, 'db.logs', 'db.logs__ice_staging')
+        assert match is True
