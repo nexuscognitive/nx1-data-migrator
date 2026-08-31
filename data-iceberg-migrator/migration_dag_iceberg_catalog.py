@@ -61,8 +61,21 @@ else:
         "env files not loaded, using Airflow Variables / defaults"
     )
 
+
+def _resolve_dag_owner() -> str:
+    """Owner shown in the Airflow UI, fixed at DAG parse time.
+
+    Not read from an Airflow Variable: parse time has no run, so it cannot tell
+    a portal-triggered run from a hand-launched one, and reading the portal's
+    value here pinned every manual run to the last portal user. deploy.py
+    rewrites this literal via --owner. The per-run owner comes from
+    dag_run.conf and is resolved in get_config().
+    """
+    return 'data-migration'
+
+
 default_args = {
-    'owner': 'data-migration',
+    'owner': _resolve_dag_owner(),
     'depends_on_past': False,
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
