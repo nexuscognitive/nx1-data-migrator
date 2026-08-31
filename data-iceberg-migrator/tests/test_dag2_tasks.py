@@ -976,3 +976,39 @@ class TestInplaceTextCtasFlag:
     def test_other_falsey_spellings_disable_it(self, monkeypatch):
         monkeypatch.setenv('MIGRATION_ICEBERG_INPLACE_TEXT_CTAS', 'no')
         assert m.get_config()['iceberg_inplace_text_ctas'] is False
+
+
+class TestStagingHelpers:
+
+    def test_staging_name(self):
+        assert m._ice_staging_name('logs') == 'logs__ice_staging'
+
+    def test_recognises_staging_table(self):
+        assert m._is_ice_staging_table('logs__ice_staging') is True
+        assert m._is_ice_staging_table('LOGS__ICE_STAGING') is True
+        assert m._is_ice_staging_table('logs') is False
+        assert m._is_ice_staging_table('') is False
+
+    def test_backup_and_staging_are_distinct(self):
+        assert m._is_iceberg_backup_table('logs__ice_staging') is False
+        assert m._is_ice_staging_table('logs_backup_') is False
+
+
+class TestCtasTargetLocation:
+
+    def test_s3a_gets_iceberg_sibling(self):
+        assert m._ctas_target_location('s3a://bucket/db/logs') == 's3a://bucket/db/logs_iceberg'
+
+    def test_trailing_slash_stripped(self):
+        assert m._ctas_target_location('s3a://bucket/db/logs/') == 's3a://bucket/db/logs_iceberg'
+
+    def test_s3_scheme_normalized_to_s3a(self):
+        assert m._ctas_target_location('s3://bucket/db/logs') == 's3a://bucket/db/logs_iceberg'
+
+    def test_non_s3_scheme_returns_none(self):
+        # normalize_s3 would turn this into 's3a://maprfs:///data/logs'
+        assert m._ctas_target_location('maprfs:///data/logs') is None
+
+    def test_empty_returns_none(self):
+        assert m._ctas_target_location('') is None
+        assert m._ctas_target_location(None) is None

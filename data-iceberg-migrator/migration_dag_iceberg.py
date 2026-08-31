@@ -25,6 +25,7 @@ from migrator_utils.migrations.shared import (
     execute_with_iceberg_retry,
     get_config,
     is_permanent_error,
+    normalize_s3,
     permanent_fail,
     track_duration,
 )
@@ -600,6 +601,39 @@ def _is_iceberg_backup_table(table_name: str) -> bool:
     """True if table_name looks like a backup produced by system.migrate."""
     n = (table_name or '').strip()
     return n.lower().endswith('_backup_') or n.upper().endswith('__BACKUP__')
+
+
+ICEBERG_STAGING_SUFFIX = '__ice_staging'
+
+_S3_SCHEMES = ('s3a://', 's3://', 's3n://')
+
+
+def _ice_staging_name(table_name: str) -> str:
+    return f"{table_name}{ICEBERG_STAGING_SUFFIX}"
+
+
+def _is_ice_staging_table(table_name: str) -> bool:
+    """True if table_name looks like a staging table left by an in-place CTAS."""
+    return (table_name or '').strip().lower().endswith(ICEBERG_STAGING_SUFFIX)
+
+
+def _ctas_target_location(location: str | None) -> str | None:
+    """Sibling '<location>_iceberg' path for an in-place CTAS, or None to let the
+    catalog choose.
+
+    Non-S3 locations must not reach normalize_s3: it prefixes anything unknown
+    with 's3a://', turning 'maprfs:///data/logs' into 's3a://maprfs:///data/logs'.
+    """
+    loc = (location or '').strip()
+    if not loc:
+        return None
+    if not loc.lower().startswith(_S3_SCHEMES):
+        logger.warning(
+            f"[IcebergMigrate] Location '{loc}' is not an S3 path — the in-place copy will use the "
+            f"catalog's default location instead of a '_iceberg' sibling path."
+        )
+        return None
+    return normalize_s3(loc).rstrip('/') + '_iceberg'
 
 
 def _table_exists(spark, db: str, tbl: str) -> bool:
