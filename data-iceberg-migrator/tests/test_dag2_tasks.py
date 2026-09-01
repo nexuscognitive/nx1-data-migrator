@@ -231,6 +231,34 @@ class TestDiscoverHiveTables:
         assert entry['skip_status'] == 'FAILED'
         assert 'RENAME TO db.logs' in entry['skip_message']
 
+    def test_literal_token_with_surviving_backup_in_snapshot_mode_is_table_not_found(self, mock_spark):
+        """Same shape (token missing, its '_backup_' surviving) means nothing in snapshot mode —
+        a genuinely missing table beside an unrelated 'foo_backup_' must not be misread as an
+        interrupted in-place swap and permanently FAILED."""
+        def router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'show databases' in sl:
+                df.count.return_value = 1
+            elif 'show tables' in sl:
+                name = sql.split("LIKE '")[1].rstrip("'").strip()
+                df.count.return_value = 1 if name == 'logs_backup_' else 0
+                df.collect.return_value = []
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        mock_spark.sql.side_effect = router
+        result = m.discover_hive_tables.function.__wrapped__(
+            db_config={'source_database': 'db', 'table_tokens': ['logs'],
+                       'inplace_migration': False, 'destination_iceberg_database': 'db_iceberg',
+                       'run_id': 'r1'},
+            spark=mock_spark,
+        )
+        entry = result['discovered_tables'][0]
+        assert entry['skip_code'] == 'TABLE_NOT_FOUND'
+        assert entry['skip_status'] == 'SKIPPED'
+
     def test_wildcard_orphan_backup_does_not_create_a_row(self, mock_spark):
         """A tenant table named foo_backup_ must not be reported as a broken swap."""
         def router(sql):
@@ -769,6 +797,31 @@ class TestMigrateTablesToIceberg:
         assert row['status'] == 'FAILED'
         assert row['reason_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
         assert row['migration_type'] == 'INPLACE_CTAS'
+
+    def test_repair_exception_for_one_table_does_not_block_the_next(self, mock_spark):
+        """_repair_partial_text_swap is the only pre-check that issues SQL, so it is the only
+        one that can raise. That must not escape the per-table loop and abandon the rest of
+        the group — it must be recorded as FAILED and the loop must move on."""
+        ti = MagicMock()
+        discovery = self._text_inplace_discovery()
+        discovery['discovered_tables'] = [
+            {**discovery['discovered_tables'][0], 'table': 'logs_a'},
+            {**discovery['discovered_tables'][0], 'table': 'logs_b'},
+        ]
+        mock_spark.sql.side_effect = self._text_inplace_router(existing=('logs_a', 'logs_b'))
+        with (
+            patch.object(m, '_repair_partial_text_swap', side_effect=[Exception('boom'), 'READY']),
+            pytest.raises(Exception, match='Iceberg migration failed'),
+        ):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=ti,
+            )
+        rows = {r['source_table']: r for r in ti.xcom_push.call_args.kwargs['value']['results']}
+        failed = rows['sales_data_s3.logs_a']
+        assert failed['status'] == 'FAILED'
+        assert failed['reason_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
+        assert failed['migration_type'] == 'INPLACE_CTAS'
+        assert rows['sales_data_s3.logs_b']['status'] == 'COMPLETED'
 
     def test_verification_failure_is_failed_not_permanent(self, mock_spark):
         """TextCtasError must not suppress retries — the retry performs the rollback."""
@@ -1420,6 +1473,43 @@ class TestRepairPartialTextSwap:
         mock_spark.sql.side_effect = self._router(set())
         assert m._repair_partial_text_swap(
             mock_spark, 'db', 'logs', 's3a://bucket/db/logs') == 'UNRECOVERABLE'
+
+    def _iceberg_live_router(self, existing):
+        """SHOW TABLES answers existence; DESCRIBE FORMATTED reports the live table as Iceberg —
+        simulates a retry with the same discovery XCom hitting a table this run already swapped."""
+        def router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'show tables' in sl:
+                name = sql.split("LIKE '")[1].rstrip("'").strip()
+                df.count.return_value = 1 if name in existing else 0
+            elif 'describe formatted' in sl:
+                df.collect.return_value = [MagicMock(col_name='Provider', data_type='iceberg')]
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        return router
+
+    def test_retry_after_success_with_backup_present_is_already_migrated(self, mock_spark):
+        """Attempt 2 re-processing a table attempt 1 already swapped must not downgrade it."""
+        mock_spark.sql.side_effect = self._iceberg_live_router({'logs', 'logs_backup_'})
+        state = m._repair_partial_text_swap(mock_spark, 'db', 'logs', 's3a://bucket/db/logs')
+        assert state == 'ALREADY_MIGRATED'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'drop table' not in issued
+        assert 'rename to' not in issued
+
+    def test_retry_after_success_with_backup_dropped_is_already_migrated(self, mock_spark):
+        """Same shape under iceberg_drop_backup=true, where the backup no longer exists — the
+        CTAS must not re-run over the copy that already holds the migrated data."""
+        mock_spark.sql.side_effect = self._iceberg_live_router({'logs'})
+        state = m._repair_partial_text_swap(mock_spark, 'db', 'logs', 's3a://bucket/db/logs')
+        assert state == 'ALREADY_MIGRATED'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'drop table' not in issued
+        assert 'create table' not in issued
+        assert 'rename to' not in issued
 
 
 class TestMigrateTextTableInplace:

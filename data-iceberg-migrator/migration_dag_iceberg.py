@@ -386,6 +386,7 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
 def discover_hive_tables(db_config: dict, spark) -> dict:
     """Discover Hive tables matching the pattern in the source database."""
     src_db = db_config['source_database']
+    inplace_migration = bool(db_config.get('inplace_migration'))
     raw_tokens = db_config.get('table_tokens') or []
     if not raw_tokens:
         pattern_str = db_config.get('table_pattern', '*')
@@ -554,7 +555,10 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                 continue
             if not exists:
                 backup_name = f"{tok}{ICEBERG_BACKUP_SUFFIXES[0]}"
-                if _table_exists(spark, src_db, backup_name):
+                # This shape (token missing, its backup surviving) only means an interrupted
+                # in-place swap when the group is actually running in-place. In snapshot mode a
+                # missing table beside an unrelated '*_backup_' table is just TABLE_NOT_FOUND.
+                if inplace_migration and _table_exists(spark, src_db, backup_name):
                     detail = (
                         f"Table '{src_db}.{tok}' is missing but '{src_db}.{backup_name}' exists — an "
                         f"in-place text copy was interrupted between renaming the source and promoting "
@@ -688,7 +692,7 @@ def _normalize_type_for_iceberg(hive_type: str) -> str:
     return t
 
 
-def _describe_columns(spark, table: str) -> dict:
+def _describe_columns(spark, table: str) -> dict[str, str]:
     """{column: type} from DESCRIBE, skipping the section headers Hive emits.
 
     Partition columns appear twice in Hive's output; the dict collapses them.
@@ -700,7 +704,7 @@ def _describe_columns(spark, table: str) -> dict:
     }
 
 
-def _compare_table_schemas(spark, source_table: str, dest_table: str):
+def _compare_table_schemas(spark, source_table: str, dest_table: str) -> tuple[bool, list[str]]:
     """(match, diffs) comparing column names and Iceberg-normalized types."""
     src_cols = _describe_columns(spark, source_table)
     dest_cols = _describe_columns(spark, dest_table)
@@ -807,7 +811,7 @@ def _repair_partial_text_swap(spark, db: str, tbl: str, expected_location: str |
 
     Any partial swap is undone rather than resumed: restarting the copy costs time,
     resuming risks promoting a copy that nothing verified. Returns READY,
-    STAGING_CLEARED, ROLLED_BACK, BACKUP_CONFLICT or UNRECOVERABLE.
+    STAGING_CLEARED, ROLLED_BACK, BACKUP_CONFLICT, ALREADY_MIGRATED or UNRECOVERABLE.
     """
     staging = _ice_staging_name(tbl)
     backup = f"{tbl}{ICEBERG_BACKUP_SUFFIXES[0]}"
@@ -816,6 +820,12 @@ def _repair_partial_text_swap(spark, db: str, tbl: str, expected_location: str |
     has_staging = _table_exists(spark, db, staging)
 
     if live:
+        # A retry with the same discovery XCom still describes this table as TEXT. If it
+        # already swapped successfully (this attempt or an earlier one), that must win over
+        # both the backup and staging checks below — otherwise a completed table gets its
+        # backup dropped and reclassified as SKIPPED, or its CTAS re-run over the live copy.
+        if _is_iceberg_table(spark, db, tbl):
+            return 'ALREADY_MIGRATED'
         if has_backup:
             return 'BACKUP_CONFLICT'
         if has_staging:
@@ -1084,7 +1094,24 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                         f"to EXTERNAL, or set inplace_migration=F to migrate it via snapshot."
                     )
                 else:
-                    swap_state = _repair_partial_text_swap(spark, src_db, tbl, location)
+                    # The only pre-check that issues SQL (DROP ... PURGE / ALTER ... RENAME), so
+                    # it is the only one that can raise here. Left uncaught, the exception would
+                    # escape the per-table loop entirely: no tracking row for this table, the rest
+                    # of the group never processed, no XCom pushed.
+                    try:
+                        swap_state = _repair_partial_text_swap(spark, src_db, tbl, location)
+                    except Exception as repair_err:
+                        _record_not_migrated(
+                            tbl, 'INPLACE_CTAS_SWAP_INCOMPLETE',
+                            f"Repairing an interrupted in-place copy of {src_db}.{tbl} raised "
+                            f"{repair_err!r} before the table could be migrated. Check the metastore "
+                            f"and storage location for {src_db}.{tbl}, {src_db}.{tbl}"
+                            f"{ICEBERG_BACKUP_SUFFIXES[0]} and {src_db}.{_ice_staging_name(tbl)}, then "
+                            f"re-run.",
+                            status='FAILED', location=location,
+                            started_at=tbl_migrate_start, mig_type='INPLACE_CTAS',
+                        )
+                        continue
                     if swap_state == 'BACKUP_CONFLICT':
                         inplace_block = (
                             'INPLACE_CTAS_BACKUP_CONFLICT',
@@ -1092,6 +1119,12 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                             f"confirmed as a backup this migration made, so renaming the source onto "
                             f"that name would overwrite something else. Rename or drop that table, "
                             f"then re-run."
+                        )
+                    elif swap_state == 'ALREADY_MIGRATED':
+                        inplace_block = (
+                            'ALREADY_ICEBERG',
+                            f"{src_db}.{tbl} is already an Iceberg table — it was migrated by an "
+                            f"earlier attempt of this run. No further action needed."
                         )
                     elif swap_state == 'UNRECOVERABLE':
                         inplace_block = (
