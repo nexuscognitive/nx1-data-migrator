@@ -403,6 +403,10 @@ The first token of `error_message` is a reason code, also shown under the status
 | `DATA_PATH_MISSING`               | The metastore points at a path that no longer holds data.                                            | Issue 9                                                             |
 | `DESTINATION_EXISTS`              | The destination Iceberg table already exists and could not be replaced.                              | Issue 9 — drop it (metadata-only) and re-run                        |
 | `FORMAT_UNDETECTED_INPLACE`       | Storage format could not be read, so in-place conversion is unsafe.                                  | Issue 8                                                             |
+| `INPLACE_CTAS_BACKUP_CONFLICT`    | `<table>_backup_` already exists and can't be confirmed as this migration's own backup.              | Issue 8                                                             |
+| `INPLACE_CTAS_SWAP_INCOMPLETE`    | A previous in-place text copy was interrupted between the two renames.                               | Issue 8b                                                            |
+| `INPLACE_CTAS_VERIFY_FAILED`      | The in-place text copy didn't match the source on row count or schema. The original is untouched.    | Issue 8                                                             |
+| `MANAGED_TEXT_INPLACE_UNSUPPORTED`| Text table not confirmed `EXTERNAL` — renaming a managed table would move its data directory.        | Issue 8                                                             |
 | `METADATA_READ_ERROR`             | `DESCRIBE FORMATTED` failed, so format/location/partitions are unknown.                              | Issue 9                                                             |
 | `MIGRATION_ERROR`                 | Fallback — the error matched no known pattern. Read the detail text.                                 | Issue 9                                                             |
 | `NO_TABLES_MATCHED_PATTERN`       | A `*` pattern in the Excel config matched no table.                                                  | Issue 10                                                            |
@@ -412,7 +416,7 @@ The first token of `error_message` is a reason code, also shown under the status
 | `SOURCE_NOT_V1_TABLE`             | Source is a DataSource V2 table, usually already Iceberg.                                            | Issue 8                                                             |
 | `TABLE_NOT_FOUND`                 | The `table` in the Excel config is not in the metastore.                                             | Issue 8                                                             |
 | `TASK_DID_NOT_PROCESS`            | The task ended before reaching this table, so no per-table result was captured.                      | **Re-run the DAG** for that database                                |
-| `TEXT_FORMAT_INPLACE_UNSUPPORTED` | Text/CSV table — Iceberg cannot convert it in place.                                                 | Issue 8                                                             |
+| `TEXT_FORMAT_INPLACE_UNSUPPORTED` | Text/CSV table with `iceberg_inplace_text_ctas` disabled — in-place `migrate` only registers Parquet/ORC/Avro data files. | Issue 8                                                             |
 | `UNSUPPORTED_DATA_TYPE`           | A column type has no Iceberg equivalent.                                                             | Issue 6                                                             |
 | `UNSUPPORTED_SOURCE_FORMAT`       | Source data files are in a format Iceberg cannot read.                                               | Issue 9                                                             |
 | `VALIDATION_ERROR`                | Migration succeeded but validation did not pass. The detail names the failing check and the numbers. | Issue 3 (rows) · Issue 4 (partitions) · Issue 6 (schema)            |
@@ -867,7 +871,7 @@ Look at `InputFormat` / `SerDe Library` → `PARQUET` / `ORC` / `AVRO` / `TEXT` 
 DESCRIBE FORMATTED <dest_db>.<table>;   -- InputFormat/Serde (DAG 1) or Provider=iceberg (DAG 2)
 ```
 
-**Resolution:** If tracking says `UNKNOWN`, trust the live `DESCRIBE FORMATTED` output. Note: text-format tables **cannot** be in-place-migrated to Iceberg — they surface as `SKIPPED` with `TEXT_FORMAT_INPLACE_UNSUPPORTED` in DAG 2 (Issue 8).
+**Resolution:** If tracking says `UNKNOWN`, trust the live `DESCRIBE FORMATTED` output. Note: text-format tables *can* be in-place-migrated to Iceberg, via CTAS, when `iceberg_inplace_text_ctas` is on and the table is confirmed `EXTERNAL` (Rulebook Rule 6). Otherwise they surface as `SKIPPED` in DAG 2 — `TEXT_FORMAT_INPLACE_UNSUPPORTED` if the flag is off, `MANAGED_TEXT_INPLACE_UNSUPPORTED` if the table can't be confirmed `EXTERNAL` (Issue 8).
 
 ---
 
@@ -901,7 +905,11 @@ Confirm either one is genuinely Iceberg with `DESCRIBE FORMATTED <db>.<table>` i
 
 | Reason code                                     | What happened                                                                                                                           | What to do                                                                                                                                                       |
 | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TEXT_FORMAT_INPLACE_UNSUPPORTED`               | Text/CSV table (LazySimpleSerDe) with `inplace_migration = T`. Iceberg's in-place `migrate` only registers Parquet/ORC/Avro data files. | Confirm the format (Step 4), then set `inplace_migration = F` for this table and re-run — it migrates via CTAS instead. **Read the warning below first.**        |
+| `TEXT_FORMAT_INPLACE_UNSUPPORTED`               | Text/CSV table (LazySimpleSerDe) with `inplace_migration = T` and `iceberg_inplace_text_ctas` disabled.                                 | Confirm the format (Step 4), then either enable `iceberg_inplace_text_ctas` to migrate it in place under the same name, or set `inplace_migration = F` to accept the namespace change and migrate it via snapshot CTAS. |
+| `MANAGED_TEXT_INPLACE_UNSUPPORTED`              | Text table not confirmed `EXTERNAL`. Renaming a managed table would move its data directory.                                            | Confirm with `DESCRIBE FORMATTED` (Step 4); convert to `EXTERNAL`, or use `inplace_migration = F`.                                                               |
+| `INPLACE_CTAS_VERIFY_FAILED`                    | The in-place copy did not match the source on row count or schema. The original table is untouched.                                     | Almost always a concurrent write. Freeze writers and re-run.                                                                                                    |
+| `INPLACE_CTAS_BACKUP_CONFLICT`                  | `<table>_backup_` exists and cannot be confirmed as ours.                                                                               | Rename or drop that table, then re-run.                                                                                                                         |
+| `INPLACE_CTAS_SWAP_INCOMPLETE`                  | A previous in-place text copy was interrupted between the two renames.                                                                  | Issue 8b, below.                                                                                                                                                 |
 | `FORMAT_UNDETECTED_INPLACE`                     | The storage format could not be read from the table definition, so in-place conversion is unsafe.                                       | Confirm the format (Step 4). If it is genuinely Parquet/ORC/Avro, the metastore entry is damaged — recreate the table. If it is text, treat it as the row above. |
 | `SOURCE_IS_VIEW`                                | The Excel row names a view, not a physical table.                                                                                       | Remove the row from the Excel config. Recreate the view over the migrated Iceberg tables once the migration is done.                                             |
 | `TABLE_NOT_FOUND`                               | The table name in the Excel `table` column is not in the metastore.                                                                     | Check the spelling, then confirm on the source (Issue 1, Step 2). If the table exists on the source but not on S3, run DAG 1 for it first.                       |
@@ -909,11 +917,9 @@ Confirm either one is genuinely Iceberg with `DESCRIBE FORMATTED <db>.<table>` i
 | `NO_TABLES_MATCHED_PATTERN`                     | A `*` pattern matched no table.                                                                                                         | Issue 10                                                                                                                                                         |
 | `TASK_DID_NOT_PROCESS` (on `validation_status`) | The table migrated correctly, but validation never ran for it.                                                                          | Re-run the DAG. The Iceberg table itself is intact.                                                                                                              |
 
-> ⚠️ **Switching a table to `inplace_migration = F` changes its database.** Snapshot mode writes to `{database}_iceberg`, not the original database, so the table does not keep its name. Every dashboard, query and pipeline that reads it must be repointed. This repointing — not the migration — is the main cost of the text-table path. If you would rather avoid it, convert the table to Parquet or ORC on the source first; it then migrates in place with no name change.
-
 **Step 4 — Confirm the source format** ▶ Edge node
 
-Needed only for `TEXT_FORMAT_INPLACE_UNSUPPORTED` and `FORMAT_UNDETECTED_INPLACE`.
+Needed only for `TEXT_FORMAT_INPLACE_UNSUPPORTED`, `MANAGED_TEXT_INPLACE_UNSUPPORTED` and `FORMAT_UNDETECTED_INPLACE`.
 
 ```sql
 DESCRIBE FORMATTED <db>.<table>;
@@ -944,6 +950,25 @@ WHERE  run_id = '<NEW_RUN_ID>' AND source_table = '<TABLE>';
 ```
 
 `status = VALIDATED` means the table is migrated and its row counts, partitions and schema all match the source. Anything else — go back to Step 1 with the new reason code.
+
+---
+
+## Issue 8b — Table missing after an interrupted in-place text copy
+
+**Symptom:** discovery reports `INPLACE_CTAS_SWAP_INCOMPLETE` (`FAILED`) for a table named literally in the Excel config (not a `*` pattern), and `<db>.<table>_backup_` exists in the metastore while `<db>.<table>` does not.
+
+This means an in-place text CTAS died between the two renames: the source had already been renamed to `<table>_backup_`, but the verified copy was never promoted to `<table>`. A retry **inside the same Airflow run** repairs this automatically — this manual fix is only needed after the whole run died and you're triggering a fresh one.
+
+**Fix** ▶ Spark SQL (JupyterHub terminal)
+
+```sql
+ALTER TABLE <db>.<table>_backup_ RENAME TO <db>.<table>;
+DROP TABLE IF EXISTS <db>.<table>__ice_staging PURGE;
+```
+
+The `PURGE` is safe here: `<table>__ice_staging` (if it still exists) was written by the failed run and is referenced by nothing else — restoring the backup does not touch it.
+
+Re-trigger the DAG once the table is restored.
 
 ---
 
@@ -1063,8 +1088,8 @@ beeline -u jdbc:hive2://<hs2>:10000 -e "MSCK REPAIR TABLE <db>.<table>;"
 **DAG 2 reason codes** — first token of `error_message`, format `[CODE] detail`:
 
 - _Config / discovery_ (`SKIPPED`): `DATABASE_NOT_FOUND` · `TABLE_NOT_FOUND` · `NO_TABLES_MATCHED_PATTERN`
-- _In-place not possible_ (`SKIPPED`): `ALREADY_ICEBERG` · `SOURCE_IS_VIEW` · `TEXT_FORMAT_INPLACE_UNSUPPORTED` · `FORMAT_UNDETECTED_INPLACE` · `SOURCE_NOT_V1_TABLE`
-- _Migration failures_ (`FAILED`): `DATA_PATH_MISSING` · `DESTINATION_EXISTS` · `UNSUPPORTED_SOURCE_FORMAT` · `UNSUPPORTED_DATA_TYPE` · `PERMISSION_DENIED` · `METADATA_READ_ERROR` · `RESOURCE_ERROR` · `CONCURRENT_COMMIT_CONFLICT` · `MIGRATION_ERROR`
+- _In-place not possible_ (`SKIPPED`): `ALREADY_ICEBERG` · `SOURCE_IS_VIEW` · `TEXT_FORMAT_INPLACE_UNSUPPORTED` · `MANAGED_TEXT_INPLACE_UNSUPPORTED` · `INPLACE_CTAS_BACKUP_CONFLICT` · `FORMAT_UNDETECTED_INPLACE` · `SOURCE_NOT_V1_TABLE`
+- _Migration failures_ (`FAILED`): `DATA_PATH_MISSING` · `DESTINATION_EXISTS` · `UNSUPPORTED_SOURCE_FORMAT` · `UNSUPPORTED_DATA_TYPE` · `PERMISSION_DENIED` · `METADATA_READ_ERROR` · `RESOURCE_ERROR` · `CONCURRENT_COMMIT_CONFLICT` · `INPLACE_CTAS_VERIFY_FAILED` · `INPLACE_CTAS_SWAP_INCOMPLETE` · `MIGRATION_ERROR`
 - _Never reached_: `TASK_DID_NOT_PROCESS` · `VALIDATION_ERROR`
 
 Full descriptions and actions: §4.4. Triage procedure: Issue 8.
