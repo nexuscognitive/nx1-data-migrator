@@ -120,12 +120,12 @@ Add one connection manually:
 
 **Airflow UI → Admin → Variables** — add these:
 
-<<<<<<< HEAD
 | Key                                | Value for local testing                               |
 | ---------------------------------- | ----------------------------------------------------- |
 | `cluster_ssh_conn_id`              | `cluster_edge_ssh`                                    |
 | `cluster_edge_temp_path`           | `/tmp/migration`                                      |
 | `cluster_edge_discovery_temp_path` | `/tmp`                                                |
+| `cluster_hive_scratch_dir`         | `/tmp/hive`                                           |
 | `auth_method`                      | `none`                                                |
 | `migration_distcp_mappers`         | `1`                                                   |
 | `migration_distcp_bandwidth`       | `10`                                                  |
@@ -137,24 +137,6 @@ Add one connection manually:
 | `migration_tracking_location`      | `s3a://<bucket>/<path>/migration_tracking_<initials>` |
 | `migration_report_location`        | `s3a://<bucket>/<path>/migration_reports_<initials>`  |
 | `migration_email_recipients`       | `your@email.com`                                      |
-=======
-| Key                           | Value for local testing                               |
-| ----------------------------- | ----------------------------------------------------- |
-| `cluster_ssh_conn_id`         | `cluster_edge_ssh`                                    |
-| `cluster_edge_temp_path`      | `/tmp/migration`                                      |
-| `cluster_hive_scratch_dir`    | `/tmp/hive`                                           |
-| `auth_method`                 | `none`                                                |
-| `migration_distcp_mappers`    | `1`                                                   |
-| `migration_distcp_bandwidth`  | `10`                                                  |
-| `migration_spark_conn_id`     | `spark_default`                                       |
-| `migration_smtp_conn_id`      | `smtp_default`                                        |
-| `s3_listing_tool`             | `hadoop`                                              |
-| `migration_default_s3_bucket` | `s3a://<your-tenant-bucket>/<path>`                   |
-| `migration_tracking_database` | `migration_tracking_<your_initials>`                  |
-| `migration_tracking_location` | `s3a://<bucket>/<path>/migration_tracking_<initials>` |
-| `migration_report_location`   | `s3a://<bucket>/<path>/migration_reports_<initials>`  |
-| `migration_email_recipients`  | `your@email.com`                                      |
->>>>>>> origin/main
 
 ### Common issues
 

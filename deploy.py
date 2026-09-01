@@ -15,10 +15,10 @@ PROJECTS = {
         "dir": "data-iceberg-migrator",
         "package": "migrator_utils",
         "dags": {
-            # Migrator DAGs resolve their owner at parse time via the
-            # migration_dag_owner Airflow Variable; --owner replaces the
-            # fallback literal inside _resolve_dag_owner(), so the Variable
-            # (when set) still takes precedence over the deployed value.
+            # --owner replaces the literal in _resolve_dag_owner(), setting
+            # the DAG-level owner field visible in Airflow. The runtime
+            # execution user is set separately via dag_run.conf['dag_owner']
+            # in get_config().
             "mapr": {
                 "file": "migration_dag_mapr_to_s3.py",
                 "dag_id": "source_to_s3_migration",
@@ -40,6 +40,12 @@ PROJECTS = {
             "parquet_hms": {
                 "file": "migration_dag_parquet_hms.py",
                 "dag_id": "parquet_hms_registration",
+                "owner_marker": "return 'data-migration'",
+                "owner_replacement": "return '{owner}'",
+            },
+            "iceberg_catalog": {
+                "file": "migration_dag_iceberg_catalog.py",
+                "dag_id": "iceberg_catalog_migration",
                 "owner_marker": "return 'data-migration'",
                 "owner_replacement": "return '{owner}'",
             },

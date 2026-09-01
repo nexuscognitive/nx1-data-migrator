@@ -1,5 +1,5 @@
 """
-DAG 5: Iceberg Catalog Migration
+DAG 4: Iceberg Catalog Migration
 
 Iceberg-to-Iceberg migration using the rewrite_table_path procedure.
 Use this DAG when data AND metadata have already been copied to the destination
@@ -61,8 +61,21 @@ else:
         "env files not loaded, using Airflow Variables / defaults"
     )
 
+
+def _resolve_dag_owner() -> str:
+    """Owner shown in the Airflow UI, fixed at DAG parse time.
+
+    Not read from an Airflow Variable: parse time has no run, so it cannot tell
+    a portal-triggered run from a hand-launched one, and reading the portal's
+    value here pinned every manual run to the last portal user. deploy.py
+    rewrites this literal via --owner. The per-run owner comes from
+    dag_run.conf and is resolved in get_config().
+    """
+    return 'data-migration'
+
+
 default_args = {
-    'owner': 'data-migration',
+    'owner': _resolve_dag_owner(),
     'depends_on_past': False,
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
@@ -70,7 +83,7 @@ default_args = {
 
 
 # =============================================================================
-# DAG 5: ICEBERG REWRITE TABLE PATH MIGRATION TASKS
+# DAG 4: ICEBERG REWRITE TABLE PATH MIGRATION TASKS
 # =============================================================================
 
 @task.pyspark(conn_id='spark_default')
@@ -1581,7 +1594,7 @@ def finalize_run(run_id: str, spark) -> dict:
 
 
 # =============================================================================
-# DAG 5 DEFINITION
+# DAG 4 DEFINITION
 # =============================================================================
 
 with DAG(
