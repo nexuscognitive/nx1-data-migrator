@@ -798,6 +798,97 @@ class TestMigrateTablesToIceberg:
         assert row['reason_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
         assert row['migration_type'] == 'INPLACE_CTAS'
 
+    def test_blocked_rollback_is_failed_not_skipped(self, mock_spark):
+        """Source gone and the backup unprovable means the table is missing from the
+        metastore. Recording that as SKIPPED would let the run finish green."""
+        ti = MagicMock()
+        # The router reports every backup at s3a://bucket/logs_iceberg, which does not
+        # match the discovery location — so the rollback cannot be confirmed safe.
+        mock_spark.sql.side_effect = self._text_inplace_router(existing=('logs_backup_',))
+        with pytest.raises(Exception, match='Iceberg migration failed'):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
+                spark=mock_spark, ti=ti,
+            )
+        row = ti.xcom_push.call_args.kwargs['value']['results'][0]
+        assert row['status'] == 'FAILED'
+        assert row['reason_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
+        assert row['migration_type'] == 'INPLACE_CTAS'
+        assert 'RENAME TO' not in ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+
+    def test_retry_of_an_already_swapped_table_stays_completed(self, mock_spark):
+        """A retry driven by another table's failure re-runs this one. Recording it as
+        SKIPPED would overwrite its COMPLETED tracking row and drop it out of validation."""
+        base = self._text_inplace_router()
+
+        def router(sql):
+            if 'describe formatted' in sql.lower():
+                df = MagicMock()
+                df.collect.return_value = [
+                    MagicMock(col_name='Provider', data_type='iceberg'),
+                    MagicMock(col_name='Location', data_type='s3a://bucket/logs_iceberg'),
+                ]
+                return df
+            return base(sql)
+
+        mock_spark.sql.side_effect = router
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        row = result['results'][0]
+        assert row['status'] == 'COMPLETED'
+        assert row['migration_type'] == 'INPLACE_CTAS'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'AS SELECT' not in issued
+        assert 'RENAME TO' not in issued
+
+    def test_permanent_ctas_error_short_circuits_before_any_rename(self, mock_spark):
+        """Nothing has been renamed yet, so retrying only re-copies the table. The
+        rollback guarantee only needs to hold once a RENAME has been issued."""
+        ti = MagicMock()
+        base = self._text_inplace_router()
+
+        def router(sql):
+            if 'as select' in sql.lower():
+                raise Exception(
+                    "A column or function parameter with name `dt` cannot be found. "
+                    "Verify the spelling and correctness of the column name."
+                )
+            return base(sql)
+
+        mock_spark.sql.side_effect = router
+        with (
+            patch.object(m, 'permanent_fail', side_effect=Exception('permanent')) as pf,
+            pytest.raises(Exception, match='permanent'),
+        ):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
+                spark=mock_spark, ti=ti,
+            )
+        assert pf.called
+
+    def test_failed_staging_cleanup_does_not_mask_the_verification_error(self, mock_spark):
+        """The DROP that clears the staging copy runs while a TextCtasError is in flight;
+        letting it throw would replace the row-count detail with a generic classification."""
+        ti = MagicMock()
+        base = self._text_inplace_router(hive_rows=10, staging_rows=9)
+
+        def router(sql):
+            if sql.lower().strip().startswith('drop table'):
+                raise Exception('metastore unavailable')
+            return base(sql)
+
+        mock_spark.sql.side_effect = router
+        with pytest.raises(Exception, match='Iceberg migration failed'):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
+                spark=mock_spark, ti=ti,
+            )
+        row = ti.xcom_push.call_args.kwargs['value']['results'][0]
+        assert row['reason_code'] == 'INPLACE_CTAS_VERIFY_FAILED'
+        assert '9 rows' in row['error']
+
     def test_repair_exception_for_one_table_does_not_block_the_next(self, mock_spark):
         """_repair_partial_text_swap is the only pre-check that issues SQL, so it is the only
         one that can raise. That must not escape the per-table loop and abandon the rest of
@@ -1327,6 +1418,12 @@ class TestCtasTargetLocation:
         assert m._ctas_target_location('') is None
         assert m._ctas_target_location(None) is None
 
+    def test_uppercase_scheme_does_not_double_prefix(self):
+        # normalize_s3 matches schemes case-sensitively, so passing the raw value
+        # through would yield 's3a://S3://bucket/db/logs'.
+        assert m._ctas_target_location('S3://bucket/db/logs') == 's3a://bucket/db/logs_iceberg'
+        assert m._ctas_target_location('S3A://bucket/db/logs') == 's3a://bucket/db/logs_iceberg'
+
 
 class TestSchemaNormalization:
 
@@ -1338,6 +1435,19 @@ class TestSchemaNormalization:
         assert m._normalize_type_for_iceberg('varchar(20)') == 'string'
         assert m._normalize_type_for_iceberg('CHAR(3)') == 'string'
         assert m._normalize_type_for_iceberg('varchar') == 'string'
+
+    def test_nested_types_are_normalized(self):
+        assert m._normalize_type_for_iceberg('array<tinyint>') == 'array<int>'
+        assert m._normalize_type_for_iceberg('map<string,varchar(5)>') == 'map<string,string>'
+        assert m._normalize_type_for_iceberg(
+            'struct<a:varchar(10),b:tinyint>') == 'struct<a:string,b:int>'
+        assert m._normalize_type_for_iceberg(
+            'array<struct<a:char(2),b:smallint>>') == 'array<struct<a:string,b:int>>'
+
+    def test_field_names_matching_type_keywords_are_left_alone(self):
+        assert m._normalize_type_for_iceberg('struct<varchar:int>') == 'struct<varchar:int>'
+        assert m._normalize_type_for_iceberg('struct<tinyint:tinyint>') == 'struct<tinyint:int>'
+        assert m._normalize_type_for_iceberg('decimal(10,2)') == 'decimal(10,2)'
 
     def test_other_types_pass_through_lowercased(self):
         assert m._normalize_type_for_iceberg('  BIGINT ') == 'bigint'
@@ -1457,17 +1567,19 @@ class TestRepairPartialTextSwap:
         issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
         assert 'drop table if exists db.logs__ice_staging purge' in issued
 
-    def test_backup_at_a_different_location_is_a_conflict(self, mock_spark):
+    def test_backup_at_a_different_location_blocks_the_rollback(self, mock_spark):
+        """Source gone and the backup unprovable is a different state from a stray backup
+        beside a live table — it must not share BACKUP_CONFLICT, which is recorded SKIPPED."""
         mock_spark.sql.side_effect = self._router(
             {'logs_backup_'}, backup_location='s3a://bucket/other/thing')
         state = m._repair_partial_text_swap(mock_spark, 'db', 'logs', 's3a://bucket/db/logs')
-        assert state == 'BACKUP_CONFLICT'
+        assert state == 'ROLLBACK_BLOCKED'
         assert 'RENAME TO' not in ' '.join(str(c) for c in mock_spark.sql.call_args_list)
 
-    def test_unknown_expected_location_is_a_conflict(self, mock_spark):
+    def test_unknown_expected_location_blocks_the_rollback(self, mock_spark):
         """Without a location from discovery the guard cannot be evaluated."""
         mock_spark.sql.side_effect = self._router({'logs_backup_'})
-        assert m._repair_partial_text_swap(mock_spark, 'db', 'logs', None) == 'BACKUP_CONFLICT'
+        assert m._repair_partial_text_swap(mock_spark, 'db', 'logs', None) == 'ROLLBACK_BLOCKED'
 
     def test_missing_table_and_no_backup_is_unrecoverable(self, mock_spark):
         mock_spark.sql.side_effect = self._router(set())

@@ -972,6 +972,14 @@ The `PURGE` is safe here: `<table>__ice_staging` (if it still exists) was writte
 
 Re-trigger the DAG once the table is restored.
 
+**Variant — the backup could not be confirmed.** The same reason code is recorded by the migration task (not discovery) when `<db>.<table>` is missing and `<db>.<table>_backup_` exists but its `Location` does not match the location discovery recorded for the source. The DAG refuses to rename it back, because doing so could resurrect an unrelated table under the production name. Compare the two by hand before running the fix above:
+
+```sql
+DESCRIBE FORMATTED <db>.<table>_backup_;   -- Location must be the source's original path
+```
+
+If the backup is the source, run the fix above. If it is something else, find where the source went from the failed run's logs before touching either table.
+
 ---
 
 ## Issue 9 — Run reports COMPLETED_WITH_FAILURES (get the exact list)

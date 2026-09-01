@@ -14,6 +14,7 @@ Excel columns: database | table | inplace_migration | destination_iceberg_databa
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -667,13 +668,25 @@ def _ctas_target_location(location: str | None) -> str | None:
     loc = (location or '').strip()
     if not loc:
         return None
-    if not loc.lower().startswith(_S3_SCHEMES):
+    scheme = next((s for s in _S3_SCHEMES if loc.lower().startswith(s)), None)
+    if scheme is None:
         logger.warning(
             f"[IcebergMigrate] Location '{loc}' is not an S3 path — the in-place copy will use the "
             f"catalog's default location instead of a '_iceberg' sibling path."
         )
         return None
-    return normalize_s3(loc).rstrip('/') + '_iceberg'
+    # normalize_s3 matches schemes case-sensitively, so 'S3://b/x' would come back as
+    # 's3a://S3://b/x'. Hand it the canonical lowercase scheme.
+    return normalize_s3(scheme + loc[len(scheme):]).rstrip('/') + '_iceberg'
+
+
+# A struct field name is the only token followed by ':', so the lookahead keeps
+# 'struct<varchar:int>' from having its field renamed; \b keeps 'tinyint_col' intact.
+_ICEBERG_TYPE_REWRITES = (
+    (re.compile(r'\b(?:char|varchar)\s*\(\s*\d+\s*\)'), 'string'),
+    (re.compile(r'\b(?:char|varchar)\b(?!\s*[:(])'), 'string'),
+    (re.compile(r'\b(?:tinyint|smallint)\b(?!\s*[:(])'), 'int'),
+)
 
 
 def _normalize_type_for_iceberg(hive_type: str) -> str:
@@ -682,13 +695,12 @@ def _normalize_type_for_iceberg(hive_type: str) -> str:
     Iceberg has neither TINYINT/SMALLINT (both become IntegerType, shown as 'int')
     nor CHAR/VARCHAR (both become StringType, shown as 'string'). Without the
     char/varchar mapping, a faithful copy of a text table declared with varchar(n)
-    reads as a schema mismatch.
+    reads as a schema mismatch. The rewrite is textual so it also reaches these
+    types nested inside struct/array/map.
     """
     t = (hive_type or '').strip().lower()
-    if t in ('tinyint', 'smallint'):
-        return 'int'
-    if t in ('char', 'varchar') or t.startswith('char(') or t.startswith('varchar('):
-        return 'string'
+    for pattern, replacement in _ICEBERG_TYPE_REWRITES:
+        t = pattern.sub(replacement, t)
     return t
 
 
@@ -811,7 +823,8 @@ def _repair_partial_text_swap(spark, db: str, tbl: str, expected_location: str |
 
     Any partial swap is undone rather than resumed: restarting the copy costs time,
     resuming risks promoting a copy that nothing verified. Returns READY,
-    STAGING_CLEARED, ROLLED_BACK, BACKUP_CONFLICT, ALREADY_MIGRATED or UNRECOVERABLE.
+    STAGING_CLEARED, ROLLED_BACK, BACKUP_CONFLICT, ROLLBACK_BLOCKED, ALREADY_MIGRATED
+    or UNRECOVERABLE.
     """
     staging = _ice_staging_name(tbl)
     backup = f"{tbl}{ICEBERG_BACKUP_SUFFIXES[0]}"
@@ -840,7 +853,10 @@ def _repair_partial_text_swap(spark, db: str, tbl: str, expected_location: str |
     if not has_backup:
         return 'UNRECOVERABLE'
     if not _backup_matches_location(spark, db, backup, expected_location):
-        return 'BACKUP_CONFLICT'
+        # The source is gone and this backup cannot be confirmed as the one we renamed,
+        # so restoring from it could resurrect the wrong table. Distinct from the live
+        # BACKUP_CONFLICT above, where nothing has been lost.
+        return 'ROLLBACK_BLOCKED'
     if has_staging:
         spark.sql(f"DROP TABLE IF EXISTS {db}.{staging} PURGE")
     spark.sql(f"ALTER TABLE {db}.{backup} RENAME TO {db}.{tbl}")
@@ -852,9 +868,13 @@ def _repair_partial_text_swap(spark, db: str, tbl: str, expected_location: str |
 
 
 class TextCtasError(Exception):
-    """Failure inside the in-place text CTAS path.
+    """Failure inside the in-place text CTAS path, with the source still in place."""
 
-    Never classified permanent: the Airflow retry is what rolls a partial swap back.
+
+class TextCtasSwapError(TextCtasError):
+    """Failure after the source was renamed away, leaving a partial swap to undo.
+
+    Never classified permanent: the Airflow retry is what rolls the swap back.
     """
 
 
@@ -908,11 +928,25 @@ def _migrate_text_table_inplace(
                 f"{'; '.join(schema_diffs[:5])}. The original table is untouched."
             )
     except Exception:
-        spark.sql(f"DROP TABLE IF EXISTS {staging_table} PURGE")
+        try:
+            spark.sql(f"DROP TABLE IF EXISTS {staging_table} PURGE")
+        except Exception as cleanup_err:
+            logger.warning(
+                f"[IcebergMigrate] Could not drop {staging_table} after a failed copy: "
+                f"{cleanup_err!r}"
+            )
         raise
 
-    spark.sql(f"ALTER TABLE {db}.{tbl} RENAME TO {backup_table}")
-    spark.sql(f"ALTER TABLE {staging_table} RENAME TO {db}.{tbl}")
+    try:
+        spark.sql(f"ALTER TABLE {db}.{tbl} RENAME TO {backup_table}")
+        spark.sql(f"ALTER TABLE {staging_table} RENAME TO {db}.{tbl}")
+    except Exception as e:
+        # Either rename may have committed in the metastore before the client saw the
+        # error, so the whole pair is the window in which a rollback can be pending.
+        raise TextCtasSwapError(
+            f"The swap for {db}.{tbl} failed partway: {e!r}. The source may be parked as "
+            f"{backup_table} with {staging_table} unpromoted; the next attempt rolls it back."
+        ) from e
     logger.info(
         f"[IcebergMigrate] {db}.{tbl} is now Iceberg; the text table is preserved as {backup_table}"
     )
@@ -1060,6 +1094,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             inplace_block = None
             inplace_block_status = 'SKIPPED'
             inplace_block_mig_type = None
+            text_ctas_already_done = False
             if source_format == 'ICEBERG':
                 inplace_block = (
                     'ALREADY_ICEBERG',
@@ -1121,18 +1156,27 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                             f"then re-run."
                         )
                     elif swap_state == 'ALREADY_MIGRATED':
-                        inplace_block = (
-                            'ALREADY_ICEBERG',
-                            f"{src_db}.{tbl} is already an Iceberg table — it was migrated by an "
-                            f"earlier attempt of this run. No further action needed."
-                        )
-                    elif swap_state == 'UNRECOVERABLE':
+                        # Re-verify below instead of recording a skip. Rewriting the row an
+                        # earlier attempt wrote as COMPLETED would report a successful
+                        # migration as skipped and drop it out of the validation pass.
+                        text_ctas_already_done = True
+                    elif swap_state in ('UNRECOVERABLE', 'ROLLBACK_BLOCKED'):
+                        if swap_state == 'UNRECOVERABLE':
+                            missing_detail = (
+                                f"there is no {tbl}{ICEBERG_BACKUP_SUFFIXES[0]} to restore it from"
+                            )
+                        else:
+                            missing_detail = (
+                                f"{tbl}{ICEBERG_BACKUP_SUFFIXES[0]} exists but could not be confirmed "
+                                f"as the table an interrupted copy renamed away (expected it at "
+                                f"{location or 'an unrecorded location'})"
+                            )
                         inplace_block = (
                             'INPLACE_CTAS_SWAP_INCOMPLETE',
-                            f"{src_db}.{tbl} is not in the metastore and there is no "
-                            f"{tbl}{ICEBERG_BACKUP_SUFFIXES[0]} to restore it from, so an interrupted "
-                            f"in-place copy cannot be rolled back automatically. Check the storage "
-                            f"location and the previous run's logs."
+                            f"{src_db}.{tbl} is not in the metastore and {missing_detail}, so an "
+                            f"interrupted in-place copy cannot be rolled back automatically. Restore "
+                            f"{src_db}.{tbl} by hand before re-running; check the storage location and "
+                            f"the previous attempt's logs."
                         )
                         inplace_block_status = 'FAILED'
                         inplace_block_mig_type = 'INPLACE_CTAS'
@@ -1188,13 +1232,19 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 dest_table = f"{src_db}.{tbl}"
                 if source_format == 'TEXT':
                     migration_type = "INPLACE_CTAS"
-                    _migrate_text_table_inplace(
-                        spark, src_db, tbl,
-                        location=location,
-                        partition_columns=partition_columns,
-                        hive_count=hive_count,
-                        drop_backup=drop_backup,
-                    )
+                    if text_ctas_already_done:
+                        logger.warning(
+                            f"[IcebergMigrate] {src_db}.{tbl} was already swapped to Iceberg by an "
+                            f"earlier attempt of this run — re-verifying instead of copying again."
+                        )
+                    else:
+                        _migrate_text_table_inplace(
+                            spark, src_db, tbl,
+                            location=location,
+                            partition_columns=partition_columns,
+                            hive_count=hive_count,
+                            drop_backup=drop_backup,
+                        )
                 else:
                     migration_type = "INPLACE"
                     _drop_stale_inplace_backup(spark, src_db, tbl)
@@ -1391,7 +1441,9 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             err_text = str(e)
             dest_table_name = f"{src_db}.{tbl}" if inplace else f"{dest_db}.{tbl}"
             _text_ctas_attempt = inplace and source_format == 'TEXT'
-            if isinstance(e, TextCtasError):
+            if isinstance(e, TextCtasSwapError):
+                code, detail = 'INPLACE_CTAS_SWAP_INCOMPLETE', err_text
+            elif isinstance(e, TextCtasError):
                 code, detail = 'INPLACE_CTAS_VERIFY_FAILED', err_text
             else:
                 code, detail = classify_migration_error(err_text, src_db, tbl, dest_table_name, inplace)
@@ -1413,7 +1465,11 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 status='FAILED', location=location, started_at=tbl_migrate_start,
                 mig_type=('INPLACE_CTAS' if _text_ctas_attempt else None),
             )
-            if not _text_ctas_attempt and is_permanent_error("iceberg_migrate", e):
+            # A pending rollback needs the retry that performs it, whatever the error
+            # markers say (a swap-window rename reports TABLE_OR_VIEW_NOT_FOUND, which is
+            # one of them). Every other text-CTAS failure leaves the source untouched, so
+            # it should short-circuit rather than re-copy the whole table twice more.
+            if not isinstance(e, TextCtasSwapError) and is_permanent_error("iceberg_migrate", e):
                 _permanent_failure = (f"migrate_tables_to_iceberg:{src_db}.{tbl}", e)
 
     failed_migrations = [r for r in results if r['status'] == 'FAILED']
