@@ -347,7 +347,9 @@ Field meanings are largely the same as DAG 1's `migration_runs` (§1.1), except 
 | `destination_database` / `destination_table` | Iceberg destination | For SNAPSHOT this is a new DB (e.g. `<src>_iceberg`);                                                            |
 
 For INPLACE it equals the source |
-| `migration_type` | Conversion strategy | `INPLACE` = source table converted in place;
+| `migration_type` | Conversion strategy | `INPLACE` = source table converted in place (zero-copy, via `system.migrate`);
+
+`INPLACE_CTAS` = source table converted in place via a full copy plus a name swap (text tables only, see Rulebook Rule 6);
 
 `SNAPSHOT` = new Iceberg table created alongside the source |
 | `table_location` | Final Iceberg table location | `s3a://...` |

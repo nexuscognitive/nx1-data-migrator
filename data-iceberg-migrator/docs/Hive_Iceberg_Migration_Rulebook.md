@@ -225,7 +225,7 @@ This requires the table to be confirmed **EXTERNAL**. A text table that can't be
 
 If verification fails — almost always a concurrent write — the staging table is dropped and the original is left untouched: `INPLACE_CTAS_VERIFY_FAILED`, status FAILED. Freeze writers and re-run.
 
-**With `iceberg_inplace_text_ctas = false`, or `inplace_migration = F`:** text (and unknown-format) tables are skipped — `TEXT_FORMAT_INPLACE_UNSUPPORTED` — and the only path is Snapshot, which routes them through CTAS into the destination database:
+**With `iceberg_inplace_text_ctas = false`, or `inplace_migration = F`:** text tables are skipped — `TEXT_FORMAT_INPLACE_UNSUPPORTED` — and the only path is Snapshot, which routes them through CTAS into the destination database. (`UNKNOWN`-format tables are a separate, unconditional case: they're always skipped with `FORMAT_UNDETECTED_INPLACE`, regardless of this flag.)
 
 1. Freeze writers to those tables **before** the CTAS run — the copy is point-in-time.
 2. Run the snapshot DAG; validate row counts and schema.
