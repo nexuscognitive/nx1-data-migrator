@@ -172,6 +172,90 @@ class TestDiscoverHiveTables:
         assert entries[0]['skip_code'] == 'NO_TABLES_MATCHED_PATTERN'
         assert entries[0]['skip_status'] == 'SKIPPED'
 
+    def test_wildcard_excludes_staging_tables(self, mock_spark):
+        def router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'show databases' in sl:
+                df.count.return_value = 1
+            elif 'show tables' in sl:
+                df.collect.return_value = [
+                    MagicMock(tableName='logs'),
+                    MagicMock(tableName='logs__ice_staging'),
+                    MagicMock(tableName='logs_backup_'),
+                ]
+                df.count.return_value = 3
+            elif 'describe formatted' in sl:
+                df.collect.return_value = [
+                    MagicMock(col_name='Location', data_type='s3a://bucket/logs'),
+                ]
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        mock_spark.sql.side_effect = router
+        result = m.discover_hive_tables.function.__wrapped__(
+            db_config={'source_database': 'db', 'table_tokens': ['*'],
+                       'inplace_migration': True, 'destination_iceberg_database': 'db',
+                       'run_id': 'r1'},
+            spark=mock_spark,
+        )
+        names = [t['table'] for t in result['discovered_tables']]
+        assert 'logs' in names
+        assert 'logs__ice_staging' not in names
+        assert 'logs_backup_' not in names
+
+    def test_literal_token_with_surviving_backup_reports_incomplete_swap(self, mock_spark):
+        def router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'show databases' in sl:
+                df.count.return_value = 1
+            elif 'show tables' in sl:
+                name = sql.split("LIKE '")[1].rstrip("'").strip()
+                df.count.return_value = 1 if name == 'logs_backup_' else 0
+                df.collect.return_value = []
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        mock_spark.sql.side_effect = router
+        result = m.discover_hive_tables.function.__wrapped__(
+            db_config={'source_database': 'db', 'table_tokens': ['logs'],
+                       'inplace_migration': True, 'destination_iceberg_database': 'db',
+                       'run_id': 'r1'},
+            spark=mock_spark,
+        )
+        entry = result['discovered_tables'][0]
+        assert entry['skip_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
+        assert entry['skip_status'] == 'FAILED'
+        assert 'RENAME TO db.logs' in entry['skip_message']
+
+    def test_wildcard_orphan_backup_does_not_create_a_row(self, mock_spark):
+        """A tenant table named foo_backup_ must not be reported as a broken swap."""
+        def router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'show databases' in sl:
+                df.count.return_value = 1
+            elif 'show tables' in sl:
+                df.collect.return_value = [MagicMock(tableName='foo_backup_')]
+                df.count.return_value = 1
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        mock_spark.sql.side_effect = router
+        result = m.discover_hive_tables.function.__wrapped__(
+            db_config={'source_database': 'db', 'table_tokens': ['*'],
+                       'inplace_migration': True, 'destination_iceberg_database': 'db',
+                       'run_id': 'r1'},
+            spark=mock_spark,
+        )
+        codes = [t.get('skip_code') for t in result['discovered_tables']]
+        assert 'INPLACE_CTAS_SWAP_INCOMPLETE' not in codes
+        assert codes == ['NO_TABLES_MATCHED_PATTERN']
+
 
 class TestMigrateTablesToIceberg:
 

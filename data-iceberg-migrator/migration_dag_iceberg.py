@@ -511,15 +511,24 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                 tables_metadata.append(skip_entry(tok, code, status, detail))
                 continue
             names = [r.tableName for r in rows]
-            backups = [n for n in names if _is_iceberg_backup_table(n)]
-            for b in backups:
-                logger.info(f"[IcebergDiscover] Skipping Iceberg backup table: {src_db}.{b}")
-            names = [n for n in names if not _is_iceberg_backup_table(n)]
+            excluded = [n for n in names
+                        if _is_iceberg_backup_table(n) or _is_ice_staging_table(n)]
+            live = {n.lower() for n in names if n not in excluded}
+            for b in excluded:
+                logger.info(f"[IcebergDiscover] Skipping Iceberg backup/staging table: {src_db}.{b}")
+                if _is_iceberg_backup_table(b) and _strip_backup_suffix(b).lower() not in live:
+                    logger.warning(
+                        f"[IcebergDiscover] {src_db}.{b} has no live table beside it — a previous "
+                        f"in-place text copy may have been interrupted. Not reported as a failure "
+                        f"because '{tok}' is a wildcard; name the table explicitly in the Excel "
+                        f"config to have it checked."
+                    )
+            names = [n for n in names if n not in excluded]
             if not names:
                 detail = (
                     f"No table in database '{src_db}' matched the pattern '{tok}' from the Excel config"
-                    + (f" ({len(backups)} Iceberg backup table(s) matched and were excluded on purpose)"
-                       if backups else " (the database is empty or the pattern is wrong)")
+                    + (f" ({len(excluded)} Iceberg backup/staging table(s) matched and were excluded on purpose)"
+                       if excluded else " (the database is empty or the pattern is wrong)")
                     + "."
                 )
                 logger.warning(f"[IcebergDiscover] NO_TABLES_MATCHED_PATTERN: {detail}")
@@ -544,6 +553,20 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                 tables_metadata.append(skip_entry(tok, code, status, detail))
                 continue
             if not exists:
+                backup_name = f"{tok}{ICEBERG_BACKUP_SUFFIXES[0]}"
+                if _table_exists(spark, src_db, backup_name):
+                    detail = (
+                        f"Table '{src_db}.{tok}' is missing but '{src_db}.{backup_name}' exists — an "
+                        f"in-place text copy was interrupted between renaming the source and promoting "
+                        f"the copy. Restore it with: ALTER TABLE {src_db}.{backup_name} RENAME TO "
+                        f"{src_db}.{tok}; then DROP TABLE IF EXISTS "
+                        f"{src_db}.{_ice_staging_name(tok)} PURGE; then re-run this DAG."
+                    )
+                    logger.error(f"[IcebergDiscover] INPLACE_CTAS_SWAP_INCOMPLETE: {detail}")
+                    tables_metadata.append(
+                        skip_entry(tok, 'INPLACE_CTAS_SWAP_INCOMPLETE', 'FAILED', detail)
+                    )
+                    continue
                 detail = (
                     f"Table '{src_db}.{tok}' listed in the Excel config does not exist in the Hive "
                     f"metastore (checked with SHOW TABLES IN {src_db} LIKE '{tok}'). Verify the spelling "
@@ -619,6 +642,15 @@ def _ice_staging_name(table_name: str) -> str:
 def _is_ice_staging_table(table_name: str) -> bool:
     """True if table_name looks like a staging table left by an in-place CTAS."""
     return (table_name or '').strip().lower().endswith(ICEBERG_STAGING_SUFFIX)
+
+
+def _strip_backup_suffix(table_name: str) -> str:
+    """Base table name a backup was made from, or the name unchanged."""
+    n = (table_name or '').strip()
+    for suffix in ICEBERG_BACKUP_SUFFIXES:
+        if n.lower().endswith(suffix.lower()):
+            return n[: -len(suffix)]
+    return n
 
 
 def _ctas_target_location(location: str | None) -> str | None:
