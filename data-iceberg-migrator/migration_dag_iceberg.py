@@ -559,7 +559,12 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                 # This shape (token missing, its backup surviving) only means an interrupted
                 # in-place swap when the group is actually running in-place. In snapshot mode a
                 # missing table beside an unrelated '*_backup_' table is just TABLE_NOT_FOUND.
-                if inplace_migration and _table_exists(spark, src_db, backup_name):
+                has_backup = inplace_migration and _table_exists(spark, src_db, backup_name)
+                # An interrupted swap leaves both the parked source and the unpromoted copy. A
+                # backup on its own is also what system.migrate leaves with
+                # iceberg_drop_backup=false, and renaming that one back would be wrong advice —
+                # so only the two together fail the run.
+                if has_backup and _table_exists(spark, src_db, _ice_staging_name(tok)):
                     detail = (
                         f"Table '{src_db}.{tok}' is missing but '{src_db}.{backup_name}' exists — an "
                         f"in-place text copy was interrupted between renaming the source and promoting "
@@ -577,6 +582,13 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                     f"metastore (checked with SHOW TABLES IN {src_db} LIKE '{tok}'). Verify the spelling "
                     f"and that the table was created in S3 by the MapR-to-S3 migration."
                 )
+                if has_backup:
+                    detail += (
+                        f" '{src_db}.{backup_name}' does exist. If that is this table parked by an "
+                        f"interrupted in-place copy, confirm its Location matches the original table, "
+                        f"then restore it with ALTER TABLE {src_db}.{backup_name} RENAME TO "
+                        f"{src_db}.{tok} and re-run."
+                    )
                 logger.warning(f"[IcebergDiscover] TABLE_NOT_FOUND: {detail}")
                 tables_metadata.append(skip_entry(tok, 'TABLE_NOT_FOUND', 'SKIPPED', detail))
                 continue
@@ -839,16 +851,17 @@ def _repair_partial_text_swap(spark, db: str, tbl: str, expected_location: str |
         # backup dropped and reclassified as SKIPPED, or its CTAS re-run over the live copy.
         if _is_iceberg_table(spark, db, tbl):
             return 'ALREADY_MIGRATED'
-        if has_backup:
-            return 'BACKUP_CONFLICT'
         if has_staging:
-            # Written by an attempt that never committed, referenced by nothing else.
+            # Written by an attempt that never committed, referenced by nothing else. Cleared
+            # even when the swap is blocked below, or a full copy of the table is left on S3
+            # under a name discovery deliberately ignores.
             spark.sql(f"DROP TABLE IF EXISTS {db}.{staging} PURGE")
             logger.warning(
                 f"[IcebergMigrate] Dropped staging table left by a previous attempt: {db}.{staging}"
             )
-            return 'STAGING_CLEARED'
-        return 'READY'
+        if has_backup:
+            return 'BACKUP_CONFLICT'
+        return 'STAGING_CLEARED' if has_staging else 'READY'
 
     if not has_backup:
         return 'UNRECOVERABLE'
@@ -1006,6 +1019,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
 
     results = []
     _permanent_failure = None
+    _swap_rollback_pending = False
 
     from datetime import datetime as _dt
 
@@ -1222,6 +1236,11 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                         f"hive_nonempty_partitions={src_hive_partition_count}"
                     )
                 except Exception as _pcount_err:
+                    # SHOW PARTITIONS can fail after the DISTINCT succeeded (it rejects V2
+                    # tables outright). Leaving that DISTINCT value in place while the dest
+                    # count stays 0 is a guaranteed false mismatch, so discard both.
+                    src_hive_partition_count = 0
+                    total_registered = 0
                     logger.warning(
                         f"[IcebergMigrate] {src_db}.{tbl}: could not count Hive partitions "
                         f"(partition_columns={partition_columns}): {_pcount_err!r}. "
@@ -1469,10 +1488,18 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             # markers say (a swap-window rename reports TABLE_OR_VIEW_NOT_FOUND, which is
             # one of them). Every other text-CTAS failure leaves the source untouched, so
             # it should short-circuit rather than re-copy the whole table twice more.
-            if not isinstance(e, TextCtasSwapError) and is_permanent_error("iceberg_migrate", e):
+            if isinstance(e, TextCtasSwapError):
+                _swap_rollback_pending = True
+            elif is_permanent_error("iceberg_migrate", e):
                 _permanent_failure = (f"migrate_tables_to_iceberg:{src_db}.{tbl}", e)
 
     failed_migrations = [r for r in results if r['status'] == 'FAILED']
+    if _permanent_failure is not None and _swap_rollback_pending:
+        logger.warning(
+            f"[IcebergMigrate] {_permanent_failure[0]} hit a permanent error, but another table in "
+            f"this group is mid-swap and needs the retry to roll it back — keeping retries enabled."
+        )
+        _permanent_failure = None
     if _permanent_failure is not None:
         _label, _exc = _permanent_failure
         context['ti'].xcom_push(key='return_value', value={

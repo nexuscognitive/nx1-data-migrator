@@ -213,7 +213,8 @@ class TestDiscoverHiveTables:
                 df.count.return_value = 1
             elif 'show tables' in sl:
                 name = sql.split("LIKE '")[1].rstrip("'").strip()
-                df.count.return_value = 1 if name == 'logs_backup_' else 0
+                df.count.return_value = (
+                    1 if name in ('logs_backup_', 'logs__ice_staging') else 0)
                 df.collect.return_value = []
             else:
                 df.collect.return_value = []
@@ -230,6 +231,34 @@ class TestDiscoverHiveTables:
         assert entry['skip_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
         assert entry['skip_status'] == 'FAILED'
         assert 'RENAME TO db.logs' in entry['skip_message']
+
+    def test_backup_without_staging_is_table_not_found_with_a_hint(self, mock_spark):
+        """system.migrate leaves '<tbl>_backup_' behind too, so a backup on its own is not
+        proof of an interrupted swap — failing the run on it would be a wrong diagnosis."""
+        def router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'show databases' in sl:
+                df.count.return_value = 1
+            elif 'show tables' in sl:
+                name = sql.split("LIKE '")[1].rstrip("'").strip()
+                df.count.return_value = 1 if name == 'logs_backup_' else 0
+                df.collect.return_value = []
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        mock_spark.sql.side_effect = router
+        result = m.discover_hive_tables.function.__wrapped__(
+            db_config={'source_database': 'db', 'table_tokens': ['logs'],
+                       'inplace_migration': True, 'destination_iceberg_database': 'db',
+                       'run_id': 'r1'},
+            spark=mock_spark,
+        )
+        entry = result['discovered_tables'][0]
+        assert entry['skip_code'] == 'TABLE_NOT_FOUND'
+        assert entry['skip_status'] == 'SKIPPED'
+        assert 'db.logs_backup_' in entry['skip_message']
 
     def test_literal_token_with_surviving_backup_in_snapshot_mode_is_table_not_found(self, mock_spark):
         """Same shape (token missing, its '_backup_' surviving) means nothing in snapshot mode —
@@ -842,6 +871,66 @@ class TestMigrateTablesToIceberg:
         issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
         assert 'AS SELECT' not in issued
         assert 'RENAME TO' not in issued
+
+    def test_reverify_survives_show_partitions_failing_on_the_iceberg_table(self, mock_spark):
+        """On the re-verify path the source name is already Iceberg, and SHOW PARTITIONS rejects
+        V2 tables — it throws after the DISTINCT count succeeded. Keeping that DISTINCT value
+        against a dest count of 0 would report a partition mismatch no retry can ever clear."""
+        base = self._text_inplace_router()
+
+        def router(sql):
+            sl = sql.lower()
+            if 'show partitions' in sl:
+                raise Exception('SHOW PARTITIONS is not supported for v2 tables')
+            if 'describe formatted' in sl:
+                df = MagicMock()
+                df.collect.return_value = [
+                    MagicMock(col_name='Provider', data_type='iceberg'),
+                    MagicMock(col_name='Location', data_type='s3a://bucket/logs_iceberg'),
+                ]
+                return df
+            return base(sql)
+
+        mock_spark.sql.side_effect = router
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=self._text_inplace_discovery(partition_columns=['dt']),
+            dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )
+        row = result['results'][0]
+        assert row['status'] == 'COMPLETED'
+        assert row['partition_match'] is True
+        assert row['hive_partition_count'] == 0
+
+    def test_pending_rollback_outranks_another_tables_permanent_error(self, mock_spark):
+        """permanent_fail suppresses every remaining retry, and the retry is what rolls a partial
+        swap back — one table's corrupt file must not strand another table mid-swap."""
+        ti = MagicMock()
+        discovery = self._text_inplace_discovery()
+        discovery['discovered_tables'] = [
+            {**discovery['discovered_tables'][0], 'table': 'logs_a'},
+            {**discovery['discovered_tables'][0], 'table': 'logs_b'},
+        ]
+        base = self._text_inplace_router(existing=('logs_a', 'logs_b'))
+
+        def router(sql):
+            sl = sql.lower()
+            if 'logs_a' in sl and 'as select' in sl:
+                raise Exception('Corrupt Parquet file at footer')
+            if 'logs_b' in sl and 'rename to' in sl:
+                raise Exception('metastore connection reset')
+            return base(sql)
+
+        mock_spark.sql.side_effect = router
+        with (
+            patch.object(m, 'permanent_fail',
+                         side_effect=AssertionError('permanent_fail must not be called')),
+            pytest.raises(Exception, match='Iceberg migration failed'),
+        ):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=ti,
+            )
+        rows = {r['source_table']: r for r in ti.xcom_push.call_args.kwargs['value']['results']}
+        assert rows['sales_data_s3.logs_b']['reason_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
 
     def test_permanent_ctas_error_short_circuits_before_any_rename(self, mock_spark):
         """Nothing has been renamed yet, so retrying only re-copies the table. The
@@ -1551,6 +1640,17 @@ class TestRepairPartialTextSwap:
         assert state == 'BACKUP_CONFLICT'
         issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
         assert 'drop table' not in issued
+        assert 'rename to' not in issued
+
+    def test_staging_is_cleared_even_when_a_backup_blocks_the_swap(self, mock_spark):
+        """The staging copy is ours and holds a full copy of the data. Discovery ignores
+        '__ice_staging' names, so leaving it behind means it sits on S3 unnoticed."""
+        mock_spark.sql.side_effect = self._router({'logs', 'logs_backup_', 'logs__ice_staging'})
+        state = m._repair_partial_text_swap(mock_spark, 'db', 'logs', 's3a://bucket/db/logs')
+        assert state == 'BACKUP_CONFLICT'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert 'drop table if exists db.logs__ice_staging purge' in issued
+        assert 'drop table if exists db.logs_backup_' not in issued
         assert 'rename to' not in issued
 
     def test_missing_table_with_matching_backup_rolls_back(self, mock_spark):
