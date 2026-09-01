@@ -707,6 +707,32 @@ class TestMigrateTablesToIceberg:
         assert 'DROP TABLE IF EXISTS sales_data_s3.logs__ice_staging PURGE' in issued
         assert 'RENAME TO' not in issued
 
+    def test_swap_window_failure_with_permanent_marker_still_keeps_retries(self, mock_spark):
+        """A RENAME failure inside the swap window can raise a raw AnalysisException whose
+        message hits a permanent-error marker (e.g. TABLE_OR_VIEW_NOT_FOUND). Permanently
+        failing here would abandon the source parked as {tbl}_backup_ with no {tbl} in the
+        metastore and no further retry to roll it back — so this must stay retriable."""
+        ti = MagicMock()
+        base_router = self._text_inplace_router()
+
+        def router(sql):
+            if 'rename to' in sql.lower():
+                raise Exception("TABLE_OR_VIEW_NOT_FOUND: Table or view not found: sales_data_s3.logs")
+            return base_router(sql)
+
+        mock_spark.sql.side_effect = router
+        with (
+            patch.object(m, 'permanent_fail',
+                         side_effect=AssertionError('permanent_fail must not be called')),
+            pytest.raises(Exception, match='Iceberg migration failed'),
+        ):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
+                spark=mock_spark, ti=ti,
+            )
+        row = ti.xcom_push.call_args.kwargs['value']['results'][0]
+        assert row['status'] == 'FAILED'
+
     def test_empty_text_table_completes(self, mock_spark):
         """0 rows on both sides passes the gate; partition validation is trivially satisfied."""
         mock_spark.sql.side_effect = self._text_inplace_router(hive_rows=0)

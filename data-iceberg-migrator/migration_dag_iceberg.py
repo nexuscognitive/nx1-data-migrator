@@ -1348,7 +1348,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 status='FAILED', location=location, started_at=tbl_migrate_start,
                 mig_type=('INPLACE_CTAS' if _text_ctas_attempt else None),
             )
-            if not isinstance(e, TextCtasError) and is_permanent_error("iceberg_migrate", e):
+            if not _text_ctas_attempt and is_permanent_error("iceberg_migrate", e):
                 _permanent_failure = (f"migrate_tables_to_iceberg:{src_db}.{tbl}", e)
 
     failed_migrations = [r for r in results if r['status'] == 'FAILED']
