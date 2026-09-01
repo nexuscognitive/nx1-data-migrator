@@ -337,6 +337,7 @@ class TestMigrateTablesToIceberg:
                 'table': 'transactions',
                 'location': 's3a://bucket/transactions',
                 'source_format': source_format,
+                'table_type': 'EXTERNAL',
                 'partition_columns': ['dt'],
             }],
         }
@@ -559,24 +560,174 @@ class TestMigrateTablesToIceberg:
         assert 'dt' in all_sql and 'region' in all_sql
         assert 'system.snapshot' not in all_sql
 
-    def test_text_format_inplace_is_skipped_not_failed(self, mock_spark):
-        """TEXT+inplace is unsupported: must record SKIPPED (not FAILED) and leave _has_failures=False."""
-        discovery = {
+    def _text_inplace_discovery(self, *, table_type='EXTERNAL', partition_columns=None):
+        return {
             'source_database': 'sales_data_s3',
             'destination_iceberg_database': 'sales_data_s3',
             'inplace_migration': True,
             'run_id': 'iceberg_run_20250101_120000_abcd1234',
-            'discovered_tables': [{'table': 'logs', 'location': 's3a://bucket/logs',
-                                    'source_format': 'TEXT', 'partition_columns': []}],
+            'discovered_tables': [{
+                'table': 'logs',
+                'location': 's3a://bucket/logs',
+                'source_format': 'TEXT',
+                'table_type': table_type,
+                'partition_columns': partition_columns or [],
+            }],
         }
-        mock_spark.sql.side_effect = self._partition_router()
+
+    def _text_inplace_router(self, *, hive_rows=10, existing=('logs',), staging_rows=None):
+        """Existence for the repair check, counts for the gate, columns for the schema gate."""
+        staging_rows = hive_rows if staging_rows is None else staging_rows
+        def router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'show tables' in sl:
+                name = sql.split("LIKE '")[1].rstrip("'").strip()
+                df.count.return_value = 1 if name in existing else 0
+            elif 'select distinct' in sl or '.partitions' in sl:
+                row = MagicMock()
+                row.__getitem__ = lambda self, k: 2
+                df.collect.return_value = [row]
+            elif 'count(*)' in sl:
+                rows = staging_rows if '__ice_staging' in sl else hive_rows
+                row = MagicMock()
+                row.__getitem__ = lambda self, k, _v=rows: _v
+                df.collect.return_value = [row]
+            elif 'show partitions' in sl:
+                df.count.return_value = 2
+                df.collect.return_value = [MagicMock(), MagicMock()]
+            elif 'describe formatted' in sl:
+                df.collect.return_value = [
+                    MagicMock(col_name='Location', data_type='s3a://bucket/logs_iceberg')
+                ]
+            elif sl.strip().startswith('describe '):
+                df.collect.return_value = [MagicMock(col_name='id', data_type='varchar(20)')]
+            else:
+                df.collect.return_value = []
+                df.count.return_value = 0
+            return df
+        return router
+
+    def test_text_inplace_copies_and_swaps(self, mock_spark):
+        mock_spark.sql.side_effect = self._text_inplace_router()
         result = m.migrate_tables_to_iceberg.function.__wrapped__(
-            discovery=discovery, dag_run_id='dag_test',
+            discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
             spark=mock_spark, ti=MagicMock(),
         )
+        row = result['results'][0]
+        assert row['status'] == 'COMPLETED'
+        assert row['migration_type'] == 'INPLACE_CTAS'
+        assert row['destination_table'] == 'sales_data_s3.logs'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'system.migrate' not in issued
+        assert 'RENAME TO sales_data_s3.logs_backup_' in issued
+        assert 'INPLACE_CTAS' in issued          # reached the tracking insert
+
+    def test_text_inplace_disabled_by_flag_is_skipped(self, mock_spark):
+        base = m.get_config()
+        mock_spark.sql.side_effect = self._text_inplace_router()
+        with patch.object(m, 'get_config',
+                          return_value={**base, 'iceberg_inplace_text_ctas': False}):
+            result = m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
+                spark=mock_spark, ti=MagicMock(),
+            )
+        row = result['results'][0]
+        assert row['status'] == 'SKIPPED'
+        assert row['reason_code'] == 'TEXT_FORMAT_INPLACE_UNSUPPORTED'
+        assert row['migration_type'] == 'INPLACE'
         assert result['_has_failures'] is False
-        assert result['results'][0]['status'] == 'SKIPPED'
-        assert result['results'][0]['migration_type'] == 'INPLACE'
+        assert 'CREATE TABLE' not in ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+
+    def test_managed_text_table_is_skipped(self, mock_spark):
+        mock_spark.sql.side_effect = self._text_inplace_router()
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=self._text_inplace_discovery(table_type='MANAGED'),
+            dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )
+        row = result['results'][0]
+        assert row['status'] == 'SKIPPED'
+        assert row['reason_code'] == 'MANAGED_TEXT_INPLACE_UNSUPPORTED'
+        assert 'CREATE TABLE' not in ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+
+    def test_missing_table_type_is_skipped_as_managed(self, mock_spark):
+        mock_spark.sql.side_effect = self._text_inplace_router()
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=self._text_inplace_discovery(table_type=None),
+            dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['results'][0]['reason_code'] == 'MANAGED_TEXT_INPLACE_UNSUPPORTED'
+
+    def test_backup_conflict_is_skipped_without_touching_anything(self, mock_spark):
+        mock_spark.sql.side_effect = self._text_inplace_router(existing=('logs', 'logs_backup_'))
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
+            spark=mock_spark, ti=MagicMock(),
+        )
+        row = result['results'][0]
+        assert row['status'] == 'SKIPPED'
+        assert row['reason_code'] == 'INPLACE_CTAS_BACKUP_CONFLICT'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'CREATE TABLE' not in issued
+        assert 'RENAME TO' not in issued
+
+    def test_unrecoverable_state_is_failed(self, mock_spark):
+        # A recorded FAILED table makes the task raise after pushing its result to
+        # XCom, so read the result from the mocked ti rather than the return value.
+        ti = MagicMock()
+        mock_spark.sql.side_effect = self._text_inplace_router(existing=())
+        with pytest.raises(Exception, match='Iceberg migration failed'):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
+                spark=mock_spark, ti=ti,
+            )
+        row = ti.xcom_push.call_args.kwargs['value']['results'][0]
+        assert row['status'] == 'FAILED'
+        assert row['reason_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
+        assert row['migration_type'] == 'INPLACE_CTAS'
+
+    def test_verification_failure_is_failed_not_permanent(self, mock_spark):
+        """TextCtasError must not suppress retries — the retry performs the rollback."""
+        ti = MagicMock()
+        mock_spark.sql.side_effect = self._text_inplace_router(hive_rows=10, staging_rows=9)
+        with (
+            patch.object(m, 'permanent_fail',
+                         side_effect=AssertionError('permanent_fail must not be called')),
+            pytest.raises(Exception, match='Iceberg migration failed'),
+        ):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._text_inplace_discovery(), dag_run_id='dag_test',
+                spark=mock_spark, ti=ti,
+            )
+        row = ti.xcom_push.call_args.kwargs['value']['results'][0]
+        assert row['status'] == 'FAILED'
+        assert row['reason_code'] == 'INPLACE_CTAS_VERIFY_FAILED'
+        assert row['migration_type'] == 'INPLACE_CTAS'
+        issued = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'DROP TABLE IF EXISTS sales_data_s3.logs__ice_staging PURGE' in issued
+        assert 'RENAME TO' not in issued
+
+    def test_empty_text_table_completes(self, mock_spark):
+        """0 rows on both sides passes the gate; partition validation is trivially satisfied."""
+        mock_spark.sql.side_effect = self._text_inplace_router(hive_rows=0)
+        result = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=self._text_inplace_discovery(partition_columns=['dt']),
+            dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )
+        row = result['results'][0]
+        assert row['status'] == 'COMPLETED'
+        assert row['migration_type'] == 'INPLACE_CTAS'
+        assert row['partition_match'] is True
+
+    def test_parquet_inplace_still_uses_system_migrate(self, mock_spark):
+        """Regression guard: the zero-copy path must be untouched."""
+        mock_spark.sql.side_effect = self._partition_router()
+        m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=self._make_inplace_discovery(source_format='PARQUET'),
+            dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )
+        assert 'system.migrate' in ' '.join(
+            str(c) for c in mock_spark.sql.call_args_list).lower()
 
     def test_unpartitioned_table_skips_iceberg_partitions_query(self, mock_spark):
         """Unpartitioned tables must NOT query .partitions — Iceberg returns 1 spurious row there."""
