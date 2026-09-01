@@ -480,6 +480,7 @@ def init_tracking_tables(spark) -> dict:
                 file_count_match BOOLEAN,
                 partition_filter STRING,
                 filtered_partition_count INT,
+                empty_partition_names STRING,
                 full_table_row_count BIGINT,
                 full_table_partition_count INT,
                 discovery_status STRING,
@@ -528,6 +529,7 @@ def init_tracking_tables(spark) -> dict:
         ("partition_schema_json", "STRING"),
         ("partition_schema_match", "BOOLEAN"),
         ("partition_schema_differences", "STRING"),
+        ("empty_partition_names", "STRING"),
     ):
         try:
             spark.sql(
@@ -1532,7 +1534,8 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     overall_status, error_message,
                     updated_at, partition_filter, filtered_partition_count, full_table_row_count, full_table_partition_count,
                     yarn_application_id,
-                    partition_schema_json, partition_schema_match, partition_schema_differences
+                    partition_schema_json, partition_schema_match, partition_schema_differences,
+                    empty_partition_names
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
                     '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
@@ -1556,7 +1559,8 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     {overall_status_insert}, {error_msg_insert},
                     current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count},
                     NULL,
-                    '{partition_schema_json}', NULL, NULL
+                    '{partition_schema_json}', NULL, NULL,
+                    NULL
                 )
             """,
                 task_label=f"record_discovered_tables:{t['source_table']}",
@@ -1717,6 +1721,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
         partition_filter_active = t.get("partition_filter_active", False)
         filtered_partitions = t.get("filtered_partitions", [])
+        empty_partitions = []
 
         logger.info(f"[DistCp] Starting copy for {src_db}.{tbl}")
         logger.info(f"[DistCp]   Source : {source_loc}")
@@ -1877,6 +1882,13 @@ exit 0
                     for p in filtered_partitions
                     if partition_file_counts.get(p, 1) == 0
                 ]
+
+                if empty_partitions:
+                    logger.info(
+                        f"[DistCp] {len(empty_partitions)} empty partition(s) in "
+                        f"{src_db}.{tbl} will use mkdir instead of distcp: "
+                        f"{empty_partitions[:5]}"
+                    )
 
                 mkdir_calls = "\n".join(
                     f'hadoop fs{s3_opts} -mkdir -p "{s3_loc}/{p}" 2>/dev/null || true'
@@ -2194,6 +2206,7 @@ exit 0
                             if partition_filter_active
                             else None
                         ),
+                        "empty_partitions": empty_partitions,
                         "error": None,
                         "yarn_application_id": yarn_application_id,
                         "yarn_application_ids": yarn_application_ids,
@@ -2227,6 +2240,7 @@ exit 0
                     "partitions_requested": (
                         len(filtered_partitions) if partition_filter_active else None
                     ),
+                    "empty_partitions": empty_partitions,
                     "error": str(e)[:2000],
                     "yarn_application_id": yarn_application_id,
                     "yarn_application_ids": yarn_application_ids,
@@ -2337,6 +2351,11 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
             r.get("yarn_application_ids")
             or ([r["yarn_application_id"]] if r.get("yarn_application_id") else [])
         ).replace("'", "''")
+        empty_partitions = r.get("empty_partitions") or []
+        empty_partition_names_sql = (
+            "'" + ", ".join(empty_partitions).replace("'", "''")[:4000] + "'"
+            if empty_partitions else "NULL"
+        )
 
         execute_with_iceberg_retry(
             spark,
@@ -2360,6 +2379,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 file_size_match  = (source_total_size_bytes = {s3_size_after}),
                 overall_status = '{overall}',
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
+                empty_partition_names = {empty_partition_names_sql},
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
               AND source_database = '{r['source_database']}'
@@ -4079,6 +4099,17 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                 pf_display += f"<br><small style='color:#7f8c8d;'>({fpc} partition{'s' if fpc != 1 else ''})</small>"
         else:
             pf_display = "<span style='color:#bdc3c7;font-size:11px;'>—</span>"
+
+        _empty_names_raw = (getattr(t, "empty_partition_names", None) or "").strip()
+        if _empty_names_raw:
+            _empty_list = [p for p in _empty_names_raw.split(", ") if p]
+            _empty_preview = ", ".join(_empty_list[:3]) + (" ..." if len(_empty_list) > 3 else "")
+            _empty_safe = _empty_names_raw.replace("<", "&lt;").replace(">", "&gt;")
+            _empty_preview_safe = _empty_preview.replace("<", "&lt;").replace(">", "&gt;")
+            pf_display += (
+                f"<br><small style='color:#c0392b;' title='{_empty_safe}'>"
+                f"{len(_empty_list)} empty: {_empty_preview_safe}</small>"
+            )
 
         html += f"""
                 <tr>
