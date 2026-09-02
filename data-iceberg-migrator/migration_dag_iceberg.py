@@ -17,6 +17,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import unquote
 
 from airflow import DAG
 from airflow.decorators import task
@@ -242,12 +243,26 @@ def init_iceberg_tracking_tables(spark) -> dict:
             validation_completed_at TIMESTAMP,
             validation_duration_seconds DOUBLE,
             error_message STRING,
-            updated_at TIMESTAMP
+            updated_at TIMESTAMP,
+            empty_partition_names STRING
         )
         USING iceberg
         PARTITIONED BY (source_database)
         LOCATION '{tracking_loc}/iceberg_migration_table_status'
     """)
+    for _col_name, _col_type in (
+        ("empty_partition_names", "STRING"),
+    ):
+        try:
+            spark.sql(
+                f"ALTER TABLE {tracking_db}.iceberg_migration_table_status "
+                f"ADD COLUMN {_col_name} {_col_type}"
+            )
+            logger.info(
+                f"[init_iceberg_tracking_tables] Added column {_col_name} to iceberg_migration_table_status"
+            )
+        except Exception:
+            pass
     return {'status': 'initialized', 'database': tracking_db}
 
 @task.pyspark(conn_id='spark_default')
@@ -1062,7 +1077,8 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 {duration}, '{status}',
                 NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
                 '{sql_lit(message)}',
-                current_timestamp()
+                current_timestamp(),
+                NULL
             )
         """, task_label=f"migrate:{code.lower()}:insert:{tbl}")
 
@@ -1214,20 +1230,41 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
             src_hive_partition_count = 0
             total_registered = 0
             partition_count_ok = False
+            empty_partitions = []
             if is_partitioned:
                 try:
-                    # Count only partitions that have actual data files — these are the only
-                    # ones system.snapshot can register in Iceberg (empty Hive partition dirs
-                    # have no data files and are not visible to Iceberg after snapshot).
-                    # Using DISTINCT on partition columns avoids a separate S3 scan; it piggy-
-                    # backs on the data already read for hive_count.
+                    # Fetch the actual distinct partition-column value combinations that
+                    # have data files (previously this was wrapped in COUNT(*) and only the
+                    # count was kept — that hid *which* partitions were empty). We now keep
+                    # the real values so we can name any registered Hive partition that has
+                    # no data files: those are exactly the partitions system.snapshot /
+                    # system.migrate silently drop, since Iceberg only registers partitions
+                    # that contain data files.
                     part_cols_expr = ', '.join(partition_columns)
-                    src_hive_partition_count = spark.sql(f"""
-                        SELECT COUNT(*) as cnt FROM (
-                            SELECT DISTINCT {part_cols_expr} FROM {src_db}.{tbl}
-                        )
-                    """).collect()[0]['cnt']
-                    total_registered = spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}").count()
+                    nonempty_rows = spark.sql(f"""
+                        SELECT DISTINCT {part_cols_expr} FROM {src_db}.{tbl}
+                    """).collect()
+                    src_hive_partition_count = len(nonempty_rows)
+                    nonempty_keys = {
+                        tuple(str(row[col]) for col in partition_columns)
+                        for row in nonempty_rows
+                    }
+
+                    registered_specs = [
+                        r[0] for r in spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}").collect()
+                    ]
+                    total_registered = len(registered_specs)
+
+                    for spec in registered_specs:
+                        kv = {}
+                        for segment in spec.split('/'):
+                            if '=' in segment:
+                                k, _, v = segment.partition('=')
+                                kv[k] = unquote(v)
+                        key = tuple(kv.get(col) for col in partition_columns)
+                        if key not in nonempty_keys:
+                            empty_partitions.append(spec)
+
                     partition_count_ok = True
                     logger.info(
                         f"[IcebergMigrate] {src_db}.{tbl} | "
@@ -1235,6 +1272,14 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                         f"hive_registered_partitions={total_registered} | "
                         f"hive_nonempty_partitions={src_hive_partition_count}"
                     )
+                    if empty_partitions:
+                        logger.warning(
+                            f"[IcebergMigrate] {src_db}.{tbl}: {len(empty_partitions)} of "
+                            f"{total_registered} registered Hive partition(s) contain no data "
+                            f"files and will be silently dropped by the Iceberg migration "
+                            f"(system.snapshot/system.migrate only register partitions that "
+                            f"have data files). Empty partition(s): {empty_partitions}"
+                        )
                 except Exception as _pcount_err:
                     # SHOW PARTITIONS can fail after the DISTINCT succeeded (it rejects V2
                     # tables outright). Leaving that DISTINCT value in place while the dest
@@ -1411,8 +1456,10 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 'iceberg_count': iceberg_count,
                 'counts_match': counts_match,
                 'hive_partition_count': src_hive_partition_count,
+                'hive_total_partition_count': total_registered,
                 'iceberg_partition_count': dest_iceberg_partition_count,
                 'partition_match': partition_match,
+                'empty_partitions': empty_partitions,
                 'error': None
             })
 
@@ -1422,6 +1469,10 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                   AND source_database = '{src_db}'
                   AND source_table = '{tbl}'
             """, task_label=f"migrate:completed:delete:{tbl}")
+
+            empty_partition_names_sql = (
+                f"'{sql_lit(', '.join(empty_partitions), 4000)}'" if empty_partitions else "NULL"
+            )
 
             tbl_migrate_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
             execute_with_iceberg_retry(spark, f"""
@@ -1452,7 +1503,8 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     NULL,
                     NULL,
                     NULL,
-                    current_timestamp()
+                    current_timestamp(),
+                    {empty_partition_names_sql}
                 )
             """, task_label=f"migrate:completed:insert:{tbl}")
 
@@ -2266,6 +2318,7 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
                     <th>Row Count Match</th>
                     <th>Source Partitions (non-empty)</th>
                     <th>Hive Total Partitions</th>
+                    <th>Empty Partitions (dropped)</th>
                     <th>Dest Partitions</th>
                     <th>Partition Match</th>
                     <th>Schema Match</th>
@@ -2286,6 +2339,14 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
             row_match_class = part_match_class = schema_match_class = 'duration'
             row_match_icon = part_match_icon = schema_match_icon = 'N/A'
 
+        _empty_names_raw = (_row_value(t, 'empty_partition_names', '') or '').strip()
+        _empty_names = [p for p in _empty_names_raw.split(', ') if p] if _empty_names_raw else []
+        _empty_cell = (
+            f'<span class="validation-fail" title="{_esc(_empty_names_raw)}">'
+            f'{len(_empty_names)}: {_esc(", ".join(_empty_names[:3]))}'
+            f'{" ..." if len(_empty_names) > 3 else ""}</span>'
+        ) if _empty_names else '0'
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
@@ -2295,6 +2356,7 @@ def generate_iceberg_html_report(run_id: str, spark, **context) -> str:
                     <td class="{row_match_class}">{row_match_icon}</td>
                     <td class="metric">{t.source_hive_partition_count or 0}</td>
                     <td class="metric">{_row_value(t, 'source_hive_total_partition_count', 0) or 0}</td>
+                    <td class="metric">{_empty_cell}</td>
                     <td class="metric">{t.dest_iceberg_partition_count or 0}</td>
                     <td class="{part_match_class}">{part_match_icon}</td>
                     <td class="{schema_match_class}">{schema_match_icon}</td>

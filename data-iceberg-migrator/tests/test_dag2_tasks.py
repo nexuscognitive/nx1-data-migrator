@@ -489,6 +489,12 @@ class TestMigrateTablesToIceberg:
         d['destination_iceberg_database'] = d['source_database']
         return d
 
+    class _FakeRow(dict):
+        """dict that returns None for unknown keys instead of raising KeyError,
+        so tests with multi-column partition_columns don't need every key set."""
+        def __missing__(self, key):
+            return None
+
     def _partition_router(self, *, hive_rows=5, non_empty=1, registered=2, iceberg=1, iceberg_with_data=None):
         """SQL router that distinguishes SELECT DISTINCT, .partitions, row-count, SHOW PARTITIONS."""
         if iceberg_with_data is None:
@@ -498,8 +504,9 @@ class TestMigrateTablesToIceberg:
             df = MagicMock()
             row = MagicMock()
             if 'select distinct' in sl:
-                row.__getitem__ = lambda self, k: non_empty
-                df.collect.return_value = [row]
+                df.collect.return_value = [
+                    self._FakeRow(dt=f'nonempty_{i}') for i in range(non_empty)
+                ]
             elif '.partitions' in sl:
                 val = iceberg_with_data if 'record_count' in sl else iceberg
                 row.__getitem__ = lambda self, k, _v=val: _v
@@ -508,8 +515,10 @@ class TestMigrateTablesToIceberg:
                 row.__getitem__ = lambda self, k: hive_rows
                 df.collect.return_value = [row]
             elif 'show partitions' in sl:
+                specs = [f'dt=nonempty_{i}' for i in range(non_empty)]
+                specs += [f'dt=empty_{i}' for i in range(max(registered - non_empty, 0))]
+                df.collect.return_value = [[s] for s in specs]
                 df.count.return_value = registered
-                df.collect.return_value = [MagicMock() for _ in range(registered)]
             elif 'describe formatted' in sl:
                 loc = MagicMock()
                 loc.col_name = 'Location'
@@ -620,6 +629,37 @@ class TestMigrateTablesToIceberg:
         assert r['hive_partition_count'] == 0
         assert r['iceberg_partition_count'] == 0
         assert r['partition_match'] is True
+
+    def test_empty_partition_names_written_to_tracking_insert(self, mock_spark):
+        """Empty partition names must be persisted into the tracking table's
+        empty_partition_names column, not just logged."""
+        discovery = self._make_partitioned_discovery()
+        mock_spark.sql.side_effect = self._partition_router(
+            hive_rows=10, non_empty=3, registered=5, iceberg=5, iceberg_with_data=3,
+        )
+        m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )
+        insert_calls = [
+            str(c) for c in mock_spark.sql.call_args_list
+            if 'insert into' in str(c).lower()
+        ]
+        assert any('dt=empty_0' in c and 'dt=empty_1' in c for c in insert_calls)
+
+    def test_no_empty_partitions_writes_null_to_tracking_insert(self, mock_spark):
+        """When nothing is empty, the column must be NULL, not an empty string."""
+        discovery = self._make_partitioned_discovery()
+        mock_spark.sql.side_effect = self._partition_router(
+            hive_rows=10, non_empty=2, registered=2, iceberg=2,
+        )
+        m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )
+        insert_sqls = [
+            c.args[0] for c in mock_spark.sql.call_args_list
+            if c.args and 'insert into' in c.args[0].lower()
+        ]
+        assert any(sql.rstrip().endswith('NULL\n                )') for sql in insert_sqls)
 
     def test_total_registered_written_to_tracking_insert(self, mock_spark):
         """SHOW PARTITIONS count (total_registered=7) is stored in the tracking INSERT SQL."""
@@ -1320,6 +1360,88 @@ class TestGenerateIcebergHtmlReport:
 
         def asDict(self, recursive=False):
             return dict(self.__dict__)
+
+    def test_html_report_shows_empty_partition_names(self, mock_spark, sample_iceberg_run_id):
+        """Empty partition names persisted in the tracking table must render in the
+        HTML report's 'Empty Partitions (dropped)' column."""
+        tbl_row = self._Row(
+            source_database='sales_s3', source_table='transactions',
+            migration_type='SNAPSHOT', destination_table='sales_s3_iceberg.transactions',
+            status='VALIDATED', migration_duration_seconds=10.0,
+            validation_duration_seconds=1.0, validation_status='COMPLETED',
+            row_count_match=True, partition_count_match=False, schema_match=True,
+            source_hive_row_count=5, destination_iceberg_row_count=5,
+            source_hive_partition_count=3, source_hive_total_partition_count=5,
+            dest_iceberg_partition_count=3,
+            empty_partition_names='dt=2024-01-01, dt=2024-01-02',
+        )
+        ivs_row = MagicMock()
+        ivs_row.__getitem__ = lambda self, k: 1 if k == 'total_tables_validated' else 0
+        ivs_row.total_tables_validated = 1
+        ivs_row.tables_passed_validation = 0
+        ivs_row.tables_failed_validation = 1
+        ivs_row.total_row_count_mismatches = 0
+        ivs_row.total_partition_count_mismatches = 1
+        ivs_row.total_schema_mismatches = 0
+
+        def router(sql):
+            df = MagicMock()
+            if 'order by' in sql.lower():
+                df.collect.return_value = [tbl_row]
+            elif 'sum(case when' in sql.lower():
+                df.collect.return_value = [ivs_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+        m.generate_iceberg_html_report.function(run_id=sample_iceberg_run_id, spark=mock_spark)
+
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        written_bytes = fs_mock.create.return_value.write.call_args[0][0]
+        html = written_bytes.decode('utf-8')
+        assert 'Empty Partitions (dropped)' in html
+        assert 'dt=2024-01-01' in html
+        assert 'dt=2024-01-02' in html
+
+    def test_html_report_empty_partitions_cell_shows_zero_when_none(self, mock_spark, sample_iceberg_run_id):
+        """Tables with no empty partitions (or rows written before this column existed)
+        must render '0', not raise, and not show stray partition text."""
+        tbl_row = SimpleNamespace(
+            source_database='sales_s3', source_table='transactions',
+            migration_type='SNAPSHOT', destination_table='sales_s3_iceberg.transactions',
+            status='VALIDATED', migration_duration_seconds=10.0,
+            validation_duration_seconds=1.0, validation_status='COMPLETED',
+            row_count_match=True, partition_count_match=True, schema_match=True,
+            source_hive_row_count=5, destination_iceberg_row_count=5,
+            source_hive_partition_count=1, dest_iceberg_partition_count=1,
+        )
+        ivs_row = MagicMock()
+        ivs_row.__getitem__ = lambda self, k: 1 if k == 'total_tables_validated' else 0
+        ivs_row.total_tables_validated = 1
+        ivs_row.tables_passed_validation = 1
+        ivs_row.tables_failed_validation = 0
+        ivs_row.total_row_count_mismatches = 0
+        ivs_row.total_partition_count_mismatches = 0
+        ivs_row.total_schema_mismatches = 0
+
+        def router(sql):
+            df = MagicMock()
+            if 'order by' in sql.lower():
+                df.collect.return_value = [tbl_row]
+            elif 'sum(case when' in sql.lower():
+                df.collect.return_value = [ivs_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = router
+        m.generate_iceberg_html_report.function(run_id=sample_iceberg_run_id, spark=mock_spark)
+
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        written_bytes = fs_mock.create.return_value.write.call_args[0][0]
+        html = written_bytes.decode('utf-8')
+        assert '<td class="metric">0</td>' in html
 
     def test_status_column_carries_reason_and_no_per_table_detail_section(
         self, mock_spark, sample_iceberg_run_id,
