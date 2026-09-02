@@ -9,6 +9,13 @@ import pytest
 from .helpers import make_excel_bytes, setup_spark_excel
 
 
+def _keyed_row(value):
+    """A Row-like mock returning `value` for any key or index."""
+    row = MagicMock()
+    row.__getitem__ = lambda self, k, _v=value: _v
+    return row
+
+
 class TestInitIcebergTrackingTables:
 
     def test_creates_database_and_tables(self, mock_spark):
@@ -765,7 +772,11 @@ class TestMigrateTablesToIceberg:
             if 'show tables' in sl:
                 name = sql.split("LIKE '")[1].rstrip("'").strip()
                 df.count.return_value = 1 if name in existing else 0
-            elif 'select distinct' in sl or '.partitions' in sl:
+            elif 'select distinct' in sl:
+                # Real values, not a count: the caller derives the non-empty partition
+                # keys from these and diffs them against SHOW PARTITIONS.
+                df.collect.return_value = [_keyed_row(v) for v in ('a', 'b')]
+            elif '.partitions' in sl:
                 row = MagicMock()
                 row.__getitem__ = lambda self, k: 2
                 df.collect.return_value = [row]
@@ -776,7 +787,7 @@ class TestMigrateTablesToIceberg:
                 df.collect.return_value = [row]
             elif 'show partitions' in sl:
                 df.count.return_value = 2
-                df.collect.return_value = [MagicMock(), MagicMock()]
+                df.collect.return_value = [_keyed_row(f"dt={v}") for v in ('a', 'b')]
             elif 'describe formatted' in sl:
                 df.collect.return_value = [
                     MagicMock(col_name='Location', data_type='s3a://bucket/logs_iceberg')
