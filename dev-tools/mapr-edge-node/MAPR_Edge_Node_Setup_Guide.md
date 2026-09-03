@@ -48,6 +48,7 @@ Set these in Airflow UI → **Admin → Variables** before triggering a DAG run:
 | `s3_access_key`            | Your AWS Access Key ID     |
 | `s3_secret_key`            | Your AWS Secret Access Key |
 | `migration_distcp_mappers` | `1`                        |
+| `migration_distcp_bandwidth` | `10`                     |
 
 ---
 
@@ -276,7 +277,7 @@ Once test data is loaded and the pod setup script has been run:
 2. Trigger the `source_to_s3_migration` DAG with an Excel config pointing at any of the test tables below
 3. Airflow will SSH into the pod using `cluster_edge_ssh`, run the discover PySpark script, and execute distcp
 
-**Mapper count:** DistCp runs in local MapReduce mode (not YARN). Set `migration_distcp_mappers = 1`. No DAG code changes are needed — the flag is already in the distcp commands.
+**Mapper count:** DistCp runs in local MapReduce mode (not YARN). Set `migration_distcp_mappers = 1` and `migration_distcp_bandwidth = 10`. The two are a pair: set both to force fixed values, or neither to let the DAG auto-size each table from its discovered size. Setting one alone is rejected at config resolution and fails the task. No DAG code changes are needed — the flags are already in the distcp commands.
 
 ---
 

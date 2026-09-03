@@ -28,7 +28,13 @@ class TestGetConfig:
             assert key in cfg, f"Missing key: {key}"
 
     def test_falls_back_to_default_when_variable_missing(self):
-        with patch('airflow.models.Variable.get', return_value='fallback'):
+        # Scoped to the key under test: a blanket 'fallback' would also land in
+        # the integer-typed DistCp sizing keys, which reject a non-numeric value
+        # at config resolution by design.
+        def _get(key, default_var=None, **kw):
+            return 'fallback' if key == 'cluster_ssh_conn_id' else default_var
+
+        with patch('airflow.models.Variable.get', side_effect=_get):
             cfg = m.get_config()
         assert cfg['ssh_conn_id'] == 'fallback'
 
