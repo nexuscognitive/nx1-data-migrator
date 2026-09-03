@@ -239,9 +239,8 @@ class TestDiscoverHiveTables:
         assert entry['skip_status'] == 'FAILED'
         assert 'RENAME TO db.logs' in entry['skip_message']
 
-    def test_backup_without_staging_is_table_not_found_with_a_hint(self, mock_spark):
-        """system.migrate leaves '<tbl>_backup_' behind too, so a backup on its own is not
-        proof of an interrupted swap — failing the run on it would be a wrong diagnosis."""
+    def _missing_with_backup_router(self, backup_serde):
+        """'logs' absent, 'logs_backup_' present with the given Serde Library, no staging."""
         def router(sql):
             df = MagicMock()
             sl = sql.lower()
@@ -251,21 +250,46 @@ class TestDiscoverHiveTables:
                 name = sql.split("LIKE '")[1].rstrip("'").strip()
                 df.count.return_value = 1 if name == 'logs_backup_' else 0
                 df.collect.return_value = []
+            elif 'describe formatted' in sl:
+                df.collect.return_value = [
+                    MagicMock(col_name='# Detailed Table Information', data_type=''),
+                    MagicMock(col_name='Serde Library', data_type=backup_serde),
+                ]
             else:
                 df.collect.return_value = []
                 df.count.return_value = 0
             return df
-        mock_spark.sql.side_effect = router
-        result = m.discover_hive_tables.function.__wrapped__(
+        return router
+
+    def _discover_logs(self, mock_spark):
+        return m.discover_hive_tables.function.__wrapped__(
             db_config={'source_database': 'db', 'table_tokens': ['logs'],
                        'inplace_migration': True, 'destination_iceberg_database': 'db',
                        'run_id': 'r1'},
             spark=mock_spark,
-        )
-        entry = result['discovered_tables'][0]
+        )['discovered_tables'][0]
+
+    def test_parquet_backup_without_staging_is_table_not_found_with_a_hint(self, mock_spark):
+        """system.migrate parks the original under '<tbl>_backup_' too when
+        iceberg_drop_backup is false. Failing the run on that is a wrong diagnosis, and the
+        rollback SQL it prints would restore a metadata-only backup sharing data files."""
+        mock_spark.sql.side_effect = self._missing_with_backup_router(
+            'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe')
+        entry = self._discover_logs(mock_spark)
         assert entry['skip_code'] == 'TABLE_NOT_FOUND'
         assert entry['skip_status'] == 'SKIPPED'
         assert 'db.logs_backup_' in entry['skip_message']
+
+    def test_text_backup_without_staging_still_reports_an_incomplete_swap(self, mock_spark):
+        """The staging copy may already have been cleared by a later attempt. A TEXT backup
+        still identifies the in-place text path — system.migrate never parks a text table —
+        so the run must fail rather than report the missing table as a benign skip."""
+        mock_spark.sql.side_effect = self._missing_with_backup_router(
+            'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe')
+        entry = self._discover_logs(mock_spark)
+        assert entry['skip_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
+        assert entry['skip_status'] == 'FAILED'
+        assert 'RENAME TO db.logs' in entry['skip_message']
 
     def test_literal_token_with_surviving_backup_in_snapshot_mode_is_table_not_found(self, mock_spark):
         """Same shape (token missing, its '_backup_' surviving) means nothing in snapshot mode —

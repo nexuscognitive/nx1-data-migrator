@@ -957,9 +957,9 @@ WHERE  run_id = '<NEW_RUN_ID>' AND source_table = '<TABLE>';
 
 ## Issue 8b — Table missing after an interrupted in-place text copy
 
-**Symptom:** discovery reports `INPLACE_CTAS_SWAP_INCOMPLETE` (`FAILED`) for a table named literally in the Excel config (not a `*` pattern), and **both** `<db>.<table>_backup_` and `<db>.<table>__ice_staging` exist in the metastore while `<db>.<table>` does not.
+**Symptom:** discovery reports `INPLACE_CTAS_SWAP_INCOMPLETE` (`FAILED`) for a table named literally in the Excel config (not a `*` pattern), `<db>.<table>_backup_` exists in the metastore, and `<db>.<table>` does not.
 
-Both are required. A `_backup_` table on its own is also what `system.migrate` leaves behind when `iceberg_drop_backup` is false, so a missing table beside one of those is reported as `TABLE_NOT_FOUND` (`SKIPPED`) with a note naming the backup — not as an interrupted swap.
+The backup alone is not enough to raise this, because `system.migrate` also parks the original under `<table>_backup_` when `iceberg_drop_backup` is false. Discovery confirms the swap one of two ways: `<db>.<table>__ice_staging` is also present (the copy was never promoted), or the backup is itself a **text** table — `system.migrate` only ever parks Parquet/ORC/Avro, so a text backup can only have come from the in-place text path. Failing neither test, the table is reported as `TABLE_NOT_FOUND` (`SKIPPED`) with a note naming the backup.
 
 This means an in-place text CTAS died between the two renames: the source had already been renamed to `<table>_backup_`, but the verified copy was never promoted to `<table>`. A retry **inside the same Airflow run** repairs this automatically — this manual fix is only needed after the whole run died and you're triggering a fresh one.
 
@@ -982,7 +982,7 @@ DESCRIBE FORMATTED <db>.<table>_backup_;   -- Location must be the source's orig
 
 If the backup is the source, run the fix above. If it is something else, find where the source went from the failed run's logs before touching either table.
 
-**Check for orphaned files.** The copy is written to `<source_location>_iceberg`. If a CTAS died after writing data files but before the metastore commit, no table ever existed to `DROP ... PURGE`, so those files stay behind and the next attempt writes a fresh table alongside them. After any interrupted in-place copy, list that prefix and remove anything the current table's snapshot does not reference:
+**Check for orphaned files — this is not automatic.** The copy is written to `<source_location>_iceberg`. If a CTAS died after writing data files but before the metastore commit, no table ever existed to `DROP ... PURGE`, so those files stay behind. The next attempt does **not** fail on them: `CREATE TABLE ... LOCATION` over a path already holding Iceberg metadata was verified on 2026-09-03 to succeed rather than refuse, so it writes a fresh table alongside the dead files. The new copy is still correct — Iceberg reads only its own metadata and never scans the directory, and the row-count/schema gate still applies — but nothing reclaims the leftovers. After any interrupted in-place copy, list that prefix and remove anything the current table's snapshot does not reference:
 
 ```bash
 hdfs dfs -ls -R s3a://<bucket>/<path>/<table>_iceberg

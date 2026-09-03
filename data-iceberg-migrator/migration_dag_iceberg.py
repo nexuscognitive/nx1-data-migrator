@@ -575,11 +575,27 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                 # in-place swap when the group is actually running in-place. In snapshot mode a
                 # missing table beside an unrelated '*_backup_' table is just TABLE_NOT_FOUND.
                 has_backup = inplace_migration and _table_exists(spark, src_db, backup_name)
-                # An interrupted swap leaves both the parked source and the unpromoted copy. A
-                # backup on its own is also what system.migrate leaves with
-                # iceberg_drop_backup=false, and renaming that one back would be wrong advice —
-                # so only the two together fail the run.
-                if has_backup and _table_exists(spark, src_db, _ice_staging_name(tok)):
+                # An interrupted swap leaves both the parked source and the unpromoted copy.
+                # A backup on its own is also what system.migrate leaves with
+                # iceberg_drop_backup=false, and renaming that one back would be wrong advice.
+                # The copy having already been cleared is a real state though, so fall back to
+                # the backup's own format: system.migrate only ever parks Parquet/ORC/Avro
+                # tables, so a TEXT backup can only have come from the in-place text path.
+                is_swap_remnant = False
+                if has_backup:
+                    if _table_exists(spark, src_db, _ice_staging_name(tok)):
+                        is_swap_remnant = True
+                    else:
+                        try:
+                            is_swap_remnant = parse_describe_formatted(
+                                spark.sql(f"DESCRIBE FORMATTED {src_db}.{backup_name}").collect()
+                            )['source_format'] == 'TEXT'
+                        except Exception as e:
+                            logger.warning(
+                                f"[IcebergDiscover] Could not read the format of "
+                                f"{src_db}.{backup_name}: {e!r}. Treating '{tok}' as simply absent."
+                            )
+                if is_swap_remnant:
                     detail = (
                         f"Table '{src_db}.{tok}' is missing but '{src_db}.{backup_name}' exists — an "
                         f"in-place text copy was interrupted between renaming the source and promoting "
