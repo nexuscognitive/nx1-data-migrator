@@ -420,6 +420,14 @@ def get_config() -> dict:
             )
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
+        'iceberg_inplace_text_ctas': str(
+            _dag_run_conf.get(
+                'iceberg_inplace_text_ctas',
+                _var('migration_iceberg_inplace_text_ctas',
+                     'MIGRATION_ICEBERG_INPLACE_TEXT_CTAS', 'true')
+            )
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+
         # When true, create_hive_tables DROPS an existing destination table
         # (metadata only — EXTERNAL tables keep their S3 data) and recreates it
         # from scratch, instead of MSCK-repair-only. Used to fix tables created
