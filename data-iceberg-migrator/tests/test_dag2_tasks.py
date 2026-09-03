@@ -1007,6 +1007,60 @@ class TestMigrateTablesToIceberg:
         rows = {r['source_table']: r for r in ti.xcom_push.call_args.kwargs['value']['results']}
         assert rows['sales_data_s3.logs_b']['reason_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE'
 
+    def _skip_entry_discovery(self, code, status='FAILED', table='t_gone'):
+        d = self._text_inplace_discovery()
+        d['discovered_tables'] = [{
+            'table': table, 'location': 's3a://bucket/logs', 'source_format': 'TEXT',
+            'table_type': 'EXTERNAL', 'partition_columns': [],
+            'skip_code': code, 'skip_status': status,
+            'skip_message': f'{code} detail from discovery',
+        }]
+        return d
+
+    def test_discovery_swap_incomplete_skip_suppresses_retries(self, mock_spark):
+        """The table has to be restored by hand and never reaches the repair path, so each
+        retry only re-records the same row — 3x the task duration for no chance of success."""
+        mock_spark.sql.side_effect = self._text_inplace_router(existing=())
+        with (
+            patch.object(m, 'permanent_fail', side_effect=Exception('permanent')) as pf,
+            pytest.raises(Exception, match='permanent'),
+        ):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._skip_entry_discovery('INPLACE_CTAS_SWAP_INCOMPLETE'),
+                dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+            )
+        assert pf.called
+
+    def test_other_failed_discovery_skips_keep_their_retries(self, mock_spark):
+        """PERMISSION_DENIED and METADATA_READ_ERROR can be a transient metastore blip,
+        where the retry is exactly what fixes them."""
+        ti = MagicMock()
+        mock_spark.sql.side_effect = self._text_inplace_router(existing=())
+        with (
+            patch.object(m, 'permanent_fail',
+                         side_effect=AssertionError('permanent_fail must not be called')),
+            pytest.raises(Exception, match='Iceberg migration failed'),
+        ):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._skip_entry_discovery('PERMISSION_DENIED'),
+                dag_run_id='dag_test', spark=mock_spark, ti=ti,
+            )
+        assert ti.xcom_push.call_args.kwargs['value']['results'][0]['status'] == 'FAILED'
+
+    def test_failure_summary_names_the_failed_tables(self, mock_spark):
+        """The summary reaches XCom, the HTML report and the notification email, so ending it
+        at 'table(s): ' with no names strands whoever reads it."""
+        ti = MagicMock()
+        mock_spark.sql.side_effect = self._text_inplace_router(existing=())
+        with pytest.raises(Exception, match='Iceberg migration failed'):
+            m.migrate_tables_to_iceberg.function.__wrapped__(
+                discovery=self._skip_entry_discovery('PERMISSION_DENIED', table='t_gone'),
+                dag_run_id='dag_test', spark=mock_spark, ti=ti,
+            )
+        summary = ti.xcom_push.call_args.kwargs['value']['_failure_summary']
+        assert 'sales_data_s3.t_gone' in summary
+        assert not summary.rstrip().endswith(':')
+
     def test_permanent_ctas_error_short_circuits_before_any_rename(self, mock_spark):
         """Nothing has been renamed yet, so retrying only re-copies the table. The
         rollback guarantee only needs to hold once a RENAME has been issued."""

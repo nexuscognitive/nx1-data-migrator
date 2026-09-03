@@ -1125,6 +1125,15 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 location=location,
                 started_at=tbl_migrate_start,
             )
+            # The table has to be restored by hand and never reaches the repair path,
+            # so each retry only re-records the same row. Deliberately narrow: the other
+            # FAILED discovery codes (PERMISSION_DENIED, METADATA_READ_ERROR) can be a
+            # transient metastore blip, where retrying is exactly what fixes them.
+            if tbl_meta['skip_code'] == 'INPLACE_CTAS_SWAP_INCOMPLETE':
+                _permanent_failure = (
+                    f"migrate_tables_to_iceberg:{src_db}.{tbl}",
+                    Exception(reason(tbl_meta['skip_code'], tbl_meta.get('skip_message') or '')),
+                )
             continue
 
         logger.info(
@@ -1591,6 +1600,8 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
         '_has_failures': has_failures,
         '_failure_summary': (
             f"Iceberg migration failed for {len(failed_migrations)}/{len(results)} table(s): "
+            + ', '.join(r['source_table'] for r in failed_migrations[:20])
+            + (f" (+{len(failed_migrations) - 20} more)" if len(failed_migrations) > 20 else "")
             if has_failures else None
         )
     }
