@@ -34,10 +34,12 @@ from migrator_utils.migrations.shared import (
     _login_shell,
     build_s3_opts,
     cluster_login,
+    distcp_jvm_opts,
     execute_with_iceberg_retry,
     get_config,
     hive_type_to_spark_ddl,
     normalize_s3,
+    size_distcp_job,
     track_duration,
     validate_bucket_endpoint_pairs,
 )
@@ -1585,9 +1587,17 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
     tables = discovery["tables"]
     temp_dir = cluster_setup["temp_dir"]
     distcp_log_dir = cluster_setup.get("distcp_log_dir") or temp_dir
-    mappers = config["distcp_mappers"]
-    bandwidth = config["distcp_bandwidth"]
     preserve_delete = config.get("distcp_preserve_delete", True)
+    jvm_opts = distcp_jvm_opts(config)
+    # shlex.quote leaves a bare word like 'dynamic' untouched, so the default
+    # command is byte-identical to the pre-branch hardcoded -strategy dynamic.
+    strategy = shlex.quote(config["distcp_strategy"])
+    client_java_opts = str(config.get("distcp_client_java_opts") or "").strip()
+    client_opts_export = (
+        f"export HADOOP_CLIENT_OPTS={shlex.quote(client_java_opts)}\n"
+        if client_java_opts
+        else ""
+    )
 
     s3_opts = build_s3_opts(
         discovery["dest_bucket"], config, discovery.get("dest_endpoint", "")
@@ -1640,8 +1650,22 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             effective_file_count = t.get(
                 "filtered_file_count", t.get("source_file_count", 0)
             )
+            effective_size = t.get(
+                "filtered_source_size_bytes", t.get("source_total_size_bytes", 0)
+            )
         else:
             effective_file_count = t.get("source_file_count", 0)
+            effective_size = t.get("source_total_size_bytes", 0)
+
+        mappers, bandwidth = size_distcp_job(
+            effective_size, effective_file_count, config
+        )
+        logger.info(
+            f"[DistCp] Sized {t['source_database']}.{t['source_table']}: "
+            f"{mappers} mappers x {bandwidth} MB/s "
+            f"(= {mappers * bandwidth} MB/s aggregate) for "
+            f"{effective_size} bytes / {effective_file_count} files"
+        )
 
         if effective_file_count == 0:
             logger.warning(
@@ -1768,16 +1792,45 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                 )
 
                 distcp_calls = ""
-                for part_idx, (src_part, dst_part) in enumerate(partition_copy_pairs):
+                for part_idx, (part_name, (src_part, dst_part)) in enumerate(
+                    zip(non_empty_partitions, partition_copy_pairs, strict=True)
+                ):
+                    # Each partition is its own DistCp job, so it gets its own
+                    # mapper count. Sizing every one at the table level would
+                    # give a ten-file partition the whole table's mappers.
+                    part_files = partition_file_counts.get(part_name, 0)
+                    if part_files > 0:
+                        # Discovery records a file count per partition but not a
+                        # size, so apportion the table's bytes by file share.
+                        part_size = (
+                            effective_size * part_files // effective_file_count
+                            if effective_file_count > 0
+                            else 0
+                        )
+                        part_mappers, part_bandwidth = size_distcp_job(
+                            part_size, part_files, config
+                        )
+                    else:
+                        # No per-partition count (empty dict from an older
+                        # discovery payload). Keep the table-level sizing rather
+                        # than reading the absence as a one-file partition.
+                        part_size = 0
+                        part_mappers, part_bandwidth = mappers, bandwidth
+                    # Debug, not info: a 200-partition table would flood the log.
+                    logger.debug(
+                        f"[DistCp]   Partition {part_name}: {part_mappers} mappers "
+                        f"x {part_bandwidth} MB/s for {part_size} bytes / "
+                        f"{part_files} files"
+                    )
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
-run_distcp_with_retry hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+run_distcp_with_retry hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {part_mappers} -bandwidth {part_bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
 """
 
                 cmd = f"""set -e
-
+{client_opts_export}
 calculate_s3_metrics_hadoop() {{
     local location=$1
     if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
@@ -1899,7 +1952,7 @@ exit 0
                 )
 
                 cmd = f"""set -e
-
+{client_opts_export}
 calculate_s3_metrics_hadoop() {{
     local location=$1
     if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
@@ -1952,7 +2005,7 @@ echo "=== Creating empty partition directories ==="
 
 echo "=== Running distcp using source path list (delete disabled) ==="
 set +e
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+DISTCP_OUTPUT=$(hadoop distcp{s3_opts}{jvm_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
@@ -1992,7 +2045,7 @@ exit 0
 """
         else:
             cmd = f"""set -e
-
+{client_opts_export}
 calculate_s3_metrics_hadoop() {{
     local location=$1
 
@@ -2023,7 +2076,7 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 
 echo "=== Running distcp ==="
 set +e
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+DISTCP_OUTPUT=$(hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e

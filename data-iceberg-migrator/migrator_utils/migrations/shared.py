@@ -59,12 +59,14 @@ __all__ = [
     "cell_str",
     "cluster_login",
     "compute_dest_path",
+    "distcp_jvm_opts",
     "execute_with_iceberg_retry",
     "get_config",
     "hive_type_to_spark_ddl",
     "is_permanent_error",
     "normalize_s3",
     "permanent_fail",
+    "size_distcp_job",
     "track_duration",
     "validate_bucket_endpoint_pairs",
 ]
@@ -352,6 +354,16 @@ def get_config() -> dict:
         # file. Only the branch above is new.
         return Variable.get(base_key, default_var=os.getenv(env_var, default))
 
+    def _int_var(base_key: str, env_var: str, default: str) -> int:
+        """Resolve one integer config value, treating an empty value as unset.
+
+        Airflow reports a Variable cleared in the UI as present-but-empty, so ''
+        means unset and falls through to the default rather than blowing up. A
+        value that is set but not an integer raises here, at config resolution,
+        rather than producing a malformed DistCp command mid-copy.
+        """
+        raw = str(_var(base_key, env_var, default) or '').strip()
+        return int(raw or default)
 
     dag_owner = _var('migration_dag_owner', 'MIGRATION_DAG_OWNER', '') \
                 or _dag_run_conf.get('dag_owner', '') \
@@ -374,8 +386,41 @@ def get_config() -> dict:
         's3_secret_key': _var('s3_secret_key', 'S3_SECRET_KEY', ''),
 
         # DistCp Configuration
-        'distcp_mappers': _var('migration_distcp_mappers', 'MIGRATION_DISTCP_MAPPERS', '50'),
-        'distcp_bandwidth': _var('migration_distcp_bandwidth', 'MIGRATION_DISTCP_BANDWIDTH', '100'),
+        # Empty = auto-size from the source size probe (see size_distcp_job).
+        # Both must be set together to force a fixed value.
+        'distcp_mappers': _var('migration_distcp_mappers', 'MIGRATION_DISTCP_MAPPERS', ''),
+        'distcp_bandwidth': _var('migration_distcp_bandwidth', 'MIGRATION_DISTCP_BANDWIDTH', ''),
+
+        # Auto-sizing inputs, coerced here rather than at the call site so a
+        # malformed Variable fails at config resolution, not mid-copy.
+        'distcp_target_bytes_per_mapper': _int_var(
+            'migration_distcp_target_bytes_per_mapper',
+            'MIGRATION_DISTCP_TARGET_BYTES_PER_MAPPER', str(2 * 1024 ** 3)
+        ),
+        'distcp_min_mappers': _int_var(
+            'migration_distcp_min_mappers', 'MIGRATION_DISTCP_MIN_MAPPERS', '1'
+        ),
+        'distcp_max_mappers': _int_var(
+            'migration_distcp_max_mappers', 'MIGRATION_DISTCP_MAX_MAPPERS', '100'
+        ),
+        'distcp_target_aggregate_mbps': _int_var(
+            'migration_distcp_target_aggregate_mbps',
+            'MIGRATION_DISTCP_TARGET_AGGREGATE_MBPS', '2000'
+        ),
+        # Used when the size probe returns nothing usable.
+        'distcp_default_mappers': _int_var(
+            'migration_distcp_default_mappers', 'MIGRATION_DISTCP_DEFAULT_MAPPERS', '50'
+        ),
+        'distcp_default_bandwidth': _int_var(
+            'migration_distcp_default_bandwidth', 'MIGRATION_DISTCP_DEFAULT_BANDWIDTH', '100'
+        ),
+
+        # JVM / MapReduce knobs. Empty means emit nothing at all.
+        'distcp_strategy': _var('migration_distcp_strategy', 'MIGRATION_DISTCP_STRATEGY', 'dynamic'),
+        'distcp_map_memory_mb': _var('migration_distcp_map_memory_mb', 'MIGRATION_DISTCP_MAP_MEMORY_MB', ''),
+        'distcp_map_java_opts': _var('migration_distcp_map_java_opts', 'MIGRATION_DISTCP_MAP_JAVA_OPTS', ''),
+        'distcp_client_java_opts': _var('migration_distcp_client_java_opts', 'MIGRATION_DISTCP_CLIENT_JAVA_OPTS', ''),
+        'distcp_extra_hadoop_opts': _var('migration_distcp_extra_hadoop_opts', 'MIGRATION_DISTCP_EXTRA_HADOOP_OPTS', ''),
         'distcp_preserve_delete': str(
             _var(
                 'migration_distcp_preserve_delete',
@@ -696,6 +741,66 @@ def _endpoint_credentials(ep_hostname: str, config: dict) -> tuple[str, str]:
     if access_key and secret_key:
         return access_key, secret_key
     return (config.get('s3_access_key') or '', config.get('s3_secret_key') or '')
+
+
+def size_distcp_job(size_bytes: int, file_count: int, config: dict) -> tuple[int, int]:
+    """Derive (mappers, bandwidth_mb_per_mapper) for one DistCp job from its source size."""
+    forced_m = str(config.get('distcp_mappers') or '').strip()
+    forced_b = str(config.get('distcp_bandwidth') or '').strip()
+
+    if forced_m and forced_b:
+        return int(forced_m), int(forced_b)
+    if forced_m or forced_b:
+        missing = 'distcp_bandwidth' if forced_m else 'distcp_mappers'
+        raise ValueError(
+            f"DistCp override is half-configured: {missing} is not set. "
+            f"Set both migration_distcp_mappers and migration_distcp_bandwidth "
+            f"to force fixed values, or neither to auto-size."
+        )
+
+    min_mappers = int(config['distcp_min_mappers'])
+    max_mappers = int(config['distcp_max_mappers'])
+
+    if size_bytes <= 0 and file_count > 0:
+        logger.warning(
+            f"[size_distcp_job] Source size probe returned {size_bytes} bytes for "
+            f"{file_count} file(s) — unusable for sizing. Falling back to configured "
+            f"defaults: {config['distcp_default_mappers']} mappers / "
+            f"{config['distcp_default_bandwidth']} MB/s per mapper."
+        )
+        return int(config['distcp_default_mappers']), int(config['distcp_default_bandwidth'])
+
+    # Integer ceiling. Float division loses precision above 2**53 bytes.
+    by_size = -(-size_bytes // int(config['distcp_target_bytes_per_mapper']))
+    mappers = max(min_mappers, min(by_size, max_mappers))
+    # Hadoop 2.7 has no -blocksperchunk, so a mapper beyond the file count idles.
+    if file_count > 0:
+        mappers = min(mappers, file_count)
+    mappers = max(mappers, min_mappers)
+
+    bandwidth = max(1, int(config['distcp_target_aggregate_mbps']) // mappers)
+    return mappers, bandwidth
+
+
+def distcp_jvm_opts(config: dict) -> str:
+    """Build the leading-space-prefixed -D block that follows build_s3_opts in a DistCp command."""
+    opts = ''
+
+    map_memory = str(config.get('distcp_map_memory_mb') or '').strip()
+    if map_memory:
+        opts += f" -Dmapreduce.map.memory.mb={map_memory}"
+
+    map_java_opts = str(config.get('distcp_map_java_opts') or '').strip()
+    if map_java_opts:
+        opts += f" -Dmapreduce.map.java.opts={shlex.quote(map_java_opts)}"
+
+    # Deliberately unquoted: this is a raw flag string, so it must already be
+    # -D-formatted and it reaches the shell unescaped. Trusted input only.
+    extra = str(config.get('distcp_extra_hadoop_opts') or '').strip()
+    if extra:
+        opts += f" {extra}"
+
+    return opts
 
 
 def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -> str:

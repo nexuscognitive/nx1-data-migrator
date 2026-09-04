@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import re
+import shlex
 from datetime import datetime, timedelta
 from html import escape as _html_escape
 from pathlib import Path
@@ -25,11 +26,13 @@ from migrator_utils.migrations.shared import (
     _login_shell,
     build_s3_opts,
     cluster_login,
+    distcp_jvm_opts,
     execute_with_iceberg_retry,
     get_config,
     is_permanent_error,
     normalize_s3,
     permanent_fail,
+    size_distcp_job,
 )
 
 _dag_stem = Path(__file__).stem
@@ -467,6 +470,52 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
     return configs
 
 
+def _probe_source_size(ssh, source_path: str, config: dict) -> tuple[int, int]:
+    """Probe a source path with `hadoop fs -count`, returning (content_size, file_count)."""
+    # (0, 1) is the "size probe unusable" pair size_distcp_job routes to the
+    # configured defaults. This DAG has no discovery task to fall back on, and a
+    # probe failure must not fail the copy.
+    unusable = (0, 1)
+    cmd = f'hadoop fs -count "{source_path}"'
+    try:
+        with ssh.get_conn() as client:
+            _, stdout, stderr = client.exec_command(
+                _login_shell(cmd, config.get('cluster_type', 'MapR')),
+                timeout=SSH_COMMAND_TIMEOUT,
+            )
+            output = stdout.read().decode()
+            exit_code = stdout.channel.recv_exit_status()
+            error_output = stderr.read().decode()
+
+        if exit_code != 0:
+            logger.warning(
+                f"[FolderCopy] Size probe for {source_path} exited {exit_code} — "
+                f"falling back to configured DistCp defaults. {error_output.strip()[:300]}"
+            )
+            return unusable
+
+        for line in reversed(output.splitlines()):
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            try:
+                return int(fields[2]), int(fields[1])
+            except ValueError:
+                continue
+
+        logger.warning(
+            f"[FolderCopy] Could not parse `hadoop fs -count` output for {source_path} — "
+            f"falling back to configured DistCp defaults. Output: {output.strip()[:300]}"
+        )
+        return unusable
+    except Exception as exc:
+        logger.warning(
+            f"[FolderCopy] Size probe for {source_path} failed ({exc}) — "
+            f"falling back to configured DistCp defaults."
+        )
+        return unusable
+
+
 @task
 def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **context) -> dict:
     """Copy a single source folder to S3 via SSH DistCp with -update for incremental runs."""
@@ -482,8 +531,24 @@ def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **con
     dest_endpoint = folder_config.get('dest_endpoint', '')
     s3_dest = f"{dest_bucket}/{dest_folder}"
 
-    mappers = config['distcp_mappers']
-    bandwidth = config['distcp_bandwidth']
+    probe_size, probe_files = _probe_source_size(ssh, source_path, config)
+    mappers, bandwidth = size_distcp_job(probe_size, probe_files, config)
+    logger.info(
+        f"[FolderCopy] Sized {source_path}: {mappers} mappers x {bandwidth} MB/s "
+        f"(= {mappers * bandwidth} MB/s aggregate) for "
+        f"{probe_size} bytes / {probe_files} files"
+    )
+
+    jvm_opts = distcp_jvm_opts(config)
+    # shlex.quote leaves a bare word like 'dynamic' untouched, so the default
+    # command is byte-identical to the pre-branch hardcoded -strategy dynamic.
+    strategy = shlex.quote(config['distcp_strategy'])
+    client_java_opts = str(config.get('distcp_client_java_opts') or '').strip()
+    client_opts_export = (
+        f'export HADOOP_CLIENT_OPTS={shlex.quote(client_java_opts)}\n'
+        if client_java_opts
+        else ''
+    )
 
     cluster_setup = cluster_setup if isinstance(cluster_setup, dict) else {}
     distcp_log_dir = (
@@ -511,7 +576,7 @@ def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **con
     s3_opts = build_s3_opts(dest_bucket, config, dest_endpoint)
 
     cmd = f'''set +e
-
+{client_opts_export}
 calculate_s3_metrics() {{
     local location=$1
     if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
@@ -583,7 +648,7 @@ if [ "$SRC_FILE_COUNT" -eq 0 ]; then
 fi
 
 echo "=== Running distcp ==="
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update{delete_flag} -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+DISTCP_OUTPUT=$(hadoop distcp{s3_opts}{jvm_opts} -update{delete_flag} -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{log_name}.log "{source_path}" "{s3_dest}" 2>&1)
 DISTCP_EXIT=$?
 echo "$DISTCP_OUTPUT"
