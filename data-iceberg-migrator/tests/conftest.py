@@ -4,6 +4,7 @@ All external dependencies (SSH, Spark, Airflow Variables, SMTP) are mocked.
 """
 
 import sys
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -56,6 +57,9 @@ class _FakeDAG:
     def __init__(self, dag_id, **kwargs):
         self.dag_id = dag_id
         self.params = kwargs.get('params', {})
+        self.tags = kwargs.get('tags', [])
+        self.default_args = kwargs.get('default_args', {})
+        self.tasks = []
 
     def __enter__(self):
         _FakeDAG._active = self
@@ -64,6 +68,15 @@ class _FakeDAG:
     def __exit__(self, *args):
         _FakeDAG._active = None
         return False
+
+class _FakeSSHOperator:
+    def __init__(self, task_id=None, ssh_conn_id=None, command=None, **kwargs):
+        self.task_id = task_id
+        self.ssh_conn_id = ssh_conn_id
+        self.command = command
+        if _FakeDAG._active is not None:
+            _FakeDAG._active.tasks.append(self)
+
 
 class _FakeAirflowFailException(Exception):
     """Stub for airflow.exceptions.AirflowFailException — behaves like a real exception under test."""
@@ -113,8 +126,14 @@ def _make_airflow_stubs():
     airflow_decorators.task = passthrough_task
 
     airflow_models = MagicMock()
+    airflow_models.DAG = _FakeDAG
     airflow_models.Variable = variable_mock
     airflow_models.param = MagicMock(Param=_FakeParam)
+
+    pendulum_mock = MagicMock()
+    pendulum_mock.datetime.side_effect = (
+        lambda *args, **kwargs: datetime(*args)
+    )
 
     pyspark_sql_utils = MagicMock()
     pyspark_sql_utils.AnalysisException = type('AnalysisException', (Exception,), {})
@@ -139,10 +158,13 @@ def _make_airflow_stubs():
         "airflow.providers.ssh":                MagicMock(),
         "airflow.providers.ssh.hooks":          MagicMock(),
         "airflow.providers.ssh.hooks.ssh":      MagicMock(),
+        "airflow.providers.ssh.operators":      MagicMock(),
+        "airflow.providers.ssh.operators.ssh":  MagicMock(SSHOperator=_FakeSSHOperator),
         "airflow.utils":                        MagicMock(),
         "airflow.utils.email":                  MagicMock(),
         "airflow.utils.trigger_rule":           MagicMock(TriggerRule=MagicMock(ALL_DONE="all_done")),
         "dotenv":                               MagicMock(),
+        "pendulum":                             pendulum_mock,
         "pyspark":                              MagicMock(),
         "pyspark.sql":                          MagicMock(),
         "pyspark.sql.utils":                    pyspark_sql_utils,

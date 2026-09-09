@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shlex
+import sys
 from datetime import datetime, timedelta
 from html import escape as _html_escape
 from pathlib import Path
@@ -21,6 +22,9 @@ from airflow.decorators import task
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from migrator_utils.migrations.shared import (
     SSH_COMMAND_TIMEOUT,
     _login_shell,
