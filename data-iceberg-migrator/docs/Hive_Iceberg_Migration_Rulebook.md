@@ -14,35 +14,36 @@ How to migrate Hive tables to Iceberg with `migration_dag_iceberg.py`: which str
 | UAT / testing | **Snapshot** | `False` | Non-destructive, source stays live, drop and rebuild freely |
 | Prod shadow validation | **Snapshot** | `False` | Validate against real data with zero risk |
 | **Prod cutover** | **In-place** | `True` | Self-contained, zero-copy, keeps the table name, rollback via backup |
-| Cutover of **text/CSV** | **Snapshot (CTAS)** | `False` | In-place cannot migrate text — see [Rule 6](#rule-6--text-tables-are-the-exception) |
+| Cutover of **text/CSV** | **In-place (CTAS)** | `True` | Full copy under the original name, gated by `iceberg_inplace_text_ctas` — see [Rule 6](#rule-6--text-tables-are-the-exception) |
 
 ---
 
 ## The two strategies
 
-|  | **In-place** (`migrate`) | **Snapshot** |
+|  | **In-place** (`migrate` / CTAS) | **Snapshot** |
 | --- | --- | --- |
 | Excel setting | `inplace_migration = True` | `inplace_migration = False` |
 | What it does | Converts the Hive table into Iceberg in place | Creates a separate Iceberg table in a destination DB |
-| Data movement | None (zero-copy) | None for parquet/orc/avro; **full copy** for text (CTAS) |
+| Data movement | None (zero-copy) for parquet/orc/avro; **full copy** for text (CTAS, gated by `iceberg_inplace_text_ctas`) | None for parquet/orc/avro; **full copy** for text (CTAS) |
 | Source table after | Renamed to `<table>_backup_` | Untouched, stays live |
-| Result location | Same DB, same location as source | Destination DB, new metadata location |
+| Result location | Same DB; same location as source for parquet/orc/avro, new sibling location `<location>_iceberg` for text | Destination DB, new metadata location |
 | Owns its data? | **Yes** | **No** for zero-copy (references source files); yes for CTAS |
-| Formats | parquet / orc / avro | parquet / orc / avro, **and** text (via CTAS) |
+| Formats | parquet / orc / avro, **and** text via CTAS (`EXTERNAL` tables only) | parquet / orc / avro, **and** text (via CTAS) |
 | Sees later source writes? | n/a | **No** — frozen point-in-time |
-| Re-run | SKIPPED (already Iceberg), never fails | Drop + rebuild; CTAS orphans the old copy |
+| Re-run | SKIPPED (already Iceberg), never fails; an interrupted text swap auto-repairs on retry within the same run | Drop + rebuild; CTAS orphans the old copy |
 
 ### Where data and metadata actually live
 
 | Case | Data files | Metadata | Self-contained? |
 | --- | --- | --- | --- |
-| **In-place** | Original location `L`, unmoved | Same location `L` | **Yes** |
+| **In-place — parquet/orc/avro** | Original location `L`, unmoved | Same location `L` | **Yes** |
+| **In-place — text (CTAS)** | New sibling location `L_iceberg`, full copy | Same location `L_iceberg` | **Yes** |
 | **Snapshot — parquet/orc/avro** | Source location `L_hive`, referenced not copied | Destination `L_ice` | **No** — depends on source data |
 | **Snapshot — CTAS** (text/unknown/empty AVRO) | Destination `L_ice`, **new full copy** | Destination `L_ice` | **Yes** |
 
-CTAS lands at the catalog/warehouse default for the destination database
+Snapshot CTAS lands at the catalog/warehouse default for the destination database
 
-(`<warehouse root>/<destination_db>/<table>/`).
+(`<warehouse root>/<destination_db>/<table>/`). In-place text CTAS lands at the sibling path `<original location>_iceberg` in the *same* database — no destination database is created.
 
 ### Why a snapshot can never be your production table
 
@@ -190,7 +191,7 @@ After a clean soak: re-run with `iceberg_drop_backup = true`, or drop `<table>_b
 
 Point-in-time, doesn't own its data, wrong namespace. 
 
-Only exception: text tables (Rule 6), where CTAS produces a genuinely self-contained table.
+Only exception: text tables on the snapshot CTAS fallback ([Rule 6](#rule-6--text-tables-are-the-exception)) — unlike a zero-copy snapshot, that CTAS output is genuinely self-contained, so it's safe to cut over on directly. Prefer the in-place text CTAS route in Rule 6 when it's available; it needs no such exception.
 
 ### Rule 2 — Drop snapshot tables before running in-place on the same source
 
@@ -212,17 +213,36 @@ Tasks use `trigger_rule = 'all_done'` and aggregate per-item failures instead of
 
 ### Rule 6 — Text tables are the exception
 
-In-place **cannot** migrate text/CSV/unknown formats — Iceberg's `migrate` rejects `LazySimpleSerDe`, so those tables are recorded as **SKIPPED**. Their only path is Snapshot, which routes them through CTAS: a full copy into the destination warehouse. 
+Iceberg's in-place `migrate` only registers Parquet/ORC/Avro data files — it rejects `LazySimpleSerDe` — so it can never convert a text table without a copy. Whether that copy still counts as "in-place" (same database, same table name) depends on `iceberg_inplace_text_ctas`.
 
-That result *is* self-contained, so it's a legitimate cutover artifact — but the procedure differs:
+**With `iceberg_inplace_text_ctas = true` (default) and `inplace_migration = T`:** in-place *can* migrate text, via CTAS instead of `migrate`:
+
+1. CTAS copies the table into a staging table at the sibling location `<original location>_iceberg`, in the same database.
+2. The copy is verified against the still-live source on row count and (Iceberg-normalized) schema — before anything is renamed.
+3. Only once verification passes: the source is renamed to `<table>_backup_`, then the staging copy is renamed to `<table>`. The name and database never change.
+
+This requires the table to be confirmed **EXTERNAL**. A text table that can't be positively confirmed EXTERNAL is skipped with `MANAGED_TEXT_INPLACE_UNSUPPORTED` — renaming a *managed* Hive table makes the metastore move its data directory, which on S3 is a second full copy on top of the one this migration already makes. Convert it to EXTERNAL, or fall back to the snapshot route below.
+
+If verification fails — almost always a concurrent write — the staging table is dropped and the original is left untouched: `INPLACE_CTAS_VERIFY_FAILED`, status FAILED. Freeze writers and re-run.
+
+**With `iceberg_inplace_text_ctas = false`, or `inplace_migration = F`:** text tables are skipped — `TEXT_FORMAT_INPLACE_UNSUPPORTED` — and the only path is Snapshot, which routes them through CTAS into the destination database. (`UNKNOWN`-format tables are a separate, unconditional case: they're always skipped with `FORMAT_UNDETECTED_INPLACE`, regardless of this flag.)
 
 1. Freeze writers to those tables **before** the CTAS run — the copy is point-in-time.
 2. Run the snapshot DAG; validate row counts and schema.
-3. Repoint consumers to the **destination database name** — the table doesn't keep its namespace. This repointing is the main cost of the text path.
+3. Repoint consumers to the **destination database name** — this route doesn't keep the table's namespace. This repointing is the main cost of the snapshot text path.
 4. Retire the source Hive tables per your retention policy.
 5. **Clean up orphans.** CTAS re-runs drop metadata-only and write fresh files, leaving the previous copy unreferenced. Correctness is fine; storage isn't.
 
-Cheaper alternative: convert text tables to parquet/orc **before** migrating, and they rejoin the normal in-place path with no namespace change.
+**Freeze writers for the in-place text route too.** It is the one exception to [Rule 4](#rule-4--freeze-for-in-place-not-for-snapshot): the copy is point-in-time and the verification gate uses strict row equality, so a single concurrent write fails an otherwise good copy.
+
+**What the in-place text path does not give you:**
+
+- **Only as faithful as Hive's serde.** Text values that don't parse as their declared column type already read as NULL through Hive's serde — on the source and the copy alike — so row-count-and-schema verification cannot see a difference no existing reader could see either.
+- **Metadata is not carried over.** CTAS creates a brand-new table; the original's comment, column comments, owner and any custom `TBLPROPERTIES` are lost. "In place" preserves the name and database, not the rest of the table's metadata.
+- **Storage doubles until cleanup.** Dropping `<table>_backup_` (P5) is metadata-only, as always — but for text, nothing else references those files afterward, so they become orphans on S3 that only a manual cleanup reclaims.
+- **No concurrent runs on the same database.** If a second DAG 2 run starts while a first run's text copy is in flight, the second run's interrupted-swap repair will drop the first run's staging table with `PURGE`. A worse interleaving is equally reachable: if the second run's repair lands in the narrow window between the first run's two renames — `{table}` already renamed to `{table}_backup_`, the staging copy not yet renamed into `{table}` — the second run sees `{table}` absent beside a location-matching backup that is, in fact, the very table it is trying to repair, not a stale one. It purges the first run's already-verified staging copy and renames the backup back into place, which then breaks the first run's own second rename (the staging table it expects is gone). No tenant data is lost either way — the original text files and the original table always survive, restored under their original name — but the first run's copy is destroyed and it must redo the CTAS on retry.
+
+Cheaper alternative, still available: convert text tables to parquet/orc/avro **before** migrating, and they take the zero-copy in-place path with none of the above.
 
 ### Rule 7 — Migrate in waves, sized by measured durations
 
@@ -246,4 +266,4 @@ Never cut over the whole warehouse in one run. Order waves by blast radius: low-
 
 **Results:** `migration_tracking.iceberg_migration_runs` (run level) · `migration_tracking.iceberg_migration_table_status` (per table) · HTML report written to S3 and emailed at the end of each run.
 
-**Backups:** `system.migrate` always renames the source to `<table>_backup_`. Discovery skips `*_backup_` / `*__BACKUP__`, so backups are never re-migrated. All backup drops are metadata-only, so they never delete data.
+**Backups:** in-place migration always renames the source to `<table>_backup_` — via `system.migrate` for parquet/orc/avro, or directly as part of the verified swap for text CTAS. Discovery skips `*_backup_` / `*__BACKUP__`, so backups are never re-migrated. All backup drops are metadata-only, so they never delete data — though for text, that leaves the backup's files as orphans on S3 (Rule 6), since nothing else references them.
