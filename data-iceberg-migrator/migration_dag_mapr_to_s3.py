@@ -25,6 +25,11 @@ from airflow.decorators import task
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from migrator_utils.migrations.partition_utils import (
     partitions_to_where_clause as _partitions_to_where_clause,
 )

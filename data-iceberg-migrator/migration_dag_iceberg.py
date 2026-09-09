@@ -23,6 +23,11 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.models.param import Param
 from dotenv import load_dotenv
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from migrator_utils.migrations.shared import (
     execute_with_iceberg_retry,
     get_config,
