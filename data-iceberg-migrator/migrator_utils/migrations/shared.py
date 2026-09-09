@@ -359,11 +359,21 @@ def get_config() -> dict:
 
         Airflow reports a Variable cleared in the UI as present-but-empty, so ''
         means unset and falls through to the default rather than blowing up. A
-        value that is set but not an integer raises here, at config resolution,
-        rather than producing a malformed DistCp command mid-copy.
+        value that is set but is not a positive integer raises here, at config
+        resolution, rather than producing a malformed DistCp command mid-copy.
+
+        Zero and negatives are rejected, not just non-numerics: every knob this
+        resolves is a divisor or a bound in size_distcp_job, so 0 would surface
+        as a ZeroDivisionError inside the DistCp task, after discovery has run.
         """
         raw = str(_var(base_key, env_var, default) or '').strip()
-        return int(raw or default)
+        value = int(raw or default)
+        if value <= 0:
+            raise ValueError(
+                f"{base_key} must be a positive integer, got {value!r}. "
+                f"Set it above zero or unset it to use the default ({default})."
+            )
+        return value
 
     dag_owner = _var('migration_dag_owner', 'MIGRATION_DAG_OWNER', '') \
                 or _dag_run_conf.get('dag_owner', '') \
@@ -416,7 +426,14 @@ def get_config() -> dict:
         ),
 
         # JVM / MapReduce knobs. Empty means emit nothing at all.
-        'distcp_strategy': _var('migration_distcp_strategy', 'MIGRATION_DISTCP_STRATEGY', 'dynamic'),
+        # Strategy is the exception: DistCp needs a value, and shlex.quote('')
+        # would emit a literal -strategy '' that it rejects with a usage error.
+        # A Variable cleared in the UI reads back as present-but-empty, so treat
+        # empty as unset the way _int_var does.
+        'distcp_strategy': (
+            str(_var('migration_distcp_strategy', 'MIGRATION_DISTCP_STRATEGY', 'dynamic') or '').strip()
+            or 'dynamic'
+        ),
         'distcp_map_memory_mb': _var('migration_distcp_map_memory_mb', 'MIGRATION_DISTCP_MAP_MEMORY_MB', ''),
         'distcp_map_java_opts': _var('migration_distcp_map_java_opts', 'MIGRATION_DISTCP_MAP_JAVA_OPTS', ''),
         'distcp_client_java_opts': _var('migration_distcp_client_java_opts', 'MIGRATION_DISTCP_CLIENT_JAVA_OPTS', ''),

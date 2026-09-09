@@ -229,6 +229,80 @@ class TestVarPrecedence:
 
 
 # ---------------------------------------------------------------------------
+# DistCp knob validation — get_config rejects values that would only fail later
+# ---------------------------------------------------------------------------
+_SIZING_KNOBS = [
+    'migration_distcp_target_bytes_per_mapper',
+    'migration_distcp_min_mappers',
+    'migration_distcp_max_mappers',
+    'migration_distcp_target_aggregate_mbps',
+    'migration_distcp_default_mappers',
+    'migration_distcp_default_bandwidth',
+]
+
+
+def _only(key, value):
+    """Resolve one Variable to `value`, everything else to its default."""
+    return patch('airflow.models.Variable.get',
+                 side_effect=lambda k, default_var=None, **kw:
+                     value if k == key else default_var)
+
+
+class TestDistcpKnobValidation:
+
+    @pytest.mark.parametrize('key', _SIZING_KNOBS)
+    @pytest.mark.parametrize('bad', ['0', '-1', ' -4 '])
+    def test_non_positive_sizing_knob_raises_at_config_resolution(self, key, bad):
+        """Every knob is a divisor or a bound in size_distcp_job.
+
+        Left to reach the task, 0 surfaces as a ZeroDivisionError mid-copy after
+        discovery has already run, which is what the docstring promises against.
+        """
+        with _only(key, bad), pytest.raises(ValueError, match=key):
+            m.get_config()
+
+    @pytest.mark.parametrize('key', _SIZING_KNOBS)
+    def test_non_numeric_sizing_knob_raises(self, key):
+        with _only(key, 'three'), pytest.raises(ValueError):
+            m.get_config()
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_cleared_sizing_knob_falls_back_to_default(self, blank):
+        # Airflow reports a Variable cleared in the UI as present-but-empty.
+        with _only('migration_distcp_max_mappers', blank):
+            assert m.get_config()['distcp_max_mappers'] == 100
+
+    @pytest.mark.parametrize('key', _SIZING_KNOBS)
+    def test_positive_sizing_knob_is_accepted_as_int(self, key):
+        with _only(key, '7'):
+            assert m.get_config()[key.replace('migration_', '')] == 7
+
+
+class TestDistcpStrategy:
+
+    def test_defaults_to_dynamic(self):
+        assert m.get_config()['distcp_strategy'] == 'dynamic'
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_cleared_strategy_falls_back_to_dynamic(self, blank):
+        """An empty strategy would emit `-strategy ''`, which DistCp rejects.
+
+        shlex.quote('') is "''", so the empty string does not vanish from the
+        command the way the JVM knobs do — it becomes a literal argument.
+        """
+        with _only('migration_distcp_strategy', blank):
+            assert m.get_config()['distcp_strategy'] == 'dynamic'
+
+    def test_explicit_strategy_is_honoured(self):
+        with _only('migration_distcp_strategy', 'uniformsize'):
+            assert m.get_config()['distcp_strategy'] == 'uniformsize'
+
+    def test_strategy_is_stripped(self):
+        with _only('migration_distcp_strategy', '  dynamic  '):
+            assert m.get_config()['distcp_strategy'] == 'dynamic'
+
+
+# ---------------------------------------------------------------------------
 # _load_tenant_profile — origin split for the migration_tenant_profiles Variable
 # ---------------------------------------------------------------------------
 _ACME_NX1_PROFILE = json.dumps({'acme': {'ssh_conn_id': 'FROM_NX1_PROFILE'}})

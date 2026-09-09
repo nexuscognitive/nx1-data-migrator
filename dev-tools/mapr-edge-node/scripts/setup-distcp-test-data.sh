@@ -1,11 +1,11 @@
 #!/bin/bash
 # =============================================================================
-# setup-distcp-sizing-test-data.sh
+# setup-distcp-test-data.sh
 #
 # Test data for the DistCp size-aware tuning feature (feat/distcp_tuning).
 #
 # Run INSIDE the container:
-#   docker exec -u root mapr-edge-node bash /setup-distcp-sizing-test-data.sh
+#   docker exec -u root mapr-edge-node bash /setup-distcp-test-data.sh
 #
 # WHY THIS EXISTS
 # ---------------
@@ -31,7 +31,10 @@
 # as size_distcp_job(). Compare that table against the "[DistCp] Sized ..."
 # lines in the Airflow task log.
 #
-# Safe to re-run — tables are DROP + CREATE, HDFS paths are overwritten.
+# Safe to re-run — the tables are EXTERNAL, so the DROP + CREATE in [4/5]
+# touches metadata only. They must stay EXTERNAL: as managed tables, DROP
+# TABLE deletes the LOCATION directory, which on a re-run is the data [3/5]
+# has just loaded, and every fixture reports 0 bytes / 0 files.
 # =============================================================================
 
 set -euo pipefail
@@ -76,6 +79,13 @@ cat "${STAGE}/block_1m.txt" "${STAGE}/block_1m.txt" "${STAGE}/block_1m.txt" \
 echo "============================================================"
 echo " [2/5] Creating HDFS layout"
 echo "============================================================"
+
+# Clear the metastore before any data is loaded. A table left over from an
+# older revision of this script is MANAGED, so [4/5]'s DROP TABLE would delete
+# the LOCATION directory that [3/5] has just filled. Dropping the database here
+# — while the directories are still empty — makes those DROPs unconditional
+# no-ops and the script idempotent from any prior state.
+$BEELINE -e "DROP DATABASE IF EXISTS ${DB} CASCADE;"
 
 hdfs dfs -rm -r -f -skipTrash "${DBDIR}" >/dev/null 2>&1 || true
 hdfs dfs -rm -r -f -skipTrash "${FOLDER_SRC}" >/dev/null 2>&1 || true
@@ -136,31 +146,31 @@ CREATE DATABASE IF NOT EXISTS ${DB}
   LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db';
 
 DROP TABLE IF EXISTS ${DB}.t_tiny;
-CREATE TABLE ${DB}.t_tiny (line STRING)
+CREATE EXTERNAL TABLE ${DB}.t_tiny (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
   LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_tiny';
 
 DROP TABLE IF EXISTS ${DB}.t_size_bound;
-CREATE TABLE ${DB}.t_size_bound (line STRING)
+CREATE EXTERNAL TABLE ${DB}.t_size_bound (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
   LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_size_bound';
 
 DROP TABLE IF EXISTS ${DB}.t_max_clamp;
-CREATE TABLE ${DB}.t_max_clamp (line STRING)
+CREATE EXTERNAL TABLE ${DB}.t_max_clamp (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
   LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_max_clamp';
 
 DROP TABLE IF EXISTS ${DB}.t_file_clamp;
-CREATE TABLE ${DB}.t_file_clamp (line STRING)
+CREATE EXTERNAL TABLE ${DB}.t_file_clamp (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
   LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_file_clamp';
 
 DROP TABLE IF EXISTS ${DB}.t_partitioned;
-CREATE TABLE ${DB}.t_partitioned (line STRING)
+CREATE EXTERNAL TABLE ${DB}.t_partitioned (line STRING)
   PARTITIONED BY (dt STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
@@ -169,7 +179,7 @@ ALTER TABLE ${DB}.t_partitioned ADD IF NOT EXISTS PARTITION (dt='2024-01-01');
 ALTER TABLE ${DB}.t_partitioned ADD IF NOT EXISTS PARTITION (dt='2024-01-02');
 
 DROP TABLE IF EXISTS ${DB}.t_empty;
-CREATE TABLE ${DB}.t_empty (line STRING)
+CREATE EXTERNAL TABLE ${DB}.t_empty (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
   LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_empty';
@@ -235,12 +245,20 @@ echo
 read -r tfiles tbytes <<< "$(probe "${DBDIR}/t_partitioned")"
 printf "%-34s %10s %7s %8s %11s\n" "PARTITION" "APPORT.B" "FILES" "EXP -m" "EXP -bw"
 printf '%.0s-' {1..80}; echo
-for p in dt=2024-01-01 dt=2024-01-02; do
-  read -r pfiles _ <<< "$(probe "${DBDIR}/t_partitioned/${p}")"
-  psize=$(( tbytes * pfiles / tfiles ))
-  read -r m bw <<< "$(size_job "$psize" "$pfiles")"
-  printf "%-34s %10s %7s %8s %11s\n" "$p" "$psize" "$pfiles" "$m" "$bw"
-done
+# Mirrors the guard in mapr_to_s3.py's per-partition loop: apportioning by file
+# share divides by the table's file count, so an unloaded table would abort the
+# whole report here under `set -e` instead of showing why it is empty.
+if [ "${tfiles:-0}" -eq 0 ]; then
+  echo "  ${DB}.t_partitioned has 0 files — nothing to apportion."
+  echo "  The table data did not survive [4/5]. Are the tables still EXTERNAL?"
+else
+  for p in dt=2024-01-01 dt=2024-01-02; do
+    read -r pfiles _ <<< "$(probe "${DBDIR}/t_partitioned/${p}")"
+    psize=$(( tbytes * pfiles / tfiles ))
+    read -r m bw <<< "$(size_job "$psize" "$pfiles")"
+    printf "%-34s %10s %7s %8s %11s\n" "$p" "$psize" "$pfiles" "$m" "$bw"
+  done
+fi
 
 echo
 echo "Done. Compare these against the '[DistCp] Sized' lines and the emitted"
