@@ -46,6 +46,14 @@ DBDIR="${WH}/${DB}.db"
 FOLDER_SRC="hdfs://localhost:9000/user/testdata/distcp_sizing_folder"
 STAGE="/tmp/distcp_sizing_stage"
 
+# t_partitioned needs a partition the DAG's filter EXCLUDES. mapr_to_s3.py:1128
+# sets partition_filter_active only when len(filtered) < len(all), so a filter
+# matching every partition is treated as no filter at all and the table takes the
+# plain full-table path instead of the per-partition one. dt=2024-01-03 is the
+# decoy that makes `dt<=2024-01-02` a real filter.
+PART_INCLUDED="dt=2024-01-01 dt=2024-01-02"
+PART_EXCLUDED="dt=2024-01-03"
+
 # Sizing knobs — MUST match the Airflow Variables you set for the test run.
 TARGET_BYTES_PER_MAPPER=${TARGET_BYTES_PER_MAPPER:-1048576}
 MIN_MAPPERS=${MIN_MAPPERS:-1}
@@ -96,6 +104,7 @@ hdfs dfs -mkdir -p "${DBDIR}/t_max_clamp"
 hdfs dfs -mkdir -p "${DBDIR}/t_file_clamp"
 hdfs dfs -mkdir -p "${DBDIR}/t_partitioned/dt=2024-01-01"
 hdfs dfs -mkdir -p "${DBDIR}/t_partitioned/dt=2024-01-02"
+hdfs dfs -mkdir -p "${DBDIR}/t_partitioned/dt=2024-01-03"
 hdfs dfs -mkdir -p "${DBDIR}/t_empty"
 hdfs dfs -mkdir -p "${FOLDER_SRC}"
 
@@ -127,6 +136,11 @@ hdfs dfs -put -f "${STAGE}/block_5m.txt" "${DBDIR}/t_file_clamp/data_01.txt"
 hdfs dfs -put -f "${STAGE}/block_1m.txt" "${DBDIR}/t_partitioned/dt=2024-01-01/data_00.txt"
 for i in 0 1 2 3 4 5; do
   hdfs dfs -put -f "${STAGE}/block_1m.txt" "${DBDIR}/t_partitioned/dt=2024-01-02/data_0${i}.txt"
+done
+# Decoy: excluded by the filter, so it must never be copied. Its presence is what
+# makes the filter active and routes the table down the per-partition branch.
+for i in 0 1; do
+  hdfs dfs -put -f "${STAGE}/block_1m.txt" "${DBDIR}/t_partitioned/dt=2024-01-03/data_0${i}.txt"
 done
 
 # t_empty        — directory only. Exercises: EMPTY_SOURCE short-circuit,
@@ -177,6 +191,7 @@ CREATE EXTERNAL TABLE ${DB}.t_partitioned (line STRING)
   LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_partitioned';
 ALTER TABLE ${DB}.t_partitioned ADD IF NOT EXISTS PARTITION (dt='2024-01-01');
 ALTER TABLE ${DB}.t_partitioned ADD IF NOT EXISTS PARTITION (dt='2024-01-02');
+ALTER TABLE ${DB}.t_partitioned ADD IF NOT EXISTS PARTITION (dt='2024-01-03');
 
 DROP TABLE IF EXISTS ${DB}.t_empty;
 CREATE EXTERNAL TABLE ${DB}.t_empty (line STRING)
@@ -232,7 +247,25 @@ report "${DBDIR}/t_tiny"        "${DB}.t_tiny"        "min_mappers floor"
 report "${DBDIR}/t_size_bound"  "${DB}.t_size_bound"  "size-driven, no clamp"
 report "${DBDIR}/t_max_clamp"   "${DB}.t_max_clamp"   "max_mappers ceiling"
 report "${DBDIR}/t_file_clamp"  "${DB}.t_file_clamp"  "file-count clamp (no -blocksperchunk)"
-report "${DBDIR}/t_partitioned" "${DB}.t_partitioned" "table-level value"
+# Sum only the partitions the filter selects: with the filter active, discovery
+# reports filtered_file_count / filtered_source_size_bytes, not the whole table.
+sum_parts() {
+  local f=0 b=0 pf pb
+  for sp in "$@"; do
+    read -r pf pb <<< "$(probe "${DBDIR}/t_partitioned/${sp}")"
+    f=$(( f + ${pf:-0} )); b=$(( b + ${pb:-0} ))
+  done
+  echo "$f $b"
+}
+read -r tfiles tbytes <<< "$(sum_parts ${PART_INCLUDED})"
+if [ "${tfiles:-0}" -eq 0 ]; then
+  printf "%-34s %10s %7s %8s %11s   %s\n" "${DB}.t_partitioned" 0 0 "-" "-" \
+    "NO DATA — did the tables stay EXTERNAL?"
+else
+  read -r tm tbw <<< "$(size_job "$tbytes" "$tfiles")"
+  printf "%-34s %10s %7s %8s %11s   %s\n" "${DB}.t_partitioned" "$tbytes" "$tfiles" \
+    "$tm" "$tbw" "table-level, filtered to ${PART_INCLUDED// /,}"
+fi
 report "${DBDIR}/t_empty"       "${DB}.t_empty"       "EMPTY_SOURCE — no distcp expected"
 report "${FOLDER_SRC}"          "DAG3 folder"         "hadoop fs -count probe"
 
@@ -242,21 +275,26 @@ echo "(preserve_delete=true emits one distcp per partition; the DAG apportions"
 echo " table bytes by each partition's file share)"
 echo
 
-read -r tfiles tbytes <<< "$(probe "${DBDIR}/t_partitioned")"
 printf "%-34s %10s %7s %8s %11s\n" "PARTITION" "APPORT.B" "FILES" "EXP -m" "EXP -bw"
 printf '%.0s-' {1..80}; echo
 # Mirrors the guard in mapr_to_s3.py's per-partition loop: apportioning by file
-# share divides by the table's file count, so an unloaded table would abort the
+# share divides by the filtered file count, so an unloaded table would abort the
 # whole report here under `set -e` instead of showing why it is empty.
 if [ "${tfiles:-0}" -eq 0 ]; then
   echo "  ${DB}.t_partitioned has 0 files — nothing to apportion."
   echo "  The table data did not survive [4/5]. Are the tables still EXTERNAL?"
 else
-  for p in dt=2024-01-01 dt=2024-01-02; do
+  for p in ${PART_INCLUDED}; do
     read -r pfiles _ <<< "$(probe "${DBDIR}/t_partitioned/${p}")"
     psize=$(( tbytes * pfiles / tfiles ))
     read -r m bw <<< "$(size_job "$psize" "$pfiles")"
     printf "%-34s %10s %7s %8s %11s\n" "$p" "$psize" "$pfiles" "$m" "$bw"
+  done
+  echo
+  for p in ${PART_EXCLUDED}; do
+    read -r pfiles pbytes <<< "$(probe "${DBDIR}/t_partitioned/${p}")"
+    echo "  EXCLUDED by the filter: ${p} — ${pfiles:-0} file(s), ${pbytes:-0} bytes."
+    echo "  Must not appear in any emitted distcp command or at the destination."
   done
 fi
 
