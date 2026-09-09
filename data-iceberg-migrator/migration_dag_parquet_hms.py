@@ -13,6 +13,7 @@ Excel columns: database | table | s3_location
 import logging
 import os
 import re
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -20,8 +21,6 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.models.param import Param
 from dotenv import load_dotenv
-
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 

@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import re
+import sys
 from datetime import datetime, timedelta
 from html import escape as _html_escape
 from pathlib import Path
@@ -20,8 +21,6 @@ from airflow.decorators import task
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
-
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
