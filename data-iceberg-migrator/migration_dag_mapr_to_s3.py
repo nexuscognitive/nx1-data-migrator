@@ -35,6 +35,7 @@ from migrator_utils.migrations.shared import (
     build_s3_opts,
     cluster_login,
     distcp_jvm_opts,
+    distcp_sizing_mode,
     execute_with_iceberg_retry,
     get_config,
     hive_type_to_spark_ddl,
@@ -1588,6 +1589,9 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
     temp_dir = cluster_setup["temp_dir"]
     distcp_log_dir = cluster_setup.get("distcp_log_dir") or temp_dir
     preserve_delete = config.get("distcp_preserve_delete", True)
+    # Once per task: size_distcp_job's forced branch returns silently, so without
+    # this a pinned -m 1 reads exactly like auto-sizing that chose 1.
+    logger.info(f"[DistCp] Sizing mode: {distcp_sizing_mode(config)}")
     jvm_opts = distcp_jvm_opts(config)
     # shlex.quote leaves a bare word like 'dynamic' untouched, so the default
     # command is byte-identical to the pre-branch hardcoded -strategy dynamic.

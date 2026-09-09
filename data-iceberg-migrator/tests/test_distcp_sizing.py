@@ -1,7 +1,11 @@
 """Tests for DistCp auto-sizing and JVM option assembly in shared.py."""
 
 import pytest
-from migrator_utils.migrations.shared import distcp_jvm_opts, size_distcp_job
+from migrator_utils.migrations.shared import (
+    distcp_jvm_opts,
+    distcp_sizing_mode,
+    size_distcp_job,
+)
 
 GB = 1024 ** 3
 TB = 1024 ** 4
@@ -115,3 +119,40 @@ class TestDistcpJvmOpts:
     def test_client_java_opts_not_emitted_as_minus_d(self):
         cfg = _config(distcp_client_java_opts='-Xmx2g')
         assert distcp_jvm_opts(cfg) == ''
+
+
+class TestDistcpSizingMode:
+    """The forced branch of size_distcp_job returns silently, so a pinned -m 1
+    is indistinguishable in the log from auto-sizing that chose 1. This is what
+    makes the two tellable apart."""
+
+    def test_auto_when_neither_half_is_set(self):
+        mode = distcp_sizing_mode(_config())
+        assert mode.startswith("AUTO")
+        # The knobs in play belong in the line, so the numbers below it make sense.
+        assert str(2 * GB) in mode and "2000 MB/s aggregate" in mode
+
+    def test_forced_when_both_halves_are_set(self):
+        mode = distcp_sizing_mode(_config(distcp_mappers='1', distcp_bandwidth='100'))
+        assert mode.startswith("FORCED")
+        assert "-m 1 -bandwidth 100" in mode
+
+    def test_forced_names_the_env_file_trap(self):
+        # The deployed env.shared counts as "set", which is how this feature
+        # ships inert on an upgrade.
+        mode = distcp_sizing_mode(_config(distcp_mappers='50', distcp_bandwidth='100'))
+        assert "env.shared" in mode
+
+    @pytest.mark.parametrize('half', [
+        {'distcp_mappers': '1'},
+        {'distcp_bandwidth': '100'},
+    ])
+    def test_half_set_still_reports_auto(self, half):
+        # size_distcp_job raises on a half-set pair; the mode line must not claim
+        # the values are pinned before that happens.
+        assert distcp_sizing_mode(_config(**half)).startswith("AUTO")
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_whitespace_only_is_not_forced(self, blank):
+        mode = distcp_sizing_mode(_config(distcp_mappers=blank, distcp_bandwidth=blank))
+        assert mode.startswith("AUTO")

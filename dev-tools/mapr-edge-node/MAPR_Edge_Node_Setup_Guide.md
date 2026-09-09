@@ -277,7 +277,7 @@ Once test data is loaded and the pod setup script has been run:
 2. Trigger the `source_to_s3_migration` DAG with an Excel config pointing at any of the test tables below
 3. Airflow will SSH into the pod using `cluster_edge_ssh`, run the discover PySpark script, and execute distcp
 
-**Mapper count:** DistCp runs in local MapReduce mode (not YARN). Set `migration_distcp_mappers = 1` and `migration_distcp_bandwidth = 10`. The two are a pair: set both to force fixed values, or neither to let the DAG auto-size each table from its discovered size. Setting one alone is rejected when the DistCp task starts, not at config resolution — the Excel parse, cluster login and discovery all succeed first. No DAG code changes are needed — the flags are already in the distcp commands.
+**Mapper count:** DistCp runs in local MapReduce mode (not YARN). Set `migration_distcp_mappers = 1` and `migration_distcp_bandwidth = 10`. The two are a pair: set both to force fixed values, or neither to let the DAG auto-size each table from its discovered size. Setting one alone is rejected when the DistCp task starts, not at config resolution — the Excel parse, cluster login and discovery all succeed first. No DAG code changes are needed — the flags are already in the distcp commands. Note that setting both here disables auto-sizing for every table; the task log's `[DistCp] Sizing mode:` line states which mode is active.
 
 ---
 

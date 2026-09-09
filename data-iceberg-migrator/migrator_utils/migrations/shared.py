@@ -60,6 +60,7 @@ __all__ = [
     "cluster_login",
     "compute_dest_path",
     "distcp_jvm_opts",
+    "distcp_sizing_mode",
     "execute_with_iceberg_retry",
     "get_config",
     "hive_type_to_spark_ddl",
@@ -797,6 +798,26 @@ def size_distcp_job(size_bytes: int, file_count: int, config: dict) -> tuple[int
 
     bandwidth = max(1, int(config['distcp_target_aggregate_mbps']) // mappers)
     return mappers, bandwidth
+
+
+def distcp_sizing_mode(config: dict) -> str:
+    """Describe where size_distcp_job's numbers come from, for the task log.
+
+    The forced branch returns early and silently, so a pinned `-m 1` looks
+    identical in the log to auto-sizing that happened to choose 1. Callers log
+    this once per task so the numbers below it can be read for what they are.
+    """
+    forced_m = str(config.get('distcp_mappers') or '').strip()
+    forced_b = str(config.get('distcp_bandwidth') or '').strip()
+    if forced_m and forced_b:
+        return (f"FORCED — every table pinned to -m {forced_m} -bandwidth {forced_b} by "
+                f"migration_distcp_mappers/migration_distcp_bandwidth. Auto-sizing is off. "
+                f"Note a value in the deployed env.shared counts as set; clear both to "
+                f"empty Airflow Variables to mask it.")
+    return (f"AUTO — sized per table from discovered size: "
+            f"{config['distcp_target_bytes_per_mapper']} bytes/mapper, "
+            f"{config['distcp_min_mappers']}-{config['distcp_max_mappers']} mappers, "
+            f"{config['distcp_target_aggregate_mbps']} MB/s aggregate")
 
 
 def distcp_jvm_opts(config: dict) -> str:

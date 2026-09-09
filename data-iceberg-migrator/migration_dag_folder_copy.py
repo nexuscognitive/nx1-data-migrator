@@ -27,6 +27,7 @@ from migrator_utils.migrations.shared import (
     build_s3_opts,
     cluster_login,
     distcp_jvm_opts,
+    distcp_sizing_mode,
     execute_with_iceberg_retry,
     get_config,
     is_permanent_error,
@@ -531,6 +532,7 @@ def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **con
     dest_endpoint = folder_config.get('dest_endpoint', '')
     s3_dest = f"{dest_bucket}/{dest_folder}"
 
+    logger.info(f"[FolderCopy] Sizing mode: {distcp_sizing_mode(config)}")
     probe_size, probe_files = _probe_source_size(ssh, source_path, config)
     mappers, bandwidth = size_distcp_job(probe_size, probe_files, config)
     logger.info(

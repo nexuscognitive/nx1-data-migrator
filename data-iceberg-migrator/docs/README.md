@@ -87,6 +87,19 @@ First match wins:
 | `migration_email_recipients`       | _(empty)_        | Comma-separated email addresses for reports                                                                                                                                                                      | All DAGs                                          |
 | `hdfs_nameservice`                 | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR                                                                                                                                                     | `source_to_s3_migration`, `folder_only_data_copy` |
 
+> **Upgrading an existing deployment:** auto-sizing only engages when
+> `migration_distcp_mappers` **and** `migration_distcp_bandwidth` are unset at *every*
+> tier — Airflow Variable, then env var, then the built-in default. Deployments created
+> from an earlier `env.shared.example` carry `MIGRATION_DISTCP_MAPPERS=50` and
+> `MIGRATION_DISTCP_BANDWIDTH=100` in their **deployed** `env.shared`, which is a
+> fully-set pair, so the DAG keeps using those fixed values and auto-sizing never runs.
+> Changing `env.shared.example` in this repo does not affect an already-deployed
+> `env.shared`. Either delete both lines from `env.shared` and redeploy, or set both
+> Airflow Variables to an **empty string** — Airflow reports an empty Variable as
+> present, so it masks the env file where deleting the Variable would expose it.
+> `[DistCp] Sizing mode:` in the task log says which mode is active.
+
+
 #### Service account configuration
 
 **Set `service_account_user_id` explicitly for every tenant.** It is the single
