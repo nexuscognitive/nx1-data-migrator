@@ -1,5 +1,6 @@
 """DAG 1 Task Tests: mapr_to_s3_migration pipeline."""
 
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1063,6 +1064,77 @@ class TestRunDistcpSsh:
         self._assert_metrics_scoped_to_partitions(
             ssh_cmd, s3_loc, ['dt=2024-01-01', 'dt=2024-01-02'],
         )
+
+    def _run_per_partition_sized(self, mock_ssh_hook, sample_discovery,
+                                 config_overrides=None):
+        """Helper: per-partition copy of a 40 GiB / 300-file table across two partitions."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+        )
+        filtered_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'partition_filter': 'dt>=2024-01-01',
+                'filtered_partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+                'partition_filter_active': True,
+                'filtered_source_size_bytes': 40 * 1024 ** 3,
+                'filtered_file_count': 300,
+                'partition_file_counts': {'dt=2024-01-01': 100, 'dt=2024-01-02': 200},
+                'serde_properties': {},
+            }],
+        }
+        cfg = {**m.get_config(), 'distcp_preserve_delete': True}
+        cfg.update(config_overrides or {})
+        with patch.object(m, 'get_config', return_value=cfg):
+            m.run_distcp_ssh.function.__wrapped__(
+                discovery=filtered_discovery,
+                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+                ti=MagicMock(),
+            )
+        return client.exec_command.call_args[0][0]
+
+    def test_per_partition_mappers_scale_with_partition_file_share(self, mock_ssh_hook,
+                                                                   sample_discovery):
+        ssh_cmd = self._run_per_partition_sized(
+            mock_ssh_hook, sample_discovery,
+            config_overrides={'distcp_mappers': '', 'distcp_bandwidth': ''},
+        )
+        pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
+        assert len(pairs) == 2
+        mapper_counts = [int(m_) for m_, _ in pairs]
+        assert len(set(mapper_counts)) == 2, f"expected distinct -m values, got {pairs}"
+        # dt=2024-01-01 holds 100 of the 300 files, dt=2024-01-02 holds 200, and
+        # the partitions are emitted in filtered_partitions order.
+        assert mapper_counts[0] < mapper_counts[1]
+        assert mapper_counts == [7, 14]
+
+    def test_per_partition_override_forces_same_values_everywhere(self, mock_ssh_hook,
+                                                                 sample_discovery):
+        ssh_cmd = self._run_per_partition_sized(
+            mock_ssh_hook, sample_discovery,
+            config_overrides={'distcp_mappers': '50', 'distcp_bandwidth': '100'},
+        )
+        pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
+        assert len(pairs) == 2
+        assert set(pairs) == {('50', '100')}
+
+    def test_strategy_with_shell_metacharacter_is_quoted(self, mock_ssh_hook,
+                                                         sample_discovery):
+        ssh_cmd = self._run_per_partition_sized(
+            mock_ssh_hook, sample_discovery,
+            config_overrides={'distcp_strategy': 'dynamic; rm -rf /'},
+        )
+        assert "-strategy 'dynamic; rm -rf /'" in ssh_cmd
+        assert '-strategy dynamic; rm' not in ssh_cmd
+
+    def test_default_strategy_emits_no_quotes(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_per_partition_sized(mock_ssh_hook, sample_discovery)
+        assert '-strategy dynamic ' in ssh_cmd
+        assert "-strategy 'dynamic'" not in ssh_cmd
 
     def test_empty_source_skips_distcp_and_sets_empty_source_status(self, mock_ssh_hook, sample_discovery):
         """If source has 0 files, distcp must be skipped and status set to EMPTY_SOURCE."""
