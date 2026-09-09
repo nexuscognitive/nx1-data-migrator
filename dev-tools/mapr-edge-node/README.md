@@ -198,6 +198,7 @@ In **Airflow UI → Admin → Variables**, set these before triggering a DAG run
 | `s3_access_key`            | Your AWS Access Key ID     |
 | `s3_secret_key`            | Your AWS Secret Access Key |
 | `migration_distcp_mappers` | `1`                        |
+| `migration_distcp_bandwidth` | `10`                     |
 
 > `maprlogin` and `/tmp/maprticket` are baked into the image. No manual
 > ticket creation steps are needed.
