@@ -15,10 +15,11 @@ PROJECTS = {
         "dir": "data-iceberg-migrator",
         "package": "migrator_utils",
         "dags": {
-            # --owner replaces the literal in _resolve_dag_owner(), setting
-            # the DAG-level owner field visible in Airflow. The runtime
-            # execution user is set separately via dag_run.conf['dag_owner']
-            # in get_config().
+            # --owner replaces the fallback literal in _resolve_dag_owner(),
+            # so a migration_dag_owner Airflow Variable still outranks it. The
+            # value lands in HADOOP_USER_NAME on the task pods, not just the UI.
+            # The per-run execution user is separate: dag_run.conf['dag_owner']
+            # via get_config().
             "mapr": {
                 "file": "migration_dag_mapr_to_s3.py",
                 "dag_id": "source_to_s3_migration",

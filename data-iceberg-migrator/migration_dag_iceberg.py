@@ -48,14 +48,24 @@ else:
     logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
 
 def _resolve_dag_owner() -> str:
-    """Owner shown in the Airflow UI, fixed at DAG parse time.
+    """Owner shown in Airflow, and the task pod's HADOOP_USER_NAME.
 
-    Not read from an Airflow Variable: parse time has no run, so it cannot tell
-    a portal-triggered run from a hand-launched one, and reading the portal's
-    value here pinned every manual run to the last portal user. deploy.py
-    rewrites this literal via --owner. The per-run owner comes from
-    dag_run.conf and is resolved in get_config().
+    A pod_mutation_hook in nx1-full-package turns the dag.owners column this
+    feeds into HADOOP_USER_NAME/SPARK_USER, so this is the principal Ranger
+    authorizes. Blank or comma-bearing values fall through to the literal
+    deploy.py rewrites via --owner -- the hook splits dag.owners on ','.
+
+    Never reads an nx1_ key: parse time has no dag_run to identify an origin
+    by. One value per DAG, refreshed each parse; the per-run owner is separate,
+    resolved by get_config() into spark.sql.kyuubi.session.user.
     """
+    try:
+        from airflow.models import Variable
+        owner = (Variable.get('migration_dag_owner', default_var='') or '').strip()
+        if owner and ',' not in owner:
+            return owner
+    except Exception:
+        pass
     return 'data-migration'
 
 default_args = {
