@@ -1150,6 +1150,96 @@ class TestRunDistcpSsh:
             assert 'distcp' not in cmd.lower(), "distcp should not be called for empty source"
 
 
+class TestDistcpShellHardening:
+
+    def _script(self, mock_ssh_hook, discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
+        return client.exec_command.call_args[0][0]
+
+    def test_every_copy_is_wrapped_in_timeout(self, mock_ssh_hook, sample_discovery):
+        script = self._script(mock_ssh_hook, sample_discovery)
+        assert 'run_distcp_with_retry' in script
+        assert 'timeout -k 60s' in script
+
+    def test_timeout_is_guarded_by_command_v(self, mock_ssh_hook, sample_discovery):
+        """An edge node without coreutils must degrade, not fail every copy."""
+        script = self._script(mock_ssh_hook, sample_discovery)
+        assert 'command -v timeout' in script
+
+    def test_retry_helper_never_retries_a_timeout(self, mock_ssh_hook, sample_discovery):
+        script = self._script(mock_ssh_hook, sample_discovery)
+        assert 'rc -eq 124' in script
+        assert 'not retrying' in script
+
+    def test_metrics_helper_is_defined_once(self, mock_ssh_hook, sample_discovery):
+        script = self._script(mock_ssh_hook, sample_discovery)
+        assert script.count('calculate_s3_metrics_hadoop() {') == 1
+
+    def test_call_timeout_scales_with_the_estimate(self):
+        cfg = {'distcp_call_timeout_max_seconds': 21600}
+        assert m._call_timeout_seconds(10.0, cfg) == 1800       # floor
+        assert m._call_timeout_seconds(3000.0, cfg) == 9000     # 3x estimate
+        assert m._call_timeout_seconds(100000.0, cfg) == 21600  # ceiling
+
+    def test_timed_out_copy_kills_its_yarn_application(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        stdout = mock_ssh_stdout(124, (
+            'Submitted application application_1700000000000_0042\n'
+            '  [DistCp] TIMED OUT after 1800s — not retrying\n'
+        ).encode())
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        # A single failing table makes run_distcp_ssh raise after recording the
+        # per-table result (see test_distcp_failure_raises) — the result dict
+        # itself was already pushed to XCom by then, so read it back from there.
+        kwargs = distcp_call(sample_discovery)
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_distcp_ssh.function.__wrapped__(**kwargs)
+
+        result = kwargs['ti'].xcom_push.call_args.kwargs['value']
+        assert result['distcp_results'][0]['status'] == 'FAILED'
+        kill_calls = [
+            c for c in client.exec_command.call_args_list
+            if 'application -kill' in str(c)
+        ]
+        assert kill_calls, 'expected a yarn application -kill after a timeout'
+        assert 'application_1700000000000_0042' in str(kill_calls[0])
+
+    def test_non_timeout_failure_does_not_kill_the_application(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        stdout = mock_ssh_stdout(1, b'Submitted application application_1_0001\nboom\n')
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
+
+        assert not [
+            c for c in client.exec_command.call_args_list
+            if 'application -kill' in str(c)
+        ]
+
+    def test_logs_estimate_against_actual(self, mock_ssh_hook, sample_discovery, caplog):
+        """The client guide tells users to grep for this line."""
+        with caplog.at_level(logging.INFO):
+            self._script(mock_ssh_hook, sample_discovery)
+        assert 'cost estimate' in caplog.text
+        assert 'vs actual' in caplog.text
+
+
 class TestDistcpBatchResolution:
 
     def test_copies_only_the_tables_in_its_batch(self, mock_ssh_hook, sample_discovery):

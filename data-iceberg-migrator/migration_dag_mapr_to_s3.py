@@ -150,6 +150,118 @@ def _resolve_dag_owner() -> str:
         pass
     return 'data-migration'
 
+
+# A stuck copy should die in minutes; a healthy 5 TB copy needs hours. A flat
+# timeout cannot serve both, so each call gets a multiple of its own estimate.
+_CALL_TIMEOUT_MULTIPLIER = 3
+_CALL_TIMEOUT_FLOOR_SECONDS = 1800
+
+
+def _call_timeout_seconds(estimate_secs: float, config: dict) -> int:
+    """Seconds to allow one `hadoop distcp` invocation."""
+    ceiling = int(config["distcp_call_timeout_max_seconds"])
+    scaled = estimate_secs * _CALL_TIMEOUT_MULTIPLIER
+    return int(max(_CALL_TIMEOUT_FLOOR_SECONDS, min(scaled, ceiling)))
+
+
+def _distcp_shell_prelude(s3_opts: str, deadline_epoch: int) -> str:
+    """Shell helpers shared by all three DistCp paths.
+
+    A function rather than a constant because calculate_s3_metrics_hadoop
+    interpolates the per-bucket s3_opts.
+
+    run_distcp_with_retry preserves the child's exit code so the caller can tell
+    a timeout (124) from a genuine failure, and never retries a timeout: three
+    attempts at a multi-hour ceiling would blow the batch budget on its own.
+    """
+    return f"""
+calculate_s3_metrics_hadoop() {{
+    local location=$1
+    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
+        echo "S3_FILE_COUNT=0"
+        echo "S3_TOTAL_SIZE=0"
+        return
+    fi
+    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
+    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
+    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
+    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
+    echo "S3_FILE_COUNT=$FILE_COUNT"
+    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
+}}
+
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_PREFIX="timeout -k 60s"
+else
+    echo "  [DistCp] WARNING: coreutils timeout not found — copies run unbounded"
+    TIMEOUT_PREFIX=""
+fi
+
+DISTCP_DEADLINE_EPOCH={deadline_epoch}
+
+deadline_ok() {{
+    [ "$DISTCP_DEADLINE_EPOCH" -eq 0 ] && return 0
+    [ "$(date +%s)" -lt "$DISTCP_DEADLINE_EPOCH" ]
+}}
+
+run_distcp_with_retry() {{
+    local secs=$1; shift
+    local max_attempts=3
+    local delay=30
+    local attempt=1
+    local rc=0
+    while [ $attempt -le $max_attempts ]; do
+        echo "  [DistCp] Attempt $attempt/$max_attempts (timeout ${{secs}}s): $*"
+        if [ -n "$TIMEOUT_PREFIX" ]; then
+            $TIMEOUT_PREFIX "${{secs}}" "$@" && rc=0 || rc=$?
+        else
+            "$@" && rc=0 || rc=$?
+        fi
+        [ $rc -eq 0 ] && return 0
+        if [ $rc -eq 124 ]; then
+            echo "  [DistCp] TIMED OUT after ${{secs}}s — not retrying"
+            return 124
+        fi
+        echo "  [DistCp] Attempt $attempt/$max_attempts failed (rc=$rc)"
+        attempt=$((attempt + 1))
+        if [ $attempt -le $max_attempts ]; then
+            echo "  [DistCp] Retrying in ${{delay}}s..."
+            sleep $delay
+        fi
+    done
+    echo "  [DistCp] All $max_attempts attempts failed (rc=$rc)"
+    return $rc
+}}
+"""
+
+
+def _kill_yarn_apps(ssh, app_ids: list[str], config: dict, label: str) -> None:
+    """Kill DistCp YARN applications left behind by a timed-out client.
+
+    `timeout` kills the `hadoop` wrapper, not the MapReduce job it submitted, so
+    without this a timed-out copy keeps writing to the destination while the
+    Airflow retry starts a second writer under the same prefix — and the plain
+    path runs -update -delete.
+    """
+    if not app_ids:
+        logger.warning(
+            f"[DistCp] {label} timed out with no YARN application id to kill"
+        )
+        return
+    cmd = " ; ".join(f"yarn application -kill {a}" for a in app_ids)
+    try:
+        with ssh.get_conn() as client:
+            _, stdout, _ = client.exec_command(
+                _login_shell(cmd, config.get("cluster_type", "MapR")), timeout=300
+            )
+            stdout.channel.recv_exit_status()
+        logger.warning(f"[DistCp] {label} timed out — killed YARN app(s): {app_ids}")
+    except Exception as e:
+        logger.error(
+            f"[DistCp] {label} timed out and killing YARN app(s) {app_ids} failed: {e}"
+        )
+
+
 default_args = {
     "owner": _resolve_dag_owner(),
     "depends_on_past": False,
@@ -1822,6 +1934,8 @@ def run_distcp_ssh(
         mappers, bandwidth = size_distcp_job(
             effective_size, effective_file_count, config
         )
+        table_estimate = estimate_distcp_cost(t, config)
+        call_timeout = _call_timeout_seconds(table_estimate, config)
         logger.info(
             f"[DistCp] Sized {t['source_database']}.{t['source_table']}: "
             f"{mappers} mappers x {bandwidth} MB/s "
@@ -1984,50 +2098,32 @@ def run_distcp_ssh(
                         f"x {part_bandwidth} MB/s for {part_size} bytes / "
                         f"{part_files} files"
                     )
+                    # Sized on this partition alone so one stuck partition dies on
+                    # its own scale, not the whole table's.
+                    part_timeout = _call_timeout_seconds(
+                        estimate_distcp_cost(
+                            {
+                                **t,
+                                "partition_filter_active": True,
+                                "filtered_partitions": [part_name],
+                                "filtered_file_count": part_files,
+                                "filtered_source_size_bytes": part_size,
+                                "partition_file_counts": {part_name: part_files},
+                            },
+                            config,
+                        ),
+                        config,
+                    )
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
-run_distcp_with_retry hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {part_mappers} -bandwidth {part_bandwidth} -strategy {strategy} \\
+run_distcp_with_retry {part_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {part_mappers} -bandwidth {part_bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
 """
 
                 cmd = f"""set -e
 {client_opts_export}
-calculate_s3_metrics_hadoop() {{
-    local location=$1
-    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
-        echo "S3_FILE_COUNT=0"
-        echo "S3_TOTAL_SIZE=0"
-        return
-    fi
-    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
-    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
-    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
-    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
-    echo "S3_FILE_COUNT=$FILE_COUNT"
-    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
-}}
-
-run_distcp_with_retry() {{
-    local max_attempts=3
-    local delay=30
-    local attempt=1
-    while [ $attempt -le $max_attempts ]; do
-        echo "  [DistCp] Attempt $attempt/$max_attempts: $*"
-        if "$@"; then
-            return 0
-        fi
-        echo "  [DistCp] Attempt $attempt/$max_attempts failed"
-        attempt=$((attempt + 1))
-        if [ $attempt -le $max_attempts ]; then
-            echo "  [DistCp] Retrying in ${{delay}}s..."
-            sleep $delay
-        fi
-    done
-    echo "  [DistCp] All $max_attempts attempts failed"
-    return 1
-}}
-
+{_distcp_shell_prelude(s3_opts, 0)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 
@@ -2115,21 +2211,7 @@ exit 0
 
                 cmd = f"""set -e
 {client_opts_export}
-calculate_s3_metrics_hadoop() {{
-    local location=$1
-    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
-        echo "S3_FILE_COUNT=0"
-        echo "S3_TOTAL_SIZE=0"
-        return
-    fi
-    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
-    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
-    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
-    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
-    echo "S3_FILE_COUNT=$FILE_COUNT"
-    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
-}}
-
+{_distcp_shell_prelude(s3_opts, 0)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 PATHLIST="{temp_dir}/distcp_{tbl}_sources.txt"
@@ -2167,7 +2249,7 @@ echo "=== Creating empty partition directories ==="
 
 echo "=== Running distcp using source path list (delete disabled) ==="
 set +e
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts}{jvm_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
+DISTCP_OUTPUT=$(run_distcp_with_retry {call_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
@@ -2208,24 +2290,7 @@ exit 0
         else:
             cmd = f"""set -e
 {client_opts_export}
-calculate_s3_metrics_hadoop() {{
-    local location=$1
-
-    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
-        echo "S3_FILE_COUNT=0"
-        echo "S3_TOTAL_SIZE=0"
-        return
-    fi
-
-    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
-    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
-    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
-    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
-
-    echo "S3_FILE_COUNT=$FILE_COUNT"
-    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
-}}
-
+{_distcp_shell_prelude(s3_opts, 0)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 
@@ -2238,7 +2303,7 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 
 echo "=== Running distcp ==="
 set +e
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
+DISTCP_OUTPUT=$(run_distcp_with_retry {call_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
@@ -2384,6 +2449,14 @@ exit 0
                 if exit_code != 0:
                     logger.error(f"=== DistCp Error for {src_db}.{tbl} ===")
                     logger.error(error_output[:1000])
+                    if exit_code == 124 or "TIMED OUT" in combined_output:
+                        _kill_yarn_apps(
+                            ssh, yarn_application_ids, config, f"{src_db}.{tbl}"
+                        )
+                        raise Exception(
+                            f"DistCp timed out for {src_db}.{tbl} after "
+                            f"{call_timeout}s (estimate was {table_estimate:.0f}s)"
+                        )
                     raise Exception(
                         f"DistCp failed for {src_db}.{tbl} with exit code {exit_code}\n"
                         f"Error: {error_output[:1000]}"
@@ -2393,6 +2466,10 @@ exit 0
                 distcp_duration_secs = (
                     _end_dt - _dt.strptime(distcp_started_at, "%Y-%m-%d %H:%M:%S")
                 ).total_seconds()
+                logger.info(
+                    f"[DistCp] cost estimate {table_estimate:.0f}s vs actual "
+                    f"{distcp_duration_secs:.0f}s for {src_db}.{tbl}"
+                )
                 logger.info(
                     f"[DistCp] COMPLETED: {src_db}.{tbl} | incremental={is_incr} | bytes_copied={bytes_copied} | files_copied={files_copied}"
                 )
