@@ -1935,13 +1935,41 @@ def run_distcp_ssh(
                 f"[DistCp] budget of {budget_secs:.0f}s exhausted — not starting "
                 f"{t['source_database']}.{t['source_table']}"
             )
+            # FAILED (unlike SKIPPED above) is not in update_distcp_status's
+            # skip-list, so this row is read by direct key indexing there —
+            # it must carry the same full shape as the exception-catch block
+            # below, not just the fields that look relevant at a glance.
+            from datetime import datetime as _dt
+
+            _skip_at = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             results.append(
                 {
                     "source_database": t["source_database"],
                     "source_table": t["source_table"],
                     "dest_database": t["dest_database"],
                     "status": "FAILED",
+                    "distcp_started_at": _skip_at,
+                    "distcp_completed_at": _skip_at,
+                    "distcp_duration_secs": 0.0,
+                    "is_incremental": False,
+                    "bytes_copied": 0,
+                    "files_copied": 0,
+                    "s3_total_size_bytes_before": 0,
+                    "s3_file_count_before": 0,
+                    "s3_total_size_bytes_after": 0,
+                    "s3_file_count_after": 0,
+                    "s3_bytes_transferred": 0,
+                    "s3_files_transferred": 0,
+                    "partition_filter_active": t.get("partition_filter_active", False),
+                    "partitions_requested": (
+                        len(t.get("filtered_partitions", []))
+                        if t.get("partition_filter_active")
+                        else None
+                    ),
+                    "empty_partitions": [],
                     "error": _BUDGET_EXHAUSTED_ERROR,
+                    "yarn_application_id": None,
+                    "yarn_application_ids": [],
                     "partition_filter": t.get("partition_filter"),
                 }
             )

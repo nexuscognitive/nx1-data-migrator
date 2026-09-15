@@ -1483,6 +1483,37 @@ class TestUpdateDistcpStatus:
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
         assert any('FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_budget_skip_row_survives_the_tracking_update(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """A budget-skip row (run_distcp_ssh's soft-deadline guard) is FAILED,
+        not SKIPPED, so it is not in update_distcp_status's skip-list and
+        reaches code that indexes several fields directly rather than via
+        .get(). A row missing any of them must not reach here — this pins the
+        exact shape the guard is required to produce."""
+        sample_distcp_result['distcp_results'][0] = {
+            'source_database': 'sales_data', 'source_table': 'transactions',
+            'dest_database': 'sales_data_s3',
+            'status': 'FAILED',
+            'distcp_started_at': '2025-01-01 12:00:00',
+            'distcp_completed_at': '2025-01-01 12:00:00',
+            'distcp_duration_secs': 0.0,
+            'is_incremental': False,
+            'bytes_copied': 0, 'files_copied': 0,
+            's3_total_size_bytes_before': 0, 's3_file_count_before': 0,
+            's3_total_size_bytes_after': 0, 's3_file_count_after': 0,
+            's3_bytes_transferred': 0, 's3_files_transferred': 0,
+            'partition_filter_active': False, 'partitions_requested': None,
+            'empty_partitions': [],
+            'error': m._BUDGET_EXHAUSTED_ERROR,
+            'yarn_application_id': None, 'yarn_application_ids': [],
+            'partition_filter': None,
+        }
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert "distcp_status = 'FAILED'" in sql_calls
+        assert 'budget exhausted' in sql_calls
+
     def test_empty_partition_names_written_to_tracking_update(
         self, mock_spark, sample_distcp_result, mock_iceberg_retry
     ):
