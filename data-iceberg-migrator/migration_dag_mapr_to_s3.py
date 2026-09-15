@@ -33,8 +33,8 @@ from migrator_utils.migrations.partition_utils import (
     partitions_to_where_clause as _partitions_to_where_clause,
 )
 from migrator_utils.migrations.shared import (
-    SSH_COMMAND_TIMEOUT,
     _BUDGET_SLACK,
+    SSH_COMMAND_TIMEOUT,
     _hive_scratch_dir,
     _login_shell,
     build_s3_opts,
