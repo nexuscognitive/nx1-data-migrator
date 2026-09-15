@@ -152,6 +152,31 @@ def _resolve_dag_owner() -> str:
     return 'data-migration'
 
 
+def _env_int(env_var: str, default: int) -> int:
+    """Read a parse-time integer from the environment only.
+
+    Deliberately not get_config(): these values are needed while the DAG file is
+    parsed, and test_dag_integrity asserts the parse path reads no Airflow
+    Variable except migration_dag_owner — each read is a metadata-DB round trip
+    on every parse loop. load_dotenv has already run at import (:55-63), so a
+    value in the deployed env.shared is visible here.
+
+    Never raises: a bad value must not drop the DAG from Airflow.
+    """
+    raw = str(os.getenv(env_var) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(f"{env_var}={raw!r} is not an integer — using {default}")
+        return default
+    if value <= 0:
+        logger.warning(f"{env_var}={value} is not positive — using {default}")
+        return default
+    return value
+
+
 # A stuck copy should die in minutes; a healthy 5 TB copy needs hours. A flat
 # timeout cannot serve both, so each call gets a multiple of its own estimate.
 _CALL_TIMEOUT_MULTIPLIER = 3
@@ -5051,10 +5076,19 @@ with DAG(
     t_discover = discover_tables_via_spark_ssh.expand(db_config=t_excel)
     t_record = record_discovered_tables.expand(discovery=t_discover)
     t_record.operator.trigger_rule = "all_done"
-    t_distcp = run_distcp_ssh.partial(cluster_setup=t_cluster).expand(
-        discovery=t_record
-    )
+    t_batches = flatten_and_batch(discoveries=t_record)
+    t_batches.operator.trigger_rule = "all_done"
+    t_distcp = run_distcp_ssh.partial(
+        cluster_setup=t_cluster, source_task_id="record_discovered_tables"
+    ).expand(batch=t_batches)
     t_distcp.operator.trigger_rule = "all_done"
+    # The edge node and YARN queue are shared, and no Pool is available without
+    # an infra change, so this caps per run only: total concurrent copies is
+    # this times max_active_runs (5).
+    t_distcp.operator.max_active_tis_per_dagrun = _env_int(
+        "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    )
+    t_distcp.operator.execution_timeout = _DISTCP_EXECUTION_TIMEOUT
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
     t_distcp_status.operator.trigger_rule = "all_done"
     t_tables = create_hive_tables.expand(distcp_result=t_distcp_status)
@@ -5066,10 +5100,15 @@ with DAG(
     t_dest_validation = validate_destination_tables.expand(
         source_validation=t_tbl_status
     )
-    t_dest_validation.operator.max_active_tis_per_dagrun = 3
+    t_dest_validation.operator.max_active_tis_per_dagrun = _env_int(
+        "MIGRATION_VALIDATION_MAX_CONCURRENT", 3
+    )
     t_dest_validation.operator.trigger_rule = "all_done"
     t_val_status = update_validation_status.expand(validation_result=t_dest_validation)
     t_val_status.operator.trigger_rule = "all_done"
+
+    t_reconcile = reconcile_unprocessed_tables(run_id=t_run_id)
+    t_reconcile.operator.trigger_rule = "all_done"
 
     # Report generation
     t_report = generate_html_report(
@@ -5089,6 +5128,6 @@ with DAG(
 
     # Dependencies
     t_validate >> t_init >> t_run_id >> t_excel >> t_cluster >> t_discover >> t_record
-    t_record >> t_distcp >> t_distcp_status >> t_tables >> t_tbl_status
-    t_tbl_status >> t_dest_validation >> t_val_status
-    t_val_status >> t_report >> t_email >> t_final  # >> t_cleanup
+    t_record >> t_batches >> t_distcp >> t_distcp_status >> t_tables >> t_tbl_status
+    t_tbl_status >> t_dest_validation >> t_val_status >> t_reconcile
+    t_reconcile >> t_report >> t_email >> t_final  # >> t_cleanup

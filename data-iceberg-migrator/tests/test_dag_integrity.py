@@ -16,6 +16,24 @@ class TestMaprToS3DagIntegrity:
     def test_excel_param_defined(self):
         assert 'excel_file_path' in m1.dag_mapr_to_s3.params
 
+    def test_dag1_has_the_batching_and_reconcile_tasks(self):
+        import migration_dag_mapr_to_s3 as m1
+        for name in ('flatten_and_batch', 'reconcile_unprocessed_tables'):
+            assert hasattr(m1, name), name
+
+    def test_parse_path_reads_no_variable_except_the_owner(self):
+        """Operator attributes are set at parse; a Variable read there costs a
+        metadata-DB round trip on every scheduler parse loop."""
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        before, _, after = source.partition('def _resolve_dag_owner')
+        owner_body, _, rest = after.partition('\ndef ')
+        assert 'Variable.get(' not in before
+        assert 'Variable.get(' not in rest
+        assert 'Variable.get(' in owner_body
+
 
 class TestIcebergDagIntegrity:
 
@@ -108,3 +126,29 @@ class TestDagOwnerResolution:
         for name in self._MODULES:
             source = (root / f'{name}.py').read_text()
             assert "return 'data-migration'" in source, name
+
+
+class TestEnvInt:
+
+    def test_missing_env_var_uses_the_default(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.delenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', raising=False)
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
+
+    def test_valid_value_is_used(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', '8')
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 8
+
+    def test_garbage_falls_back_rather_than_breaking_dag_parse(self, monkeypatch):
+        """Raising here would drop the DAG from Airflow entirely."""
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 'lots')
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
+
+    def test_zero_and_negative_fall_back(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', '0')
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
+        monkeypatch.setenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', '-2')
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
