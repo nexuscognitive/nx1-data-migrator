@@ -158,7 +158,7 @@ def _env_int(env_var: str, default: int) -> int:
     Deliberately not get_config(): these values are needed while the DAG file is
     parsed, and test_dag_integrity asserts the parse path reads no Airflow
     Variable except migration_dag_owner — each read is a metadata-DB round trip
-    on every parse loop. load_dotenv has already run at import (:55-63), so a
+    on every parse loop. load_dotenv has already run at import (:64-65), so a
     value in the deployed env.shared is visible here.
 
     Never raises: a bad value must not drop the DAG from Airflow.

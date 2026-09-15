@@ -17,9 +17,29 @@ class TestMaprToS3DagIntegrity:
         assert 'excel_file_path' in m1.dag_mapr_to_s3.params
 
     def test_dag1_has_the_batching_and_reconcile_tasks(self):
-        import migration_dag_mapr_to_s3 as m1
-        for name in ('flatten_and_batch', 'reconcile_unprocessed_tables'):
-            assert hasattr(m1, name), name
+        """Guards the DAG *body's* wiring, not just that the functions exist
+        somewhere in the module: flatten_and_batch/reconcile_unprocessed_tables
+        are also plain module-level functions, so a hasattr(module, name) check
+        stays green even if the with DAG(...) block stopped calling them. The
+        test suite stubs Airflow (conftest.py's _FakeDAG has no task_dict, and
+        the @task stub never registers calls with the active DAG), so the
+        parsed graph is not observable here — asserting on the DAG body's
+        source text is what actually catches the wiring being dropped or the
+        mapped keyword drifting back from `batch`.
+        """
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        _, _, dag_body = source.partition('with DAG(')
+        for needle in (
+            'flatten_and_batch(discoveries=',
+            'reconcile_unprocessed_tables(run_id=',
+            '.expand(batch=t_batches)',
+            't_record >> t_batches',
+            '>> t_reconcile',
+        ):
+            assert needle in dag_body, needle
 
     def test_parse_path_reads_no_variable_except_the_owner(self):
         """Operator attributes are set at parse; a Variable read there costs a
