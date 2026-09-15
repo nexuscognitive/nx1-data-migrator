@@ -157,10 +157,7 @@ def _resolve_dag_owner() -> str:
 _CALL_TIMEOUT_MULTIPLIER = 3
 _CALL_TIMEOUT_FLOOR_SECONDS = 1800
 
-# Marks a table skipped by the batch soft-deadline rather than a real copy
-# failure. run_distcp_ssh must not raise on these alone: unlike a genuine
-# distcp failure, they carry no work to retry, so raising would just mark the
-# task instance failed for no operational reason.
+# Error text for a table the batch soft-deadline stopped before it started.
 _BUDGET_EXHAUSTED_ERROR = "batch budget exhausted before this table started"
 
 
@@ -2604,14 +2601,7 @@ exit 0
 
     context["ti"].xcom_push(key="return_value", value=result_dict)
 
-    # Budget-exhausted skips are recorded as FAILED so tracking shows them, but
-    # they are not a copy error — raising here would fail the task instance
-    # over work that was never attempted, discarding nothing since the XCom
-    # above already carries every completed table's result.
-    unstarted_by_budget = [
-        r for r in failed_tables if r.get("error") == _BUDGET_EXHAUSTED_ERROR
-    ]
-    if len(failed_tables) > len(unstarted_by_budget):
+    if has_failures:
         raise Exception(
             f"DistCp failed — {result_dict['_failure_summary']}. Per-table errors in tracking."
         )

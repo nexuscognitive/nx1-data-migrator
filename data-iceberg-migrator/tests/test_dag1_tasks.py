@@ -1365,11 +1365,18 @@ class TestDistcpSoftDeadline:
         ticks = iter([0.0, 0.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0])
         monkeypatch.setattr(m.time, 'monotonic', lambda: next(ticks, 10_000.0))
 
-        result = m.run_distcp_ssh.function.__wrapped__(
-            **distcp_call(d, budget=100.0)
-        )
+        # A budget skip is still a FAILED result, so run_distcp_ssh raises
+        # after the XCom push — same as any other per-table failure — so the
+        # final attempt's tracking is complete and Airflow retries the batch
+        # (see test_timed_out_copy_kills_its_yarn_application). Read the
+        # result back from the push rather than a normal return value.
+        kwargs = distcp_call(d, budget=100.0)
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_distcp_ssh.function.__wrapped__(**kwargs)
 
+        result = kwargs['ti'].xcom_push.call_args.kwargs['value']
         by_table = {r['source_table']: r for r in result['distcp_results']}
+        assert by_table[base['source_table']]['status'] == 'COMPLETED'
         assert by_table['second']['status'] == 'FAILED'
         assert 'budget exhausted' in by_table['second']['error']
         assert by_table['third']['status'] == 'FAILED'
@@ -1394,9 +1401,16 @@ class TestDistcpSoftDeadline:
         # pytest.ini sets --timeout=60.
         ticks = itertools.count(10_000.0)
         monkeypatch.setattr(m.time, 'monotonic', lambda: next(ticks))
-        result = m.run_distcp_ssh.function.__wrapped__(
-            **distcp_call(d, budget=1.0)
-        )
+
+        # All 4 are budget skips, still FAILED results, so run_distcp_ssh
+        # raises after the XCom push (see
+        # test_tables_not_started_before_the_budget_expires_are_failed) — read
+        # the result back from the push rather than a normal return value.
+        kwargs = distcp_call(d, budget=1.0)
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_distcp_ssh.function.__wrapped__(**kwargs)
+
+        result = kwargs['ti'].xcom_push.call_args.kwargs['value']
         assert len(result['distcp_results']) == 4
         assert result['_has_failures'] is True
 
