@@ -1406,7 +1406,7 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
 
 
 @task.pyspark(conn_id="spark_default")
-def record_discovered_tables(discovery: dict, spark) -> dict:
+def record_discovered_tables(discovery: dict, spark, **context) -> dict:
     """Record discovered tables in Iceberg tracking table."""
 
     if not isinstance(discovery, dict) or "tables" not in discovery:
@@ -1583,7 +1583,10 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                 task_label=f"record_discovered_tables:{t['source_table']}",
             )
 
-    return discovery
+    # Stamped here because the batch descriptors downstream must address their
+    # group by map index: the reduce sequence they are built from omits map
+    # indexes whose task instance died, so list position is not the index.
+    return {**discovery, "_map_index": context["ti"].map_index}
 
 
 @task

@@ -647,7 +647,9 @@ class TestRecordDiscoveredTables:
 
     def test_inserts_new_record(self, mock_spark, sample_discovery, mock_iceberg_retry):
         self._setup_count(mock_spark, 0)
-        result = m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        result = m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         assert any('INSERT INTO' in str(c) for c in mock_iceberg_retry.call_args_list)
         assert result['run_id'] == sample_discovery['run_id']
 
@@ -657,7 +659,9 @@ class TestRecordDiscoveredTables:
         rejects the write with INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_FIND_DATA."""
         self._setup_count(mock_spark, 0)
         sample_discovery['tables'][0]['partition_schema'] = [{'name': 'dt', 'type': 'date'}]
-        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         insert_sql = next(
             c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
         )
@@ -672,7 +676,9 @@ class TestRecordDiscoveredTables:
         INSERT, which broke record_discovered_tables in production with
         INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_FIND_DATA."""
         self._setup_count(mock_spark, 0)
-        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         insert_sql = next(
             c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
         )
@@ -721,7 +727,9 @@ class TestRecordDiscoveredTables:
             return [p for p in parts if p.strip()]
 
         self._setup_count(mock_spark, 0)
-        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         insert_sql = next(
             c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
         )
@@ -736,7 +744,9 @@ class TestRecordDiscoveredTables:
 
     def test_updates_existing_record(self, mock_spark, sample_discovery, mock_iceberg_retry):
         self._setup_count(mock_spark, 1)
-        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         assert any('UPDATE' in str(c) for c in mock_iceberg_retry.call_args_list)
 
     def test_writes_table_not_found_status(self, mock_spark, sample_discovery, mock_iceberg_retry):
@@ -749,7 +759,9 @@ class TestRecordDiscoveredTables:
                 'error_type': 'TABLE_NOT_FOUND',
             }],
         }
-        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
         assert "'TABLE_NOT_FOUND'" in all_sql
         assert 'Table or view not found' in all_sql
@@ -764,7 +776,9 @@ class TestRecordDiscoveredTables:
                 'error_type': 'DATABASE_NOT_FOUND',
             }],
         }
-        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
         assert "'DATABASE_NOT_FOUND'" in all_sql
         assert 'does not exist' in all_sql
@@ -780,7 +794,9 @@ class TestRecordDiscoveredTables:
                 'error_type': 'SOURCE_PATH_NOT_FOUND',
             }],
         }
-        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
         assert "'SOURCE_PATH_NOT_FOUND'" in all_sql
         assert 'Path does not exist' in all_sql
@@ -788,6 +804,22 @@ class TestRecordDiscoveredTables:
         # only started carrying a location in this change, so nothing pinned this.
         assert "o''brien" in all_sql
         assert "o'brien'" not in all_sql
+
+    def test_stamps_its_map_index_for_batch_resolution(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        """Batches resolve their group by this index, never by list position."""
+        self._setup_count(mock_spark, 0)
+        ti = MagicMock()
+        ti.map_index = 7
+        result = m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=ti
+        )
+        assert result['_map_index'] == 7
+
+    def test_failed_upstream_input_returns_empty_without_an_index(self, mock_spark):
+        result = m.record_discovered_tables.function(
+            discovery={}, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
+        assert result == {}
 
 
 class TestRunDistcpSsh:
