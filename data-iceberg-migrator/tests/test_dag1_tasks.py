@@ -8,7 +8,19 @@ from unittest.mock import MagicMock, patch
 import migration_dag_mapr_to_s3 as m
 import pytest
 
-from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
+from .helpers import distcp_call, make_excel_bytes, mock_ssh_stdout, setup_spark_excel
+
+
+def _make_distcp_stdout(incremental=False):
+    return mock_ssh_stdout(0, (
+        "===DISTCP_METRICS_START===\n"
+        f"INCREMENTAL={'true' if incremental else 'false'}\n"
+        "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\nDISTCP_EXIT_CODE=0\n"
+        "BYTES_COPIED=10485760\nFILES_COPIED=5\n"
+        "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
+        "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
+        "===DISTCP_METRICS_END===\n"
+    ).encode())
 
 
 def assert_each_overall_status_case_preserves_skippable(calls):
@@ -825,28 +837,13 @@ class TestRecordDiscoveredTables:
 
 class TestRunDistcpSsh:
 
-    def _make_distcp_stdout(self, incremental=False):
-        return mock_ssh_stdout(0, (
-            "===DISTCP_METRICS_START===\n"
-            f"INCREMENTAL={'true' if incremental else 'false'}\n"
-            "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\nDISTCP_EXIT_CODE=0\n"
-            "BYTES_COPIED=10485760\nFILES_COPIED=5\n"
-            "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
-            "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
-            "===DISTCP_METRICS_END===\n"
-        ).encode())
-
     def test_successful_copy_detects_incremental(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
         stderr = MagicMock()
         stderr.read.return_value = b''
-        client.exec_command.return_value = (MagicMock(), self._make_distcp_stdout(incremental=True), stderr)
+        client.exec_command.return_value = (MagicMock(), _make_distcp_stdout(incremental=True), stderr)
 
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=sample_discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
         assert result['distcp_results'][0]['bytes_copied'] == 10485760
         assert result['distcp_results'][0]['is_incremental'] is True
@@ -861,11 +858,7 @@ class TestRunDistcpSsh:
                 'error_type': 'TABLE_NOT_FOUND',
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
         assert result['distcp_results'][0]['status'] == 'TABLE_NOT_FOUND'
         client.exec_command.assert_not_called()
 
@@ -879,11 +872,7 @@ class TestRunDistcpSsh:
                 'error_type': 'SOURCE_PATH_NOT_FOUND',
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
         assert result['distcp_results'][0]['status'] == 'SOURCE_PATH_NOT_FOUND'
         client.exec_command.assert_not_called()
 
@@ -897,11 +886,7 @@ class TestRunDistcpSsh:
                 'error_type': 'DATABASE_NOT_FOUND',
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
         assert result['distcp_results'][0]['status'] == 'DATABASE_NOT_FOUND'
         client.exec_command.assert_not_called()
 
@@ -914,18 +899,14 @@ class TestRunDistcpSsh:
         )
 
         with pytest.raises(Exception, match="DistCp failed"):
-            m.run_distcp_ssh.function.__wrapped__(
-                discovery=sample_discovery,
-                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-                ti=MagicMock(),
-            )
+            m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
 
     def test_partition_filter_active_uses_per_partition_distcp(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
         stderr = MagicMock()
         stderr.read.return_value = b''
         client.exec_command.return_value = (
-            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
         )
 
         filtered_discovery = {
@@ -943,11 +924,7 @@ class TestRunDistcpSsh:
                 'serde_properties': {},
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=filtered_discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
         assert result['distcp_results'][0]['partition_filter_active'] is True
 
@@ -971,7 +948,7 @@ class TestRunDistcpSsh:
         stderr = MagicMock()
         stderr.read.return_value = b''
         client.exec_command.return_value = (
-            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
         )
 
         filtered_discovery = {
@@ -992,11 +969,7 @@ class TestRunDistcpSsh:
 
         cfg = {**m.get_config(), 'distcp_preserve_delete': False}
         with patch.object(m, 'get_config', return_value=cfg):
-            result = m.run_distcp_ssh.function.__wrapped__(
-                discovery=filtered_discovery,
-                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-                ti=MagicMock(),
-            )
+            result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
 
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
 
@@ -1027,11 +1000,7 @@ class TestRunDistcpSsh:
                 'serde_properties': {},
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=empty_filter_discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(empty_filter_discovery))
         assert result['distcp_results'][0]['status'] == 'SKIPPED'
         client.exec_command.assert_not_called()
 
@@ -1041,7 +1010,7 @@ class TestRunDistcpSsh:
         stderr = MagicMock()
         stderr.read.return_value = b''
         client.exec_command.return_value = (
-            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
         )
         filtered_discovery = {
             **sample_discovery,
@@ -1060,11 +1029,7 @@ class TestRunDistcpSsh:
         }
         cfg = {**m.get_config(), 'distcp_preserve_delete': preserve_delete}
         with patch.object(m, 'get_config', return_value=cfg):
-            m.run_distcp_ssh.function.__wrapped__(
-                discovery=filtered_discovery,
-                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-                ti=MagicMock(),
-            )
+            m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
         return client.exec_command.call_args[0][0]
 
     def _assert_metrics_scoped_to_partitions(self, ssh_cmd, s3_loc, partitions):
@@ -1105,7 +1070,7 @@ class TestRunDistcpSsh:
         stderr = MagicMock()
         stderr.read.return_value = b''
         client.exec_command.return_value = (
-            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
         )
         filtered_discovery = {
             **sample_discovery,
@@ -1123,11 +1088,7 @@ class TestRunDistcpSsh:
         cfg = {**m.get_config(), 'distcp_preserve_delete': True}
         cfg.update(config_overrides or {})
         with patch.object(m, 'get_config', return_value=cfg):
-            m.run_distcp_ssh.function.__wrapped__(
-                discovery=filtered_discovery,
-                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-                ti=MagicMock(),
-            )
+            m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
         return client.exec_command.call_args[0][0]
 
     def test_per_partition_mappers_scale_with_partition_file_share(self, mock_ssh_hook,
@@ -1182,15 +1143,110 @@ class TestRunDistcpSsh:
                 'filtered_file_count': 0,
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=empty_source_discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(empty_source_discovery))
         assert result['distcp_results'][0]['status'] == 'EMPTY_SOURCE'
         if client.exec_command.called:
             cmd = client.exec_command.call_args[0][0]
             assert 'distcp' not in cmd.lower(), "distcp should not be called for empty source"
+
+
+class TestDistcpBatchResolution:
+
+    def test_copies_only_the_tables_in_its_batch(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        two = {
+            **sample_discovery,
+            'tables': [
+                sample_discovery['tables'][0],
+                {**sample_discovery['tables'][0], 'source_table': 'other'},
+            ],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(two, table_names=['other'])
+        )
+        assert [t['source_table'] for t in result['tables']] == ['other']
+        assert [r['source_table'] for r in result['distcp_results']] == ['other']
+
+    def test_pulls_its_group_by_map_index(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        kwargs = distcp_call({**sample_discovery, '_map_index': 5})
+        m.run_distcp_ssh.function.__wrapped__(**kwargs)
+        kwargs['ti'].xcom_pull.assert_called_once_with(
+            task_ids='record_discovered_tables', map_indexes=5
+        )
+
+    def test_raises_when_the_pulled_group_is_a_different_database(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        """A shifted map index must fail loudly, not copy the wrong tables."""
+        other = {**sample_discovery, 'source_database': 'someone_else'}
+        with pytest.raises(ValueError, match='refusing to copy'):
+            m.run_distcp_ssh.function.__wrapped__(
+                **distcp_call(sample_discovery, pulled=other)
+            )
+
+    def test_raises_when_the_group_xcom_is_missing(self, mock_ssh_hook, sample_discovery):
+        with pytest.raises(ValueError, match='could not read group discovery'):
+            m.run_distcp_ssh.function.__wrapped__(
+                **distcp_call(sample_discovery, pulled={})
+            )
+
+    def test_invalid_descriptor_is_skipped_not_raised(self, mock_ssh_hook):
+        assert m.run_distcp_ssh.function.__wrapped__(
+            batch={}, cluster_setup={'temp_dir': '/tmp', 'run_id': 'r'},
+            source_task_id='record_discovered_tables', ti=MagicMock(),
+        ) == {}
+
+    def test_matches_keys_when_partition_filter_is_none(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        """Discovery rows carry None; descriptors carry ''. They must still match."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        d = {
+            **sample_discovery,
+            'tables': [{**sample_discovery['tables'][0], 'partition_filter': None}],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(d))
+        assert len(result['tables']) == 1
+
+    def test_does_not_cross_match_two_slices_of_one_table(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        """Multi-slice runs hold several rows per table, differing only by filter."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        base = sample_discovery['tables'][0]
+        d = {
+            **sample_discovery,
+            'tables': [
+                {**base, 'partition_filter': 'd=2023'},
+                {**base, 'partition_filter': 'd=2024'},
+            ],
+        }
+        kwargs = distcp_call(d)
+        kwargs['batch']['table_keys'] = [[base['source_table'], 'd=2024']]
+        result = m.run_distcp_ssh.function.__wrapped__(**kwargs)
+        assert len(result['tables']) == 1
+        assert result['tables'][0]['partition_filter'] == 'd=2024'
 
 
 class TestUpdateDistcpStatus:

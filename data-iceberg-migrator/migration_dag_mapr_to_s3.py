@@ -1694,18 +1694,56 @@ def flatten_and_batch(discoveries) -> list[dict]:
 
 @task
 @track_duration
-def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
-    """Run DistCp via SSH for all tables. Uses -update for incremental."""
+def run_distcp_ssh(
+    batch: dict, cluster_setup: dict, source_task_id: str, **context
+) -> dict:
+    """Run DistCp via SSH for one batch of tables. Uses -update for incremental."""
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config["ssh_conn_id"])
 
-    if not isinstance(discovery, dict) or "tables" not in discovery:
+    if not isinstance(batch, dict) or "table_keys" not in batch:
         logger.warning(
-            f"[run_distcp_ssh] Skipping invalid/failed upstream input: {type(discovery)}"
+            f"[run_distcp_ssh] Skipping invalid/failed upstream input: {type(batch)}"
         )
         return {}
 
-    tables = discovery["tables"]
+    # The batch carries identities, not metadata, so the group's discovery is
+    # read straight from its own XCom row: one row per batch instead of the
+    # whole run's metadata materialized in every batch.
+    group = context["ti"].xcom_pull(
+        task_ids=source_task_id, map_indexes=batch["group_map_index"]
+    )
+    if not isinstance(group, dict) or "tables" not in group:
+        raise ValueError(
+            f"[run_distcp_ssh] batch {batch.get('batch_index')} could not read group "
+            f"discovery at map index {batch['group_map_index']} from {source_task_id}"
+        )
+    if (group.get("run_id"), group.get("source_database")) != (
+        batch.get("run_id"),
+        batch.get("source_database"),
+    ):
+        raise ValueError(
+            f"[run_distcp_ssh] group at map index {batch['group_map_index']} is "
+            f"{group.get('source_database')}/{group.get('run_id')}, expected "
+            f"{batch.get('source_database')}/{batch.get('run_id')} — refusing to copy "
+            f"the wrong tables"
+        )
+
+    wanted = {(str(k[0]), str(k[1] or "")) for k in batch["table_keys"]}
+    tables = [
+        t
+        for t in group["tables"]
+        if (str(t.get("source_table")), str(t.get("partition_filter") or "")) in wanted
+    ]
+    if len(tables) != len(wanted):
+        logger.warning(
+            f"[run_distcp_ssh] batch {batch.get('batch_index')} matched "
+            f"{len(tables)} of {len(wanted)} table key(s) in group "
+            f"{group.get('source_database')} — unmatched tables will be marked "
+            f"unprocessed by reconcile_unprocessed_tables"
+        )
+
+    discovery = {**group, "tables": tables}
     temp_dir = cluster_setup["temp_dir"]
     distcp_log_dir = cluster_setup.get("distcp_log_dir") or temp_dir
     preserve_delete = config.get("distcp_preserve_delete", True)
