@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from datetime import datetime, timedelta
 from html import escape as html_escape  # aliased: generate_html_report binds a local `html`
 from pathlib import Path
@@ -155,6 +156,12 @@ def _resolve_dag_owner() -> str:
 # timeout cannot serve both, so each call gets a multiple of its own estimate.
 _CALL_TIMEOUT_MULTIPLIER = 3
 _CALL_TIMEOUT_FLOOR_SECONDS = 1800
+
+# Marks a table skipped by the batch soft-deadline rather than a real copy
+# failure. run_distcp_ssh must not raise on these alone: unlike a genuine
+# distcp failure, they carry no work to retry, so raising would just mark the
+# task instance failed for no operational reason.
+_BUDGET_EXHAUSTED_ERROR = "batch budget exhausted before this table started"
 
 
 def _call_timeout_seconds(estimate_secs: float, config: dict) -> int:
@@ -1877,6 +1884,12 @@ def run_distcp_ssh(
         discovery["dest_bucket"], config, discovery.get("dest_endpoint", "")
     )
 
+    # Soft budget: stop starting new work rather than being killed mid-table by
+    # execution_timeout, which would discard this batch's XCom and leave every
+    # table it already copied with no tracking row.
+    budget_secs = float(batch.get("batch_budget_secs") or 0)
+    batch_started_at = time.monotonic()
+
     results = []
     for t in tables:
         if t.get("error_type") in SKIPPABLE_DISCOVERY_ERRORS:
@@ -1919,6 +1932,29 @@ def run_distcp_ssh(
                 }
             )
             continue
+
+        if budget_secs and (time.monotonic() - batch_started_at) >= budget_secs:
+            logger.warning(
+                f"[DistCp] budget of {budget_secs:.0f}s exhausted — not starting "
+                f"{t['source_database']}.{t['source_table']}"
+            )
+            results.append(
+                {
+                    "source_database": t["source_database"],
+                    "source_table": t["source_table"],
+                    "dest_database": t["dest_database"],
+                    "status": "FAILED",
+                    "error": _BUDGET_EXHAUSTED_ERROR,
+                    "partition_filter": t.get("partition_filter"),
+                }
+            )
+            continue
+
+        if budget_secs:
+            remaining = budget_secs - (time.monotonic() - batch_started_at)
+            deadline_epoch = int(time.time() + max(0.0, remaining))
+        else:
+            deadline_epoch = 0
 
         if t.get("partition_filter_active"):
             effective_file_count = t.get(
@@ -2116,14 +2152,18 @@ def run_distcp_ssh(
                     )
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
+if deadline_ok; then
 run_distcp_with_retry {part_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {part_mappers} -bandwidth {part_bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
+else
+echo "=== DEADLINE reached — skipping partition {part_name} ==="
+fi
 """
 
                 cmd = f"""set -e
 {client_opts_export}
-{_distcp_shell_prelude(s3_opts, 0)}
+{_distcp_shell_prelude(s3_opts, deadline_epoch)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 
@@ -2211,7 +2251,7 @@ exit 0
 
                 cmd = f"""set -e
 {client_opts_export}
-{_distcp_shell_prelude(s3_opts, 0)}
+{_distcp_shell_prelude(s3_opts, deadline_epoch)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 PATHLIST="{temp_dir}/distcp_{tbl}_sources.txt"
@@ -2290,7 +2330,7 @@ exit 0
         else:
             cmd = f"""set -e
 {client_opts_export}
-{_distcp_shell_prelude(s3_opts, 0)}
+{_distcp_shell_prelude(s3_opts, deadline_epoch)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 
@@ -2564,7 +2604,14 @@ exit 0
 
     context["ti"].xcom_push(key="return_value", value=result_dict)
 
-    if has_failures:
+    # Budget-exhausted skips are recorded as FAILED so tracking shows them, but
+    # they are not a copy error — raising here would fail the task instance
+    # over work that was never attempted, discarding nothing since the XCom
+    # above already carries every completed table's result.
+    unstarted_by_budget = [
+        r for r in failed_tables if r.get("error") == _BUDGET_EXHAUSTED_ERROR
+    ]
+    if len(failed_tables) > len(unstarted_by_budget):
         raise Exception(
             f"DistCp failed — {result_dict['_failure_summary']}. Per-table errors in tracking."
         )

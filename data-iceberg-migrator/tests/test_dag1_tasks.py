@@ -1,5 +1,6 @@
 """DAG 1 Task Tests: mapr_to_s3_migration pipeline."""
 
+import itertools
 import logging
 import re
 from types import SimpleNamespace
@@ -1337,6 +1338,123 @@ class TestDistcpBatchResolution:
         result = m.run_distcp_ssh.function.__wrapped__(**kwargs)
         assert len(result['tables']) == 1
         assert result['tables'][0]['partition_filter'] == 'd=2024'
+
+
+class TestDistcpSoftDeadline:
+
+    def test_tables_not_started_before_the_budget_expires_are_failed(
+        self, mock_ssh_hook, sample_discovery, monkeypatch
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        base = sample_discovery['tables'][0]
+        d = {
+            **sample_discovery,
+            'tables': [
+                base,
+                {**base, 'source_table': 'second'},
+                {**base, 'source_table': 'third'},
+            ],
+        }
+        # Clock jumps past the budget after the first table. Never sleep:
+        # pytest.ini sets --timeout=60.
+        ticks = iter([0.0, 0.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0])
+        monkeypatch.setattr(m.time, 'monotonic', lambda: next(ticks, 10_000.0))
+
+        result = m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(d, budget=100.0)
+        )
+
+        by_table = {r['source_table']: r for r in result['distcp_results']}
+        assert by_table['second']['status'] == 'FAILED'
+        assert 'budget exhausted' in by_table['second']['error']
+        assert by_table['third']['status'] == 'FAILED'
+
+    def test_every_remaining_table_still_gets_a_result_row(
+        self, mock_ssh_hook, sample_discovery, monkeypatch
+    ):
+        """Rows are what make the failure visible in tracking."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        base = sample_discovery['tables'][0]
+        d = {
+            **sample_discovery,
+            'tables': [{**base, 'source_table': f't{i}'} for i in range(4)],
+        }
+        # Monotonically increasing rather than a fixed value: a truly frozen
+        # clock can never show elapsed time exceeding the budget. Never sleep:
+        # pytest.ini sets --timeout=60.
+        ticks = itertools.count(10_000.0)
+        monkeypatch.setattr(m.time, 'monotonic', lambda: next(ticks))
+        result = m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(d, budget=1.0)
+        )
+        assert len(result['distcp_results']) == 4
+        assert result['_has_failures'] is True
+
+    def test_zero_budget_disables_the_deadline(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        result = m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(sample_discovery, budget=0.0)
+        )
+        assert result['distcp_results'][0]['status'] == 'COMPLETED'
+
+    def test_partition_copies_are_guarded_by_the_in_shell_deadline(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        """A 300-partition table must honour the budget between partitions."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        base = sample_discovery['tables'][0]
+        d = {
+            **sample_discovery,
+            'tables': [{
+                **base,
+                'partition_filter_active': True,
+                'partition_filter': 'd>=2024',
+                'filtered_partitions': ['d=2024', 'd=2025'],
+                'partition_file_counts': {'d=2024': 5, 'd=2025': 5},
+                'filtered_file_count': 10,
+                'filtered_source_size_bytes': 1024 ** 3,
+            }],
+        }
+        m.run_distcp_ssh.function.__wrapped__(**distcp_call(d, budget=3600.0))
+        script = client.exec_command.call_args[0][0]
+        assert 'deadline_ok' in script
+        assert script.count('if deadline_ok; then') == 2
+
+    def test_deadline_epoch_is_zero_when_there_is_no_budget(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(sample_discovery, budget=0.0)
+        )
+        assert 'DISTCP_DEADLINE_EPOCH=0' in client.exec_command.call_args[0][0]
 
 
 class TestUpdateDistcpStatus:
