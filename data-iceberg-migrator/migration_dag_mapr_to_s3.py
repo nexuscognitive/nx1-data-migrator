@@ -3963,6 +3963,56 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 
 
 @task.pyspark(conn_id="spark_default")
+def reconcile_unprocessed_tables(run_id: str, spark) -> dict:
+    """Mark tables that no batch ever reported on.
+
+    Fan-out lets a batch vanish without reporting: killed by execution_timeout
+    before its XCom push, or its group's discovery XCom lost. The per-element
+    catch-all in update_distcp_status cannot cover those tables because it is
+    scoped to its own element's table list, so without this they would stay NULL
+    and invisible for the whole run.
+    """
+    config = get_config()
+    tracking_db = config["tracking_database"]
+
+    unprocessed = spark.sql(f"""
+        SELECT COUNT(*) AS cnt
+        FROM {tracking_db}.migration_table_status
+        WHERE run_id = '{run_id}'
+          AND discovery_status = 'COMPLETED'
+          AND distcp_status IS NULL
+    """).collect()[0]["cnt"]
+
+    if unprocessed == 0:
+        logger.info("[reconcile] every discovered table has a copy status")
+        return {"run_id": run_id, "unprocessed": 0}
+
+    logger.warning(
+        f"[reconcile] {unprocessed} table(s) were never processed by any batch "
+        f"— marking FAILED"
+    )
+    execute_with_iceberg_retry(
+        spark,
+        f"""
+        UPDATE {tracking_db}.migration_table_status
+        SET distcp_status = 'FAILED',
+            overall_status = CASE
+                WHEN overall_status = 'EMPTY_SOURCE' THEN 'EMPTY_SOURCE'
+                {_PRESERVE_SKIPPABLE_STATUS_SQL}
+                ELSE 'FAILED'
+            END,
+            error_message = COALESCE(error_message, 'not processed by any batch'),
+            updated_at = current_timestamp()
+        WHERE run_id = '{run_id}'
+          AND discovery_status = 'COMPLETED'
+          AND distcp_status IS NULL
+    """,
+        task_label="reconcile_unprocessed_tables",
+    )
+    return {"run_id": run_id, "unprocessed": unprocessed}
+
+
+@task.pyspark(conn_id="spark_default")
 def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **context) -> str:
     """Generate comprehensive HTML migration report."""
     from datetime import datetime

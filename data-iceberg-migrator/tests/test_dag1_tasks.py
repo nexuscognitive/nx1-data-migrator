@@ -1695,6 +1695,40 @@ class TestUpdateDistcpStatus:
         assert "WHEN overall_status = 'EMPTY_SOURCE'" in joined
 
 
+class TestReconcileUnprocessedTables:
+
+    def test_marks_tables_no_batch_ever_processed(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [{'cnt': 3}]
+        result = m.reconcile_unprocessed_tables.function(
+            run_id='run-1', spark=mock_spark
+        )
+        assert result == {'run_id': 'run-1', 'unprocessed': 3}
+        statements = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'distcp_status IS NULL' in statements
+
+    def test_is_a_no_op_when_every_table_has_a_status(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [{'cnt': 0}]
+        result = m.reconcile_unprocessed_tables.function(
+            run_id='run-1', spark=mock_spark
+        )
+        assert result['unprocessed'] == 0
+        # Only the counting SELECT ran — no UPDATE.
+        assert mock_spark.sql.call_count == 1
+
+    def test_preserves_skippable_and_empty_source_statuses(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [{'cnt': 1}]
+        m.reconcile_unprocessed_tables.function(run_id='run-1', spark=mock_spark)
+        statements = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'EMPTY_SOURCE' in statements
+        assert 'TABLE_NOT_FOUND' in statements
+
+    def test_only_touches_tables_that_finished_discovery(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [{'cnt': 1}]
+        m.reconcile_unprocessed_tables.function(run_id='run-1', spark=mock_spark)
+        statements = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert "discovery_status = 'COMPLETED'" in statements
+
+
 class TestCreateHiveTables:
 
     def test_creates_new_table(self, mock_spark, sample_distcp_result):
