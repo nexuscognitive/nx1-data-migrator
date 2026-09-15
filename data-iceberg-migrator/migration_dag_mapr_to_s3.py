@@ -34,16 +34,21 @@ from migrator_utils.migrations.partition_utils import (
 )
 from migrator_utils.migrations.shared import (
     SSH_COMMAND_TIMEOUT,
+    _BUDGET_SLACK,
     _hive_scratch_dir,
     _login_shell,
     build_s3_opts,
     cluster_login,
+    distcp_batching_mode,
     distcp_jvm_opts,
     distcp_sizing_mode,
+    estimate_distcp_cost,
     execute_with_iceberg_retry,
     get_config,
     hive_type_to_spark_ddl,
     normalize_s3,
+    pack_tables_into_batches,
+    resolve_batch_cap,
     size_distcp_job,
     track_duration,
     validate_bucket_endpoint_pairs,
@@ -88,6 +93,14 @@ _SKIPPABLE_STATUS_SQL_IN = ", ".join(f"'{s}'" for s in SKIPPABLE_DISCOVERY_ERROR
 _PRESERVE_SKIPPABLE_STATUS_SQL = (
     f"WHEN overall_status IN ({_SKIPPABLE_STATUS_SQL_IN}) THEN overall_status"
 )
+
+# Last-resort guard on one batch. The soft deadline inside run_distcp_ssh is the
+# real stuck-detector; this only catches a stall in paramiko's stdout.read(),
+# which sits below the shell where neither the deadline nor `timeout` can reach.
+# A constant, not config, because operator attributes are set at DAG parse and
+# test_dag_integrity forbids new parse-time Variable reads. flatten_and_batch
+# warns when a computed budget outgrows it.
+_DISTCP_EXECUTION_TIMEOUT = timedelta(hours=8)
 
 
 def _classify_discovery_error(error: str, source_path_exists: bool | None) -> str:
@@ -1587,6 +1600,96 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
     # group by map index: the reduce sequence they are built from omits map
     # indexes whose task instance died, so list position is not the index.
     return {**discovery, "_map_index": context["ti"].map_index}
+
+
+@task
+def flatten_and_batch(discoveries) -> list[dict]:
+    """Re-key the copy stage from one task per group to one task per batch.
+
+    Takes record_discovered_tables' per-group output and returns one lightweight
+    descriptor per batch. Descriptors carry table *identities*, never table
+    metadata: Airflow resolves a mapped argument by deserializing the whole
+    upstream value and then indexing it, so a descriptor holding schemas and
+    partition lists would make all 500+ tables' metadata land in every batch
+    instance.
+
+    Packing runs per group and never mixes source databases, because
+    update_distcp_status and validate_destination_tables both read
+    source_database at group level.
+    """
+    config = get_config()
+    logger.info(f"[Batching] {distcp_batching_mode(config)}")
+
+    groups = []
+    for d in discoveries:
+        if not isinstance(d, dict) or "tables" not in d:
+            logger.warning(
+                f"[Batching] Skipping invalid/failed group discovery: {type(d)}"
+            )
+            continue
+        if d.get("_map_index") is None:
+            raise ValueError(
+                "[Batching] a group discovery has no _map_index, so its batches "
+                "could resolve to the wrong group. Redeploy the DAG so "
+                "record_discovered_tables stamps it."
+            )
+        groups.append(d)
+
+    if not groups:
+        logger.warning("[Batching] no usable group discoveries — no batches planned")
+        return []
+
+    total_cost = sum(
+        estimate_distcp_cost(t, config) for g in groups for t in g["tables"]
+    )
+    cap = resolve_batch_cap(total_cost, config)
+    logger.info(
+        f"[Batching] {sum(len(g['tables']) for g in groups)} table(s) in "
+        f"{len(groups)} group(s), estimated {total_cost:.0f}s total, "
+        f"cap {cap:.0f}s per batch"
+    )
+
+    bins = []
+    for g in groups:
+        for bin_cost, bin_tables in pack_tables_into_batches(g["tables"], cap, config):
+            bins.append((bin_cost, g, bin_tables))
+    bins.sort(key=lambda b: b[0], reverse=True)
+
+    backstop = _DISTCP_EXECUTION_TIMEOUT.total_seconds()
+    descriptors = []
+    for batch_index, (bin_cost, g, bin_tables) in enumerate(bins):
+        # max() matters: a single over-cap monster needs a budget matching its
+        # own cost, not the cap it already blew through.
+        budget = max(bin_cost, cap) * _BUDGET_SLACK
+        if budget > backstop:
+            logger.warning(
+                f"[Batching] batch {batch_index} budget {budget:.0f}s exceeds the "
+                f"{backstop:.0f}s execution_timeout backstop — healthy batches may "
+                f"be killed. Raise migration_distcp_max_batches or lower "
+                f"migration_distcp_batch_target_cost_seconds."
+            )
+        descriptors.append(
+            {
+                "group_map_index": g["_map_index"],
+                "table_keys": [
+                    [t["source_table"], t.get("partition_filter") or ""]
+                    for t in bin_tables
+                ],
+                "batch_index": batch_index,
+                "batch_cost_secs": bin_cost,
+                "batch_budget_secs": budget,
+                "run_id": g["run_id"],
+                "source_database": g["source_database"],
+            }
+        )
+        logger.info(
+            f"[Batching] batch {batch_index}: {g['source_database']} "
+            f"(group {g['_map_index']}), {len(bin_tables)} table(s), "
+            f"est {bin_cost:.0f}s, budget {budget:.0f}s — "
+            f"{[t['source_table'] for t in bin_tables]}"
+        )
+
+    return descriptors
 
 
 @task

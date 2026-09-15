@@ -1,5 +1,6 @@
 """DAG 1 Task Tests: mapr_to_s3_migration pipeline."""
 
+import logging
 import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -2342,3 +2343,109 @@ class TestFinalizeRun:
         ))
         assert "status = 'COMPLETED'" in sqls
         assert 'COMPLETED_WITH_MISSING' not in sqls
+
+
+class TestFlattenAndBatch:
+
+    def _group(self, map_index, db, table_names, **table_overrides):
+        tables = []
+        for name in table_names:
+            t = {
+                'source_database': db, 'source_table': name,
+                'dest_database': f'{db}_s3', 'dest_bucket': 's3a://test-bucket',
+                'source_total_size_bytes': 10 * 1024 ** 3,
+                'source_file_count': 100, 'partition_filter_active': False,
+            }
+            t.update(table_overrides)
+            tables.append(t)
+        return {
+            'run_id': 'run-1', 'source_database': db, 'dest_database': f'{db}_s3',
+            'dest_bucket': 's3a://test-bucket', 'tables': tables,
+            '_map_index': map_index,
+        }
+
+    def test_emits_one_descriptor_per_bin_covering_every_table(self):
+        groups = [self._group(0, 'db_a', ['t1', 't2']), self._group(1, 'db_b', ['t3'])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        keys = [tuple(k) for b in batches for k in b['table_keys']]
+        assert sorted(keys) == [('t1', ''), ('t2', ''), ('t3', '')]
+
+    def test_batches_never_mix_source_databases(self):
+        groups = [self._group(0, 'db_a', ['t1']), self._group(1, 'db_b', ['t2'])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert {b['source_database'] for b in batches} == {'db_a', 'db_b'}
+        assert all(len({b['source_database']}) == 1 for b in batches)
+
+    def test_addresses_groups_by_map_index_not_list_position(self):
+        """A dead record_discovered_tables instance leaves a gap in the sequence."""
+        groups = [
+            self._group(0, 'db_a', ['t1']),
+            self._group(1, 'db_b', ['t2']),
+            self._group(3, 'db_d', ['t4']),
+        ]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert sorted(b['group_map_index'] for b in batches) == [0, 1, 3]
+        assert 2 not in {b['group_map_index'] for b in batches}
+
+    def test_skips_failed_group_discoveries(self):
+        groups = [{}, self._group(1, 'db_b', ['t2']), None]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert len(batches) == 1
+        assert batches[0]['group_map_index'] == 1
+
+    def test_raises_when_a_group_has_no_map_index(self):
+        stale = self._group(0, 'db_a', ['t1'])
+        del stale['_map_index']
+        with pytest.raises(ValueError, match='_map_index'):
+            m.flatten_and_batch.function(discoveries=[stale])
+
+    def test_descriptors_are_ordered_by_cost_descending(self):
+        groups = [
+            self._group(0, 'db_a', ['small'], source_total_size_bytes=1024,
+                        source_file_count=1),
+            self._group(1, 'db_b', ['huge'],
+                        source_total_size_bytes=5000 * 1024 ** 3,
+                        source_file_count=100000),
+        ]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert batches[0]['source_database'] == 'db_b'
+        costs = [b['batch_cost_secs'] for b in batches]
+        assert costs == sorted(costs, reverse=True)
+
+    def test_batch_index_is_contiguous_from_zero(self):
+        groups = [self._group(0, 'db_a', [f't{i}' for i in range(30)])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert [b['batch_index'] for b in batches] == list(range(len(batches)))
+
+    def test_descriptors_carry_no_table_metadata(self):
+        """The whole point: every batch TI deserializes this list in full."""
+        groups = [self._group(0, 'db_a', ['t1'], schema=[{'name': 'c'}],
+                              partitions=['d=1'], partition_file_counts={'d=1': 3})]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        for key in ('schema', 'partitions', 'partition_file_counts', 'tables'):
+            assert key not in batches[0]
+
+    def test_budget_covers_an_over_cap_monster_batch(self):
+        groups = [self._group(0, 'db_a', ['huge'],
+                              source_total_size_bytes=20000 * 1024 ** 3,
+                              source_file_count=10)]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert batches[0]['batch_budget_secs'] >= batches[0]['batch_cost_secs']
+
+    def test_partition_filter_is_part_of_the_table_key(self):
+        group = self._group(0, 'db_a', ['t1'])
+        group['tables'].append({**group['tables'][0], 'partition_filter': 'd=2024'})
+        batches = m.flatten_and_batch.function(discoveries=[group])
+        keys = sorted(tuple(k) for b in batches for k in b['table_keys'])
+        assert keys == [('t1', ''), ('t1', 'd=2024')]
+
+    def test_warns_when_a_budget_exceeds_the_execution_timeout(self, caplog):
+        groups = [self._group(0, 'db_a', ['huge'],
+                              source_total_size_bytes=500000 * 1024 ** 3,
+                              source_file_count=10)]
+        with caplog.at_level(logging.WARNING):
+            m.flatten_and_batch.function(discoveries=groups)
+        assert 'execution_timeout' in caplog.text
+
+    def test_empty_input_returns_an_empty_plan(self):
+        assert m.flatten_and_batch.function(discoveries=[]) == []
