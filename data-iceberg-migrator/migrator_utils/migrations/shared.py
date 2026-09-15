@@ -59,14 +59,19 @@ __all__ = [
     "cell_str",
     "cluster_login",
     "compute_dest_path",
+    "distcp_batching_mode",
     "distcp_jvm_opts",
     "distcp_sizing_mode",
+    "effective_source_metrics",
+    "estimate_distcp_cost",
     "execute_with_iceberg_retry",
     "get_config",
     "hive_type_to_spark_ddl",
     "is_permanent_error",
     "normalize_s3",
+    "pack_tables_into_batches",
     "permanent_fail",
+    "resolve_batch_cap",
     "size_distcp_job",
     "track_duration",
     "validate_bucket_endpoint_pairs",
@@ -445,6 +450,36 @@ def get_config() -> dict:
                 'MIGRATION_DISTCP_PRESERVE_DELETE', 'true'
             )
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+
+        # Batch planning weights — see estimate_distcp_cost. distcp_cost_mbps is
+        # OBSERVED aggregate throughput, not the -bandwidth cap that
+        # migration_distcp_target_aggregate_mbps asks DistCp for.
+        'distcp_cost_mbps': _int_var(
+            'migration_distcp_cost_mbps', 'MIGRATION_DISTCP_COST_MBPS', '150'
+        ),
+        'distcp_cost_seconds_per_job': _int_var(
+            'migration_distcp_cost_seconds_per_job',
+            'MIGRATION_DISTCP_COST_SECONDS_PER_JOB', '45'
+        ),
+        'distcp_cost_seconds_per_path_scan': _int_var(
+            'migration_distcp_cost_seconds_per_path_scan',
+            'MIGRATION_DISTCP_COST_SECONDS_PER_PATH_SCAN', '12'
+        ),
+        'distcp_batch_target_cost_seconds': _int_var(
+            'migration_distcp_batch_target_cost_seconds',
+            'MIGRATION_DISTCP_BATCH_TARGET_COST_SECONDS', '1800'
+        ),
+        'distcp_max_batches': _int_var(
+            'migration_distcp_max_batches', 'MIGRATION_DISTCP_MAX_BATCHES', '60'
+        ),
+        'distcp_max_tables_per_batch': _int_var(
+            'migration_distcp_max_tables_per_batch',
+            'MIGRATION_DISTCP_MAX_TABLES_PER_BATCH', '25'
+        ),
+        'distcp_call_timeout_max_seconds': _int_var(
+            'migration_distcp_call_timeout_max_seconds',
+            'MIGRATION_DISTCP_CALL_TIMEOUT_MAX_SECONDS', '21600'
+        ),
 
         # Spark Configuration
         'spark_conn_id': _var('migration_spark_conn_id', 'MIGRATION_SPARK_CONN_ID', 'spark_default'),
@@ -826,6 +861,148 @@ def distcp_sizing_mode(config: dict) -> str:
             f"{config['distcp_target_bytes_per_mapper']} bytes/mapper, "
             f"{config['distcp_min_mappers']}-{config['distcp_max_mappers']} mappers, "
             f"{config['distcp_target_aggregate_mbps']} MB/s aggregate")
+
+
+# =============================================================================
+# DistCp batch planning
+# =============================================================================
+# Second-order weights. Deliberately module constants rather than config keys:
+# exposing them would add rows to the client tuning guide for terms nobody
+# adjusts, and the two that matter (throughput, per-job cost) are exposed.
+_COST_BASE_SECONDS = 30
+_COST_SECONDS_PER_FILE = 0.002
+_COST_MKDIR_SECONDS_PER_PATH = 2
+# A batch is allowed a quarter more than its plan before the deadline bites.
+_BUDGET_SLACK = 1.25
+
+
+def effective_source_metrics(table: dict) -> tuple[int, int]:
+    """Return (size_bytes, file_count) DistCp will actually move for one table.
+
+    A partition filter narrows the copy, so the filtered totals are the real
+    input. run_distcp_ssh and estimate_distcp_cost must agree on this rule or
+    the plan describes a copy that never happens.
+    """
+    if table.get('partition_filter_active'):
+        size = table.get('filtered_source_size_bytes',
+                         table.get('source_total_size_bytes', 0))
+        files = table.get('filtered_file_count',
+                          table.get('source_file_count', 0))
+    else:
+        size = table.get('source_total_size_bytes', 0)
+        files = table.get('source_file_count', 0)
+    return int(size or 0), int(files or 0)
+
+
+def estimate_distcp_cost(table: dict, config: dict) -> float:
+    """Estimated wall-clock seconds to copy one table.
+
+    Mirrors the three shell paths in run_distcp_ssh rather than size alone.
+    With preserve_delete on (the default) a partition-filtered copy submits one
+    DistCp job per non-empty partition and scans every partition path twice, so
+    for those tables partition count dominates bytes.
+
+    Calibrated for a full first copy. Every copy runs -update, so on a re-run
+    the real cost is dominated by the before/after directory scans and this
+    overestimates — relative ordering survives, which is what the packer needs.
+    """
+    if table.get('error') or table.get('error_type'):
+        return 0.0
+
+    size_bytes, file_count = effective_source_metrics(table)
+    filtered = bool(table.get('partition_filter_active'))
+    partitions = list(table.get('filtered_partitions') or []) if filtered else []
+
+    if filtered and not partitions:
+        # The loop SKIPs a filter that matched nothing before any copy work.
+        return float(_COST_BASE_SECONDS)
+
+    paths = len(partitions) if filtered else 1
+
+    if file_count == 0:
+        # Empty source: one SSH call of mkdir -p, no job and no metrics scans.
+        return float(_COST_BASE_SECONDS + paths * _COST_MKDIR_SECONDS_PER_PATH)
+
+    if filtered and config.get('distcp_preserve_delete'):
+        counts = table.get('partition_file_counts') or {}
+        # .get(p, 1) mirrors the shell: an absent count means "assume non-empty".
+        jobs = sum(1 for p in partitions if counts.get(p, 1) > 0)
+    else:
+        jobs = 1
+
+    return (
+        _COST_BASE_SECONDS
+        + size_bytes / (int(config['distcp_cost_mbps']) * 1024 * 1024)
+        + jobs * int(config['distcp_cost_seconds_per_job'])
+        + paths * int(config['distcp_cost_seconds_per_path_scan']) * 2
+        + file_count * _COST_SECONDS_PER_FILE
+    )
+
+
+def resolve_batch_cap(total_cost: float, config: dict) -> float:
+    """Per-batch cost ceiling in seconds.
+
+    distcp_max_batches is a target that only ever raises the cap. At 500 tables
+    it, not the target, is what limits batch count — a deliberate trade of
+    blast radius for downstream Kyuubi sessions, since every batch costs five
+    @task.pyspark instances.
+    """
+    target = float(config['distcp_batch_target_cost_seconds'])
+    max_batches = int(config['distcp_max_batches'])
+    if max_batches <= 0:
+        return target
+    return max(target, total_cost / max_batches)
+
+
+def pack_tables_into_batches(
+    tables: list[dict], cap_seconds: float, config: dict
+) -> list[tuple[float, list[dict]]]:
+    """First-fit-decreasing pack of one group's tables into cost-capped bins.
+
+    Returns (bin_cost, bin_tables) sorted by cost descending, so the caller can
+    give the expensive batches the low map indexes and let Airflow start them
+    first.
+
+    Never drops a table: one costing more than the cap gets a bin to itself, and
+    max_tables_per_batch is a hard cap that wins over the cost cap. Zero-cost
+    skippable tables are packed too — their SKIPPED status is written by
+    update_distcp_status from whichever element they belong to.
+    """
+    max_tables = int(config['distcp_max_tables_per_batch'])
+    costed = sorted(
+        ((estimate_distcp_cost(t, config), t) for t in tables),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+
+    bins: list[list] = []  # [cost, tables]
+    for cost, table in costed:
+        for b in bins:
+            if len(b[1]) < max_tables and b[0] + cost <= cap_seconds:
+                b[0] += cost
+                b[1].append(table)
+                break
+        else:
+            bins.append([cost, [table]])
+
+    bins.sort(key=lambda b: b[0], reverse=True)
+    return [(b[0], b[1]) for b in bins]
+
+
+def distcp_batching_mode(config: dict) -> str:
+    """Describe the batch plan's inputs, for the task log.
+
+    Same reason distcp_sizing_mode exists: without it a plan of one giant batch
+    reads identically whether the cap bound or the count ceiling did.
+    """
+    return (
+        f"COST-CAPPED — target {config['distcp_batch_target_cost_seconds']}s/batch, "
+        f"at most {config['distcp_max_batches']} batches and "
+        f"{config['distcp_max_tables_per_batch']} tables/batch; weights: "
+        f"{config['distcp_cost_mbps']} MB/s, "
+        f"{config['distcp_cost_seconds_per_job']}s/job, "
+        f"{config['distcp_cost_seconds_per_path_scan']}s/path-scan"
+    )
 
 
 def distcp_jvm_opts(config: dict) -> str:
