@@ -188,6 +188,19 @@ class TestPackTablesIntoBatches:
         assert by_name['big'][0] > 1800.0
         assert len(by_name['big'][1]) == 1
 
+    def test_two_tables_that_together_exceed_the_cap_are_split(self):
+        """The cap's actual job: each fits alone, the pair does not."""
+        cfg = _config()
+        tables = [_table(f't{i}', source_total_size_bytes=100 * GB,
+                         source_file_count=100) for i in range(2)]
+        # Derived from the estimate so the test does not re-implement the model.
+        each = estimate_distcp_cost(tables[0], cfg)
+        cap = each * 1.5
+        assert each <= cap < each * 2
+        bins = pack_tables_into_batches(tables, cap, cfg)
+        assert len(bins) == 2
+        assert all(len(b[1]) == 1 for b in bins)
+
     def test_max_tables_per_batch_is_a_hard_cap(self):
         cfg = _config(distcp_max_tables_per_batch=3)
         tables = [_table(f't{i}', source_total_size_bytes=MB, source_file_count=1)

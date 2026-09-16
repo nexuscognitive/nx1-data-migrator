@@ -555,8 +555,9 @@ duration, not by table size, because size alone is misleading here. Each table
 is charged a fixed setup cost, its bytes divided by the observed throughput, a
 cost per DistCp job, a cost per directory scan, and a small per-file cost. When
 a partition filter is active, the copy submits **one DistCp job per partition**
-and scans every partition directory twice — so for a filtered table, the
-number of partitions matters more than its size.
+— with delete-preservation on, the default — and scans every partition
+directory twice, so for a filtered table the number of partitions matters more
+than its size.
 
 | Variable | Default | Raise it when... | Lower it when... |
 | --- | --- | --- | --- |
@@ -585,7 +586,22 @@ safe, just conservative.
 concurrent copies per DAG run. It is read from `env.shared` at parse time, so
 changing it means redeploying with `deploy.py`, not editing an Airflow
 Variable. With `max_active_runs=5`, up to five runs can each use that many
-slots, so the true ceiling is five times the value.
+slots, so the true ceiling is five times the value — but Airflow's default of
+16 task slots per DAG binds first: at 3 × 5 = 15 the copies leave almost
+nothing for the rest of the pipeline.
+
+**Two new errors in the report.** `batch budget exhausted before this table
+started` means the batch ran out of its time budget, so the table was not
+copied or only partly copied; the batch retries itself, and if the error
+survives the retries, lower `migration_distcp_batch_target_cost_seconds` so
+batches are smaller. `not processed by any batch` means no copy task ever
+reported on the table at all — usually its batch was killed by the 8-hour task
+timeout — so re-run the DAG for that database.
+
+**Before deploying this version.** Let in-flight `source_to_s3_migration` runs
+finish, or clear them. A run whose discovery completed under the previous
+version carries no batch index, so the new batching task raises by design
+rather than risk copying the wrong tables.
 
 ---
 
