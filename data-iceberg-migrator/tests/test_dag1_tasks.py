@@ -1659,7 +1659,7 @@ class TestDistcpSoftDeadline:
 
         row = kwargs['ti'].xcom_push.call_args.kwargs['value']['distcp_results'][0]
         assert row['status'] == 'FAILED'
-        assert row['error'] == m._BUDGET_EXHAUSTED_ERROR
+        assert row['error'] == m._BUDGET_PARTIAL_ERROR
         # The counts the copy did manage are still accurate and worth keeping.
         assert row['s3_files_transferred'] == 5
         assert row['distcp_started_at']
@@ -3009,12 +3009,29 @@ class TestFlattenAndBatch:
         for key in ('schema', 'partitions', 'partition_file_counts', 'tables'):
             assert key not in batches[0]
 
-    def test_budget_covers_an_over_cap_monster_batch(self):
+    def test_a_normal_batch_budget_still_covers_its_own_cost(self):
+        """The clamp must not starve ordinary batches: if a batch's budget fell
+        below its estimate, a healthy copy would be failed by its own deadline."""
+        groups = [self._group(0, 'db_a', ['t1', 't2', 't3', 't4'])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        for b in batches:
+            assert b['batch_budget_secs'] >= b['batch_cost_secs']
+
+    def test_an_over_clamp_batch_is_budgeted_below_its_cost_on_purpose(self):
+        """Replaces test_budget_covers_an_over_cap_monster_batch, which asserted
+        the bug: a ~19.5 TiB table used to get a budget matching its own cost
+        (170790s), far past the 28800s execution_timeout, so Airflow SIGKILLed
+        the task before the soft budget could fire and the XCom — and every
+        FAILED row in it — was discarded. Being under-budgeted is the fix: the
+        batch now fails cleanly and -update lets the retry resume."""
+        backstop = m._DISTCP_EXECUTION_TIMEOUT.total_seconds()
         groups = [self._group(0, 'db_a', ['huge'],
                               source_total_size_bytes=20000 * 1024 ** 3,
                               source_file_count=10)]
         batches = m.flatten_and_batch.function(discoveries=groups)
-        assert batches[0]['batch_budget_secs'] >= batches[0]['batch_cost_secs']
+        assert batches[0]['batch_budget_secs'] == pytest.approx(
+            m._BATCH_BUDGET_FRACTION * backstop)
+        assert batches[0]['batch_budget_secs'] < batches[0]['batch_cost_secs']
 
     def test_partition_filter_is_part_of_the_table_key(self):
         group = self._group(0, 'db_a', ['t1'])
@@ -3023,13 +3040,65 @@ class TestFlattenAndBatch:
         keys = sorted(tuple(k) for b in batches for k in b['table_keys'])
         assert keys == [('t1', ''), ('t1', 'd=2024')]
 
-    def test_warns_when_a_budget_exceeds_the_execution_timeout(self, caplog):
-        groups = [self._group(0, 'db_a', ['huge'],
-                              source_total_size_bytes=500000 * 1024 ** 3,
-                              source_file_count=10)]
-        with caplog.at_level(logging.WARNING):
-            m.flatten_and_batch.function(discoveries=groups)
-        assert 'execution_timeout' in caplog.text
-
     def test_empty_input_returns_an_empty_plan(self):
         assert m.flatten_and_batch.function(discoveries=[]) == []
+
+    def test_no_batch_budget_can_exceed_the_execution_timeout(self):
+        """The property the clamp exists for: a budget above the backstop can
+        never fire, so the batch is SIGKILLed and its XCom discarded instead of
+        writing FAILED rows."""
+        backstop = m._DISTCP_EXECUTION_TIMEOUT.total_seconds()
+        # 40 TiB in one table: estimated far above any per-batch budget.
+        groups = [self._group(
+            0, 'db_a', ['huge'],
+            source_total_size_bytes=40 * 1024 ** 4, source_file_count=100_000)]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert batches
+        for b in batches:
+            assert b['batch_budget_secs'] <= backstop
+
+    def test_an_over_budget_batch_is_warned_about_by_table_name(self, caplog):
+        groups = [self._group(
+            0, 'db_a', ['huge'],
+            source_total_size_bytes=40 * 1024 ** 4, source_file_count=100_000)]
+        with caplog.at_level(logging.WARNING):
+            m.flatten_and_batch.function(discoveries=groups)
+        assert 'huge' in caplog.text
+        assert 'more than one attempt' in caplog.text
+        # The retired knobs must not be named as the fix.
+        assert 'max_batches' not in caplog.text
+        assert 'batch_target_cost_seconds' not in caplog.text
+
+    def test_a_normal_batch_is_not_warned_about(self, caplog):
+        groups = [self._group(
+            0, 'db_a', ['t1', 't2', 't3', 't4'],
+            source_total_size_bytes=1024 ** 3, source_file_count=10)]
+        with caplog.at_level(logging.WARNING):
+            m.flatten_and_batch.function(discoveries=groups)
+        assert 'more than one attempt' not in caplog.text
+
+    def test_batch_count_follows_the_cap_not_the_table_count(
+            self, monkeypatch):
+        """The plan's central behaviour, and nothing else pins it. Fixture
+        tables cost ~167s each, so four of them give a cap of 670/(3*2) = 112s
+        and no two share a bin. Under the retired seconds-target cap (1800s)
+        all four landed in ONE batch, and no other test in this class would
+        notice the difference."""
+        monkeypatch.delenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT',
+                           raising=False)
+        groups = [self._group(0, 'db_a', ['t1', 't2', 't3', 't4'])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert len(batches) == 4
+        assert all(len(b['table_keys']) == 1 for b in batches)
+
+    def test_a_small_run_is_spread_across_the_lanes(self, monkeypatch):
+        """One table is one batch — nothing to spread. Two tables must not
+        collapse into a single task while lanes sit idle."""
+        monkeypatch.delenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT',
+                           raising=False)
+        one = m.flatten_and_batch.function(
+            discoveries=[self._group(0, 'db_a', ['solo'])])
+        two = m.flatten_and_batch.function(
+            discoveries=[self._group(0, 'db_a', ['a', 'b'])])
+        assert len(one) == 1
+        assert len(two) == 2

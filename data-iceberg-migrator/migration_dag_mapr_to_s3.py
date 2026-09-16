@@ -34,6 +34,7 @@ from migrator_utils.migrations.partition_utils import (
     partitions_to_where_clause as _partitions_to_where_clause,
 )
 from migrator_utils.migrations.shared import (
+    _BATCH_BUDGET_FRACTION,
     _BUDGET_SLACK,
     SSH_COMMAND_TIMEOUT,
     _hive_scratch_dir,
@@ -193,6 +194,11 @@ _SSH_READ_SLACK_SECONDS = 1800
 
 # Error text for a table the batch soft-deadline stopped before it started.
 _BUDGET_EXHAUSTED_ERROR = "batch budget exhausted before this table started"
+# Distinct string: the in-shell deadline can also stop a table that already
+# started. Deliberately does not claim bytes moved — if the budget ran out
+# during the pre-copy metrics scan, every partition is skipped and nothing was
+# copied. The row's own byte counts carry that detail.
+_BUDGET_PARTIAL_ERROR = "batch budget exhausted while copying this table"
 
 
 def _call_timeout_seconds(estimate_secs: float, config: dict) -> int:
@@ -1818,7 +1824,6 @@ def flatten_and_batch(discoveries) -> list[dict]:
     source_database at group level.
     """
     config = get_config()
-    logger.info(f"[Batching] {distcp_batching_mode(config)}")
 
     groups = []
     for d in discoveries:
@@ -1842,7 +1847,10 @@ def flatten_and_batch(discoveries) -> list[dict]:
     total_cost = sum(
         estimate_distcp_cost(t, config) for g in groups for t in g["tables"]
     )
-    cap = resolve_batch_cap(total_cost, config)
+    backstop = _DISTCP_EXECUTION_TIMEOUT.total_seconds()
+    lanes = _env_int("MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3)
+    cap = resolve_batch_cap(total_cost, lanes, backstop)
+    logger.info(f"[Batching] {distcp_batching_mode(cap, lanes, backstop, config)}")
     logger.info(
         f"[Batching] {sum(len(g['tables']) for g in groups)} table(s) in "
         f"{len(groups)} group(s), estimated {total_cost:.0f}s total, "
@@ -1855,18 +1863,23 @@ def flatten_and_batch(discoveries) -> list[dict]:
             bins.append((bin_cost, g, bin_tables))
     bins.sort(key=lambda b: b[0], reverse=True)
 
-    backstop = _DISTCP_EXECUTION_TIMEOUT.total_seconds()
     descriptors = []
     for batch_index, (bin_cost, g, bin_tables) in enumerate(bins):
-        # max() matters: a single over-cap monster needs a budget matching its
-        # own cost, not the cap it already blew through.
-        budget = max(bin_cost, cap) * _BUDGET_SLACK
-        if budget > backstop:
+        # max() gives a single over-cap monster a budget matching its own cost
+        # rather than the cap it already blew through; min() then stops that
+        # budget landing past the point where execution_timeout SIGKILLs the
+        # task, which would discard the XCom before any FAILED row is written.
+        budget = min(
+            max(bin_cost, cap) * _BUDGET_SLACK,
+            _BATCH_BUDGET_FRACTION * backstop,
+        )
+        if bin_cost > budget:
             logger.warning(
-                f"[Batching] batch {batch_index} budget {budget:.0f}s exceeds the "
-                f"{backstop:.0f}s execution_timeout backstop — healthy batches may "
-                f"be killed. Raise migration_distcp_max_batches or lower "
-                f"migration_distcp_batch_target_cost_seconds."
+                f"[Batching] batch {batch_index} estimates {bin_cost:.0f}s but "
+                f"is budgeted {budget:.0f}s, the most that can fire before the "
+                f"{backstop:.0f}s execution_timeout. It will need more than one "
+                f"attempt; -update makes each retry resume where the last "
+                f"stopped. Tables: {[t['source_table'] for t in bin_tables]}"
             )
         descriptors.append(
             {
@@ -2659,7 +2672,7 @@ exit 0
                             else None
                         ),
                         "empty_partitions": empty_partitions,
-                        "error": _BUDGET_EXHAUSTED_ERROR if deadline_skipped else None,
+                        "error": _BUDGET_PARTIAL_ERROR if deadline_skipped else None,
                         "yarn_application_id": yarn_application_id,
                         "yarn_application_ids": yarn_application_ids,
                         "partition_filter": t.get("partition_filter"),
@@ -5170,6 +5183,12 @@ with DAG(
     t_distcp.operator.execution_timeout = _DISTCP_EXECUTION_TIMEOUT
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
     t_distcp_status.operator.trigger_rule = "all_done"
+    # One Iceberg writer per batch, and the batch count is no longer bounded by
+    # a config ceiling. Reuses the copy lane count: a status write is far
+    # cheaper than a copy and never needs more lanes than the stage feeding it.
+    t_distcp_status.operator.max_active_tis_per_dagrun = _env_int(
+        "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    )
     t_tables = create_hive_tables.expand(distcp_result=t_distcp_status)
     t_tables.operator.trigger_rule = "all_done"
     t_tbl_status = update_table_create_status.expand(table_result=t_tables)

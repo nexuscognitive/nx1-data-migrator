@@ -50,6 +50,20 @@ PORTAL_OWNED_KEYS = frozenset({
     'service_account_user_id',
 })
 
+# Keys retired by the calibration-free batching change. Warned about rather
+# than ignored: all five are commented out in env.shared.example, so a value
+# here means someone deliberately set it and is owed an explanation.
+_RETIRED_DISTCP_KEYS = {
+    'migration_distcp_cost_mbps': 'throughput is a fixed constant',
+    'migration_distcp_cost_seconds_per_job': 'per-job cost is a fixed constant',
+    'migration_distcp_cost_seconds_per_path_scan':
+        'per-path-scan cost is a fixed constant',
+    'migration_distcp_batch_target_cost_seconds':
+        'the batch cap derives from execution_timeout',
+    'migration_distcp_max_batches':
+        'the batch cap derives from execution_timeout',
+}
+
 __all__ = [
     "PORTAL_TRIGGER",
     "PORTAL_OWNED_KEYS",
@@ -381,6 +395,13 @@ def get_config() -> dict:
             )
         return value
 
+    for _retired_key, _reason in _RETIRED_DISTCP_KEYS.items():
+        if str(_var(_retired_key, _retired_key.upper(), '') or '').strip():
+            logger.warning(
+                f"[Config] {_retired_key} is set but no longer used — "
+                f"{_reason}. Remove it to silence this."
+            )
+
     dag_owner = _var('migration_dag_owner', 'MIGRATION_DAG_OWNER', '') \
                 or _dag_run_conf.get('dag_owner', '') \
                 or _dag_run_conf.get('spark_user', '') \
@@ -451,27 +472,6 @@ def get_config() -> dict:
             )
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
-        # Batch planning weights — see estimate_distcp_cost. distcp_cost_mbps is
-        # OBSERVED aggregate throughput, not the -bandwidth cap that
-        # migration_distcp_target_aggregate_mbps asks DistCp for.
-        'distcp_cost_mbps': _int_var(
-            'migration_distcp_cost_mbps', 'MIGRATION_DISTCP_COST_MBPS', '150'
-        ),
-        'distcp_cost_seconds_per_job': _int_var(
-            'migration_distcp_cost_seconds_per_job',
-            'MIGRATION_DISTCP_COST_SECONDS_PER_JOB', '45'
-        ),
-        'distcp_cost_seconds_per_path_scan': _int_var(
-            'migration_distcp_cost_seconds_per_path_scan',
-            'MIGRATION_DISTCP_COST_SECONDS_PER_PATH_SCAN', '12'
-        ),
-        'distcp_batch_target_cost_seconds': _int_var(
-            'migration_distcp_batch_target_cost_seconds',
-            'MIGRATION_DISTCP_BATCH_TARGET_COST_SECONDS', '1800'
-        ),
-        'distcp_max_batches': _int_var(
-            'migration_distcp_max_batches', 'MIGRATION_DISTCP_MAX_BATCHES', '60'
-        ),
         'distcp_max_tables_per_batch': _int_var(
             'migration_distcp_max_tables_per_batch',
             'MIGRATION_DISTCP_MAX_TABLES_PER_BATCH', '25'
@@ -866,14 +866,23 @@ def distcp_sizing_mode(config: dict) -> str:
 # =============================================================================
 # DistCp batch planning
 # =============================================================================
-# Second-order weights. Deliberately module constants rather than config keys:
-# exposing them would add rows to the client tuning guide for terms nobody
-# adjusts, and the two that matter (throughput, per-job cost) are exposed.
+# Cost weights. Deliberately module constants rather than config keys: the
+# ratios between them are what the packer consumes, and a 30x error in the
+# assumed throughput costs under 5% makespan (see the design doc's Evidence),
+# so exposing them bought tuning guidance for terms that do not move the plan.
+_COST_MBPS = 150
+_COST_SECONDS_PER_JOB = 45
+_COST_SECONDS_PER_PATH_SCAN = 12
 _COST_BASE_SECONDS = 30
 _COST_SECONDS_PER_FILE = 0.002
 _COST_MKDIR_SECONDS_PER_PATH = 2
 # A batch is allowed a quarter more than its plan before the deadline bites.
 _BUDGET_SLACK = 1.25
+# The largest share of execution_timeout a batch budget may claim, so the soft
+# budget always fires before Airflow's SIGKILL discards the batch's XCom.
+_BATCH_BUDGET_FRACTION = 0.9
+# Batch-count floor per concurrency lane, so a small run still spreads out.
+_BATCHES_PER_LANE = 2
 
 
 def effective_source_metrics(table: dict) -> tuple[int, int]:
@@ -902,9 +911,10 @@ def estimate_distcp_cost(table: dict, config: dict) -> float:
     DistCp job per non-empty partition and scans every partition path twice, so
     for those tables partition count dominates bytes.
 
-    Calibrated for a full first copy. Every copy runs -update, so on a re-run
-    the real cost is dominated by the before/after directory scans and this
-    overestimates — relative ordering survives, which is what the packer needs.
+    Weights are fixed constants, not config: see the design doc. Calibrated for
+    a full first copy. Every copy runs -update, so on a re-run the real cost is
+    dominated by the before/after directory scans and this overestimates —
+    relative ordering survives, which is what the packer needs.
     """
     if table.get('error') or table.get('error_type'):
         return 0.0
@@ -932,26 +942,43 @@ def estimate_distcp_cost(table: dict, config: dict) -> float:
 
     return (
         _COST_BASE_SECONDS
-        + size_bytes / (int(config['distcp_cost_mbps']) * 1024 * 1024)
-        + jobs * int(config['distcp_cost_seconds_per_job'])
-        + paths * int(config['distcp_cost_seconds_per_path_scan']) * 2
+        + size_bytes / (_COST_MBPS * 1024 * 1024)
+        + jobs * _COST_SECONDS_PER_JOB
+        + paths * _COST_SECONDS_PER_PATH_SCAN * 2
         + file_count * _COST_SECONDS_PER_FILE
     )
 
 
-def resolve_batch_cap(total_cost: float, config: dict) -> float:
-    """Per-batch cost ceiling in seconds.
+def _cap_ceiling(backstop_seconds: float) -> float:
+    """Largest per-batch cost whose budget can still fire before the SIGKILL.
 
-    distcp_max_batches is a target that only ever raises the cap. At 500 tables
-    it, not the target, is what limits batch count — a deliberate trade of
-    blast radius for downstream Kyuubi sessions, since every batch costs five
-    @task.pyspark instances.
+    Shared by resolve_batch_cap and distcp_batching_mode so the cap and the
+    label describing which term produced it cannot disagree.
     """
-    target = float(config['distcp_batch_target_cost_seconds'])
-    max_batches = int(config['distcp_max_batches'])
-    if max_batches <= 0:
-        return target
-    return max(target, total_cost / max_batches)
+    return _BATCH_BUDGET_FRACTION * backstop_seconds / _BUDGET_SLACK
+
+
+def resolve_batch_cap(
+    total_cost: float, lanes: int, backstop_seconds: float
+) -> float:
+    """Per-batch cost ceiling in seconds. No knobs, two terms.
+
+    The backstop term is the largest batch whose budget can still fire before
+    Airflow's execution_timeout SIGKILLs the task; a cap above it produces
+    batches that die without writing their FAILED rows, which is what the
+    retired migration_distcp_max_batches actively caused at 500 tables.
+
+    The lane term is a floor on batch count, so a small run spreads across the
+    concurrency available to it instead of collapsing into a single task. It
+    only binds below roughly lanes * _BATCHES_PER_LANE * ceiling of total work.
+
+    backstop_seconds is a parameter, not a constant, because it belongs to the
+    DAG (_DISTCP_EXECUTION_TIMEOUT) and shared.py must not import the DAG.
+    """
+    ceiling = _cap_ceiling(backstop_seconds)
+    if lanes <= 0:
+        return ceiling
+    return min(ceiling, total_cost / (lanes * _BATCHES_PER_LANE))
 
 
 def pack_tables_into_batches(
@@ -989,19 +1016,26 @@ def pack_tables_into_batches(
     return [(b[0], b[1]) for b in bins]
 
 
-def distcp_batching_mode(config: dict) -> str:
-    """Describe the batch plan's inputs, for the task log.
+def distcp_batching_mode(
+    cap_seconds: float, lanes: int, backstop_seconds: float, config: dict
+) -> str:
+    """Describe the derived batch plan, for the task log.
 
-    Same reason distcp_sizing_mode exists: without it a plan of one giant batch
-    reads identically whether the cap bound or the count ceiling did.
+    Naming which term bound the cap is the point: without it a plan of one
+    giant batch reads identically whether the backstop ceiling bound or the
+    lane floor did.
     """
+    ceiling = _cap_ceiling(backstop_seconds)
+    bound_by = (
+        'execution_timeout backstop' if cap_seconds >= ceiling
+        else f'{lanes}-lane floor'
+    )
     return (
-        f"COST-CAPPED — target {config['distcp_batch_target_cost_seconds']}s/batch, "
-        f"at most {config['distcp_max_batches']} batches and "
-        f"{config['distcp_max_tables_per_batch']} tables/batch; weights: "
-        f"{config['distcp_cost_mbps']} MB/s, "
-        f"{config['distcp_cost_seconds_per_job']}s/job, "
-        f"{config['distcp_cost_seconds_per_path_scan']}s/path-scan"
+        f"DERIVED-CAP — cap {cap_seconds:.0f}s/batch (bound by the "
+        f"{bound_by}), at most {config['distcp_max_tables_per_batch']} "
+        f"tables/batch; weights fixed at {_COST_MBPS} MB/s, "
+        f"{_COST_SECONDS_PER_JOB}s/job, {_COST_SECONDS_PER_PATH_SCAN}s/"
+        f"path-scan (not configurable)"
     )
 
 

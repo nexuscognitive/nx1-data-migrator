@@ -2,6 +2,7 @@
 
 import random
 
+import pytest
 from migrator_utils.migrations.shared import (
     distcp_batching_mode,
     effective_source_metrics,
@@ -154,21 +155,78 @@ class TestEstimateDistcpCost:
         cfg = _config()
         assert estimate_distcp_cost(_table(error='boom'), cfg) == 0.0
 
+    def test_retired_weight_keys_in_config_are_ignored(self):
+        """The three weights are constants now. A client who still has them set
+        must get the same estimate as one who does not."""
+        table = _table(source_total_size_bytes=10 * GB, source_file_count=100)
+        baseline = estimate_distcp_cost(table, {'distcp_preserve_delete': True})
+        with_retired = estimate_distcp_cost(table, _config(
+            distcp_cost_mbps=1,
+            distcp_cost_seconds_per_job=9999,
+            distcp_cost_seconds_per_path_scan=9999,
+        ))
+        assert with_retired == baseline
+
+    def test_estimate_needs_only_preserve_delete_from_config(self):
+        """Guards against a weight sneaking back into config: a config holding
+        nothing but the one flag the function legitimately reads must work."""
+        table = _table(source_total_size_bytes=10 * GB, source_file_count=100)
+        # 30 base + 10240 MiB / 150 + 45 job + 24 scan + 100 * 0.002 = 167.47s
+        assert estimate_distcp_cost(
+            table, {'distcp_preserve_delete': True}
+        ) == pytest.approx(167.47, abs=0.01)
+
 
 class TestResolveBatchCap:
 
-    def test_target_wins_when_total_is_small(self):
-        assert resolve_batch_cap(9000.0, _config()) == 1800.0
+    BACKSTOP = 8 * 3600.0
+    # 0.9 * 28800 / 1.25
+    CEILING = 20736.0
 
-    def test_max_batches_raises_the_cap_when_it_binds(self):
-        # 300000 / 60 = 5000 > 1800
-        assert resolve_batch_cap(300000.0, _config()) == 5000.0
+    def test_backstop_ceiling_binds_for_a_large_run(self):
+        """1000h of work must not produce one 1000h batch: the cap is the
+        largest batch whose budget can still fire before the SIGKILL."""
+        assert resolve_batch_cap(1000 * 3600.0, 3, self.BACKSTOP) == self.CEILING
 
-    def test_zero_cost_run_still_returns_the_target(self):
-        assert resolve_batch_cap(0.0, _config()) == 1800.0
+    def test_lane_floor_binds_for_a_small_run(self):
+        """A 600s run over 3 lanes must not collapse into one batch."""
+        assert resolve_batch_cap(600.0, 3, self.BACKSTOP) == 100.0
+
+    def test_cap_is_never_above_the_ceiling(self):
+        for total in (0.0, 1.0, 1e3, 1e6, 1e9):
+            assert resolve_batch_cap(total, 3, self.BACKSTOP) <= self.CEILING
+
+    def test_a_budget_built_on_the_cap_always_fires_before_the_backstop(self):
+        """The property the ceiling exists for."""
+        cap = resolve_batch_cap(1e9, 3, self.BACKSTOP)
+        assert cap * 1.25 <= 0.9 * self.BACKSTOP
+
+    def test_more_lanes_lower_the_cap(self):
+        small = 600.0
+        assert (resolve_batch_cap(small, 6, self.BACKSTOP)
+                < resolve_batch_cap(small, 3, self.BACKSTOP))
+
+    def test_zero_cost_run_gives_a_zero_cap(self):
+        """Every table errored. Documented and desired: the packer then fills
+        bins to max_tables_per_batch, because 0 + 0 <= 0."""
+        assert resolve_batch_cap(0.0, 3, self.BACKSTOP) == 0.0
+
+    def test_nonpositive_lanes_fall_back_to_the_ceiling(self):
+        assert resolve_batch_cap(1e9, 0, self.BACKSTOP) == self.CEILING
 
 
 class TestPackTablesIntoBatches:
+
+    def test_a_zero_cap_fills_bins_to_the_table_limit(self):
+        """Every table errored, so total cost is 0 and the cap is 0. A
+        zero-cost table satisfies bin_cost + 0 <= 0, so bins fill to
+        max_tables_per_batch rather than one table per bin."""
+        cfg = _config()
+        tables = [_table(f't{i}', error='boom') for i in range(60)]
+        bins = pack_tables_into_batches(tables, 0.0, cfg)
+        assert [len(ts) for _, ts in bins] == [25, 25, 10]
+        packed = [t['source_table'] for _, ts in bins for t in ts]
+        assert len(packed) == len(set(packed)) == 60
 
     def test_small_tables_share_one_bin(self):
         cfg = _config()
@@ -247,7 +305,75 @@ class TestPackTablesIntoBatches:
 
 class TestDistcpBatchingMode:
 
-    def test_banner_names_every_weight_and_knob(self):
-        banner = distcp_batching_mode(_config())
-        for fragment in ('1800', '60', '25', '150', '45', '12'):
+    BACKSTOP = 8 * 3600.0
+    CEILING = 20736.0
+
+    def test_banner_names_the_cap_and_the_tables_cap(self):
+        banner = distcp_batching_mode(
+            self.CEILING, 3, self.BACKSTOP, _config())
+        assert '20736' in banner
+        assert '25' in banner
+
+    def test_banner_says_when_the_backstop_bound_the_cap(self):
+        banner = distcp_batching_mode(
+            self.CEILING, 3, self.BACKSTOP, _config())
+        assert 'backstop' in banner
+
+    def test_banner_says_when_the_lane_floor_bound_the_cap(self):
+        """Without this a plan of one giant batch reads identically whether the
+        backstop bound or the lane floor did."""
+        banner = distcp_batching_mode(100.0, 3, self.BACKSTOP, _config())
+        assert 'lane' in banner
+        assert 'backstop' not in banner
+
+    def test_banner_reports_the_fixed_weights_as_fixed(self):
+        banner = distcp_batching_mode(
+            self.CEILING, 3, self.BACKSTOP, _config())
+        for fragment in ('150', '45', '12'):
             assert fragment in banner
+        assert 'not configurable' in banner
+
+
+class TestRetiredKeys:
+
+    RETIRED = (
+        'migration_distcp_cost_mbps',
+        'migration_distcp_cost_seconds_per_job',
+        'migration_distcp_cost_seconds_per_path_scan',
+        'migration_distcp_batch_target_cost_seconds',
+        'migration_distcp_max_batches',
+    )
+
+    def test_get_config_no_longer_emits_them(self):
+        from migrator_utils.migrations.shared import get_config
+        cfg = get_config()
+        for base in self.RETIRED:
+            assert base.removeprefix('migration_') not in cfg
+
+    def test_the_two_survivors_are_still_emitted(self):
+        from migrator_utils.migrations.shared import get_config
+        cfg = get_config()
+        assert cfg['distcp_max_tables_per_batch'] == 25
+        assert cfg['distcp_call_timeout_max_seconds'] == 21600
+
+    def test_a_set_retired_env_var_warns_by_name(self, monkeypatch, caplog):
+        """A client who deliberately set one must be told it is ignored, not
+        silently overridden."""
+        import logging
+
+        from migrator_utils.migrations.shared import get_config
+        monkeypatch.setenv('MIGRATION_DISTCP_COST_MBPS', '600')
+        with caplog.at_level(logging.WARNING):
+            get_config()
+        assert 'migration_distcp_cost_mbps' in caplog.text
+        assert 'no longer used' in caplog.text
+
+    def test_an_unset_retired_key_is_silent(self, monkeypatch, caplog):
+        import logging
+
+        from migrator_utils.migrations.shared import get_config
+        for base in self.RETIRED:
+            monkeypatch.delenv(base.upper(), raising=False)
+        with caplog.at_level(logging.WARNING):
+            get_config()
+        assert 'no longer used' not in caplog.text

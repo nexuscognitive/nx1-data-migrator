@@ -41,6 +41,25 @@ class TestMaprToS3DagIntegrity:
         ):
             assert needle in dag_body, needle
 
+    def test_distcp_status_writer_has_an_explicit_concurrency_cap(self):
+        """t_distcp_status is one Iceberg writer per batch, and retiring
+        migration_distcp_max_batches removed the implicit bound on batch count,
+        so relying on Airflow's 16-slot default is no longer good enough. Source
+        text, not the parsed graph: conftest stubs Airflow (see
+        test_dag1_has_the_batching_and_reconcile_tasks)."""
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        _, _, dag_body = source.partition('with DAG(')
+        # Anchor on each assignment and look just past it: a bare occurrence
+        # count would pass for a hardcoded cap plus two unrelated mentions.
+        for task_var in ('t_distcp', 't_distcp_status'):
+            anchor = f'{task_var}.operator.max_active_tis_per_dagrun'
+            assert anchor in dag_body, anchor
+            window = dag_body[dag_body.index(anchor):][:200]
+            assert 'MIGRATION_DISTCP_COPY_MAX_CONCURRENT' in window, task_var
+
     def test_parse_path_reads_no_variable_except_the_owner(self):
         """Operator attributes are set at parse; a Variable read there costs a
         metadata-DB round trip on every scheduler parse loop."""
