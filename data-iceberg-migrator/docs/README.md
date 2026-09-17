@@ -546,22 +546,63 @@ and the tables in it. Search its log for the table name to find which
 tracking tables, so it still lists every table individually.
 
 **How the split is decided.** Nothing to configure and nothing to measure.
-Discovery already records each table's size, file count and partition list, and
-the planner estimates each table's copy time from those. Batches are filled to a
-cap that comes from the DAG's own 8-hour `execution_timeout`, so a batch is
-never *planned* larger than it can finish and report on. A copy already running
-when the budget expires is not interrupted — only partition-filtered tables
-carry a between-partitions deadline — so a batch holding one much-slower-than-
-estimated copy can still overrun its task timeout. A small run is spread across
-up to twice the number of concurrent copy slots, so it does not collapse into a
-single task.
+Five steps, all finished before the first copy starts.
 
-Cost weights — throughput, per-job and per-directory-scan cost — are fixed in
-code. They were configurable, and the calibration they invited was not worth
-doing: the batch plan is driven by the *ratio* between a table's size and its
-partition count, and that ratio barely moves. Planning as though the cluster ran
-at 150 MB/s when it actually runs at 5 MB/s changes total runtime by under 5% on
-the table-population shapes this was measured against.
+**1. Estimate each table, in seconds.** Discovery already recorded size, file
+count and partition list, so the estimate is:
+
+```
+30s  +  size / 150 MB/s  +  45s per DistCp job  +  24s per partition directory
+     +  0.002s per file
+```
+
+A partition-filtered table with `MIGRATION_DISTCP_PRESERVE_DELETE=true` (the
+default) runs **one DistCp job per partition** and scans each partition
+directory twice, so a 365-partition table costs far more than its size alone
+suggests. A table that failed discovery estimates 0.
+
+**2. Set one size limit for every batch** — the smaller of these two:
+
+- **5.76 hours** — the largest batch whose budget can still fire before the
+  8-hour `execution_timeout` kills the task.
+- **total estimated work / 6** — twice `MIGRATION_DISTCP_COPY_MAX_CONCURRENT`
+  (default 3), so the work spreads across the copy slots available to it.
+
+Below roughly 35 hours of total work the second is smaller and you get about
+six to ten batches. Above that the 5.76-hour limit takes over and holds, for a
+run of any size.
+
+**3. Fill the batches.** Tables are sorted most expensive first, and each one
+goes into the first batch with room left — under the size limit, and under
+`migration_distcp_max_tables_per_batch` (25). A table whose own estimate
+exceeds the limit gets a batch to itself, because one table cannot be split. A
+batch never spans two source databases.
+
+**4. Budget each batch:** `max(its own estimate, the size limit) x 1.25`,
+capped at 7.2 hours. The `max` stops a small batch being starved by its own low
+estimate, the 1.25 is slack for a wrong estimate, and the 7.2-hour cap — nine
+tenths of the task timeout — keeps the budget firing *before* the task is
+killed. That last part matters: a batch killed by the task timeout writes no
+status rows at all, which is why no batch is ever budgeted past it.
+
+**5. Order batches most expensive first,** so the long ones start first and the
+whole run finishes sooner.
+
+So batch count follows from total work — expect roughly one batch per four to
+six hours of estimated work, depending on how evenly the tables pack.
+
+**What this does not cover.** A copy already running when the budget expires is
+not interrupted — only partition-filtered tables carry a between-partitions
+deadline. A batch holding one much-slower-than-estimated unfiltered copy can
+still overrun its task timeout.
+
+The weights above are fixed in code, and deliberately not configurable. What
+drives the plan is the *ratio* between a table's size and its partition count,
+not the absolute numbers, and that ratio barely moves between clusters.
+Planning as though the cluster ran at 150 MB/s when it actually runs at 5 MB/s
+changes total runtime by under 5% on the table-population shapes this was
+measured against — which is why tuning them would not repay the calibration
+runs it would cost.
 
 Each copy still logs `[DistCp] cost estimate Xs vs actual Ys`; it is
 informational only — there is nothing to adjust in response to it.
