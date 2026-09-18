@@ -228,7 +228,9 @@ def _ssh_read_timeout(call_timeout: int) -> int:
     return int(min(SSH_COMMAND_TIMEOUT, bound))
 
 
-def _distcp_shell_prelude(s3_opts: str, deadline_epoch: int) -> str:
+def _distcp_shell_prelude(
+    s3_opts: str, deadline_epoch: int, elapsed_secs: float = 0.0
+) -> str:
     """Shell helpers shared by all three DistCp paths.
 
     A function rather than a constant because calculate_s3_metrics_hadoop
@@ -237,7 +239,16 @@ def _distcp_shell_prelude(s3_opts: str, deadline_epoch: int) -> str:
     run_distcp_with_retry preserves the child's exit code so the caller can tell
     a timeout (124) from a genuine failure, and never retries a timeout: three
     attempts at a multi-hour ceiling would blow the batch budget on its own.
+
+    It also cuts every attempt short at a hard stop _SSH_READ_SLACK_SECONDS before
+    execution_timeout, measured from elapsed_secs into the batch. The soft budget
+    only stops new tables from starting; without the hard stop a copy started
+    late runs into the kill, which discards the batch's XCom and leaves the
+    copy's YARN job writing while the retry starts a second writer.
     """
+    hard_stop_in = int(
+        _DISTCP_EXECUTION_TIMEOUT.total_seconds() - elapsed_secs - _SSH_READ_SLACK_SECONDS
+    )
     return f"""
 calculate_s3_metrics_hadoop() {{
     local location=$1
@@ -263,6 +274,9 @@ fi
 
 DISTCP_DEADLINE_EPOCH={deadline_epoch}
 
+# Set from this node's clock, so skew against the Airflow worker cannot move it.
+DISTCP_HARD_STOP_EPOCH=$(( $(date +%s) + {hard_stop_in} ))
+
 # Reported back in the metrics block: the per-partition script exits 0 whether
 # or not the deadline cut it short, so this counter is Python's only way to
 # tell a complete copy from a partial one.
@@ -280,6 +294,12 @@ run_distcp_with_retry() {{
     local attempt=1
     local rc=0
     while [ $attempt -le $max_attempts ]; do
+        local left=$((DISTCP_HARD_STOP_EPOCH - $(date +%s)))
+        if [ $left -lt $secs ]; then secs=$left; fi
+        if [ $secs -le 0 ]; then
+            echo "  [DistCp] TIMED OUT — no time left before execution_timeout, not starting attempt $attempt"
+            return 124
+        fi
         # Never echo "$@": it carries -Dfs.s3a.secret.key, and this output is
         # logged verbatim by the task. The -log flag records the command.
         echo "  [DistCp] Attempt $attempt/$max_attempts (timeout ${{secs}}s)"
@@ -2072,8 +2092,9 @@ def run_distcp_ssh(
             )
             continue
 
+        elapsed = time.monotonic() - batch_started_at
         if budget_secs:
-            remaining = budget_secs - (time.monotonic() - batch_started_at)
+            remaining = budget_secs - elapsed
             deadline_epoch = int(time.time() + max(0.0, remaining))
         else:
             deadline_epoch = 0
@@ -2280,7 +2301,7 @@ fi
 
                 cmd = f"""set -e
 {client_opts_export}
-{_distcp_shell_prelude(s3_opts, deadline_epoch)}
+{_distcp_shell_prelude(s3_opts, deadline_epoch, elapsed)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 
@@ -2369,7 +2390,7 @@ exit 0
 
                 cmd = f"""set -e
 {client_opts_export}
-{_distcp_shell_prelude(s3_opts, deadline_epoch)}
+{_distcp_shell_prelude(s3_opts, deadline_epoch, elapsed)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 PATHLIST="{temp_dir}/distcp_{tbl}_sources.txt"
@@ -2448,7 +2469,7 @@ exit 0
         else:
             cmd = f"""set -e
 {client_opts_export}
-{_distcp_shell_prelude(s3_opts, deadline_epoch)}
+{_distcp_shell_prelude(s3_opts, deadline_epoch, elapsed)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 

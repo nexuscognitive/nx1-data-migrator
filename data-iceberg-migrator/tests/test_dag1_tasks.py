@@ -3,6 +3,8 @@
 import itertools
 import logging
 import re
+import shutil
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1367,6 +1369,78 @@ class TestDistcpShellHardening:
             self._script(mock_ssh_hook, sample_discovery)
         assert 'cost estimate' in caplog.text
         assert 'vs actual' in caplog.text
+
+    def test_the_hard_stop_is_measured_from_the_batch_start(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        offset = _hard_stop_offset(self._script(mock_ssh_hook, sample_discovery))
+        assert _HARD_STOP - 60 < offset <= _HARD_STOP
+        # Past the longest timeout any copy can have, so an early copy is never cut short.
+        assert offset > int(m.get_config()['distcp_call_timeout_max_seconds'])
+
+    def test_a_table_started_late_gets_only_what_is_left_of_the_window(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        seven_hours = 7 * 3600
+        starts = iter([0.0])  # batch_started_at, then every later reading is 7h on
+        clock = SimpleNamespace(time=m.time.time,
+                                monotonic=lambda: next(starts, seven_hours))
+        with patch.object(m, 'time', clock):
+            script = self._script(mock_ssh_hook, sample_discovery)
+        assert _hard_stop_offset(script) == int(_HARD_STOP - seven_hours)
+
+
+_HAS_SHELL = bool(shutil.which('bash') and shutil.which('timeout'))
+# Every copy attempt must have ended by here: execution_timeout less the
+# allowance for the post-copy scans and reporting.
+_HARD_STOP = m._DISTCP_EXECUTION_TIMEOUT.total_seconds() - m._SSH_READ_SLACK_SECONDS
+
+
+def _hard_stop_offset(script):
+    return int(re.search(
+        r'DISTCP_HARD_STOP_EPOCH=\$\(\( \$\(date \+%s\) \+ (-?\d+) \)\)', script
+    )[1])
+
+
+def _run_retry_helper(elapsed_secs, command, delay=None):
+    """Run the rendered run_distcp_with_retry against a stand-in for hadoop distcp."""
+    prelude = m._distcp_shell_prelude('', 0, elapsed_secs=elapsed_secs)
+    if delay is not None:
+        prelude = prelude.replace('local delay=30', f'local delay={delay}')
+    proc = subprocess.run(
+        ['bash', '-c', f'set -e\n{prelude}\nrun_distcp_with_retry 30 {command}'],
+        capture_output=True, text=True, timeout=30,
+    )
+    return proc.returncode, proc.stdout
+
+
+@pytest.mark.skipif(not _HAS_SHELL, reason='needs bash and coreutils timeout')
+class TestHardStopBeforeExecutionTimeout:
+    """A copy started late in a batch must end before execution_timeout, whose
+    kill discards the batch's XCom and leaves the copy's YARN job writing while
+    the retry starts a second one under -update -delete."""
+
+    def test_an_attempt_is_cut_off_at_the_hard_stop(self):
+        rc, out = _run_retry_helper(_HARD_STOP - 2, 'sleep 20')
+        assert rc == 124, out
+
+    def test_no_attempt_starts_once_the_hard_stop_has_passed(self, tmp_path):
+        marker = tmp_path / 'ran'
+        rc, out = _run_retry_helper(_HARD_STOP + 5, f'touch {marker}')
+        assert rc == 124
+        assert not marker.exists()
+        assert 'not starting' in out
+
+    def test_a_retry_gets_only_what_is_left_before_the_hard_stop(self):
+        # A genuine failure, not a timeout, so it would normally be retried twice.
+        rc, out = _run_retry_helper(_HARD_STOP - 3, "sh -c 'sleep 2; exit 1'", delay=0)
+        assert rc == 124, out
+        assert 'Attempt 3/' not in out
+
+    def test_a_copy_started_early_keeps_its_full_timeout(self):
+        rc, out = _run_retry_helper(0, 'true')
+        assert rc == 0
+        assert 'Attempt 1/3 (timeout 30s)' in out
 
 
 class TestDistcpBatchResolution:

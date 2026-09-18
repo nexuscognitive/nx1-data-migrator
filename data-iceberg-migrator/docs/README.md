@@ -591,10 +591,14 @@ whole run finishes sooner.
 So batch count follows from total work — expect roughly one batch per four to
 six hours of estimated work, depending on how evenly the tables pack.
 
-**What this does not cover.** A copy already running when the budget expires is
-not interrupted — only partition-filtered tables carry a between-partitions
-deadline. A batch holding one much-slower-than-estimated unfiltered copy can
-still overrun its task timeout.
+**A copy that starts late.** The budget only stops new tables from starting; a
+copy already running when it runs out keeps going. So every copy attempt,
+retries included, is also cut off half an hour before the eight-hour task
+timeout, whatever its own timeout says, leaving that half hour for the checks
+that run after a copy. A copy cut off this way is recorded as timed out, its
+YARN job is killed, and the automatic retry resumes it with `-update`. Without
+this, the task timeout would kill the whole batch, lose its status rows, and
+leave the copy's YARN job writing while the retry started a second one.
 
 The weights above are fixed in code, and deliberately not configurable. What
 drives the plan is the *ratio* between a table's size and its partition count,
@@ -643,9 +647,8 @@ over. If a table still fails after all three attempts, it needs more time than
 one task can be given — split it at the source, or have the eight-hour task
 timeout raised in the DAG source — unlike the settings above, it is a constant
 in code rather than a configurable value. `not processed by any batch` means no
-copy task ever reported on
-the table — usually its batch was killed by that task timeout — so re-run the
-DAG for that database.
+copy task ever reported on the table — its batch was killed before it could
+report — so re-run the DAG for that database.
 
 **Before deploying this version.** Let in-flight `source_to_s3_migration` runs
 finish, or clear them. A run whose discovery completed under the previous
