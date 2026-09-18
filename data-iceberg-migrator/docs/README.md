@@ -81,6 +81,10 @@ First match wins:
 | `migration_distcp_client_java_opts` | _(empty)_        | When set, exported as `HADOOP_CLIENT_OPTS` for the DistCp client JVM; empty emits nothing                                                                                                                        | `source_to_s3_migration`, `folder_only_data_copy` |
 | `migration_distcp_extra_hadoop_opts` | _(empty)_        | Extra DistCp flags appended verbatim and unescaped — must already be `-D`-formatted and must be trusted input                                                                                                    | `source_to_s3_migration`, `folder_only_data_copy` |
 | `migration_distcp_preserve_delete` | `true`           | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes))                                                                                  | `source_to_s3_migration`                          |
+| `migration_distcp_max_tables_per_batch` | `25`        | Hard cap on tables per batch                                                                                                                                                                                      | `source_to_s3_migration`                          |
+| `migration_distcp_call_timeout_max_seconds` | `21600` | Ceiling on one DistCp call's timeout, in seconds                                                                                                                                                                 | `source_to_s3_migration`                          |
+| `MIGRATION_DISTCP_COPY_MAX_CONCURRENT` | `3`         | Concurrent DistCp copies per DAG run. **Env-only** — read at DAG parse time, so it must be set in `env.shared` and redeployed with `deploy.py`; there is no equivalent Airflow Variable                          | `source_to_s3_migration`                          |
+| `MIGRATION_VALIDATION_MAX_CONCURRENT` | `3`          | Concurrent destination-validation tasks per DAG run. **Env-only**, same reason as above                                                                                                                          | `source_to_s3_migration`                          |
 | `migration_include_db_in_path`     | `true`           | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted)                                                                  | `source_to_s3_migration`                          |
 | `s3_listing_tool`                  | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`                                                                                                                                                                         | Currently unused                                  |
 | `migration_smtp_conn_id`           | `smtp_default`   | Airflow SMTP connection ID for email reports                                                                                                                                                                     | All DAGs                                          |
@@ -519,11 +523,137 @@ Orchestrates the complete migration of Hive tables from a source cluster (MapR-F
 
 - **SSH Operations** - All source (MapR/HDP) cluster interactions via SSH to edge node
 - **Beeline Discovery** - Automated metadata extraction using HiveServer2
-- **Hadoop DistCp** - Efficient bulk data transfer with 24-hour timeout
+- **Hadoop DistCp** - Efficient bulk data transfer; each copy gets its own timeout, sized from its cost estimate (see [batching](#how-the-s3-copy-is-split-into-batches))
 - **Incremental Support** - Automatic detection and `update` flag usage
 - **Partition Support** - Automatic partition discovery and repair
 - **Format Preservation** - Supports Parquet, ORC, and Avro
 - **Comprehensive Validation** - Row counts, partition counts, schema comparison
+
+---
+
+### How the S3 copy is split into batches
+
+The copy stage used to run one Airflow task per database, copying that
+database's tables one after another. A single stuck copy could freeze every
+other table in the same database for up to 24 hours, and an Airflow retry
+re-ran all of them. The copy stage now runs one task per *batch* of tables, so
+a stuck copy fails its own batch and the others keep going.
+
+**Finding your table.** The `flatten_and_batch` task logs the whole plan before
+any copying starts — one line per batch with its index, its estimated duration
+and the tables in it. Search its log for the table name to find which
+`run_distcp_ssh` map index to open. The HTML report is unchanged: it reads the
+tracking tables, so it still lists every table individually.
+
+**How the split is decided.** Nothing to configure and nothing to measure.
+Five steps, all finished before the first copy starts.
+
+**1. Estimate each table, in seconds.** Discovery already recorded size, file
+count and partition list, so the estimate is:
+
+```
+30s  +  size / 150 MB/s  +  45s per DistCp job  +  24s per partition directory
+     +  0.002s per file
+```
+
+A partition-filtered table with `MIGRATION_DISTCP_PRESERVE_DELETE=true` (the
+default) runs **one DistCp job per partition** and scans each partition
+directory twice, so a 365-partition table costs far more than its size alone
+suggests. A table that failed discovery estimates 0.
+
+**2. Set one size limit for every batch** — the smaller of these two:
+
+- **5.76 hours** — the largest batch whose budget can still fire before the
+  8-hour `execution_timeout` kills the task.
+- **total estimated work / 6** — twice `MIGRATION_DISTCP_COPY_MAX_CONCURRENT`
+  (default 3), so the work spreads across the copy slots available to it.
+
+Below roughly 35 hours of total work the second is smaller and you get about
+six to ten batches. Above that the 5.76-hour limit takes over and holds, for a
+run of any size.
+
+**3. Fill the batches.** Tables are sorted most expensive first, and each one
+goes into the first batch with room left — under the size limit, and under
+`migration_distcp_max_tables_per_batch` (25). A table whose own estimate
+exceeds the limit gets a batch to itself, because one table cannot be split. A
+batch never spans two source databases.
+
+**4. Budget each batch:** `max(its own estimate, the size limit) x 1.25`,
+capped at 7.2 hours. The `max` stops a small batch being starved by its own low
+estimate, the 1.25 is slack for a wrong estimate, and the 7.2-hour cap — nine
+tenths of the task timeout — keeps the budget firing *before* the task is
+killed. That last part matters: a batch killed by the task timeout writes no
+status rows at all, which is why no batch is ever budgeted past it.
+
+**5. Order batches most expensive first,** so the long ones start first and the
+whole run finishes sooner.
+
+So batch count follows from total work — expect roughly one batch per four to
+six hours of estimated work, depending on how evenly the tables pack.
+
+**A copy that starts late.** The budget only stops new tables from starting; a
+copy already running when it runs out keeps going. So every copy attempt,
+retries included, is also cut off half an hour before the eight-hour task
+timeout, whatever its own timeout says, leaving that half hour for the checks
+that run after a copy. A copy cut off this way is recorded as timed out, its
+YARN job is killed, and the automatic retry resumes it with `-update`. Without
+this, the task timeout would kill the whole batch, lose its status rows, and
+leave the copy's YARN job writing while the retry started a second one.
+
+The weights above are fixed in code, and deliberately not configurable. What
+drives the plan is the *ratio* between a table's size and its partition count,
+not the absolute numbers, and that ratio barely moves between clusters.
+Planning as though the cluster ran at 150 MB/s when it actually runs at 5 MB/s
+changes total runtime by under 5% on the table-population shapes this was
+measured against — which is why tuning them would not repay the calibration
+runs it would cost.
+
+Each copy still logs `[DistCp] cost estimate Xs vs actual Ys`; it is
+informational only — there is nothing to adjust in response to it.
+
+**One caveat.** Estimates assume a full first copy. Re-runs use DistCp's
+incremental mode, where most of the time goes on directory scans rather than
+transfer, so estimates come out high and batches correspondingly small. This is
+safe, just conservative.
+
+**A table larger than one attempt.** Two limits matter, and they are not the
+same number. Any single copy call is abandoned after six hours
+(`migration_distcp_call_timeout_max_seconds`), so a table needing longer than
+that will always take more than one attempt. The batching log only warns about
+it once the estimate passes 7.2 hours — nine tenths of the eight-hour task
+timeout, which is the most any batch can be budgeted. Between those two figures
+a table retries silently: expect it to succeed on a later attempt rather than to
+be announced in advance. Either way it is not stuck, because every copy runs
+`-update` and each attempt resumes where the last stopped. Past roughly three
+attempts' worth of work, split the table at the source. Raising that ceiling
+past 28200 seconds requires raising `SSH_COMMAND_TIMEOUT` with it, or an
+abandoned copy can leave an orphaned YARN job writing to the destination.
+
+**Concurrency.** `MIGRATION_DISTCP_COPY_MAX_CONCURRENT` (default 3) caps
+concurrent copies per DAG run. It is read from `env.shared` at parse time, so
+changing it means redeploying with `deploy.py`, not editing an Airflow
+Variable. With `max_active_runs=5`, up to five runs can each use that many
+slots, so the true ceiling is five times the value — but Airflow's default of
+16 task slots per DAG binds first: at 3 × 5 = 15 the copies leave almost
+nothing for the rest of the pipeline.
+
+**Three errors you may see in the report.** `batch budget exhausted before this
+table started` means the batch ran out of time before reaching this table at
+all — nothing was copied. `batch budget exhausted while copying this table`
+means the copy had started; how much landed is in the row's own byte and file
+counts. Both are followed by an automatic retry, and because every copy runs
+`-update`, each attempt resumes where the last stopped rather than starting
+over. If a table still fails after all three attempts, it needs more time than
+one task can be given — split it at the source, or have the eight-hour task
+timeout raised in the DAG source — unlike the settings above, it is a constant
+in code rather than a configurable value. `not processed by any batch` means no
+copy task ever reported on the table — its batch was killed before it could
+report — so re-run the DAG for that database.
+
+**Before deploying this version.** Let in-flight `source_to_s3_migration` runs
+finish, or clear them. A run whose discovery completed under the previous
+version carries no batch index, so the new batching task raises by design
+rather than risk copying the wrong tables.
 
 ---
 

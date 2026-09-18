@@ -34,3 +34,40 @@ def mock_ssh_stdout(exit_code=0, output=b''):
     s.channel.recv_exit_status.return_value = exit_code
     s.read.return_value = output
     return s
+
+
+def distcp_call(discovery, table_names=None, budget=0.0, cluster_setup=None,
+                pulled=None, **overrides):
+    """Build kwargs for run_distcp_ssh.function.__wrapped__ from a discovery dict.
+
+    The task now receives a descriptor and pulls its group's discovery from
+    XCom, so every test needs a `ti` whose xcom_pull returns that group. Pass
+    `pulled` to make the pull return something other than `discovery` — that is
+    how the identity-assertion tests inject a mismatched group.
+    """
+    tables = discovery.get('tables', [])
+    if table_names is not None:
+        tables = [t for t in tables if t.get('source_table') in table_names]
+
+    descriptor = {
+        'group_map_index': discovery.get('_map_index', 0),
+        'table_keys': [
+            [t['source_table'], t.get('partition_filter') or ''] for t in tables
+        ],
+        'batch_index': 0,
+        'batch_cost_secs': 0.0,
+        'batch_budget_secs': budget,
+        'run_id': discovery.get('run_id'),
+        'source_database': discovery.get('source_database'),
+    }
+    descriptor.update(overrides)
+
+    ti = MagicMock()
+    ti.xcom_pull.return_value = discovery if pulled is None else pulled
+
+    return {
+        'batch': descriptor,
+        'cluster_setup': cluster_setup or {'temp_dir': '/tmp/test', 'run_id': 'r'},
+        'source_task_id': 'record_discovered_tables',
+        'ti': ti,
+    }

@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from datetime import datetime, timedelta
 from html import escape as html_escape  # aliased: generate_html_report binds a local `html`
 from pathlib import Path
@@ -33,17 +34,24 @@ from migrator_utils.migrations.partition_utils import (
     partitions_to_where_clause as _partitions_to_where_clause,
 )
 from migrator_utils.migrations.shared import (
+    _BATCH_BUDGET_FRACTION,
+    _BUDGET_SLACK,
     SSH_COMMAND_TIMEOUT,
     _hive_scratch_dir,
     _login_shell,
     build_s3_opts,
     cluster_login,
+    distcp_batching_mode,
     distcp_jvm_opts,
     distcp_sizing_mode,
+    effective_source_metrics,
+    estimate_distcp_cost,
     execute_with_iceberg_retry,
     get_config,
     hive_type_to_spark_ddl,
     normalize_s3,
+    pack_tables_into_batches,
+    resolve_batch_cap,
     size_distcp_job,
     track_duration,
     validate_bucket_endpoint_pairs,
@@ -88,6 +96,14 @@ _SKIPPABLE_STATUS_SQL_IN = ", ".join(f"'{s}'" for s in SKIPPABLE_DISCOVERY_ERROR
 _PRESERVE_SKIPPABLE_STATUS_SQL = (
     f"WHEN overall_status IN ({_SKIPPABLE_STATUS_SQL_IN}) THEN overall_status"
 )
+
+# Last-resort guard on one batch. The soft deadline inside run_distcp_ssh is the
+# real stuck-detector; this only catches a stall in paramiko's stdout.read(),
+# which sits below the shell where neither the deadline nor `timeout` can reach.
+# A constant, not config, because operator attributes are set at DAG parse and
+# test_dag_integrity forbids new parse-time Variable reads. flatten_and_batch
+# warns when a computed budget outgrows it.
+_DISTCP_EXECUTION_TIMEOUT = timedelta(hours=8)
 
 
 def _classify_discovery_error(error: str, source_path_exists: bool | None) -> str:
@@ -136,6 +152,229 @@ def _resolve_dag_owner() -> str:
     except Exception:
         pass
     return 'data-migration'
+
+
+def _env_int(env_var: str, default: int) -> int:
+    """Read a parse-time integer from the environment only.
+
+    Deliberately not get_config(): these values are needed while the DAG file is
+    parsed, and test_dag_integrity asserts the parse path reads no Airflow
+    Variable except migration_dag_owner — each read is a metadata-DB round trip
+    on every parse loop. load_dotenv has already run at import (:64-65), so a
+    value in the deployed env.shared is visible here.
+
+    Never raises: a bad value must not drop the DAG from Airflow.
+    """
+    raw = str(os.getenv(env_var) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(f"{env_var}={raw!r} is not an integer — using {default}")
+        return default
+    if value <= 0:
+        logger.warning(f"{env_var}={value} is not positive — using {default}")
+        return default
+    return value
+
+
+# A stuck copy should die in minutes; a healthy 5 TB copy needs hours. A flat
+# timeout cannot serve both, so each call gets a multiple of its own estimate.
+_CALL_TIMEOUT_MULTIPLIER = 3
+_CALL_TIMEOUT_FLOOR_SECONDS = 1800
+
+# Attempts run_distcp_with_retry makes, so the SSH read window can be sized
+# from the same number the generated shell uses.
+_DISTCP_RETRY_ATTEMPTS = 3
+
+# Margin on top of the shell's own bound for the parts of the script no
+# `timeout` wraps — the before/after metrics scans and the retry sleeps.
+_SSH_READ_SLACK_SECONDS = 1800
+
+# Error text for a table the batch soft-deadline stopped before it started.
+_BUDGET_EXHAUSTED_ERROR = "batch budget exhausted before this table started"
+# Distinct string: the in-shell deadline can also stop a table that already
+# started. Deliberately does not claim bytes moved — if the budget ran out
+# during the pre-copy metrics scan, every partition is skipped and nothing was
+# copied. The row's own byte counts carry that detail.
+_BUDGET_PARTIAL_ERROR = "batch budget exhausted while copying this table"
+
+
+def _call_timeout_seconds(estimate_secs: float, config: dict) -> int:
+    """Seconds to allow one `hadoop distcp` invocation."""
+    ceiling = int(config["distcp_call_timeout_max_seconds"])
+    scaled = estimate_secs * _CALL_TIMEOUT_MULTIPLIER
+    return int(max(_CALL_TIMEOUT_FLOOR_SECONDS, min(scaled, ceiling)))
+
+
+def _ssh_read_timeout(call_timeout: int) -> int:
+    """Paramiko read window for one table's generated script.
+
+    Local override for the blanket 24h SSH_COMMAND_TIMEOUT: a stall in the
+    unwrapped metrics scans would otherwise be caught only by the batch's 8h
+    execution_timeout, which discards the XCom and drags every sibling table
+    into reconcile as FAILED. Bounded per table, the stall fails that table and
+    the siblings still report.
+
+    Sized so the shell's own `timeout` always fires first. This matters: the
+    read window is paramiko's per-recv timeout and both output-capturing
+    branches hide the copy inside a command substitution, so a healthy copy is
+    silent for up to _DISTCP_RETRY_ATTEMPTS x call_timeout. Giving up earlier
+    would abandon a live DistCp whose YARN id was never read, leaving nothing to
+    kill before the retry starts a second writer under the same prefix.
+    """
+    bound = call_timeout * _DISTCP_RETRY_ATTEMPTS + _SSH_READ_SLACK_SECONDS
+    return int(min(SSH_COMMAND_TIMEOUT, bound))
+
+
+def _distcp_shell_prelude(
+    s3_opts: str, deadline_epoch: int, elapsed_secs: float = 0.0
+) -> str:
+    """Shell helpers shared by all three DistCp paths.
+
+    A function rather than a constant because calculate_s3_metrics_hadoop
+    interpolates the per-bucket s3_opts.
+
+    run_distcp_with_retry preserves the child's exit code so the caller can tell
+    a timeout (124) from a genuine failure, and never retries a timeout: three
+    attempts at a multi-hour ceiling would blow the batch budget on its own.
+
+    It also cuts every attempt short at a hard stop _SSH_READ_SLACK_SECONDS before
+    execution_timeout, measured from elapsed_secs into the batch. The soft budget
+    only stops new tables from starting; without the hard stop a copy started
+    late runs into the kill, which discards the batch's XCom and leaves the
+    copy's YARN job writing while the retry starts a second writer.
+    """
+    hard_stop_in = int(
+        _DISTCP_EXECUTION_TIMEOUT.total_seconds() - elapsed_secs - _SSH_READ_SLACK_SECONDS
+    )
+    return f"""
+calculate_s3_metrics_hadoop() {{
+    local location=$1
+    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
+        echo "S3_FILE_COUNT=0"
+        echo "S3_TOTAL_SIZE=0"
+        return
+    fi
+    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
+    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
+    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
+    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
+    echo "S3_FILE_COUNT=$FILE_COUNT"
+    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
+}}
+
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_PREFIX="timeout -k 60s"
+else
+    echo "  [DistCp] WARNING: coreutils timeout not found — copies run unbounded"
+    TIMEOUT_PREFIX=""
+fi
+
+DISTCP_DEADLINE_EPOCH={deadline_epoch}
+
+# Set from this node's clock, so skew against the Airflow worker cannot move it.
+DISTCP_HARD_STOP_EPOCH=$(( $(date +%s) + {hard_stop_in} ))
+
+# Reported back in the metrics block: the per-partition script exits 0 whether
+# or not the deadline cut it short, so this counter is Python's only way to
+# tell a complete copy from a partial one.
+DEADLINE_SKIPPED=0
+
+deadline_ok() {{
+    [ "$DISTCP_DEADLINE_EPOCH" -eq 0 ] && return 0
+    [ "$(date +%s)" -lt "$DISTCP_DEADLINE_EPOCH" ]
+}}
+
+run_distcp_with_retry() {{
+    local secs=$1; shift
+    local max_attempts={_DISTCP_RETRY_ATTEMPTS}
+    local delay=30
+    local attempt=1
+    local rc=0
+    while [ $attempt -le $max_attempts ]; do
+        local left=$((DISTCP_HARD_STOP_EPOCH - $(date +%s)))
+        if [ $left -lt $secs ]; then secs=$left; fi
+        if [ $secs -le 0 ]; then
+            echo "  [DistCp] TIMED OUT — no time left before execution_timeout, not starting attempt $attempt"
+            return 124
+        fi
+        # Never echo "$@": it carries -Dfs.s3a.secret.key, and this output is
+        # logged verbatim by the task. The -log flag records the command.
+        echo "  [DistCp] Attempt $attempt/$max_attempts (timeout ${{secs}}s)"
+        if [ -n "$TIMEOUT_PREFIX" ]; then
+            $TIMEOUT_PREFIX "${{secs}}" "$@" && rc=0 || rc=$?
+        else
+            "$@" && rc=0 || rc=$?
+        fi
+        [ $rc -eq 0 ] && return 0
+        if [ $rc -eq 124 ]; then
+            echo "  [DistCp] TIMED OUT after ${{secs}}s — not retrying"
+            return 124
+        fi
+        echo "  [DistCp] Attempt $attempt/$max_attempts failed (rc=$rc)"
+        attempt=$((attempt + 1))
+        if [ $attempt -le $max_attempts ]; then
+            echo "  [DistCp] Retrying in ${{delay}}s..."
+            sleep $delay
+        fi
+    done
+    echo "  [DistCp] All $max_attempts attempts failed (rc=$rc)"
+    return $rc
+}}
+"""
+
+
+def _kill_yarn_apps(ssh, app_ids: list[str], config: dict, label: str) -> None:
+    """Kill DistCp YARN applications left behind by a timed-out client.
+
+    `timeout` kills the `hadoop` wrapper, not the MapReduce job it submitted, so
+    without this a timed-out copy keeps writing to the destination while the
+    Airflow retry starts a second writer under the same prefix — and the plain
+    path runs -update -delete.
+    """
+    if not app_ids:
+        logger.warning(
+            f"[DistCp] {label} timed out with no YARN application id to kill"
+        )
+        return
+    cmd = " ; ".join(f"yarn application -kill {a}" for a in app_ids)
+    try:
+        with ssh.get_conn() as client:
+            _, stdout, stderr = client.exec_command(
+                _login_shell(cmd, config.get("cluster_type", "MapR")), timeout=300
+            )
+            kill_output = stdout.read().decode(errors="replace")
+            kill_error = stderr.read().decode(errors="replace")
+            exit_code = stdout.channel.recv_exit_status()
+    except Exception as e:
+        logger.error(
+            f"[DistCp] {label} timed out and killing YARN app(s) {app_ids} failed: {e}"
+        )
+        return
+
+    if exit_code == 0:
+        logger.warning(f"[DistCp] {label} timed out — killed YARN app(s): {app_ids}")
+        return
+
+    # Every scraped id is passed, including apps that ended on their own, and
+    # `;` chaining reports only the last kill's status — so a non-zero code is
+    # not by itself proof that a live application survived.
+    combined = f"{kill_output}\n{kill_error}".strip()
+    if "already finished" in combined.lower() or "not found" in combined.lower():
+        logger.warning(
+            f"[DistCp] {label}: YARN reports some of {app_ids} already finished "
+            f"(exit {exit_code}) — nothing live left to kill"
+        )
+    else:
+        logger.error(
+            f"[DistCp] {label}: 'yarn application -kill' exited {exit_code} for "
+            f"{app_ids} — an orphaned DistCp may still be writing to the "
+            f"destination while the Airflow retry starts a second writer under "
+            f"the same prefix. Check YARN and kill it by hand. {combined[:500]}"
+        )
+
 
 default_args = {
     "owner": _resolve_dag_owner(),
@@ -1406,7 +1645,7 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
 
 
 @task.pyspark(conn_id="spark_default")
-def record_discovered_tables(discovery: dict, spark) -> dict:
+def record_discovered_tables(discovery: dict, spark, **context) -> dict:
     """Record discovered tables in Iceberg tracking table."""
 
     if not isinstance(discovery, dict) or "tables" not in discovery:
@@ -1583,23 +1822,161 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                 task_label=f"record_discovered_tables:{t['source_table']}",
             )
 
-    return discovery
+    # Stamped here because the batch descriptors downstream must address their
+    # group by map index: the reduce sequence they are built from omits map
+    # indexes whose task instance died, so list position is not the index.
+    return {**discovery, "_map_index": context["ti"].map_index}
+
+
+@task
+def flatten_and_batch(discoveries) -> list[dict]:
+    """Re-key the copy stage from one task per group to one task per batch.
+
+    Takes record_discovered_tables' per-group output and returns one lightweight
+    descriptor per batch. Descriptors carry table *identities*, never table
+    metadata: Airflow resolves a mapped argument by deserializing the whole
+    upstream value and then indexing it, so a descriptor holding schemas and
+    partition lists would make all 500+ tables' metadata land in every batch
+    instance.
+
+    Packing runs per group and never mixes source databases, because
+    update_distcp_status and validate_destination_tables both read
+    source_database at group level.
+    """
+    config = get_config()
+
+    groups = []
+    for d in discoveries:
+        if not isinstance(d, dict) or "tables" not in d:
+            logger.warning(
+                f"[Batching] Skipping invalid/failed group discovery: {type(d)}"
+            )
+            continue
+        if d.get("_map_index") is None:
+            raise ValueError(
+                "[Batching] a group discovery has no _map_index, so its batches "
+                "could resolve to the wrong group. Redeploy the DAG so "
+                "record_discovered_tables stamps it."
+            )
+        groups.append(d)
+
+    if not groups:
+        logger.warning("[Batching] no usable group discoveries — no batches planned")
+        return []
+
+    total_cost = sum(
+        estimate_distcp_cost(t, config) for g in groups for t in g["tables"]
+    )
+    backstop = _DISTCP_EXECUTION_TIMEOUT.total_seconds()
+    lanes = _env_int("MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3)
+    cap = resolve_batch_cap(total_cost, lanes, backstop)
+    logger.info(f"[Batching] {distcp_batching_mode(cap, lanes, backstop, config)}")
+    logger.info(
+        f"[Batching] {sum(len(g['tables']) for g in groups)} table(s) in "
+        f"{len(groups)} group(s), estimated {total_cost:.0f}s total, "
+        f"cap {cap:.0f}s per batch"
+    )
+
+    bins = []
+    for g in groups:
+        for bin_cost, bin_tables in pack_tables_into_batches(g["tables"], cap, config):
+            bins.append((bin_cost, g, bin_tables))
+    bins.sort(key=lambda b: b[0], reverse=True)
+
+    descriptors = []
+    for batch_index, (bin_cost, g, bin_tables) in enumerate(bins):
+        # max() gives a single over-cap monster a budget matching its own cost
+        # rather than the cap it already blew through; min() then stops that
+        # budget landing past the point where execution_timeout SIGKILLs the
+        # task, which would discard the XCom before any FAILED row is written.
+        budget = min(
+            max(bin_cost, cap) * _BUDGET_SLACK,
+            _BATCH_BUDGET_FRACTION * backstop,
+        )
+        if bin_cost > budget:
+            logger.warning(
+                f"[Batching] batch {batch_index} estimates {bin_cost:.0f}s but "
+                f"is budgeted {budget:.0f}s, the most that can fire before the "
+                f"{backstop:.0f}s execution_timeout. It will need more than one "
+                f"attempt; -update makes each retry resume where the last "
+                f"stopped. Tables: {[t['source_table'] for t in bin_tables]}"
+            )
+        descriptors.append(
+            {
+                "group_map_index": g["_map_index"],
+                "table_keys": [
+                    [t["source_table"], t.get("partition_filter") or ""]
+                    for t in bin_tables
+                ],
+                "batch_index": batch_index,
+                "batch_cost_secs": bin_cost,
+                "batch_budget_secs": budget,
+                "run_id": g["run_id"],
+                "source_database": g["source_database"],
+            }
+        )
+        logger.info(
+            f"[Batching] batch {batch_index}: {g['source_database']} "
+            f"(group {g['_map_index']}), {len(bin_tables)} table(s), "
+            f"est {bin_cost:.0f}s, budget {budget:.0f}s — "
+            f"{[t['source_table'] for t in bin_tables]}"
+        )
+
+    return descriptors
 
 
 @task
 @track_duration
-def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
-    """Run DistCp via SSH for all tables. Uses -update for incremental."""
+def run_distcp_ssh(
+    batch: dict, cluster_setup: dict, source_task_id: str, **context
+) -> dict:
+    """Run DistCp via SSH for one batch of tables. Uses -update for incremental."""
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config["ssh_conn_id"])
 
-    if not isinstance(discovery, dict) or "tables" not in discovery:
+    if not isinstance(batch, dict) or "table_keys" not in batch:
         logger.warning(
-            f"[run_distcp_ssh] Skipping invalid/failed upstream input: {type(discovery)}"
+            f"[run_distcp_ssh] Skipping invalid/failed upstream input: {type(batch)}"
         )
         return {}
 
-    tables = discovery["tables"]
+    # The batch carries identities, not metadata, so the group's discovery is
+    # read straight from its own XCom row: one row per batch instead of the
+    # whole run's metadata materialized in every batch.
+    group = context["ti"].xcom_pull(
+        task_ids=source_task_id, map_indexes=batch["group_map_index"]
+    )
+    if not isinstance(group, dict) or "tables" not in group:
+        raise ValueError(
+            f"[run_distcp_ssh] batch {batch.get('batch_index')} could not read group "
+            f"discovery at map index {batch['group_map_index']} from {source_task_id}"
+        )
+    if (group.get("run_id"), group.get("source_database")) != (
+        batch.get("run_id"),
+        batch.get("source_database"),
+    ):
+        raise ValueError(
+            f"[run_distcp_ssh] group at map index {batch['group_map_index']} is "
+            f"{group.get('source_database')}/{group.get('run_id')}, expected "
+            f"{batch.get('source_database')}/{batch.get('run_id')} — refusing to copy "
+            f"the wrong tables"
+        )
+
+    wanted = {(str(k[0]), str(k[1] or "")) for k in batch["table_keys"]}
+    tables = [
+        t
+        for t in group["tables"]
+        if (str(t.get("source_table")), str(t.get("partition_filter") or "")) in wanted
+    ]
+    if len(tables) != len(wanted):
+        logger.warning(
+            f"[run_distcp_ssh] batch {batch.get('batch_index')} matched "
+            f"{len(tables)} of {len(wanted)} table key(s) in group "
+            f"{group.get('source_database')} — unmatched tables will be marked "
+            f"unprocessed by reconcile_unprocessed_tables"
+        )
+
+    discovery = {**group, "tables": tables}
     temp_dir = cluster_setup["temp_dir"]
     distcp_log_dir = cluster_setup.get("distcp_log_dir") or temp_dir
     preserve_delete = config.get("distcp_preserve_delete", True)
@@ -1620,6 +1997,12 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
     s3_opts = build_s3_opts(
         discovery["dest_bucket"], config, discovery.get("dest_endpoint", "")
     )
+
+    # Soft budget: stop starting new work rather than being killed mid-table by
+    # execution_timeout, which would discard this batch's XCom and leave every
+    # table it already copied with no tracking row.
+    budget_secs = float(batch.get("batch_budget_secs") or 0)
+    batch_started_at = time.monotonic()
 
     results = []
     for t in tables:
@@ -1664,20 +2047,67 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             )
             continue
 
-        if t.get("partition_filter_active"):
-            effective_file_count = t.get(
-                "filtered_file_count", t.get("source_file_count", 0)
+        if budget_secs and (time.monotonic() - batch_started_at) >= budget_secs:
+            logger.warning(
+                f"[DistCp] budget of {budget_secs:.0f}s exhausted — not starting "
+                f"{t['source_database']}.{t['source_table']}"
             )
-            effective_size = t.get(
-                "filtered_source_size_bytes", t.get("source_total_size_bytes", 0)
+            # FAILED (unlike SKIPPED above) is not in update_distcp_status's
+            # skip-list, so this row is read by direct key indexing there —
+            # it must carry the same full shape as the exception-catch block
+            # below, not just the fields that look relevant at a glance.
+            from datetime import datetime as _dt
+
+            _skip_at = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            results.append(
+                {
+                    "source_database": t["source_database"],
+                    "source_table": t["source_table"],
+                    "dest_database": t["dest_database"],
+                    "status": "FAILED",
+                    "distcp_started_at": _skip_at,
+                    "distcp_completed_at": _skip_at,
+                    "distcp_duration_secs": 0.0,
+                    "is_incremental": False,
+                    "bytes_copied": 0,
+                    "files_copied": 0,
+                    "s3_total_size_bytes_before": 0,
+                    "s3_file_count_before": 0,
+                    "s3_total_size_bytes_after": 0,
+                    "s3_file_count_after": 0,
+                    "s3_bytes_transferred": 0,
+                    "s3_files_transferred": 0,
+                    "partition_filter_active": t.get("partition_filter_active", False),
+                    "partitions_requested": (
+                        len(t.get("filtered_partitions", []))
+                        if t.get("partition_filter_active")
+                        else None
+                    ),
+                    "empty_partitions": [],
+                    "error": _BUDGET_EXHAUSTED_ERROR,
+                    "yarn_application_id": None,
+                    "yarn_application_ids": [],
+                    "partition_filter": t.get("partition_filter"),
+                }
             )
+            continue
+
+        elapsed = time.monotonic() - batch_started_at
+        if budget_secs:
+            remaining = budget_secs - elapsed
+            deadline_epoch = int(time.time() + max(0.0, remaining))
         else:
-            effective_file_count = t.get("source_file_count", 0)
-            effective_size = t.get("source_total_size_bytes", 0)
+            deadline_epoch = 0
+
+        # Shared with estimate_distcp_cost so the plan cannot describe a copy
+        # different from the one this loop runs.
+        effective_size, effective_file_count = effective_source_metrics(t)
 
         mappers, bandwidth = size_distcp_job(
             effective_size, effective_file_count, config
         )
+        table_estimate = estimate_distcp_cost(t, config)
+        call_timeout = _call_timeout_seconds(table_estimate, config)
         logger.info(
             f"[DistCp] Sized {t['source_database']}.{t['source_table']}: "
             f"{mappers} mappers x {bandwidth} MB/s "
@@ -1713,7 +2143,8 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             try:
                 with ssh.get_conn() as client:
                     _, stdout, stderr = client.exec_command(
-                        mkdir_cmds, timeout=SSH_COMMAND_TIMEOUT
+                        mkdir_cmds,
+                        timeout=_ssh_read_timeout(call_timeout),
                     )
                     exit_code = stdout.channel.recv_exit_status()
                 logger.info(f"[DistCp] Created S3 prefix: {t['s3_location']}")
@@ -1840,50 +2271,37 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                         f"x {part_bandwidth} MB/s for {part_size} bytes / "
                         f"{part_files} files"
                     )
+                    # Sized on this partition alone so one stuck partition dies on
+                    # its own scale, not the whole table's.
+                    part_timeout = _call_timeout_seconds(
+                        estimate_distcp_cost(
+                            {
+                                **t,
+                                "partition_filter_active": True,
+                                "filtered_partitions": [part_name],
+                                "filtered_file_count": part_files,
+                                "filtered_source_size_bytes": part_size,
+                                "partition_file_counts": {part_name: part_files},
+                            },
+                            config,
+                        ),
+                        config,
+                    )
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
-run_distcp_with_retry hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {part_mappers} -bandwidth {part_bandwidth} -strategy {strategy} \\
+if deadline_ok; then
+run_distcp_with_retry {part_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {part_mappers} -bandwidth {part_bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
+else
+echo "=== DEADLINE reached — skipping partition {part_name} ==="
+DEADLINE_SKIPPED=$((DEADLINE_SKIPPED + 1))
+fi
 """
 
                 cmd = f"""set -e
 {client_opts_export}
-calculate_s3_metrics_hadoop() {{
-    local location=$1
-    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
-        echo "S3_FILE_COUNT=0"
-        echo "S3_TOTAL_SIZE=0"
-        return
-    fi
-    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
-    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
-    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
-    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
-    echo "S3_FILE_COUNT=$FILE_COUNT"
-    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
-}}
-
-run_distcp_with_retry() {{
-    local max_attempts=3
-    local delay=30
-    local attempt=1
-    while [ $attempt -le $max_attempts ]; do
-        echo "  [DistCp] Attempt $attempt/$max_attempts: $*"
-        if "$@"; then
-            return 0
-        fi
-        echo "  [DistCp] Attempt $attempt/$max_attempts failed"
-        attempt=$((attempt + 1))
-        if [ $attempt -le $max_attempts ]; then
-            echo "  [DistCp] Retrying in ${{delay}}s..."
-            sleep $delay
-        fi
-    done
-    echo "  [DistCp] All $max_attempts attempts failed"
-    return 1
-}}
-
+{_distcp_shell_prelude(s3_opts, deadline_epoch, elapsed)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 
@@ -1937,6 +2355,7 @@ echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
 echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
 echo "S3_FILES_TRANSFERRED=$S3_FILES_TRANSFERRED"
 echo "S3_BYTES_TRANSFERRED=$S3_BYTES_TRANSFERRED"
+echo "DEADLINE_SKIPPED_PARTITIONS=$DEADLINE_SKIPPED"
 echo "===DISTCP_METRICS_END==="
 echo "PARTITIONS_REQUESTED={len(filtered_partitions)}"
 exit 0
@@ -1971,21 +2390,7 @@ exit 0
 
                 cmd = f"""set -e
 {client_opts_export}
-calculate_s3_metrics_hadoop() {{
-    local location=$1
-    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
-        echo "S3_FILE_COUNT=0"
-        echo "S3_TOTAL_SIZE=0"
-        return
-    fi
-    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
-    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
-    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
-    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
-    echo "S3_FILE_COUNT=$FILE_COUNT"
-    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
-}}
-
+{_distcp_shell_prelude(s3_opts, deadline_epoch, elapsed)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 PATHLIST="{temp_dir}/distcp_{tbl}_sources.txt"
@@ -2023,7 +2428,7 @@ echo "=== Creating empty partition directories ==="
 
 echo "=== Running distcp using source path list (delete disabled) ==="
 set +e
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts}{jvm_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
+DISTCP_OUTPUT=$(run_distcp_with_retry {call_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
@@ -2064,24 +2469,7 @@ exit 0
         else:
             cmd = f"""set -e
 {client_opts_export}
-calculate_s3_metrics_hadoop() {{
-    local location=$1
-
-    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
-        echo "S3_FILE_COUNT=0"
-        echo "S3_TOTAL_SIZE=0"
-        return
-    fi
-
-    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
-    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
-    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
-    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
-
-    echo "S3_FILE_COUNT=$FILE_COUNT"
-    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
-}}
-
+{_distcp_shell_prelude(s3_opts, deadline_epoch, elapsed)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 
@@ -2094,7 +2482,7 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 
 echo "=== Running distcp ==="
 set +e
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
+DISTCP_OUTPUT=$(run_distcp_with_retry {call_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
@@ -2139,7 +2527,7 @@ exit 0
             with ssh.get_conn() as client:
                 _, stdout, stderr = client.exec_command(
                     _login_shell(cmd, config.get("cluster_type", "MapR")),
-                    timeout=SSH_COMMAND_TIMEOUT,
+                    timeout=_ssh_read_timeout(call_timeout),
                     get_pty=True,
                 )
                 output = stdout.read().decode()
@@ -2187,6 +2575,7 @@ exit 0
                 s3_files_after = 0
                 s3_bytes_transferred = 0
                 s3_files_transferred = 0
+                deadline_skipped = 0
 
                 m_start = output.find("===DISTCP_METRICS_START===")
                 m_end = output.find("===DISTCP_METRICS_END===")
@@ -2201,6 +2590,7 @@ exit 0
                         "S3_TOTAL_SIZE_AFTER": 0,
                         "S3_FILES_TRANSFERRED": 0,
                         "S3_BYTES_TRANSFERRED": 0,
+                        "DEADLINE_SKIPPED_PARTITIONS": 0,
                     }
                     metrics_block = output[
                         m_start + len("===DISTCP_METRICS_START===") : m_end
@@ -2232,6 +2622,7 @@ exit 0
                     s3_files_after = metrics["S3_FILE_COUNT_AFTER"]
                     s3_bytes_transferred = metrics["S3_BYTES_TRANSFERRED"]
                     s3_files_transferred = metrics["S3_FILES_TRANSFERRED"]
+                    deadline_skipped = metrics["DEADLINE_SKIPPED_PARTITIONS"]
                 else:
                     logger.warning(
                         f"[DistCp] Metrics block not found in output for {src_db}.{tbl} — all metrics will be 0"
@@ -2240,6 +2631,14 @@ exit 0
                 if exit_code != 0:
                     logger.error(f"=== DistCp Error for {src_db}.{tbl} ===")
                     logger.error(error_output[:1000])
+                    if exit_code == 124 or "TIMED OUT" in combined_output:
+                        _kill_yarn_apps(
+                            ssh, yarn_application_ids, config, f"{src_db}.{tbl}"
+                        )
+                        raise Exception(
+                            f"DistCp timed out for {src_db}.{tbl} after "
+                            f"{call_timeout}s (estimate was {table_estimate:.0f}s)"
+                        )
                     raise Exception(
                         f"DistCp failed for {src_db}.{tbl} with exit code {exit_code}\n"
                         f"Error: {error_output[:1000]}"
@@ -2250,15 +2649,31 @@ exit 0
                     _end_dt - _dt.strptime(distcp_started_at, "%Y-%m-%d %H:%M:%S")
                 ).total_seconds()
                 logger.info(
-                    f"[DistCp] COMPLETED: {src_db}.{tbl} | incremental={is_incr} | bytes_copied={bytes_copied} | files_copied={files_copied}"
+                    f"[DistCp] cost estimate {table_estimate:.0f}s vs actual "
+                    f"{distcp_duration_secs:.0f}s for {src_db}.{tbl}"
                 )
+                # The per-partition script exits 0 even when the in-shell
+                # deadline skipped partitions, so exit code alone would record
+                # an incomplete copy as COMPLETED. FAILED is what raises after
+                # the XCom push and earns the batch an Airflow retry, where
+                # -update makes the partitions already copied near-free.
+                if deadline_skipped:
+                    logger.warning(
+                        f"[DistCp] PARTIAL: {src_db}.{tbl} — the batch deadline "
+                        f"skipped {deadline_skipped} partition(s); recording FAILED "
+                        f"so the retry can finish the copy"
+                    )
+                else:
+                    logger.info(
+                        f"[DistCp] COMPLETED: {src_db}.{tbl} | incremental={is_incr} | bytes_copied={bytes_copied} | files_copied={files_copied}"
+                    )
 
                 results.append(
                     {
                         "source_database": src_db,
                         "source_table": tbl,
                         "dest_database": dest_db_for_table,
-                        "status": "COMPLETED",
+                        "status": "FAILED" if deadline_skipped else "COMPLETED",
                         "distcp_started_at": distcp_started_at,
                         "distcp_duration_secs": distcp_duration_secs,
                         "distcp_completed_at": distcp_completed_at,
@@ -2278,7 +2693,7 @@ exit 0
                             else None
                         ),
                         "empty_partitions": empty_partitions,
-                        "error": None,
+                        "error": _BUDGET_PARTIAL_ERROR if deadline_skipped else None,
                         "yarn_application_id": yarn_application_id,
                         "yarn_application_ids": yarn_application_ids,
                         "partition_filter": t.get("partition_filter"),
@@ -2617,7 +3032,16 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
             continue
 
         if dest_db not in created_dbs:
-            spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
+            try:
+                spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
+            except Exception as _dbe:
+                # Batches from one source database now run concurrently, and
+                # IF NOT EXISTS is not atomic in every metastore.
+                if "already exists" not in str(_dbe).lower():
+                    raise
+                logger.info(
+                    f"[HiveTable] {dest_db} was created concurrently by another batch"
+                )
             created_dbs.add(dest_db)
 
         table_partition_filter = t.get("partition_filter")
@@ -3677,6 +4101,56 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 
 
 @task.pyspark(conn_id="spark_default")
+def reconcile_unprocessed_tables(run_id: str, spark) -> dict:
+    """Mark tables that no batch ever reported on.
+
+    Fan-out lets a batch vanish without reporting: killed by execution_timeout
+    before its XCom push, or its group's discovery XCom lost. The per-element
+    catch-all in update_distcp_status cannot cover those tables because it is
+    scoped to its own element's table list, so without this they would stay NULL
+    and invisible for the whole run.
+    """
+    config = get_config()
+    tracking_db = config["tracking_database"]
+
+    unprocessed = spark.sql(f"""
+        SELECT COUNT(*) AS cnt
+        FROM {tracking_db}.migration_table_status
+        WHERE run_id = '{run_id}'
+          AND discovery_status = 'COMPLETED'
+          AND distcp_status IS NULL
+    """).collect()[0]["cnt"]
+
+    if unprocessed == 0:
+        logger.info("[reconcile] every discovered table has a copy status")
+        return {"run_id": run_id, "unprocessed": 0}
+
+    logger.warning(
+        f"[reconcile] {unprocessed} table(s) were never processed by any batch "
+        f"— marking FAILED"
+    )
+    execute_with_iceberg_retry(
+        spark,
+        f"""
+        UPDATE {tracking_db}.migration_table_status
+        SET distcp_status = 'FAILED',
+            overall_status = CASE
+                WHEN overall_status = 'EMPTY_SOURCE' THEN 'EMPTY_SOURCE'
+                {_PRESERVE_SKIPPABLE_STATUS_SQL}
+                ELSE 'FAILED'
+            END,
+            error_message = COALESCE(error_message, 'not processed by any batch'),
+            updated_at = current_timestamp()
+        WHERE run_id = '{run_id}'
+          AND discovery_status = 'COMPLETED'
+          AND distcp_status IS NULL
+    """,
+        task_label="reconcile_unprocessed_tables",
+    )
+    return {"run_id": run_id, "unprocessed": unprocessed}
+
+
+@task.pyspark(conn_id="spark_default")
 def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **context) -> str:
     """Generate comprehensive HTML migration report."""
     from datetime import datetime
@@ -4715,12 +5189,27 @@ with DAG(
     t_discover = discover_tables_via_spark_ssh.expand(db_config=t_excel)
     t_record = record_discovered_tables.expand(discovery=t_discover)
     t_record.operator.trigger_rule = "all_done"
-    t_distcp = run_distcp_ssh.partial(cluster_setup=t_cluster).expand(
-        discovery=t_record
-    )
+    t_batches = flatten_and_batch(discoveries=t_record)
+    t_batches.operator.trigger_rule = "all_done"
+    t_distcp = run_distcp_ssh.partial(
+        cluster_setup=t_cluster, source_task_id="record_discovered_tables"
+    ).expand(batch=t_batches)
     t_distcp.operator.trigger_rule = "all_done"
+    # The edge node and YARN queue are shared, and no Pool is available without
+    # an infra change, so this caps per run only: total concurrent copies is
+    # this times max_active_runs (5).
+    t_distcp.operator.max_active_tis_per_dagrun = _env_int(
+        "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    )
+    t_distcp.operator.execution_timeout = _DISTCP_EXECUTION_TIMEOUT
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
     t_distcp_status.operator.trigger_rule = "all_done"
+    # One Iceberg writer per batch, and the batch count is no longer bounded by
+    # a config ceiling. Reuses the copy lane count: a status write is far
+    # cheaper than a copy and never needs more lanes than the stage feeding it.
+    t_distcp_status.operator.max_active_tis_per_dagrun = _env_int(
+        "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    )
     t_tables = create_hive_tables.expand(distcp_result=t_distcp_status)
     t_tables.operator.trigger_rule = "all_done"
     t_tbl_status = update_table_create_status.expand(table_result=t_tables)
@@ -4730,10 +5219,15 @@ with DAG(
     t_dest_validation = validate_destination_tables.expand(
         source_validation=t_tbl_status
     )
-    t_dest_validation.operator.max_active_tis_per_dagrun = 3
+    t_dest_validation.operator.max_active_tis_per_dagrun = _env_int(
+        "MIGRATION_VALIDATION_MAX_CONCURRENT", 3
+    )
     t_dest_validation.operator.trigger_rule = "all_done"
     t_val_status = update_validation_status.expand(validation_result=t_dest_validation)
     t_val_status.operator.trigger_rule = "all_done"
+
+    t_reconcile = reconcile_unprocessed_tables(run_id=t_run_id)
+    t_reconcile.operator.trigger_rule = "all_done"
 
     # Report generation
     t_report = generate_html_report(
@@ -4753,6 +5247,6 @@ with DAG(
 
     # Dependencies
     t_validate >> t_init >> t_run_id >> t_excel >> t_cluster >> t_discover >> t_record
-    t_record >> t_distcp >> t_distcp_status >> t_tables >> t_tbl_status
-    t_tbl_status >> t_dest_validation >> t_val_status
-    t_val_status >> t_report >> t_email >> t_final  # >> t_cleanup
+    t_record >> t_batches >> t_distcp >> t_distcp_status >> t_tables >> t_tbl_status
+    t_tbl_status >> t_dest_validation >> t_val_status >> t_reconcile
+    t_reconcile >> t_report >> t_email >> t_final  # >> t_cleanup

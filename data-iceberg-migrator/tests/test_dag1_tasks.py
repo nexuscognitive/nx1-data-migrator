@@ -1,13 +1,46 @@
 """DAG 1 Task Tests: mapr_to_s3_migration pipeline."""
 
+import itertools
+import logging
 import re
+import shutil
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import migration_dag_mapr_to_s3 as m
 import pytest
 
-from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
+from .helpers import distcp_call, make_excel_bytes, mock_ssh_stdout, setup_spark_excel
+
+
+def _make_distcp_stdout(incremental=False):
+    return mock_ssh_stdout(0, (
+        "===DISTCP_METRICS_START===\n"
+        f"INCREMENTAL={'true' if incremental else 'false'}\n"
+        "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\nDISTCP_EXIT_CODE=0\n"
+        "BYTES_COPIED=10485760\nFILES_COPIED=5\n"
+        "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
+        "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
+        "===DISTCP_METRICS_END===\n"
+    ).encode())
+
+
+def _partitioned_discovery(sample_discovery, partitions=('d=2024', 'd=2025')):
+    """One table on the per-partition path: filtered, preserve_delete default."""
+    base = sample_discovery['tables'][0]
+    return {
+        **sample_discovery,
+        'tables': [{
+            **base,
+            'partition_filter_active': True,
+            'partition_filter': 'd>=2024',
+            'filtered_partitions': list(partitions),
+            'partition_file_counts': {p: 5 for p in partitions},
+            'filtered_file_count': 5 * len(partitions),
+            'filtered_source_size_bytes': 1024 ** 3,
+        }],
+    }
 
 
 def assert_each_overall_status_case_preserves_skippable(calls):
@@ -647,7 +680,9 @@ class TestRecordDiscoveredTables:
 
     def test_inserts_new_record(self, mock_spark, sample_discovery, mock_iceberg_retry):
         self._setup_count(mock_spark, 0)
-        result = m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        result = m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         assert any('INSERT INTO' in str(c) for c in mock_iceberg_retry.call_args_list)
         assert result['run_id'] == sample_discovery['run_id']
 
@@ -657,7 +692,9 @@ class TestRecordDiscoveredTables:
         rejects the write with INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_FIND_DATA."""
         self._setup_count(mock_spark, 0)
         sample_discovery['tables'][0]['partition_schema'] = [{'name': 'dt', 'type': 'date'}]
-        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         insert_sql = next(
             c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
         )
@@ -672,7 +709,9 @@ class TestRecordDiscoveredTables:
         INSERT, which broke record_discovered_tables in production with
         INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_FIND_DATA."""
         self._setup_count(mock_spark, 0)
-        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         insert_sql = next(
             c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
         )
@@ -721,7 +760,9 @@ class TestRecordDiscoveredTables:
             return [p for p in parts if p.strip()]
 
         self._setup_count(mock_spark, 0)
-        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         insert_sql = next(
             c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
         )
@@ -736,7 +777,9 @@ class TestRecordDiscoveredTables:
 
     def test_updates_existing_record(self, mock_spark, sample_discovery, mock_iceberg_retry):
         self._setup_count(mock_spark, 1)
-        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         assert any('UPDATE' in str(c) for c in mock_iceberg_retry.call_args_list)
 
     def test_writes_table_not_found_status(self, mock_spark, sample_discovery, mock_iceberg_retry):
@@ -749,7 +792,9 @@ class TestRecordDiscoveredTables:
                 'error_type': 'TABLE_NOT_FOUND',
             }],
         }
-        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
         assert "'TABLE_NOT_FOUND'" in all_sql
         assert 'Table or view not found' in all_sql
@@ -764,7 +809,9 @@ class TestRecordDiscoveredTables:
                 'error_type': 'DATABASE_NOT_FOUND',
             }],
         }
-        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
         assert "'DATABASE_NOT_FOUND'" in all_sql
         assert 'does not exist' in all_sql
@@ -780,7 +827,9 @@ class TestRecordDiscoveredTables:
                 'error_type': 'SOURCE_PATH_NOT_FOUND',
             }],
         }
-        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
         assert "'SOURCE_PATH_NOT_FOUND'" in all_sql
         assert 'Path does not exist' in all_sql
@@ -789,31 +838,32 @@ class TestRecordDiscoveredTables:
         assert "o''brien" in all_sql
         assert "o'brien'" not in all_sql
 
+    def test_stamps_its_map_index_for_batch_resolution(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        """Batches resolve their group by this index, never by list position."""
+        self._setup_count(mock_spark, 0)
+        ti = MagicMock()
+        ti.map_index = 7
+        result = m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=ti
+        )
+        assert result['_map_index'] == 7
+
+    def test_failed_upstream_input_returns_empty_without_an_index(self, mock_spark):
+        result = m.record_discovered_tables.function(
+            discovery={}, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
+        assert result == {}
+
 
 class TestRunDistcpSsh:
-
-    def _make_distcp_stdout(self, incremental=False):
-        return mock_ssh_stdout(0, (
-            "===DISTCP_METRICS_START===\n"
-            f"INCREMENTAL={'true' if incremental else 'false'}\n"
-            "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\nDISTCP_EXIT_CODE=0\n"
-            "BYTES_COPIED=10485760\nFILES_COPIED=5\n"
-            "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
-            "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
-            "===DISTCP_METRICS_END===\n"
-        ).encode())
 
     def test_successful_copy_detects_incremental(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
         stderr = MagicMock()
         stderr.read.return_value = b''
-        client.exec_command.return_value = (MagicMock(), self._make_distcp_stdout(incremental=True), stderr)
+        client.exec_command.return_value = (MagicMock(), _make_distcp_stdout(incremental=True), stderr)
 
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=sample_discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
         assert result['distcp_results'][0]['bytes_copied'] == 10485760
         assert result['distcp_results'][0]['is_incremental'] is True
@@ -828,11 +878,7 @@ class TestRunDistcpSsh:
                 'error_type': 'TABLE_NOT_FOUND',
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
         assert result['distcp_results'][0]['status'] == 'TABLE_NOT_FOUND'
         client.exec_command.assert_not_called()
 
@@ -846,11 +892,7 @@ class TestRunDistcpSsh:
                 'error_type': 'SOURCE_PATH_NOT_FOUND',
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
         assert result['distcp_results'][0]['status'] == 'SOURCE_PATH_NOT_FOUND'
         client.exec_command.assert_not_called()
 
@@ -864,11 +906,7 @@ class TestRunDistcpSsh:
                 'error_type': 'DATABASE_NOT_FOUND',
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
         assert result['distcp_results'][0]['status'] == 'DATABASE_NOT_FOUND'
         client.exec_command.assert_not_called()
 
@@ -881,18 +919,14 @@ class TestRunDistcpSsh:
         )
 
         with pytest.raises(Exception, match="DistCp failed"):
-            m.run_distcp_ssh.function.__wrapped__(
-                discovery=sample_discovery,
-                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-                ti=MagicMock(),
-            )
+            m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
 
     def test_partition_filter_active_uses_per_partition_distcp(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
         stderr = MagicMock()
         stderr.read.return_value = b''
         client.exec_command.return_value = (
-            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
         )
 
         filtered_discovery = {
@@ -910,11 +944,7 @@ class TestRunDistcpSsh:
                 'serde_properties': {},
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=filtered_discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
         assert result['distcp_results'][0]['partition_filter_active'] is True
 
@@ -938,7 +968,7 @@ class TestRunDistcpSsh:
         stderr = MagicMock()
         stderr.read.return_value = b''
         client.exec_command.return_value = (
-            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
         )
 
         filtered_discovery = {
@@ -959,11 +989,7 @@ class TestRunDistcpSsh:
 
         cfg = {**m.get_config(), 'distcp_preserve_delete': False}
         with patch.object(m, 'get_config', return_value=cfg):
-            result = m.run_distcp_ssh.function.__wrapped__(
-                discovery=filtered_discovery,
-                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-                ti=MagicMock(),
-            )
+            result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
 
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
 
@@ -994,11 +1020,7 @@ class TestRunDistcpSsh:
                 'serde_properties': {},
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=empty_filter_discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(empty_filter_discovery))
         assert result['distcp_results'][0]['status'] == 'SKIPPED'
         client.exec_command.assert_not_called()
 
@@ -1008,7 +1030,7 @@ class TestRunDistcpSsh:
         stderr = MagicMock()
         stderr.read.return_value = b''
         client.exec_command.return_value = (
-            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
         )
         filtered_discovery = {
             **sample_discovery,
@@ -1027,11 +1049,7 @@ class TestRunDistcpSsh:
         }
         cfg = {**m.get_config(), 'distcp_preserve_delete': preserve_delete}
         with patch.object(m, 'get_config', return_value=cfg):
-            m.run_distcp_ssh.function.__wrapped__(
-                discovery=filtered_discovery,
-                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-                ti=MagicMock(),
-            )
+            m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
         return client.exec_command.call_args[0][0]
 
     def _assert_metrics_scoped_to_partitions(self, ssh_cmd, s3_loc, partitions):
@@ -1072,7 +1090,7 @@ class TestRunDistcpSsh:
         stderr = MagicMock()
         stderr.read.return_value = b''
         client.exec_command.return_value = (
-            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
         )
         filtered_discovery = {
             **sample_discovery,
@@ -1090,11 +1108,7 @@ class TestRunDistcpSsh:
         cfg = {**m.get_config(), 'distcp_preserve_delete': True}
         cfg.update(config_overrides or {})
         with patch.object(m, 'get_config', return_value=cfg):
-            m.run_distcp_ssh.function.__wrapped__(
-                discovery=filtered_discovery,
-                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-                ti=MagicMock(),
-            )
+            m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
         return client.exec_command.call_args[0][0]
 
     def test_per_partition_mappers_scale_with_partition_file_share(self, mock_ssh_hook,
@@ -1149,15 +1163,605 @@ class TestRunDistcpSsh:
                 'filtered_file_count': 0,
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=empty_source_discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(empty_source_discovery))
         assert result['distcp_results'][0]['status'] == 'EMPTY_SOURCE'
         if client.exec_command.called:
             cmd = client.exec_command.call_args[0][0]
             assert 'distcp' not in cmd.lower(), "distcp should not be called for empty source"
+
+
+class TestDistcpShellHardening:
+
+    def _script(self, mock_ssh_hook, discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
+        return client.exec_command.call_args[0][0]
+
+    def test_every_copy_is_wrapped_in_timeout(self, mock_ssh_hook, sample_discovery):
+        script = self._script(mock_ssh_hook, sample_discovery)
+        assert 'run_distcp_with_retry' in script
+        assert 'timeout -k 60s' in script
+
+    def test_timeout_is_guarded_by_command_v(self, mock_ssh_hook, sample_discovery):
+        """An edge node without coreutils must degrade, not fail every copy."""
+        script = self._script(mock_ssh_hook, sample_discovery)
+        assert 'command -v timeout' in script
+
+    def test_retry_helper_never_retries_a_timeout(self, mock_ssh_hook, sample_discovery):
+        script = self._script(mock_ssh_hook, sample_discovery)
+        assert 'rc -eq 124' in script
+        assert 'not retrying' in script
+
+    def test_metrics_helper_is_defined_once(self, mock_ssh_hook, sample_discovery):
+        script = self._script(mock_ssh_hook, sample_discovery)
+        assert script.count('calculate_s3_metrics_hadoop() {') == 1
+
+    def test_call_timeout_scales_with_the_estimate(self):
+        cfg = {'distcp_call_timeout_max_seconds': 21600}
+        assert m._call_timeout_seconds(10.0, cfg) == 1800       # floor
+        assert m._call_timeout_seconds(3000.0, cfg) == 9000     # 3x estimate
+        assert m._call_timeout_seconds(100000.0, cfg) == 21600  # ceiling
+
+    def test_the_retry_banner_never_echoes_the_command(self, mock_ssh_hook,
+                                                       sample_discovery):
+        """The command carries -Dfs.s3a.secret.key and the task logs the
+        script's output verbatim, so no echo may interpolate it."""
+        script = self._script(mock_ssh_hook, sample_discovery)
+        echoes = [ln for ln in script.splitlines() if ln.strip().startswith('echo')]
+        assert echoes
+        assert not [ln for ln in echoes if '$*' in ln or '"$@"' in ln]
+
+    def test_ssh_read_window_outlasts_every_retry_the_shell_may_make(self):
+        """Tighter than the blanket 24h, but never tighter than the shell's own
+        bound: giving up first abandons a live DistCp whose YARN id was never
+        read, so nothing kills the orphan before the retry starts a second
+        writer."""
+        assert m._ssh_read_timeout(1800) == 1800 * 3 + 1800
+        assert m._ssh_read_timeout(1800) < m.SSH_COMMAND_TIMEOUT
+        assert m._ssh_read_timeout(1800) > 1800 * m._DISTCP_RETRY_ATTEMPTS
+        # The blanket constant stays the ceiling, so the override only tightens.
+        assert m._ssh_read_timeout(10 ** 9) == m.SSH_COMMAND_TIMEOUT
+
+    def test_the_shell_makes_exactly_the_attempts_the_window_allows_for(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        script = self._script(mock_ssh_hook, sample_discovery)
+        assert f'max_attempts={m._DISTCP_RETRY_ATTEMPTS}' in script
+
+    def test_the_copy_gets_a_bounded_read_window_not_the_blanket_one(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        self._script(mock_ssh_hook, sample_discovery)
+        passed = client.exec_command.call_args.kwargs['timeout']
+        assert passed != m.SSH_COMMAND_TIMEOUT
+        assert passed == m._ssh_read_timeout(m._call_timeout_seconds(
+            m.estimate_distcp_cost(sample_discovery['tables'][0], m.get_config()),
+            m.get_config(),
+        ))
+
+    def test_the_empty_source_mkdir_gets_a_bounded_read_window_too(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        m.run_distcp_ssh.function.__wrapped__(**distcp_call({
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'source_file_count': 0,
+                'partition_filter_active': False,
+                'filtered_file_count': 0,
+            }],
+        }))
+        passed = client.exec_command.call_args.kwargs['timeout']
+        assert passed != m.SSH_COMMAND_TIMEOUT
+        assert 0 < passed <= m._ssh_read_timeout(m._CALL_TIMEOUT_FLOOR_SECONDS)
+
+    def test_sizing_uses_the_shared_effective_metrics_helper(
+        self, mock_ssh_hook, sample_discovery, caplog
+    ):
+        """Pins the (size, files) unpacking order — a swap would size every
+        filtered copy from its file count."""
+        d = _partitioned_discovery(sample_discovery)
+        d['tables'][0]['filtered_source_size_bytes'] = 2 * 1024 * 1024
+        d['tables'][0]['filtered_file_count'] = 20
+        with caplog.at_level(logging.INFO):
+            self._script(mock_ssh_hook, d)
+        assert '2097152 bytes / 20 files' in caplog.text
+
+    def test_timed_out_copy_kills_its_yarn_application(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        stdout = mock_ssh_stdout(124, (
+            'Submitted application application_1700000000000_0042\n'
+            '  [DistCp] TIMED OUT after 1800s — not retrying\n'
+        ).encode())
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        # A single failing table makes run_distcp_ssh raise after recording the
+        # per-table result (see test_distcp_failure_raises) — the result dict
+        # itself was already pushed to XCom by then, so read it back from there.
+        kwargs = distcp_call(sample_discovery)
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_distcp_ssh.function.__wrapped__(**kwargs)
+
+        result = kwargs['ti'].xcom_push.call_args.kwargs['value']
+        assert result['distcp_results'][0]['status'] == 'FAILED'
+        kill_calls = [
+            c for c in client.exec_command.call_args_list
+            if 'application -kill' in str(c)
+        ]
+        assert kill_calls, 'expected a yarn application -kill after a timeout'
+        assert 'application_1700000000000_0042' in str(kill_calls[0])
+
+    def test_non_timeout_failure_does_not_kill_the_application(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        stdout = mock_ssh_stdout(1, b'Submitted application application_1_0001\nboom\n')
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
+
+        assert not [
+            c for c in client.exec_command.call_args_list
+            if 'application -kill' in str(c)
+        ]
+
+    def _kill(self, exit_code, output=b'', error=b''):
+        ssh = MagicMock()
+        client = MagicMock()
+        ssh.get_conn.return_value.__enter__ = MagicMock(return_value=client)
+        ssh.get_conn.return_value.__exit__ = MagicMock(return_value=False)
+        stdout = mock_ssh_stdout(exit_code, output)
+        stderr = MagicMock()
+        stderr.read.return_value = error
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+        m._kill_yarn_apps(ssh, ['application_1_0001'], {}, 'db.tbl')
+        return client
+
+    def test_a_failed_kill_is_logged_as_an_error(self, caplog):
+        """The only observability on the one failure mode with data-safety
+        stakes: an orphan writing under the same prefix as the retry."""
+        with caplog.at_level(logging.DEBUG):
+            self._kill(1, error=b'Permission denied: user=airflow')
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors
+        assert 'application_1_0001' in errors[0].message
+        assert 'Permission denied' in errors[0].message
+
+    def test_an_already_finished_app_is_not_reported_as_a_failed_kill(self, caplog):
+        """Every scraped id is passed, so this happens routinely — it must not
+        read like the orphan case."""
+        with caplog.at_level(logging.DEBUG):
+            self._kill(255, output=b'Application application_1_0001 has already finished')
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert 'already finished' in caplog.text
+
+    def test_a_successful_kill_logs_no_error(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            self._kill(0)
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert 'killed YARN app(s)' in caplog.text
+
+    def test_a_kill_that_raises_never_propagates(self, caplog):
+        """It runs on a path that is already failing."""
+        ssh = MagicMock()
+        ssh.get_conn.side_effect = OSError('socket closed')
+        with caplog.at_level(logging.DEBUG):
+            m._kill_yarn_apps(ssh, ['application_1_0001'], {}, 'db.tbl')
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_logs_estimate_against_actual(self, mock_ssh_hook, sample_discovery, caplog):
+        """The client guide tells users to grep for this line."""
+        with caplog.at_level(logging.INFO):
+            self._script(mock_ssh_hook, sample_discovery)
+        assert 'cost estimate' in caplog.text
+        assert 'vs actual' in caplog.text
+
+    def test_the_hard_stop_is_measured_from_the_batch_start(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        offset = _hard_stop_offset(self._script(mock_ssh_hook, sample_discovery))
+        assert _HARD_STOP - 60 < offset <= _HARD_STOP
+        # Past the longest timeout any copy can have, so an early copy is never cut short.
+        assert offset > int(m.get_config()['distcp_call_timeout_max_seconds'])
+
+    def test_a_table_started_late_gets_only_what_is_left_of_the_window(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        seven_hours = 7 * 3600
+        starts = iter([0.0])  # batch_started_at, then every later reading is 7h on
+        clock = SimpleNamespace(time=m.time.time,
+                                monotonic=lambda: next(starts, seven_hours))
+        with patch.object(m, 'time', clock):
+            script = self._script(mock_ssh_hook, sample_discovery)
+        assert _hard_stop_offset(script) == int(_HARD_STOP - seven_hours)
+
+
+_HAS_SHELL = bool(shutil.which('bash') and shutil.which('timeout'))
+# Every copy attempt must have ended by here: execution_timeout less the
+# allowance for the post-copy scans and reporting.
+_HARD_STOP = m._DISTCP_EXECUTION_TIMEOUT.total_seconds() - m._SSH_READ_SLACK_SECONDS
+
+
+def _hard_stop_offset(script):
+    return int(re.search(
+        r'DISTCP_HARD_STOP_EPOCH=\$\(\( \$\(date \+%s\) \+ (-?\d+) \)\)', script
+    )[1])
+
+
+def _run_retry_helper(elapsed_secs, command, delay=None):
+    """Run the rendered run_distcp_with_retry against a stand-in for hadoop distcp."""
+    prelude = m._distcp_shell_prelude('', 0, elapsed_secs=elapsed_secs)
+    if delay is not None:
+        prelude = prelude.replace('local delay=30', f'local delay={delay}')
+    proc = subprocess.run(
+        ['bash', '-c', f'set -e\n{prelude}\nrun_distcp_with_retry 30 {command}'],
+        capture_output=True, text=True, timeout=30,
+    )
+    return proc.returncode, proc.stdout
+
+
+@pytest.mark.skipif(not _HAS_SHELL, reason='needs bash and coreutils timeout')
+class TestHardStopBeforeExecutionTimeout:
+    """A copy started late in a batch must end before execution_timeout, whose
+    kill discards the batch's XCom and leaves the copy's YARN job writing while
+    the retry starts a second one under -update -delete."""
+
+    def test_an_attempt_is_cut_off_at_the_hard_stop(self):
+        rc, out = _run_retry_helper(_HARD_STOP - 2, 'sleep 20')
+        assert rc == 124, out
+
+    def test_no_attempt_starts_once_the_hard_stop_has_passed(self, tmp_path):
+        marker = tmp_path / 'ran'
+        rc, out = _run_retry_helper(_HARD_STOP + 5, f'touch {marker}')
+        assert rc == 124
+        assert not marker.exists()
+        assert 'not starting' in out
+
+    def test_a_retry_gets_only_what_is_left_before_the_hard_stop(self):
+        # A genuine failure, not a timeout, so it would normally be retried twice.
+        rc, out = _run_retry_helper(_HARD_STOP - 3, "sh -c 'sleep 2; exit 1'", delay=0)
+        assert rc == 124, out
+        assert 'Attempt 3/' not in out
+
+    def test_a_copy_started_early_keeps_its_full_timeout(self):
+        rc, out = _run_retry_helper(0, 'true')
+        assert rc == 0
+        assert 'Attempt 1/3 (timeout 30s)' in out
+
+
+class TestDistcpBatchResolution:
+
+    def test_copies_only_the_tables_in_its_batch(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        two = {
+            **sample_discovery,
+            'tables': [
+                sample_discovery['tables'][0],
+                {**sample_discovery['tables'][0], 'source_table': 'other'},
+            ],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(two, table_names=['other'])
+        )
+        assert [t['source_table'] for t in result['tables']] == ['other']
+        assert [r['source_table'] for r in result['distcp_results']] == ['other']
+
+    def test_pulls_its_group_by_map_index(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        kwargs = distcp_call({**sample_discovery, '_map_index': 5})
+        m.run_distcp_ssh.function.__wrapped__(**kwargs)
+        kwargs['ti'].xcom_pull.assert_called_once_with(
+            task_ids='record_discovered_tables', map_indexes=5
+        )
+
+    def test_raises_when_the_pulled_group_is_a_different_database(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        """A shifted map index must fail loudly, not copy the wrong tables."""
+        other = {**sample_discovery, 'source_database': 'someone_else'}
+        with pytest.raises(ValueError, match='refusing to copy'):
+            m.run_distcp_ssh.function.__wrapped__(
+                **distcp_call(sample_discovery, pulled=other)
+            )
+
+    def test_raises_when_the_group_xcom_is_missing(self, mock_ssh_hook, sample_discovery):
+        with pytest.raises(ValueError, match='could not read group discovery'):
+            m.run_distcp_ssh.function.__wrapped__(
+                **distcp_call(sample_discovery, pulled={})
+            )
+
+    def test_invalid_descriptor_is_skipped_not_raised(self, mock_ssh_hook):
+        assert m.run_distcp_ssh.function.__wrapped__(
+            batch={}, cluster_setup={'temp_dir': '/tmp', 'run_id': 'r'},
+            source_task_id='record_discovered_tables', ti=MagicMock(),
+        ) == {}
+
+    def test_matches_keys_when_partition_filter_is_none(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        """Discovery rows carry None; descriptors carry ''. They must still match."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        d = {
+            **sample_discovery,
+            'tables': [{**sample_discovery['tables'][0], 'partition_filter': None}],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(d))
+        assert len(result['tables']) == 1
+
+    def test_does_not_cross_match_two_slices_of_one_table(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        """Multi-slice runs hold several rows per table, differing only by filter."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        base = sample_discovery['tables'][0]
+        d = {
+            **sample_discovery,
+            'tables': [
+                {**base, 'partition_filter': 'd=2023'},
+                {**base, 'partition_filter': 'd=2024'},
+            ],
+        }
+        kwargs = distcp_call(d)
+        kwargs['batch']['table_keys'] = [[base['source_table'], 'd=2024']]
+        result = m.run_distcp_ssh.function.__wrapped__(**kwargs)
+        assert len(result['tables']) == 1
+        assert result['tables'][0]['partition_filter'] == 'd=2024'
+
+
+class TestDistcpSoftDeadline:
+
+    def test_tables_not_started_before_the_budget_expires_are_failed(
+        self, mock_ssh_hook, sample_discovery, monkeypatch
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        base = sample_discovery['tables'][0]
+        d = {
+            **sample_discovery,
+            'tables': [
+                base,
+                {**base, 'source_table': 'second'},
+                {**base, 'source_table': 'third'},
+            ],
+        }
+        # Clock jumps past the budget after the first table. Never sleep:
+        # pytest.ini sets --timeout=60.
+        ticks = iter([0.0, 0.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0])
+        monkeypatch.setattr(m.time, 'monotonic', lambda: next(ticks, 10_000.0))
+
+        # A budget skip is still a FAILED result, so run_distcp_ssh raises
+        # after the XCom push — same as any other per-table failure — so the
+        # final attempt's tracking is complete and Airflow retries the batch
+        # (see test_timed_out_copy_kills_its_yarn_application). Read the
+        # result back from the push rather than a normal return value.
+        kwargs = distcp_call(d, budget=100.0)
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_distcp_ssh.function.__wrapped__(**kwargs)
+
+        result = kwargs['ti'].xcom_push.call_args.kwargs['value']
+        by_table = {r['source_table']: r for r in result['distcp_results']}
+        assert by_table[base['source_table']]['status'] == 'COMPLETED'
+        assert by_table['second']['status'] == 'FAILED'
+        assert 'budget exhausted' in by_table['second']['error']
+        assert by_table['third']['status'] == 'FAILED'
+
+    def test_every_remaining_table_still_gets_a_result_row(
+        self, mock_ssh_hook, sample_discovery, monkeypatch
+    ):
+        """Rows are what make the failure visible in tracking."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        base = sample_discovery['tables'][0]
+        d = {
+            **sample_discovery,
+            'tables': [{**base, 'source_table': f't{i}'} for i in range(4)],
+        }
+        # Monotonically increasing rather than a fixed value: a truly frozen
+        # clock can never show elapsed time exceeding the budget. Never sleep:
+        # pytest.ini sets --timeout=60.
+        ticks = itertools.count(10_000.0)
+        monkeypatch.setattr(m.time, 'monotonic', lambda: next(ticks))
+
+        # All 4 are budget skips, still FAILED results, so run_distcp_ssh
+        # raises after the XCom push (see
+        # test_tables_not_started_before_the_budget_expires_are_failed) — read
+        # the result back from the push rather than a normal return value.
+        kwargs = distcp_call(d, budget=1.0)
+        with pytest.raises(Exception, match="DistCp failed"):
+            m.run_distcp_ssh.function.__wrapped__(**kwargs)
+
+        result = kwargs['ti'].xcom_push.call_args.kwargs['value']
+        assert len(result['distcp_results']) == 4
+        assert result['_has_failures'] is True
+
+    def test_zero_budget_disables_the_deadline(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        result = m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(sample_discovery, budget=0.0)
+        )
+        assert result['distcp_results'][0]['status'] == 'COMPLETED'
+
+    def test_partition_copies_are_guarded_by_the_in_shell_deadline(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        """A 300-partition table must honour the budget between partitions."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        base = sample_discovery['tables'][0]
+        d = {
+            **sample_discovery,
+            'tables': [{
+                **base,
+                'partition_filter_active': True,
+                'partition_filter': 'd>=2024',
+                'filtered_partitions': ['d=2024', 'd=2025'],
+                'partition_file_counts': {'d=2024': 5, 'd=2025': 5},
+                'filtered_file_count': 10,
+                'filtered_source_size_bytes': 1024 ** 3,
+            }],
+        }
+        m.run_distcp_ssh.function.__wrapped__(**distcp_call(d, budget=3600.0))
+        script = client.exec_command.call_args[0][0]
+        assert 'deadline_ok' in script
+        assert script.count('if deadline_ok; then') == 2
+
+    def test_deadline_epoch_is_zero_when_there_is_no_budget(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(sample_discovery, budget=0.0)
+        )
+        assert 'DISTCP_DEADLINE_EPOCH=0' in client.exec_command.call_args[0][0]
+
+    def test_skipped_partitions_are_counted_and_reported_back(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        """The in-shell deadline must be visible to Python.
+
+        The per-partition script exits 0 whether or not the deadline cut the
+        copy short, so without this counter an incomplete table is recorded
+        COMPLETED.
+        """
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(), stderr
+        )
+        m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(_partitioned_discovery(sample_discovery), budget=3600.0)
+        )
+        script = client.exec_command.call_args[0][0]
+
+        assert 'DEADLINE_SKIPPED=0' in script
+        assert script.count('DEADLINE_SKIPPED=$((DEADLINE_SKIPPED + 1))') == 2
+
+        metrics = script.split('===DISTCP_METRICS_START===')[1].split(
+            '===DISTCP_METRICS_END==='
+        )[0]
+        assert 'DEADLINE_SKIPPED_PARTITIONS=$DEADLINE_SKIPPED' in metrics
+
+    def test_a_deadline_skipped_partition_fails_the_table(
+        self, mock_ssh_hook, sample_discovery, caplog
+    ):
+        """A partial copy must not be recorded COMPLETED.
+
+        FAILED is what makes has_failures true, which raises after the XCom
+        push so Airflow retries the batch with a fresh budget.
+        """
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        stdout = mock_ssh_stdout(0, (
+            "===DISTCP_METRICS_START===\n"
+            "INCREMENTAL=false\n"
+            "BYTES_COPIED=0\nFILES_COPIED=0\n"
+            "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\n"
+            "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
+            "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
+            "DEADLINE_SKIPPED_PARTITIONS=1\n"
+            "===DISTCP_METRICS_END===\n"
+        ).encode())
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        # A FAILED table makes run_distcp_ssh raise after pushing its result
+        # (see test_timed_out_copy_kills_its_yarn_application) — read the
+        # result back from the push.
+        kwargs = distcp_call(_partitioned_discovery(sample_discovery), budget=3600.0)
+        with caplog.at_level(logging.WARNING), \
+             pytest.raises(Exception, match="DistCp failed"):
+            m.run_distcp_ssh.function.__wrapped__(**kwargs)
+
+        row = kwargs['ti'].xcom_push.call_args.kwargs['value']['distcp_results'][0]
+        assert row['status'] == 'FAILED'
+        assert row['error'] == m._BUDGET_PARTIAL_ERROR
+        # The counts the copy did manage are still accurate and worth keeping.
+        assert row['s3_files_transferred'] == 5
+        assert row['distcp_started_at']
+        assert 'transactions' in caplog.text
+        assert '1 partition' in caplog.text
+
+    def test_zero_skipped_partitions_still_completes(
+        self, mock_ssh_hook, sample_discovery
+    ):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        stdout = mock_ssh_stdout(0, (
+            "===DISTCP_METRICS_START===\n"
+            "INCREMENTAL=false\nBYTES_COPIED=0\nFILES_COPIED=0\n"
+            "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\n"
+            "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
+            "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
+            "DEADLINE_SKIPPED_PARTITIONS=0\n"
+            "===DISTCP_METRICS_END===\n"
+        ).encode())
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        result = m.run_distcp_ssh.function.__wrapped__(
+            **distcp_call(_partitioned_discovery(sample_discovery), budget=3600.0)
+        )
+        assert result['distcp_results'][0]['status'] == 'COMPLETED'
+        assert result['distcp_results'][0]['error'] is None
 
 
 class TestUpdateDistcpStatus:
@@ -1171,6 +1775,37 @@ class TestUpdateDistcpStatus:
         sample_distcp_result['distcp_results'][0]['error'] = 'Network error'
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
         assert any('FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
+
+    def test_budget_skip_row_survives_the_tracking_update(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """A budget-skip row (run_distcp_ssh's soft-deadline guard) is FAILED,
+        not SKIPPED, so it is not in update_distcp_status's skip-list and
+        reaches code that indexes several fields directly rather than via
+        .get(). A row missing any of them must not reach here — this pins the
+        exact shape the guard is required to produce."""
+        sample_distcp_result['distcp_results'][0] = {
+            'source_database': 'sales_data', 'source_table': 'transactions',
+            'dest_database': 'sales_data_s3',
+            'status': 'FAILED',
+            'distcp_started_at': '2025-01-01 12:00:00',
+            'distcp_completed_at': '2025-01-01 12:00:00',
+            'distcp_duration_secs': 0.0,
+            'is_incremental': False,
+            'bytes_copied': 0, 'files_copied': 0,
+            's3_total_size_bytes_before': 0, 's3_file_count_before': 0,
+            's3_total_size_bytes_after': 0, 's3_file_count_after': 0,
+            's3_bytes_transferred': 0, 's3_files_transferred': 0,
+            'partition_filter_active': False, 'partitions_requested': None,
+            'empty_partitions': [],
+            'error': m._BUDGET_EXHAUSTED_ERROR,
+            'yarn_application_id': None, 'yarn_application_ids': [],
+            'partition_filter': None,
+        }
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert "distcp_status = 'FAILED'" in sql_calls
+        assert 'budget exhausted' in sql_calls
 
     def test_empty_partition_names_written_to_tracking_update(
         self, mock_spark, sample_distcp_result, mock_iceberg_retry
@@ -1353,6 +1988,40 @@ class TestUpdateDistcpStatus:
         assert "WHEN overall_status = 'EMPTY_SOURCE'" in joined
 
 
+class TestReconcileUnprocessedTables:
+
+    def test_marks_tables_no_batch_ever_processed(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [{'cnt': 3}]
+        result = m.reconcile_unprocessed_tables.function(
+            run_id='run-1', spark=mock_spark
+        )
+        assert result == {'run_id': 'run-1', 'unprocessed': 3}
+        statements = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'distcp_status IS NULL' in statements
+
+    def test_is_a_no_op_when_every_table_has_a_status(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [{'cnt': 0}]
+        result = m.reconcile_unprocessed_tables.function(
+            run_id='run-1', spark=mock_spark
+        )
+        assert result['unprocessed'] == 0
+        # Only the counting SELECT ran — no UPDATE.
+        assert mock_spark.sql.call_count == 1
+
+    def test_preserves_skippable_and_empty_source_statuses(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [{'cnt': 1}]
+        m.reconcile_unprocessed_tables.function(run_id='run-1', spark=mock_spark)
+        statements = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'EMPTY_SOURCE' in statements
+        assert 'TABLE_NOT_FOUND' in statements
+
+    def test_only_touches_tables_that_finished_discovery(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [{'cnt': 1}]
+        m.reconcile_unprocessed_tables.function(run_id='run-1', spark=mock_spark)
+        statements = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert "discovery_status = 'COMPLETED'" in statements
+
+
 class TestCreateHiveTables:
 
     def test_creates_new_table(self, mock_spark, sample_distcp_result):
@@ -1362,6 +2031,28 @@ class TestCreateHiveTables:
         )
         assert result['table_results'][0]['status'] == 'COMPLETED'
         assert result['table_results'][0]['existed'] is False
+
+    def test_a_concurrent_database_create_is_tolerated(self, mock_spark,
+                                                       sample_distcp_result):
+        """Several batches from one source database now run at once, so they
+        race on CREATE DATABASE IF NOT EXISTS."""
+        mock_spark.sql.side_effect = [
+            Exception("AlreadyExistsException(message:Database sales_data_s3 "
+                      "already exists)"),
+            Exception("Not found"), None, None, None,
+        ]
+        result = m.create_hive_tables.function.__wrapped__(
+            distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['table_results'][0]['status'] == 'COMPLETED'
+
+    def test_a_real_database_create_failure_still_propagates(self, mock_spark,
+                                                             sample_distcp_result):
+        mock_spark.sql.side_effect = Exception("Permission denied: user=airflow")
+        with pytest.raises(Exception, match="Permission denied"):
+            m.create_hive_tables.function.__wrapped__(
+                distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+            )
 
     def test_skips_source_path_not_found(self, mock_spark, sample_distcp_result):
         sample_distcp_result['tables'][0].update({
@@ -2310,3 +3001,178 @@ class TestFinalizeRun:
         ))
         assert "status = 'COMPLETED'" in sqls
         assert 'COMPLETED_WITH_MISSING' not in sqls
+
+
+class TestFlattenAndBatch:
+
+    def _group(self, map_index, db, table_names, **table_overrides):
+        tables = []
+        for name in table_names:
+            t = {
+                'source_database': db, 'source_table': name,
+                'dest_database': f'{db}_s3', 'dest_bucket': 's3a://test-bucket',
+                'source_total_size_bytes': 10 * 1024 ** 3,
+                'source_file_count': 100, 'partition_filter_active': False,
+            }
+            t.update(table_overrides)
+            tables.append(t)
+        return {
+            'run_id': 'run-1', 'source_database': db, 'dest_database': f'{db}_s3',
+            'dest_bucket': 's3a://test-bucket', 'tables': tables,
+            '_map_index': map_index,
+        }
+
+    def test_emits_one_descriptor_per_bin_covering_every_table(self):
+        groups = [self._group(0, 'db_a', ['t1', 't2']), self._group(1, 'db_b', ['t3'])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        keys = [tuple(k) for b in batches for k in b['table_keys']]
+        assert sorted(keys) == [('t1', ''), ('t2', ''), ('t3', '')]
+
+    def test_batches_never_mix_source_databases(self):
+        groups = [self._group(0, 'db_a', ['t1']), self._group(1, 'db_b', ['t2'])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert {b['source_database'] for b in batches} == {'db_a', 'db_b'}
+        assert all(len({b['source_database']}) == 1 for b in batches)
+
+    def test_addresses_groups_by_map_index_not_list_position(self):
+        """A dead record_discovered_tables instance leaves a gap in the sequence."""
+        groups = [
+            self._group(0, 'db_a', ['t1']),
+            self._group(1, 'db_b', ['t2']),
+            self._group(3, 'db_d', ['t4']),
+        ]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert sorted(b['group_map_index'] for b in batches) == [0, 1, 3]
+        assert 2 not in {b['group_map_index'] for b in batches}
+
+    def test_skips_failed_group_discoveries(self):
+        groups = [{}, self._group(1, 'db_b', ['t2']), None]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert len(batches) == 1
+        assert batches[0]['group_map_index'] == 1
+
+    def test_raises_when_a_group_has_no_map_index(self):
+        stale = self._group(0, 'db_a', ['t1'])
+        del stale['_map_index']
+        with pytest.raises(ValueError, match='_map_index'):
+            m.flatten_and_batch.function(discoveries=[stale])
+
+    def test_descriptors_are_ordered_by_cost_descending(self):
+        groups = [
+            self._group(0, 'db_a', ['small'], source_total_size_bytes=1024,
+                        source_file_count=1),
+            self._group(1, 'db_b', ['huge'],
+                        source_total_size_bytes=5000 * 1024 ** 3,
+                        source_file_count=100000),
+        ]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert batches[0]['source_database'] == 'db_b'
+        costs = [b['batch_cost_secs'] for b in batches]
+        assert costs == sorted(costs, reverse=True)
+
+    def test_batch_index_is_contiguous_from_zero(self):
+        groups = [self._group(0, 'db_a', [f't{i}' for i in range(30)])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert [b['batch_index'] for b in batches] == list(range(len(batches)))
+
+    def test_descriptors_carry_no_table_metadata(self):
+        """The whole point: every batch TI deserializes this list in full."""
+        groups = [self._group(0, 'db_a', ['t1'], schema=[{'name': 'c'}],
+                              partitions=['d=1'], partition_file_counts={'d=1': 3})]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        for key in ('schema', 'partitions', 'partition_file_counts', 'tables'):
+            assert key not in batches[0]
+
+    def test_a_normal_batch_budget_still_covers_its_own_cost(self):
+        """The clamp must not starve ordinary batches: if a batch's budget fell
+        below its estimate, a healthy copy would be failed by its own deadline."""
+        groups = [self._group(0, 'db_a', ['t1', 't2', 't3', 't4'])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        for b in batches:
+            assert b['batch_budget_secs'] >= b['batch_cost_secs']
+
+    def test_an_over_clamp_batch_is_budgeted_below_its_cost_on_purpose(self):
+        """Replaces test_budget_covers_an_over_cap_monster_batch, which asserted
+        the bug: a ~19.5 TiB table used to get a budget matching its own cost
+        (170790s), far past the 28800s execution_timeout, so Airflow SIGKILLed
+        the task before the soft budget could fire and the XCom — and every
+        FAILED row in it — was discarded. Being under-budgeted is the fix: the
+        batch now fails cleanly and -update lets the retry resume."""
+        backstop = m._DISTCP_EXECUTION_TIMEOUT.total_seconds()
+        groups = [self._group(0, 'db_a', ['huge'],
+                              source_total_size_bytes=20000 * 1024 ** 3,
+                              source_file_count=10)]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert batches[0]['batch_budget_secs'] == pytest.approx(
+            m._BATCH_BUDGET_FRACTION * backstop)
+        assert batches[0]['batch_budget_secs'] < batches[0]['batch_cost_secs']
+
+    def test_partition_filter_is_part_of_the_table_key(self):
+        group = self._group(0, 'db_a', ['t1'])
+        group['tables'].append({**group['tables'][0], 'partition_filter': 'd=2024'})
+        batches = m.flatten_and_batch.function(discoveries=[group])
+        keys = sorted(tuple(k) for b in batches for k in b['table_keys'])
+        assert keys == [('t1', ''), ('t1', 'd=2024')]
+
+    def test_empty_input_returns_an_empty_plan(self):
+        assert m.flatten_and_batch.function(discoveries=[]) == []
+
+    def test_no_batch_budget_can_exceed_the_execution_timeout(self):
+        """The property the clamp exists for: a budget above the backstop can
+        never fire, so the batch is SIGKILLed and its XCom discarded instead of
+        writing FAILED rows."""
+        backstop = m._DISTCP_EXECUTION_TIMEOUT.total_seconds()
+        # 40 TiB in one table: estimated far above any per-batch budget.
+        groups = [self._group(
+            0, 'db_a', ['huge'],
+            source_total_size_bytes=40 * 1024 ** 4, source_file_count=100_000)]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert batches
+        for b in batches:
+            assert b['batch_budget_secs'] <= backstop
+
+    def test_an_over_budget_batch_is_warned_about_by_table_name(self, caplog):
+        groups = [self._group(
+            0, 'db_a', ['huge'],
+            source_total_size_bytes=40 * 1024 ** 4, source_file_count=100_000)]
+        with caplog.at_level(logging.WARNING):
+            m.flatten_and_batch.function(discoveries=groups)
+        assert 'huge' in caplog.text
+        assert 'more than one attempt' in caplog.text
+        # The retired knobs must not be named as the fix.
+        assert 'max_batches' not in caplog.text
+        assert 'batch_target_cost_seconds' not in caplog.text
+
+    def test_a_normal_batch_is_not_warned_about(self, caplog):
+        groups = [self._group(
+            0, 'db_a', ['t1', 't2', 't3', 't4'],
+            source_total_size_bytes=1024 ** 3, source_file_count=10)]
+        with caplog.at_level(logging.WARNING):
+            m.flatten_and_batch.function(discoveries=groups)
+        assert 'more than one attempt' not in caplog.text
+
+    def test_batch_count_follows_the_cap_not_the_table_count(
+            self, monkeypatch):
+        """The plan's central behaviour, and nothing else pins it. Fixture
+        tables cost ~167s each, so four of them give a cap of 670/(3*2) = 112s
+        and no two share a bin. Under the retired seconds-target cap (1800s)
+        all four landed in ONE batch, and no other test in this class would
+        notice the difference."""
+        monkeypatch.delenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT',
+                           raising=False)
+        groups = [self._group(0, 'db_a', ['t1', 't2', 't3', 't4'])]
+        batches = m.flatten_and_batch.function(discoveries=groups)
+        assert len(batches) == 4
+        assert all(len(b['table_keys']) == 1 for b in batches)
+
+    def test_a_small_run_is_spread_across_the_lanes(self, monkeypatch):
+        """One table is one batch — nothing to spread. Two tables must not
+        collapse into a single task while lanes sit idle."""
+        monkeypatch.delenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT',
+                           raising=False)
+        one = m.flatten_and_batch.function(
+            discoveries=[self._group(0, 'db_a', ['solo'])])
+        two = m.flatten_and_batch.function(
+            discoveries=[self._group(0, 'db_a', ['a', 'b'])])
+        assert len(one) == 1
+        assert len(two) == 2

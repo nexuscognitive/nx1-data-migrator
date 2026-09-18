@@ -16,6 +16,63 @@ class TestMaprToS3DagIntegrity:
     def test_excel_param_defined(self):
         assert 'excel_file_path' in m1.dag_mapr_to_s3.params
 
+    def test_dag1_has_the_batching_and_reconcile_tasks(self):
+        """Guards the DAG *body's* wiring, not just that the functions exist
+        somewhere in the module: flatten_and_batch/reconcile_unprocessed_tables
+        are also plain module-level functions, so a hasattr(module, name) check
+        stays green even if the with DAG(...) block stopped calling them. The
+        test suite stubs Airflow (conftest.py's _FakeDAG has no task_dict, and
+        the @task stub never registers calls with the active DAG), so the
+        parsed graph is not observable here — asserting on the DAG body's
+        source text is what actually catches the wiring being dropped or the
+        mapped keyword drifting back from `batch`.
+        """
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        _, _, dag_body = source.partition('with DAG(')
+        for needle in (
+            'flatten_and_batch(discoveries=',
+            'reconcile_unprocessed_tables(run_id=',
+            '.expand(batch=t_batches)',
+            't_record >> t_batches',
+            '>> t_reconcile',
+        ):
+            assert needle in dag_body, needle
+
+    def test_distcp_status_writer_has_an_explicit_concurrency_cap(self):
+        """t_distcp_status is one Iceberg writer per batch, and retiring
+        migration_distcp_max_batches removed the implicit bound on batch count,
+        so relying on Airflow's 16-slot default is no longer good enough. Source
+        text, not the parsed graph: conftest stubs Airflow (see
+        test_dag1_has_the_batching_and_reconcile_tasks)."""
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        _, _, dag_body = source.partition('with DAG(')
+        # Anchor on each assignment and look just past it: a bare occurrence
+        # count would pass for a hardcoded cap plus two unrelated mentions.
+        for task_var in ('t_distcp', 't_distcp_status'):
+            anchor = f'{task_var}.operator.max_active_tis_per_dagrun'
+            assert anchor in dag_body, anchor
+            window = dag_body[dag_body.index(anchor):][:200]
+            assert 'MIGRATION_DISTCP_COPY_MAX_CONCURRENT' in window, task_var
+
+    def test_parse_path_reads_no_variable_except_the_owner(self):
+        """Operator attributes are set at parse; a Variable read there costs a
+        metadata-DB round trip on every scheduler parse loop."""
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        before, _, after = source.partition('def _resolve_dag_owner')
+        owner_body, _, rest = after.partition('\ndef ')
+        assert 'Variable.get(' not in before
+        assert 'Variable.get(' not in rest
+        assert 'Variable.get(' in owner_body
+
 
 class TestIcebergDagIntegrity:
 
@@ -108,3 +165,29 @@ class TestDagOwnerResolution:
         for name in self._MODULES:
             source = (root / f'{name}.py').read_text()
             assert "return 'data-migration'" in source, name
+
+
+class TestEnvInt:
+
+    def test_missing_env_var_uses_the_default(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.delenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', raising=False)
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
+
+    def test_valid_value_is_used(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', '8')
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 8
+
+    def test_garbage_falls_back_rather_than_breaking_dag_parse(self, monkeypatch):
+        """Raising here would drop the DAG from Airflow entirely."""
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 'lots')
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
+
+    def test_zero_and_negative_fall_back(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', '0')
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
+        monkeypatch.setenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', '-2')
+        assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
