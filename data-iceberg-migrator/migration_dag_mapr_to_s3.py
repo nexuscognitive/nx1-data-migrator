@@ -510,6 +510,8 @@ def init_tracking_tables(spark) -> dict:
                 distcp_is_incremental BOOLEAN,
                 distcp_bytes_copied BIGINT,
                 distcp_files_copied BIGINT,
+                distcp_mappers INT,
+                distcp_bandwidth_mbps INT,
                 yarn_application_id STRING,
                 table_create_status STRING,
                 table_create_completed_at TIMESTAMP,
@@ -547,6 +549,8 @@ def init_tracking_tables(spark) -> dict:
         ("partition_schema_match", "BOOLEAN"),
         ("partition_schema_differences", "STRING"),
         ("empty_partition_names", "STRING"),
+        ("distcp_mappers", "INT"),
+        ("distcp_bandwidth_mbps", "INT"),
     ):
         try:
             spark.sql(
@@ -1736,6 +1740,8 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                     "distcp_started_at": distcp_started_at,
                     "distcp_duration_secs": distcp_duration_secs,
                     "distcp_completed_at": distcp_completed_at,
+                    "mappers": mappers,
+                    "bandwidth_mbps": bandwidth,
                     "is_incremental": False,
                     "bytes_copied": 0,
                     "files_copied": 0,
@@ -2262,6 +2268,8 @@ exit 0
                         "distcp_started_at": distcp_started_at,
                         "distcp_duration_secs": distcp_duration_secs,
                         "distcp_completed_at": distcp_completed_at,
+                        "mappers": mappers,
+                        "bandwidth_mbps": bandwidth,
                         "is_incremental": is_incr,
                         "bytes_copied": bytes_copied,
                         "files_copied": files_copied,
@@ -2298,6 +2306,8 @@ exit 0
                     "distcp_duration_secs": (
                         _fail_dt - _dt.strptime(distcp_started_at, "%Y-%m-%d %H:%M:%S")
                     ).total_seconds(),
+                    "mappers": mappers,
+                    "bandwidth_mbps": bandwidth,
                     "is_incremental": False,
                     "bytes_copied": 0,
                     "files_copied": 0,
@@ -2439,6 +2449,8 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 distcp_is_incremental = {str(r['is_incremental']).lower()},
                 distcp_bytes_copied = {r.get('bytes_copied', 0)},
                 distcp_files_copied = {r.get('files_copied', 0)},
+                distcp_mappers = {r.get('mappers') if r.get('mappers') is not None else 'NULL'},
+                distcp_bandwidth_mbps = {r.get('bandwidth_mbps') if r.get('bandwidth_mbps') is not None else 'NULL'},
                 yarn_application_id = '{yarn_app_id}',
                 s3_total_size_bytes_before = {s3_size_before},
                 s3_file_count_before = {s3_files_before},
@@ -2468,6 +2480,8 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 f"""
                 UPDATE {tracking_db}.migration_table_status
                 SET distcp_status = 'FAILED',
+                    distcp_mappers = {r.get('mappers') if r.get('mappers') is not None else 'NULL'},
+                    distcp_bandwidth_mbps = {r.get('bandwidth_mbps') if r.get('bandwidth_mbps') is not None else 'NULL'},
                     overall_status = CASE
                         WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
                         {_PRESERVE_SKIPPABLE_STATUS_SQL}
@@ -2497,6 +2511,8 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 distcp_is_incremental = false,
                 distcp_bytes_copied = 0,
                 distcp_files_copied = 0,
+                distcp_mappers = {r.get('mappers') if r.get('mappers') is not None else 'NULL'},
+                distcp_bandwidth_mbps = {r.get('bandwidth_mbps') if r.get('bandwidth_mbps') is not None else 'NULL'},
                 s3_total_size_bytes_before = 0,
                 s3_file_count_before = 0,
                 s3_total_size_bytes_after = 0,
@@ -4130,6 +4146,13 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             if t.distcp_bytes_copied
             else ""
         )
+        _distcp_mappers = getattr(t, "distcp_mappers", None)
+        _distcp_bandwidth = getattr(t, "distcp_bandwidth_mbps", None)
+        if _distcp_mappers is not None and _distcp_bandwidth is not None:
+            distcp_detail += (
+                f"<br><small style='color:#7f8c8d;'>{_distcp_mappers} mappers "
+                f"&times; {_distcp_bandwidth} MB/s</small>"
+            )
         if t.distcp_is_incremental:
             distcp_dur += " <span style='background-color: #fff3cd; padding: 2px 6px; border-radius: 4px; font-size: 10px;'>INCREMENTAL</span>"
         yarn_app_id_val = getattr(t, "yarn_application_id", None) or ""
