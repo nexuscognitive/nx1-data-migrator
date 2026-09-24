@@ -14,6 +14,10 @@ MB = 1024 ** 2
 
 def _config(**overrides):
     base = {
+        # True here so the existing tests below exercise the forced/auto
+        # branches they're named for. The master-switch-off behavior has its
+        # own test class using the real default (False).
+        'distcp_enable_auto_sizing': True,
         'distcp_mappers': '',
         'distcp_bandwidth': '',
         'distcp_target_bytes_per_mapper': 2 * GB,
@@ -26,6 +30,52 @@ def _config(**overrides):
     }
     base.update(overrides)
     return base
+
+
+class TestAutoSizingMasterSwitch:
+    """distcp_enable_auto_sizing defaults to False, so an upgrade with no new
+    Variable set reproduces the pre-auto-sizing DAG exactly."""
+
+    def test_disabled_ignores_size_and_uses_fixed_defaults(self):
+        cfg = _config(distcp_enable_auto_sizing=False)
+        assert size_distcp_job(900 * GB, 3, cfg) == (50, 100)
+        assert size_distcp_job(500 * MB, 6, cfg) == (50, 100)
+        assert size_distcp_job(0, 0, cfg) == (50, 100)
+
+    def test_disabled_honours_configured_fixed_defaults(self):
+        cfg = _config(
+            distcp_enable_auto_sizing=False,
+            distcp_default_mappers=8, distcp_default_bandwidth=250,
+        )
+        assert size_distcp_job(2 * TB, 30000, cfg) == (8, 250)
+
+    def test_disabled_ignores_forced_override_pair_too(self):
+        # The master switch gates the whole feature, including the
+        # forced-pair sub-mode — disabled means only the fixed defaults apply.
+        cfg = _config(
+            distcp_enable_auto_sizing=False,
+            distcp_mappers='10', distcp_bandwidth='50',
+        )
+        assert size_distcp_job(40 * GB, 800, cfg) == (50, 100)
+
+    def test_missing_key_defaults_to_disabled(self):
+        # get_config() always supplies this key, but size_distcp_job should
+        # fail safe (old behavior) rather than KeyError if it's ever absent.
+        cfg = _config()
+        del cfg['distcp_enable_auto_sizing']
+        assert size_distcp_job(900 * GB, 3, cfg) == (50, 100)
+
+    def test_sizing_mode_reports_disabled(self):
+        mode = distcp_sizing_mode(_config(distcp_enable_auto_sizing=False))
+        assert mode.startswith("DISABLED")
+        assert "-m 50 -bandwidth 100" in mode
+
+    def test_sizing_mode_disabled_reflects_configured_defaults(self):
+        cfg = _config(
+            distcp_enable_auto_sizing=False,
+            distcp_default_mappers=8, distcp_default_bandwidth=250,
+        )
+        assert "-m 8 -bandwidth 250" in distcp_sizing_mode(cfg)
 
 
 class TestSizeDistcpJob:

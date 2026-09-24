@@ -397,8 +397,22 @@ def get_config() -> dict:
         's3_secret_key': _var('s3_secret_key', 'S3_SECRET_KEY', ''),
 
         # DistCp Configuration
+        # Master switch for the whole sizing feature below. Defaults to
+        # false/off so an upgrade is a no-op until someone opts in: every
+        # table is pinned to distcp_default_mappers/distcp_default_bandwidth
+        # (50/100 out of the box), reproducing the pre-auto-sizing DAG
+        # exactly. Only when explicitly set to true does size_distcp_job look
+        # at size/file count at all.
+        'distcp_enable_auto_sizing': str(
+            _var(
+                'migration_distcp_enable_auto_sizing',
+                'MIGRATION_DISTCP_ENABLE_AUTO_SIZING', 'false'
+            )
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+
         # Empty = auto-size from the source size probe (see size_distcp_job).
-        # Both must be set together to force a fixed value.
+        # Both must be set together to force a fixed value. Only consulted
+        # when distcp_enable_auto_sizing is true.
         'distcp_mappers': _var('migration_distcp_mappers', 'MIGRATION_DISTCP_MAPPERS', ''),
         'distcp_bandwidth': _var('migration_distcp_bandwidth', 'MIGRATION_DISTCP_BANDWIDTH', ''),
 
@@ -785,6 +799,12 @@ def _endpoint_credentials(ep_hostname: str, config: dict) -> tuple[str, str]:
 
 def size_distcp_job(size_bytes: int, file_count: int, config: dict) -> tuple[int, int]:
     """Derive (mappers, bandwidth_mb_per_mapper) for one DistCp job from its source size."""
+    if not config.get('distcp_enable_auto_sizing', False):
+        # Master switch is off (default) — reproduce the pre-auto-sizing DAG
+        # exactly. Every table gets the same fixed values; size/file count,
+        # the forced-override pair, and every other knob below are unused.
+        return int(config['distcp_default_mappers']), int(config['distcp_default_bandwidth'])
+
     forced_m = str(config.get('distcp_mappers') or '').strip()
     forced_b = str(config.get('distcp_bandwidth') or '').strip()
 
@@ -835,6 +855,13 @@ def distcp_sizing_mode(config: dict) -> str:
     identical in the log to auto-sizing that happened to choose 1. Callers log
     this once per task so the numbers below it can be read for what they are.
     """
+    if not config.get('distcp_enable_auto_sizing', False):
+        return (f"DISABLED — migration_distcp_enable_auto_sizing is not 'true', so every "
+                f"table is pinned to -m {config['distcp_default_mappers']} "
+                f"-bandwidth {config['distcp_default_bandwidth']} (distcp_default_mappers/"
+                f"distcp_default_bandwidth). Set migration_distcp_enable_auto_sizing=true "
+                f"to size per table instead.")
+
     forced_m = str(config.get('distcp_mappers') or '').strip()
     forced_b = str(config.get('distcp_bandwidth') or '').strip()
     if forced_m and forced_b:

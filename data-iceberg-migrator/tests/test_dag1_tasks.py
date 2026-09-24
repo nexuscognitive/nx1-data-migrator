@@ -1101,7 +1101,10 @@ class TestRunDistcpSsh:
                                                                    sample_discovery):
         ssh_cmd = self._run_per_partition_sized(
             mock_ssh_hook, sample_discovery,
-            config_overrides={'distcp_mappers': '', 'distcp_bandwidth': ''},
+            config_overrides={
+                'distcp_enable_auto_sizing': True,
+                'distcp_mappers': '', 'distcp_bandwidth': '',
+            },
         )
         pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
         assert len(pairs) == 2
@@ -1116,7 +1119,10 @@ class TestRunDistcpSsh:
                                                                  sample_discovery):
         ssh_cmd = self._run_per_partition_sized(
             mock_ssh_hook, sample_discovery,
-            config_overrides={'distcp_mappers': '50', 'distcp_bandwidth': '100'},
+            config_overrides={
+                'distcp_enable_auto_sizing': True,
+                'distcp_mappers': '50', 'distcp_bandwidth': '100',
+            },
         )
         pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
         assert len(pairs) == 2
