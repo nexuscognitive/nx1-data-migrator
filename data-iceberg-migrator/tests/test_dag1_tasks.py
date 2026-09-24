@@ -678,6 +678,20 @@ class TestRecordDiscoveredTables:
         )
         assert 'empty_partition_names' in insert_sql
 
+    def test_insert_covers_distcp_sizing_columns(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        """Regression: distcp_mappers/distcp_bandwidth_mbps were added to the
+        tracking table's CREATE TABLE DDL for the auto-sizing feature but were
+        initially forgotten from this explicit-column-list INSERT — same class
+        of bug as empty_partition_names, and column-count parity alone doesn't
+        catch it, since both the list and VALUES were short by the same amount."""
+        self._setup_count(mock_spark, 0)
+        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        insert_sql = next(
+            c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
+        )
+        for col in ('distcp_mappers', 'distcp_bandwidth_mbps'):
+            assert col in insert_sql
+
     def test_insert_column_list_matches_values_count(self, mock_spark, sample_discovery, mock_iceberg_retry):
         """Generic guard: the explicit column list and the VALUES tuple in the
         discovery INSERT must always have the same number of entries, or Iceberg
@@ -886,6 +900,33 @@ class TestRunDistcpSsh:
                 cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
                 ti=MagicMock(),
             )
+
+    def test_master_switch_default_off_uses_fixed_defaults_for_full_table(
+        self, mock_ssh_hook, sample_discovery,
+    ):
+        """E2E: with migration_distcp_enable_auto_sizing unset, the real
+        get_config() resolves distcp_enable_auto_sizing=False. MOCK_VARIABLES
+        also carries a forced override pair (migration_distcp_mappers=10,
+        migration_distcp_bandwidth=50) — that must be ignored too. The
+        table's own source_total_size_bytes/source_file_count (10MB/5 files)
+        would auto-size to (1, 500) if the switch were on, so landing on
+        (50, 100) here proves the switch — not a coincidence of the inputs —
+        is what picked the value."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+        )
+
+        m.run_distcp_ssh.function.__wrapped__(
+            discovery=sample_discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        ssh_cmd = client.exec_command.call_args[0][0]
+        assert '-m 50 -bandwidth 100' in ssh_cmd
+        assert '-m 10 -bandwidth 50' not in ssh_cmd
 
     def test_partition_filter_active_uses_per_partition_distcp(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
@@ -1096,6 +1137,22 @@ class TestRunDistcpSsh:
                 ti=MagicMock(),
             )
         return client.exec_command.call_args[0][0]
+
+    def test_master_switch_default_off_uses_fixed_defaults_per_partition(
+        self, mock_ssh_hook, sample_discovery,
+    ):
+        """E2E: nothing overridden — real get_config() resolves
+        distcp_enable_auto_sizing=False (unset) and a forced override pair of
+        (10, 50) from MOCK_VARIABLES. Both partitions (100 vs. 200 of the
+        300 files) would size differently under auto-sizing (see
+        test_per_partition_mappers_scale_with_partition_file_share, which
+        gets [7, 14] for the same split with the switch on) — landing on the
+        same (50, 100) pair for both here proves the master switch, not the
+        forced pair or the partition split, decided the outcome."""
+        ssh_cmd = self._run_per_partition_sized(mock_ssh_hook, sample_discovery)
+        pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
+        assert len(pairs) == 2
+        assert set(pairs) == {('50', '100')}
 
     def test_per_partition_mappers_scale_with_partition_file_share(self, mock_ssh_hook,
                                                                    sample_discovery):
