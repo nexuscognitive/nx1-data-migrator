@@ -397,8 +397,22 @@ def get_config() -> dict:
         's3_secret_key': _var('s3_secret_key', 'S3_SECRET_KEY', ''),
 
         # DistCp Configuration
+        # Master switch for the whole sizing feature below. Defaults to
+        # false/off so an upgrade is a no-op until someone opts in: every
+        # table is pinned to distcp_default_mappers/distcp_default_bandwidth
+        # (50/100 out of the box), reproducing the pre-auto-sizing DAG
+        # exactly. Only when explicitly set to true does size_distcp_job look
+        # at size/file count at all.
+        'distcp_enable_auto_sizing': str(
+            _var(
+                'migration_distcp_enable_auto_sizing',
+                'MIGRATION_DISTCP_ENABLE_AUTO_SIZING', 'false'
+            )
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+
         # Empty = auto-size from the source size probe (see size_distcp_job).
-        # Both must be set together to force a fixed value.
+        # Both must be set together to force a fixed value. Only consulted
+        # when distcp_enable_auto_sizing is true.
         'distcp_mappers': _var('migration_distcp_mappers', 'MIGRATION_DISTCP_MAPPERS', ''),
         'distcp_bandwidth': _var('migration_distcp_bandwidth', 'MIGRATION_DISTCP_BANDWIDTH', ''),
 
@@ -417,6 +431,20 @@ def get_config() -> dict:
         'distcp_target_aggregate_mbps': _int_var(
             'migration_distcp_target_aggregate_mbps',
             'MIGRATION_DISTCP_TARGET_AGGREGATE_MBPS', '2000'
+        ),
+        # Per-mapper ceiling. Without this, a table with few files (a handful
+        # of huge files, or one huge file) gets few mappers, and the aggregate
+        # budget piles onto them — e.g. 1 mapper at a 6500 MB/s aggregate
+        # target means that single stream is told to sustain 6500 MB/s, which
+        # can exceed real link capacity and saturate the source cluster/
+        # network path. Default 500: well above the old fixed per-mapper rate
+        # (100 MB/s) so well-distributed tables still benefit from auto-sizing,
+        # but far below the multi-GB/s-per-stream values that triggered the
+        # connection timeouts this knob exists to prevent. Tune to the
+        # measured link capacity between the edge node and the destination.
+        'distcp_max_mapper_bandwidth': _int_var(
+            'migration_distcp_max_mapper_bandwidth',
+            'MIGRATION_DISTCP_MAX_MAPPER_BANDWIDTH', '500'
         ),
         # Used when the size probe returns nothing usable.
         'distcp_default_mappers': _int_var(
@@ -771,6 +799,12 @@ def _endpoint_credentials(ep_hostname: str, config: dict) -> tuple[str, str]:
 
 def size_distcp_job(size_bytes: int, file_count: int, config: dict) -> tuple[int, int]:
     """Derive (mappers, bandwidth_mb_per_mapper) for one DistCp job from its source size."""
+    if not config.get('distcp_enable_auto_sizing', False):
+        # Master switch is off (default) — reproduce the pre-auto-sizing DAG
+        # exactly. Every table gets the same fixed values; size/file count,
+        # the forced-override pair, and every other knob below are unused.
+        return int(config['distcp_default_mappers']), int(config['distcp_default_bandwidth'])
+
     forced_m = str(config.get('distcp_mappers') or '').strip()
     forced_b = str(config.get('distcp_bandwidth') or '').strip()
 
@@ -805,6 +839,12 @@ def size_distcp_job(size_bytes: int, file_count: int, config: dict) -> tuple[int
     mappers = max(mappers, min_mappers)
 
     bandwidth = max(1, int(config['distcp_target_aggregate_mbps']) // mappers)
+
+    # Cap the per-mapper rate independently of how few mappers a low-file-count
+    # table ended up with. Lowers the effective aggregate for that table instead
+    # of raising mapper count — mappers stay bound by file count above.
+    bandwidth = min(bandwidth, int(config['distcp_max_mapper_bandwidth']))
+
     return mappers, bandwidth
 
 
@@ -815,6 +855,13 @@ def distcp_sizing_mode(config: dict) -> str:
     identical in the log to auto-sizing that happened to choose 1. Callers log
     this once per task so the numbers below it can be read for what they are.
     """
+    if not config.get('distcp_enable_auto_sizing', False):
+        return (f"DISABLED — migration_distcp_enable_auto_sizing is not 'true', so every "
+                f"table is pinned to -m {config['distcp_default_mappers']} "
+                f"-bandwidth {config['distcp_default_bandwidth']} (distcp_default_mappers/"
+                f"distcp_default_bandwidth). Set migration_distcp_enable_auto_sizing=true "
+                f"to size per table instead.")
+
     forced_m = str(config.get('distcp_mappers') or '').strip()
     forced_b = str(config.get('distcp_bandwidth') or '').strip()
     if forced_m and forced_b:
@@ -825,7 +872,8 @@ def distcp_sizing_mode(config: dict) -> str:
     return (f"AUTO — sized per table from discovered size: "
             f"{config['distcp_target_bytes_per_mapper']} bytes/mapper, "
             f"{config['distcp_min_mappers']}-{config['distcp_max_mappers']} mappers, "
-            f"{config['distcp_target_aggregate_mbps']} MB/s aggregate")
+            f"{config['distcp_target_aggregate_mbps']} MB/s aggregate, "
+            f"{config['distcp_max_mapper_bandwidth']} MB/s per-mapper cap")
 
 
 def distcp_jvm_opts(config: dict) -> str:
