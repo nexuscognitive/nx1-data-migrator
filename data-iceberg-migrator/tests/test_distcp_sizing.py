@@ -20,6 +20,7 @@ def _config(**overrides):
         'distcp_min_mappers': 1,
         'distcp_max_mappers': 100,
         'distcp_target_aggregate_mbps': 2000,
+        'distcp_max_mapper_bandwidth': 500,
         'distcp_default_mappers': 50,
         'distcp_default_bandwidth': 100,
     }
@@ -48,10 +49,14 @@ class TestSizeDistcpJob:
             size_distcp_job(40 * GB, 800, cfg)
 
     @pytest.mark.parametrize("size_bytes,file_count,expected", [
-        (500 * MB, 6, (1, 2000)),
+        # 500 MB/6 files and 900 GB/3 files would be (1, 2000) and (3, 666)
+        # without the default 500 MB/s per-mapper cap — both land on 1-3
+        # mappers, so the cap is what keeps either from being told to sustain
+        # more than 500 MB/s on a single stream.
+        (500 * MB, 6, (1, 500)),
         (40 * GB, 800, (20, 100)),
         (2 * TB, 30000, (100, 20)),
-        (900 * GB, 3, (3, 666)),
+        (900 * GB, 3, (3, 500)),
         (8 * GB, 200000, (4, 500)),
     ])
     def test_auto_sizing(self, size_bytes, file_count, expected):
@@ -66,7 +71,9 @@ class TestSizeDistcpJob:
         assert size_distcp_job(0, 12, cfg) == (8, 250)
 
     def test_zero_size_and_zero_files_uses_min_mappers(self):
-        assert size_distcp_job(0, 0, _config()) == (1, 2000)
+        # 1 mapper would get the full 2000 MB/s aggregate; the default 500
+        # MB/s per-mapper cap brings it down.
+        assert size_distcp_job(0, 0, _config()) == (1, 500)
 
     def test_ceiling_is_exact_above_float_precision(self):
         # 2**53 + 1 is the first size where float division rounds down.
@@ -82,6 +89,25 @@ class TestSizeDistcpJob:
     def test_bandwidth_never_drops_below_one(self):
         cfg = _config(distcp_target_aggregate_mbps=10, distcp_max_mappers=100)
         assert size_distcp_job(2 * TB, 30000, cfg) == (100, 1)
+
+    def test_max_mapper_bandwidth_caps_low_file_count_table(self):
+        # 900 GB / 3 files would otherwise be (3, 2166) at a 6500 aggregate —
+        # the default cap of 500 already covers this; raise it to isolate the
+        # clamp at a value the default wouldn't also trigger.
+        cfg = _config(distcp_target_aggregate_mbps=6500, distcp_max_mapper_bandwidth=1000)
+        assert size_distcp_job(900 * GB, 3, cfg) == (3, 1000)
+
+    def test_max_mapper_bandwidth_noop_when_already_below_cap(self):
+        cfg = _config(distcp_target_aggregate_mbps=2000, distcp_max_mapper_bandwidth=1000)
+        assert size_distcp_job(40 * GB, 800, cfg) == (20, 100)
+
+    def test_max_mapper_bandwidth_does_not_apply_to_forced_values(self):
+        # Forced mode is explicit user intent; the cap is an auto-sizing guard.
+        cfg = _config(
+            distcp_mappers='1', distcp_bandwidth='9000',
+            distcp_max_mapper_bandwidth=500,
+        )
+        assert size_distcp_job(900 * GB, 3, cfg) == (1, 9000)
 
 
 class TestDistcpJvmOpts:
@@ -131,6 +157,7 @@ class TestDistcpSizingMode:
         assert mode.startswith("AUTO")
         # The knobs in play belong in the line, so the numbers below it make sense.
         assert str(2 * GB) in mode and "2000 MB/s aggregate" in mode
+        assert "500 MB/s per-mapper cap" in mode
 
     def test_forced_when_both_halves_are_set(self):
         mode = distcp_sizing_mode(_config(distcp_mappers='1', distcp_bandwidth='100'))
@@ -156,3 +183,7 @@ class TestDistcpSizingMode:
     def test_whitespace_only_is_not_forced(self, blank):
         mode = distcp_sizing_mode(_config(distcp_mappers=blank, distcp_bandwidth=blank))
         assert mode.startswith("AUTO")
+
+    def test_auto_mode_notes_configured_cap(self):
+        mode = distcp_sizing_mode(_config(distcp_max_mapper_bandwidth=750))
+        assert "750 MB/s per-mapper cap" in mode

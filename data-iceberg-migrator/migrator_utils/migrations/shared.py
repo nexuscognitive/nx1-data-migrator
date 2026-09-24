@@ -418,6 +418,20 @@ def get_config() -> dict:
             'migration_distcp_target_aggregate_mbps',
             'MIGRATION_DISTCP_TARGET_AGGREGATE_MBPS', '2000'
         ),
+        # Per-mapper ceiling. Without this, a table with few files (a handful
+        # of huge files, or one huge file) gets few mappers, and the aggregate
+        # budget piles onto them — e.g. 1 mapper at a 6500 MB/s aggregate
+        # target means that single stream is told to sustain 6500 MB/s, which
+        # can exceed real link capacity and saturate the source cluster/
+        # network path. Default 500: well above the old fixed per-mapper rate
+        # (100 MB/s) so well-distributed tables still benefit from auto-sizing,
+        # but far below the multi-GB/s-per-stream values that triggered the
+        # connection timeouts this knob exists to prevent. Tune to the
+        # measured link capacity between the edge node and the destination.
+        'distcp_max_mapper_bandwidth': _int_var(
+            'migration_distcp_max_mapper_bandwidth',
+            'MIGRATION_DISTCP_MAX_MAPPER_BANDWIDTH', '500'
+        ),
         # Used when the size probe returns nothing usable.
         'distcp_default_mappers': _int_var(
             'migration_distcp_default_mappers', 'MIGRATION_DISTCP_DEFAULT_MAPPERS', '50'
@@ -805,6 +819,12 @@ def size_distcp_job(size_bytes: int, file_count: int, config: dict) -> tuple[int
     mappers = max(mappers, min_mappers)
 
     bandwidth = max(1, int(config['distcp_target_aggregate_mbps']) // mappers)
+
+    # Cap the per-mapper rate independently of how few mappers a low-file-count
+    # table ended up with. Lowers the effective aggregate for that table instead
+    # of raising mapper count — mappers stay bound by file count above.
+    bandwidth = min(bandwidth, int(config['distcp_max_mapper_bandwidth']))
+
     return mappers, bandwidth
 
 
@@ -825,7 +845,8 @@ def distcp_sizing_mode(config: dict) -> str:
     return (f"AUTO — sized per table from discovered size: "
             f"{config['distcp_target_bytes_per_mapper']} bytes/mapper, "
             f"{config['distcp_min_mappers']}-{config['distcp_max_mappers']} mappers, "
-            f"{config['distcp_target_aggregate_mbps']} MB/s aggregate")
+            f"{config['distcp_target_aggregate_mbps']} MB/s aggregate, "
+            f"{config['distcp_max_mapper_bandwidth']} MB/s per-mapper cap")
 
 
 def distcp_jvm_opts(config: dict) -> str:
