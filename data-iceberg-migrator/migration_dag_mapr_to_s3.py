@@ -83,6 +83,21 @@ _PERMISSION_DENIED_MARKERS = (
 
 _SKIPPABLE_STATUS_SQL_IN = ", ".join(f"'{s}'" for s in SKIPPABLE_DISCOVERY_ERRORS)
 
+
+def _slice_clause(partition_filter) -> str:
+    """WHERE fragment scoping a tracking-row UPDATE to one partition-filter slice.
+
+    One table can be migrated in several slices in a run (one Excel row per filter), and
+    record_discovered_tables inserts one tracking row per slice. An UPDATE keyed only on
+    (run, database, table, dest database) rewrites every slice's row. Escaped exactly like
+    the INSERT, so the comparison matches the stored value.
+    """
+    value = (partition_filter or "").replace("'", "''")
+    if value:
+        return f"AND partition_filter = '{value}'"
+    return "AND (partition_filter IS NULL OR partition_filter = '')"
+
+
 # Later phases roll up their own outcome but must not overwrite a skipped table's
 # status, which already says why it was never copied.
 _PRESERVE_SKIPPABLE_STATUS_SQL = (
@@ -1479,12 +1494,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
             else "NULL"
         )
 
-        pf_check_val = partition_filter_val
-        pf_check_clause = (
-            f"AND partition_filter = '{pf_check_val}'"
-            if pf_check_val
-            else "AND (partition_filter IS NULL OR partition_filter = '')"
-        )
+        pf_check_clause = _slice_clause(t.get("partition_filter"))
 
         existing = spark.sql(f"""
             SELECT COUNT(*) as cnt
@@ -1635,6 +1645,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                     "source_database": t["source_database"],
                     "source_table": t["source_table"],
                     "dest_database": t["dest_database"],
+                    "partition_filter": t.get("partition_filter"),
                     "status": t["error_type"],
                 }
             )
@@ -1645,6 +1656,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                     "source_database": t["source_database"],
                     "source_table": t["source_table"],
                     "dest_database": t["dest_database"],
+                    "partition_filter": t.get("partition_filter"),
                     "status": "SKIPPED",
                 }
             )
@@ -1664,6 +1676,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                     "source_database": t["source_database"],
                     "source_table": t["source_table"],
                     "dest_database": t["dest_database"],
+                    "partition_filter": t.get("partition_filter"),
                     "status": "SKIPPED",
                     "error": f"partition_filter matched 0 partitions: {t.get('partition_filter')}",
                 }
@@ -2470,6 +2483,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
               AND source_database = '{r['source_database']}'
               AND source_table = '{r['source_table']}'
               AND dest_database='{r['dest_database']}'
+              {_slice_clause(r.get('partition_filter'))}
         """,
             task_label=f"update_distcp_status:{r['source_table']}",
         )
@@ -2494,6 +2508,8 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 WHERE run_id = '{run_id}'
                   AND source_database = '{r['source_database']}'
                   AND source_table = '{r['source_table']}'
+                  AND dest_database = '{r['dest_database']}'
+                  {_slice_clause(r.get('partition_filter'))}
                   AND distcp_status IS NULL
             """,
                 task_label=f"update_distcp_status:failure_patch:{r['source_table']}",
@@ -2529,6 +2545,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
               AND source_database = '{r['source_database']}'
               AND source_table = '{r['source_table']}'
               AND dest_database = '{r['dest_database']}'
+              {_slice_clause(r.get('partition_filter'))}
               AND distcp_status IS NULL
         """,
             task_label=f"update_distcp_status:empty_source:{r['source_table']}",
@@ -2538,28 +2555,29 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         r.get("dest_database", distcp_result["dest_database"])
         for r in distcp_result.get("distcp_results", [])
     )
-    _distcp_processed_tables = set(
-        r["source_table"] for r in distcp_result.get("distcp_results", [])
-    )
-    _distcp_not_in = (
-        ", ".join(f"'{t}'" for t in _distcp_processed_tables)
-        if _distcp_processed_tables
-        else "'__no_tables__'"
-    )
+    # Keyed by (dest database, partition filter): each slice of a table has its own row.
+    _distcp_processed = {
+        (r["source_table"], r.get("partition_filter") or "")
+        for r in distcp_result.get("distcp_results", [])
+    }
 
     from collections import defaultdict
 
     _slot_tables_by_db = defaultdict(set)
     for t in distcp_result.get("tables", []):
-        _slot_tables_by_db[t.get("dest_database", distcp_result["dest_database"])].add(
-            t["source_table"]
-        )
+        _slot_tables_by_db[
+            (t.get("dest_database", distcp_result["dest_database"]), t.get("partition_filter") or "")
+        ].add(t["source_table"])
     if not _slot_tables_by_db:
-        _slot_tables_by_db[distcp_result["dest_database"]] = set()
+        _slot_tables_by_db[(distcp_result["dest_database"], "")] = set()
 
-    for _pddb, _slot_tbls in _slot_tables_by_db.items():
+    for (_pddb, _slot_pf), _slot_tbls in _slot_tables_by_db.items():
         _slot_in = (
             ", ".join(f"'{t}'" for t in _slot_tbls) if _slot_tbls else "'__no_tables__'"
+        )
+        _slot_done = {tbl for tbl, pf in _distcp_processed if pf == _slot_pf}
+        _distcp_not_in = (
+            ", ".join(f"'{t}'" for t in _slot_done) if _slot_done else "'__no_tables__'"
         )
         execute_with_iceberg_retry(
             spark,
@@ -2575,6 +2593,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 updated_at=current_timestamp()
             WHERE run_id='{run_id}' AND source_database='{src_db}'
               AND dest_database='{_pddb}'
+              {_slice_clause(_slot_pf)}
               AND source_table IN ({_slot_in})
               AND source_table NOT IN ({_distcp_not_in})
               AND distcp_status IS NULL AND discovery_status='COMPLETED'
@@ -2626,6 +2645,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 {
                     "source_table": tbl,
                     "dest_database": dest_db,
+                    "partition_filter": t.get("partition_filter"),
                     "status": t["error_type"],
                     "action": "skipped_not_found",
                     "existed": False,
@@ -2665,6 +2685,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 {
                     "source_table": t["source_table"],
                     "dest_database": dest_db,
+                    "partition_filter": t.get("partition_filter"),
                     "status": "SKIPPED",
                     "error": f"DistCp status was {distcp_status}",
                     "existed": False,
@@ -2712,6 +2733,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                         {
                             "source_table": tbl,
                             "dest_database": dest_db,
+                            "partition_filter": t.get("partition_filter"),
                             "status": "FAILED",
                             "action": "skipped_iceberg",
                             "existed": True,
@@ -2791,6 +2813,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                     {
                         "source_table": tbl,
                         "dest_database": dest_db,
+                        "partition_filter": t.get("partition_filter"),
                         "status": "COMPLETED",
                         "action": "repaired",
                         "existed": True,
@@ -2819,6 +2842,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                             {
                                 "source_table": tbl,
                                 "dest_database": dest_db,
+                                "partition_filter": t.get("partition_filter"),
                                 "status": "SKIPPED",
                                 "action": "skipped_no_schema",
                                 "existed": False,
@@ -2946,6 +2970,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                     {
                         "source_table": tbl,
                         "dest_database": dest_db,
+                        "partition_filter": t.get("partition_filter"),
                         "status": "COMPLETED",
                         "action": "recreated" if was_recreated else "created",
                         "existed": was_recreated,
@@ -2958,6 +2983,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 {
                     "source_table": tbl,
                     "dest_database": dest_db,
+                    "partition_filter": t.get("partition_filter"),
                     "status": "FAILED",
                     "action": "error",
                     "existed": False,
@@ -3038,6 +3064,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
               AND source_database = '{src_db}'
               AND dest_database = '{per_table_dest_db}'
               AND source_table = '{r['source_table']}'
+              {_slice_clause(r.get('partition_filter'))}
         """,
             task_label=f"update_table_create_status:{r['source_table']}",
         )
@@ -3062,31 +3089,33 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                   AND source_database = '{src_db}'
                   AND dest_database = '{per_table_dest_db}'
                   AND source_table = '{r['source_table']}'
+                  {_slice_clause(r.get('partition_filter'))}
                   AND table_create_status IS NULL
             """,
                 task_label=f"update_table_create_status:failure_patch:{r['source_table']}",
             )
 
-    _tbl_processed_tables = set(
-        r["source_table"] for r in table_result.get("table_results", [])
-    )
-    _tbl_not_in = (
-        ", ".join(f"'{t}'" for t in _tbl_processed_tables)
-        if _tbl_processed_tables
-        else "'__no_tables__'"
-    )
+    # Keyed by (dest database, partition filter): each slice of a table has its own row.
+    _tbl_processed = {
+        (r["source_table"], r.get("partition_filter") or "")
+        for r in table_result.get("table_results", [])
+    }
     from collections import defaultdict
 
     _tbl_slot_tables_by_db = defaultdict(set)
     for t in table_result.get("tables", []):
         _tbl_slot_tables_by_db[
-            t.get("dest_database", table_result["dest_database"])
+            (t.get("dest_database", table_result["dest_database"]), t.get("partition_filter") or "")
         ].add(t["source_table"])
     if not _tbl_slot_tables_by_db:
-        _tbl_slot_tables_by_db[table_result["dest_database"]] = set()
-    for _pddb, _slot_tbls in _tbl_slot_tables_by_db.items():
+        _tbl_slot_tables_by_db[(table_result["dest_database"], "")] = set()
+    for (_pddb, _slot_pf), _slot_tbls in _tbl_slot_tables_by_db.items():
         _slot_in = (
             ", ".join(f"'{t}'" for t in _slot_tbls) if _slot_tbls else "'__no_tables__'"
+        )
+        _slot_done = {tbl for tbl, pf in _tbl_processed if pf == _slot_pf}
+        _tbl_not_in = (
+            ", ".join(f"'{t}'" for t in _slot_done) if _slot_done else "'__no_tables__'"
         )
         execute_with_iceberg_retry(
             spark,
@@ -3103,6 +3132,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
             WHERE run_id = '{run_id}'
               AND source_database = '{src_db}'
               AND dest_database = '{_pddb}'
+              {_slice_clause(_slot_pf)}
               AND source_table IN ({_slot_in})
               AND source_table NOT IN ({_tbl_not_in})
               AND table_create_status IS NULL
@@ -3145,6 +3175,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 {
                     "source_table": tbl,
                     "dest_database": per_table_dest_db,
+                    "partition_filter": t.get("partition_filter"),
                     "status": t["error_type"],
                     "error": _skippable_discovery_message(t),
                 }
@@ -3232,6 +3263,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 validation_results.append({
                     "source_table": tbl,
                     "dest_database": per_table_dest_db,
+                    "partition_filter": t.get("partition_filter"),
                     "status": "COMPLETED",
                     "source_row_count": 0,
                     "dest_hive_row_count": 0,
@@ -3264,6 +3296,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     {
                         "source_table": tbl,
                         "dest_database": per_table_dest_db,
+                        "partition_filter": t.get("partition_filter"),
                         "status": "SKIPPED",
                         "error": f"Skipped validation — upstream failure: {row['error_message']}",
                     }
@@ -3294,6 +3327,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     {
                         "source_table": tbl,
                         "dest_database": per_table_dest_db,
+                        "partition_filter": t.get("partition_filter"),
                         "status": "SKIPPED",
                         "error": "Source metrics not found in tracking table",
                     }
@@ -3445,6 +3479,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 {
                     "source_table": tbl,
                     "dest_database": per_table_dest_db,
+                    "partition_filter": t.get("partition_filter"),
                     "status": "COMPLETED",
                     "source_row_count": source_row_count,
                     "dest_hive_row_count": dest_row_count,
@@ -3470,6 +3505,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 {
                     "source_table": tbl,
                     "dest_database": per_table_dest_db,
+                    "partition_filter": t.get("partition_filter"),
                     "status": "FAILED",
                     "error": str(e)[:2000],
                 }
@@ -3621,6 +3657,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
               AND source_database = '{src_db}'
               AND dest_database = '{per_val_dest_db}'
               AND source_table = '{v['source_table']}'
+              {_slice_clause(v.get('partition_filter'))}
         """,
             task_label=f"update_validation_status:{v['source_table']}",
         )
@@ -3641,31 +3678,34 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                   AND source_database = '{src_db}'
                   AND dest_database = '{per_val_dest_db}'
                   AND source_table = '{v['source_table']}'
+                  {_slice_clause(v.get('partition_filter'))}
                   AND validation_status IS NULL
             """,
                 task_label=f"update_validation_status:failure_patch:{v['source_table']}",
             )
 
-    _val_processed_tables = set(
-        v["source_table"] for v in validation_result.get("validation_results", [])
-    )
-    _val_not_in = (
-        ", ".join(f"'{t}'" for t in _val_processed_tables)
-        if _val_processed_tables
-        else "'__no_tables__'"
-    )
+    # Keyed by (dest database, partition filter): each slice of a table has its own row.
+    _val_processed = {
+        (v["source_table"], v.get("partition_filter") or "")
+        for v in validation_result.get("validation_results", [])
+    }
 
     from collections import defaultdict
 
     _slot_tables_by_db = defaultdict(set)
     for t in validation_result.get("tables", []):
-        _slot_tables_by_db[t.get("dest_database", dest_db)].add(t["source_table"])
+        _slot_tables_by_db[
+            (t.get("dest_database", dest_db), t.get("partition_filter") or "")
+        ].add(t["source_table"])
     if not _slot_tables_by_db:
-        _slot_tables_by_db[dest_db] = set()
-
-    for _vpddb, _slot_tbls in _slot_tables_by_db.items():
+        _slot_tables_by_db[(dest_db, "")] = set()
+    for (_vpddb, _slot_pf), _slot_tbls in _slot_tables_by_db.items():
         _slot_in = (
             ", ".join(f"'{t}'" for t in _slot_tbls) if _slot_tbls else "'__no_tables__'"
+        )
+        _slot_done = {tbl for tbl, pf in _val_processed if pf == _slot_pf}
+        _val_not_in = (
+            ", ".join(f"'{t}'" for t in _slot_done) if _slot_done else "'__no_tables__'"
         )
         execute_with_iceberg_retry(
             spark,
@@ -3683,6 +3723,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
             WHERE run_id = '{run_id}'
               AND source_database = '{src_db}'
               AND dest_database = '{_vpddb}'
+              {_slice_clause(_slot_pf)}
               AND source_table IN ({_slot_in})
               AND source_table NOT IN ({_val_not_in})
               AND table_create_status = 'COMPLETED'
