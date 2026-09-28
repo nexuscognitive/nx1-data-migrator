@@ -1877,7 +1877,9 @@ run_distcp_with_retry() {{
     local delay=30
     local attempt=1
     while [ $attempt -le $max_attempts ]; do
-        echo "  [DistCp] Attempt $attempt/$max_attempts: $*"
+        # Never echo "$@": it carries -Dfs.s3a.secret.key, and this output is logged
+        # verbatim by the task. The -log flag records the command.
+        echo "  [DistCp] Attempt $attempt/$max_attempts"
         if "$@"; then
             return 0
         fi
