@@ -562,8 +562,8 @@ class TestMigrateTablesToIceberg:
         return router
 
     def test_empty_table_with_registered_empty_partitions_passes(self, mock_spark):
-        """0 rows, 3 registered-but-empty partitions: raw .partitions=3 (old bug ->
-        mismatch), data-bearing=0 -> partition_match must be True."""
+        """0 rows, 3 registered-but-empty partitions: data-bearing=0 on both sides ->
+        partition_match must be True."""
         discovery = self._make_partitioned_discovery()
         mock_spark.sql.side_effect = self._partition_router(
             hive_rows=0, non_empty=0, registered=3, iceberg=3, iceberg_with_data=0,
@@ -573,6 +573,38 @@ class TestMigrateTablesToIceberg:
         )['results'][0]
         assert r['partition_match'] is True
         assert r['iceberg_partition_count'] == 0
+
+    def test_dest_partitions_counted_from_data_not_metadata_table(self, mock_spark):
+        """<table>.partitions is denied by Ranger on Kyuubi tenants; count from the data."""
+        discovery = self._make_partitioned_discovery()
+        mock_spark.sql.side_effect = self._partition_router(hive_rows=10, non_empty=3, registered=3)
+        r = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )['results'][0]
+        all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
+        assert '.partitions' not in all_sql
+        assert 'select distinct dt from sales_data_s3_iceberg.transactions' in all_sql
+        assert r['iceberg_partition_count'] == 3
+        assert r['partition_match'] is True
+
+    def test_dest_missing_partition_is_a_mismatch(self, mock_spark):
+        """A partition that did not reach Iceberg must still fail the check."""
+        discovery = self._make_partitioned_discovery()
+        base = self._partition_router(hive_rows=10, non_empty=3, registered=3)
+
+        def router(sql):
+            if sql.lower().strip().startswith('select distinct') and '_iceberg.' in sql.lower():
+                df = MagicMock()
+                df.collect.return_value = [self._FakeRow(dt=f'nonempty_{i}') for i in range(2)]
+                return df
+            return base(sql)
+
+        mock_spark.sql.side_effect = router
+        r = m.migrate_tables_to_iceberg.function.__wrapped__(
+            discovery=discovery, dag_run_id='dag_test', spark=mock_spark, ti=MagicMock(),
+        )['results'][0]
+        assert r['iceberg_partition_count'] == 2
+        assert r['partition_match'] is False
 
     def test_partially_empty_partitions_match(self, mock_spark):
         """5 registered, 3 with data -> source 3 vs dest 3 -> match."""
