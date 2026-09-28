@@ -1302,7 +1302,7 @@ class TestUpdateDistcpStatus:
         """A COMPLETED distcp that moved zero bytes/files against a source with
         zero rows must be flipped to EMPTY_SOURCE so the report converges on a
         single tracking state regardless of stray marker files."""
-        sample_distcp_result['tables'][0]['row_count'] = 0
+        sample_distcp_result['tables'][0].update({'row_count': 0, 'source_total_size_bytes': 0})
         sample_distcp_result['distcp_results'][0].update({
             'status': 'COMPLETED', 'bytes_copied': 0, 'files_copied': 0,
             's3_file_count_after': 0, 's3_total_size_bytes_after': 0,
@@ -1328,6 +1328,22 @@ class TestUpdateDistcpStatus:
         # The main per-row UPDATE must still have fired with the original status.
         assert "distcp_status = 'COMPLETED'" in sql_calls
 
+    def test_zero_rows_with_data_on_disk_is_not_empty_source(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """Unregistered source partitions count 0 rows in the metastore while their files
+        sit on disk; an incremental copy whose files another slice already moved copies
+        nothing. Neither makes the source empty (analytics_db.sessions in the regression
+        suite ended EMPTY_SOURCE instead of VALIDATED_WITH_WARNINGS)."""
+        sample_distcp_result['tables'][0].update({'row_count': 0, 'source_total_size_bytes': 26})
+        sample_distcp_result['distcp_results'][0].update({
+            'status': 'COMPLETED', 'bytes_copied': 0, 'files_copied': 0, 'is_incremental': True,
+        })
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        sql_calls = ' '.join(str(c) for c in mock_iceberg_retry.call_args_list)
+        assert "distcp_status = 'EMPTY_SOURCE'" not in sql_calls
+        assert "distcp_status = 'COMPLETED'" in sql_calls
+
     def test_normalization_keys_match_per_partition_filter_slice(
         self, mock_spark, sample_discovery, mock_iceberg_retry
     ):
@@ -1341,6 +1357,7 @@ class TestUpdateDistcpStatus:
             'partition_filter_active': True,
             'filtered_partitions': ['dt=2025-01-02'],
             'filtered_row_count': 0,
+            'filtered_source_size_bytes': 0,
             'row_count': 0,
         })
         nonempty_slice = dict(base_t)

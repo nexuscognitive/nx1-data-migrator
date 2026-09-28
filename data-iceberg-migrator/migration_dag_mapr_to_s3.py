@@ -2408,8 +2408,16 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         src_t = _tables_by_key.get(key)
         if src_t is None:
             continue
+        # Zero bytes copied alone proves nothing on an incremental copy whose files are
+        # already at the destination, and a source with unregistered partitions counts 0
+        # rows while holding data, so the source must also be empty on disk.
+        if src_t.get("partition_filter_active"):
+            src_size = src_t.get("filtered_source_size_bytes", src_t.get("source_total_size_bytes", 0))
+        else:
+            src_size = src_t.get("source_total_size_bytes", 0)
         if (
             src_t.get("row_count", 0) == 0
+            and not src_size
             and r.get("bytes_copied", 0) == 0
             and r.get("files_copied", 0) == 0
         ):
