@@ -45,6 +45,7 @@ from migrator_utils.migrations.shared import (
     hive_type_to_spark_ddl,
     normalize_s3,
     size_distcp_job,
+    sql_quote,
     track_duration,
     validate_bucket_endpoint_pairs,
 )
@@ -92,7 +93,7 @@ def _slice_clause(partition_filter) -> str:
     (run, database, table, dest database) rewrites every slice's row. Escaped exactly like
     the INSERT, so the comparison matches the stored value.
     """
-    value = (partition_filter or "").replace("'", "''")
+    value = sql_quote(partition_filter or "")
     if value:
         return f"AND partition_filter = '{value}'"
     return "AND (partition_filter IS NULL OR partition_filter = '')"
@@ -626,8 +627,8 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
             NULL,
             'RUNNING',
             0, 0, 0,
-            '{json.dumps(config).replace("'", "''")}',
-            '{sa_user.replace("'", "''")}',
+            '{sql_quote(json.dumps(config))}',
+            '{sql_quote(sa_user)}',
             '{sa_source}'
         )
         """
@@ -1445,7 +1446,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
         is_missing = error_type in SKIPPABLE_DISCOVERY_ERRORS
         disc_status = error_type if is_missing else "COMPLETED"
         if is_missing:
-            err_msg_escaped = _skippable_discovery_message(t).replace("'", "''")[:2000]
+            err_msg_escaped = sql_quote(_skippable_discovery_message(t), 2000)
             overall_status_insert = f"'{error_type}'"
             error_msg_insert = f"'{err_msg_escaped}'"
             overall_status_update = f"'{error_type}'"
@@ -1456,17 +1457,15 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
             overall_status_update = "NULL"
             error_msg_update = "NULL"
 
-        source_location_escaped = (t.get("source_location") or "").replace("'", "''")
+        source_location_escaped = sql_quote(t.get("source_location") or "")
 
         parts = t.get("partitions", [])
         if isinstance(parts, str):
             parts = [p for p in parts.split(",") if p]
 
-        schema_json = json.dumps(t.get("schema", [])).replace("'", "''")
-        partition_schema_json = json.dumps(t.get("partition_schema", [])).replace(
-            "'", "''"
-        )
-        parts_json = json.dumps(parts).replace("'", "''")
+        schema_json = sql_quote(json.dumps(t.get("schema", [])))
+        partition_schema_json = sql_quote(json.dumps(t.get("partition_schema", [])))
+        parts_json = sql_quote(json.dumps(parts))
         table_type = t.get("table_type", "UNKNOWN")
         partition_filter_active = t.get("partition_filter_active", False)
         if partition_filter_active:
@@ -1484,7 +1483,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
         full_table_partition_count = t.get(
             "full_table_partition_count", t.get("partition_count", 0)
         )
-        partition_filter_val = (t.get("partition_filter") or "").replace("'", "''")
+        partition_filter_val = sql_quote(t.get("partition_filter") or "")
         filtered_partition_count = (
             len(t.get("filtered_partitions", [])) if partition_filter_active else None
         )
@@ -2432,7 +2431,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         if r.get("status") in ("SKIPPED", "EMPTY_SOURCE", *SKIPPABLE_DISCOVERY_ERRORS):
             continue
         overall = "COPIED" if r["status"] == "COMPLETED" else "FAILED"
-        error_msg = r.get("error", "").replace("'", "''") if r.get("error") else ""
+        error_msg = sql_quote(r.get("error", "")) if r.get("error") else ""
         distcp_duration = r.get("distcp_duration_secs", 0.0)
         started_at = r.get("distcp_started_at", "")
         completed_at = r.get("distcp_completed_at", "")
@@ -2443,13 +2442,13 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         s3_files_after = r.get("s3_file_count_after", 0)
         s3_bytes_transfer = r.get("s3_bytes_transferred", 0)
         s3_files_transfer = r.get("s3_files_transferred", 0)
-        yarn_app_id = ",".join(
+        yarn_app_id = sql_quote(",".join(
             r.get("yarn_application_ids")
             or ([r["yarn_application_id"]] if r.get("yarn_application_id") else [])
-        ).replace("'", "''")
+        ))
         empty_partitions = r.get("empty_partitions") or []
         empty_partition_names_sql = (
-            "'" + ", ".join(empty_partitions).replace("'", "''")[:4000] + "'"
+            "'" + sql_quote(", ".join(empty_partitions), 4000) + "'"
             if empty_partitions else "NULL"
         )
 
@@ -2490,7 +2489,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
 
     for r in distcp_result.get("distcp_results", []):
         if r.get("status") == "FAILED" and r.get("error"):
-            per_table_error = str(r["error"])[:2000].replace("'", "''")
+            per_table_error = sql_quote(str(r["error"])[:2000])
             execute_with_iceberg_retry(
                 spark,
                 f"""
@@ -3042,7 +3041,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
             if r["status"] == "COMPLETED"
             else ("FAILED" if r["status"] == "FAILED" else "SKIPPED")
         )
-        error_msg = (r.get("error", "") or "").replace("'", "''")[:2000]
+        error_msg = sql_quote(r.get("error", "") or "", 2000)
 
         execute_with_iceberg_retry(
             spark,
@@ -3072,7 +3071,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
     for r in table_result.get("table_results", []):
         if r.get("status") == "FAILED" and r.get("error"):
             per_table_dest_db = r.get("dest_database", table_result["dest_database"])
-            per_table_error = str(r["error"])[:2000].replace("'", "''")
+            per_table_error = sql_quote(str(r["error"])[:2000])
             execute_with_iceberg_retry(
                 spark,
                 f"""
@@ -3182,7 +3181,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             )
             continue
 
-        pf_val_upstream = (t.get("partition_filter") or "").replace("'", "''")
+        pf_val_upstream = sql_quote(t.get("partition_filter") or "")
         pf_clause_upstream = (
             f"AND partition_filter = '{pf_val_upstream}'"
             if pf_val_upstream
@@ -3306,7 +3305,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
         logger.info(f"[Validation] Starting validation for {per_table_dest_db}.{tbl}")
 
         try:
-            pf_val = (t.get("partition_filter") or "").replace("'", "''")
+            pf_val = sql_quote(t.get("partition_filter") or "")
             pf_clause = (
                 f"AND partition_filter = '{pf_val}'"
                 if pf_val
@@ -3585,11 +3584,11 @@ def update_validation_status(validation_result: dict, spark) -> dict:
             continue
 
         per_val_dest_db = v.get("dest_database", dest_db)
-        error_msg = (v.get("error", "") or "").replace("'", "''")[:2000]
-        schema_diffs = (v.get("schema_differences", "") or "").replace("'", "''")[:2000]
+        error_msg = sql_quote(v.get("error", "") or "", 2000)
+        schema_diffs = sql_quote(v.get("schema_differences", "") or "", 2000)
         partition_schema_match = v.get("partition_schema_match", True)
         partition_schema_diffs = (
-            (v.get("partition_schema_differences", "") or "").replace("'", "''")[:2000]
+            sql_quote(v.get("partition_schema_differences", "") or "", 2000)
         )
 
         is_validated = (
@@ -3617,7 +3616,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
         if v["status"] == "FAILED":
             error_message_sql = f"'{error_msg}'"
         elif not is_validated and v.get("error"):
-            mismatch_msg = str(v["error"]).replace("'", "''")[:2000]
+            mismatch_msg = sql_quote(str(v["error"]), 2000)
             error_message_sql = f"'{mismatch_msg}'"
         elif is_validated:
             error_message_sql = "NULL"
@@ -3664,7 +3663,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 
     for v in validation_result.get("validation_results", []):
         if v.get("status") == "FAILED" and v.get("error"):
-            per_table_error = str(v["error"])[:2000].replace("'", "''")
+            per_table_error = sql_quote(str(v["error"])[:2000])
             per_val_dest_db = v.get("dest_database", dest_db)
             execute_with_iceberg_retry(
                 spark,
@@ -4618,8 +4617,8 @@ def finalize_run(run_id: str, spark, cluster_setup: dict = None) -> dict:
         )
 
         if isinstance(cluster_setup, dict) and cluster_setup.get("service_account_user_id"):
-            _sa = str(cluster_setup["service_account_user_id"]).replace("'", "''")
-            _sa_src = str(cluster_setup.get("service_account_source") or "unknown").replace("'", "''")
+            _sa = sql_quote(str(cluster_setup["service_account_user_id"]))
+            _sa_src = sql_quote(str(cluster_setup.get("service_account_source") or "unknown"))
             execute_with_iceberg_retry(
                 spark,
                 f"""

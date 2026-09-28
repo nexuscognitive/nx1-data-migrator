@@ -800,7 +800,7 @@ class TestRecordDiscoveredTables:
         assert 'Path does not exist' in all_sql
         # A quote in the location must not break out of the SQL literal. Failure rows
         # only started carrying a location in this change, so nothing pinned this.
-        assert "o''brien" in all_sql
+        assert "o\\'brien" in all_sql
         assert "o'brien'" not in all_sql
 
 
@@ -1724,7 +1724,7 @@ class TestPartitionFilterSlices:
 
     def test_slice_clause(self):
         assert m._slice_clause(None) == "AND (partition_filter IS NULL OR partition_filter = '')"
-        assert m._slice_clause("a'b") == "AND partition_filter = 'a''b'"
+        assert m._slice_clause("a'b") == "AND partition_filter = 'a\\'b'"
 
     def test_create_status_update_is_scoped_to_its_slice(
         self, mock_spark, sample_table_result, mock_iceberg_retry
