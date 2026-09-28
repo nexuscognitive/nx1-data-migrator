@@ -5187,6 +5187,11 @@ with DAG(
 
     # Per-database processing (dynamic task mapping)
     t_discover = discover_tables_via_spark_ssh.expand(db_config=t_excel)
+    # Each discovery is a local[*] pyspark driver on the edge node; uncapped, one per
+    # Excel database row, they OOM-killed a small edge node mid-run.
+    t_discover.operator.max_active_tis_per_dagrun = _env_int(
+        "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3
+    )
     t_record = record_discovered_tables.expand(discovery=t_discover)
     t_record.operator.trigger_rule = "all_done"
     t_batches = flatten_and_batch(discoveries=t_record)
