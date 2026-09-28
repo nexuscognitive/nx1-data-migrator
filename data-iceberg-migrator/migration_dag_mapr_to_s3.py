@@ -172,6 +172,20 @@ def _is_iceberg_table(spark, full_name: str) -> bool:
     return False
 
 
+def _table_location(spark, full_name: str) -> str | None:
+    """The table's storage location from DESCRIBE FORMATTED, normalized for comparison
+    (s3a:// scheme, no trailing slash). None when it cannot be read."""
+    try:
+        rows = spark.sql(f"DESCRIBE FORMATTED {full_name}").collect()
+    except Exception:
+        return None
+    for r in rows:
+        if (r.col_name or "").strip().lower() == "location":
+            value = (r.data_type or "").strip()
+            return normalize_s3(value).rstrip("/") if value else None
+    return None
+
+
 def _compare_partition_schemas(src_partition_schema, dest_partition_schema):
     """Compare source vs destination partition-column schemas (name -> type).
 
@@ -2731,6 +2745,33 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 was_recreated = True
 
             if exists:
+                # Repairing registers whatever lives under the existing table's own location.
+                # If that is not where this run copied the data (another user's table with
+                # the same name, or an older layout), the repair would validate someone else's
+                # files and leave this copy unregistered. Fail instead; recreate_tables is the
+                # explicit way to take the table over.
+                existing_location = _table_location(spark, full_name)
+                copy_location = normalize_s3(s3_loc).rstrip("/")
+                if existing_location and existing_location != copy_location:
+                    msg = (
+                        f"{full_name} already exists at {existing_location}, but this run "
+                        f"copied the data to {copy_location}. Repairing it would register the "
+                        f"other location's files, not this copy. Drop or rename the existing "
+                        f"table, or re-run with migration_recreate_tables=true to replace it."
+                    )
+                    logger.error(f"[HiveTable] {msg}")
+                    results.append(
+                        {
+                            "source_table": tbl,
+                            "dest_database": dest_db,
+                            "partition_filter": t.get("partition_filter"),
+                            "status": "FAILED",
+                            "action": "location_mismatch",
+                            "existed": True,
+                            "error": msg,
+                        }
+                    )
+                    continue
                 if is_part:
                     if t.get("partition_filter_active") and t.get(
                         "filtered_partitions"
