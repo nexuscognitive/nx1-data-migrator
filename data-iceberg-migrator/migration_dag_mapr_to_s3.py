@@ -3577,6 +3577,17 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 "VALIDATED_WITH_WARNINGS" if has_mismatch_only else "VALIDATION_FAILED"
             )
         )
+        # A zero-row table is EMPTY_SOURCE whether or not DistCp copied a schema-only file.
+        # update_distcp_status normalizes only when nothing was copied, so the first run into
+        # an empty destination ended VALIDATED and every re-run EMPTY_SOURCE. Zero rows on
+        # both sides is the run-independent test; a source with unregistered partitions
+        # counts 0 in the metastore but its destination does not, so it stays as it was.
+        if (
+            is_validated
+            and v.get("source_row_count") == 0
+            and v.get("dest_hive_row_count") == 0
+        ):
+            final_overall_status = "EMPTY_SOURCE"
 
         if v["status"] == "FAILED":
             error_message_sql = f"'{error_msg}'"

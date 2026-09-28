@@ -2045,6 +2045,41 @@ class TestValidateDestinationTables:
         assert result['validation_results'][0]['status'] == 'SKIPPED'
 
 
+class TestZeroRowTableStatus:
+    """A zero-row table ends EMPTY_SOURCE on its first run too, not only on re-runs."""
+
+    def _final_status_sql(self, retry):
+        return [c.args[1] for c in retry.call_args_list
+                if "validation_status = 'COMPLETED'" in c.args[1]]
+
+    def _validate(self, mock_spark, result, retry, source_rows, dest_rows):
+        result['validation_results'][0].update({
+            'source_row_count': source_rows, 'dest_hive_row_count': dest_rows,
+            'row_count_match': source_rows == dest_rows,
+        })
+        m.update_validation_status.function(validation_result=result, spark=mock_spark)
+        return self._final_status_sql(retry)[0]
+
+    def test_zero_rows_both_sides_is_empty_source(
+        self, mock_spark, sample_validation_result, mock_iceberg_retry
+    ):
+        sql = self._validate(mock_spark, sample_validation_result, mock_iceberg_retry, 0, 0)
+        assert "ELSE 'EMPTY_SOURCE'" in sql
+
+    def test_hidden_source_rows_keep_their_warning(
+        self, mock_spark, sample_validation_result, mock_iceberg_retry
+    ):
+        """Unregistered source partitions count 0 while the destination has rows."""
+        sql = self._validate(mock_spark, sample_validation_result, mock_iceberg_retry, 0, 2)
+        assert "ELSE 'VALIDATED_WITH_WARNINGS'" in sql
+
+    def test_non_empty_table_stays_validated(
+        self, mock_spark, sample_validation_result, mock_iceberg_retry
+    ):
+        sql = self._validate(mock_spark, sample_validation_result, mock_iceberg_retry, 5, 5)
+        assert "ELSE 'VALIDATED'" in sql
+
+
 class TestUpdateValidationStatus:
 
     def test_sets_validated_on_match(self, mock_spark, sample_validation_result, mock_iceberg_retry):
