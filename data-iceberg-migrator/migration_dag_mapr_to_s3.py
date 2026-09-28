@@ -916,6 +916,12 @@ def resolve_tokens(spark, db, tokens):
         existing_rows = spark.sql("SHOW TABLES IN {{0}}".format(db)).collect()
         existing_lower = {{r.tableName.lower(): r.tableName for r in existing_rows}}
     except AnalysisException as e:
+        # Only a missing database (Spark 2 "not found", Spark 3.4+ "cannot be found") means the
+        # tokens are missing. Any other failure (metastore down, NameNode in safe mode) aborts so
+        # the task retries; the marker is needed because a raise in stdin-fed pyspark doesn't stop it.
+        if not any(m in str(e).lower() for m in ("not found", "cannot be found", "nosuchdatabase")):
+            print("===DISCOVERY_ABORT=== SHOW TABLES IN {{0}} failed: {{1}}".format(db, str(e)[:500]))
+            raise
         print("WARNING: SHOW TABLES IN {{0}} failed with AnalysisException ({{1}}). Treating all explicit tokens as missing.".format(db, str(e)[:200]))
         existing_lower = {{}}
 
@@ -1329,6 +1335,11 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
                 f"Error: {error_output[:1000]}\n"
                 f"Output: {output[-500:]}"
             )
+
+        abort_at = output.find("===DISCOVERY_ABORT===")
+        if abort_at != -1:
+            reason = output[abort_at:].splitlines()[0]
+            raise Exception(f"Table discovery for {src_db} aborted: {reason}")
 
         json_start = output.find("===JSON_START===")
         json_end = output.find("===JSON_END===")
