@@ -60,6 +60,19 @@ class TestMaprToS3DagIntegrity:
             window = dag_body[dag_body.index(anchor):][:200]
             assert 'MIGRATION_DISTCP_COPY_MAX_CONCURRENT' in window, task_var
 
+    def test_edge_discovery_has_an_explicit_concurrency_cap(self):
+        """Every discovery runs a pyspark driver on the edge node; with no cap, a
+        30-database Excel started 30 at once and the edge pod was OOM-killed."""
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        _, _, dag_body = source.partition('with DAG(')
+        anchor = 't_discover.operator.max_active_tis_per_dagrun'
+        assert anchor in dag_body, anchor
+        window = dag_body[dag_body.index(anchor):][:200]
+        assert 'MIGRATION_DISCOVERY_MAX_CONCURRENT' in window
+
     def test_parse_path_reads_no_variable_except_the_owner(self):
         """Operator attributes are set at parse; a Variable read there costs a
         metadata-DB round trip on every scheduler parse loop."""
