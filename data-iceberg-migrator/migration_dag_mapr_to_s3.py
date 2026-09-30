@@ -70,6 +70,14 @@ SKIPPABLE_DISCOVERY_ERRORS = (
     "TABLE_NOT_FOUND",
     "DATABASE_NOT_FOUND",
     "SOURCE_PATH_NOT_FOUND",
+    "TABLE_CORRUPTED",
+)
+
+# Spark's HiveExternalCatalog raises this when the spark.sql.sources.schema.* table
+# properties are missing or incomplete. Any read of the table — even SHOW TBLPROPERTIES —
+# fails the same way, so a retry cannot help; the owner has to repair the table.
+_CORRUPTED_SCHEMA_MARKERS = (
+    "could not read schema from the hive metastore because it is corrupted",
 )
 
 # "Not allowed to see it" is not "not there". Belt-and-braces: an ACL problem
@@ -92,9 +100,13 @@ _PRESERVE_SKIPPABLE_STATUS_SQL = (
 
 def _classify_discovery_error(error: str, source_path_exists: bool | None) -> str:
     """Refine the remote script's blanket FAILED into a skippable status when the
-    table's LOCATION root is verifiably gone (orphaned metastore entry).
+    table's LOCATION root is verifiably gone (orphaned metastore entry), or when its
+    metastore schema is corrupted.
 
-    Keyed off the remote fs.exists() on the root, not the exception wording, which
+    Corruption is keyed off the exception wording: Spark fails before the location is
+    read, so source_path_exists is None, and the message is specific enough to trust.
+
+    A missing root is keyed off the remote fs.exists() on the root, not the exception wording, which
     cannot tell the root being gone from a path *under* it being gone — Spark's file
     index names leaf files, so a compaction or one missing partition raises the same
     FileNotFoundException on a table that is still migratable.
@@ -103,9 +115,11 @@ def _classify_discovery_error(error: str, source_path_exists: bool | None) -> st
 
     Blind spot: a table whose partitions live outside the root reads as absent. DistCp
     copies from the root, so it was already unmigratable — now it is flagged as such."""
+    err = (error or "").lower()
+    if any(marker in err for marker in _CORRUPTED_SCHEMA_MARKERS):
+        return "TABLE_CORRUPTED"
     if source_path_exists is not False:
         return "FAILED"
-    err = (error or "").lower()
     if any(marker in err for marker in _PERMISSION_DENIED_MARKERS):
         return "FAILED"
     return "SOURCE_PATH_NOT_FOUND"
@@ -1375,6 +1389,12 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
             logger.error(
                 f"  Source data path missing for {src_db}.{t['source_table']} — orphaned "
                 f"metastore entry, will be skipped in downstream phases | "
+                f"error={t.get('error', '')[:200]}"
+            )
+        elif t.get("error_type") == "TABLE_CORRUPTED":
+            logger.error(
+                f"  Table metadata corrupted for {src_db}.{t['source_table']} — the "
+                f"table owner must repair it; will be skipped in downstream phases | "
                 f"error={t.get('error', '')[:200]}"
             )
         else:
@@ -3746,6 +3766,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     path_not_found_tables = sum(
         1 for t in table_status if t.overall_status == "SOURCE_PATH_NOT_FOUND"
     )
+    corrupted_tables = sum(1 for t in table_status if t.overall_status == "TABLE_CORRUPTED")
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (
         1024**3
     )
@@ -3877,6 +3898,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             background-color: #f3e5f5;
             color: #6a1b9a;
         }}
+        .status-corrupted {{
+            background-color: #fce4ec;
+            color: #ad1457;
+        }}
         .status-warning {{
             background-color: #fff3cd;
             color: #856404;
@@ -3963,6 +3988,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             <div class="summary-card">
                 <h3>SOURCE PATH MISSING</h3>
                 <p class="value">{path_not_found_tables}</p>
+            </div>
+            <div class="summary-card">
+                <h3>TABLE CORRUPTED</h3>
+                <p class="value">{corrupted_tables}</p>
             </div>
             <div class="summary-card info">
                 <h3>TOTAL DATA</h3>
@@ -4119,6 +4148,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif status == "SOURCE_PATH_NOT_FOUND":
             status_class = "status-path-not-found"
             status_label = status
+        elif status == "TABLE_CORRUPTED":
+            status_class = "status-corrupted"
+            status_label = status
         elif "VALIDATED_WITH_WARNINGS" in status:
             status_class = "status-warning"
             status_label = status
@@ -4255,6 +4287,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif t.overall_status == "SOURCE_PATH_NOT_FOUND":
             badge_class = "status-path-not-found"
             badge_label = "SOURCE_PATH_NOT_FOUND"
+        elif t.overall_status == "TABLE_CORRUPTED":
+            badge_class = "status-corrupted"
+            badge_label = "TABLE_CORRUPTED"
         else:
             badge_class = "status-not-found"
             badge_label = "TABLE_NOT_FOUND"
@@ -4268,6 +4303,13 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                     ' <span style="color:#6c757d;font-size:11px;">'
                     f"{html_escape(str(reason))}</span>"
                 )
+        elif t.overall_status == "TABLE_CORRUPTED" and t.error_message:
+            # Spark's message names the missing schema part, which the owner needs
+            # to repair the table.
+            detail = (
+                ' <span style="color:#6c757d;font-size:11px;">'
+                f"{html_escape(str(t.error_message))}</span>"
+            )
         return f"""
                     <tr>
                         <td>{t.source_database}</td>
