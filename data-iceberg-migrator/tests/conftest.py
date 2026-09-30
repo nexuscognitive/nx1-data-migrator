@@ -373,6 +373,7 @@ def sample_discovery(sample_run_id, sample_table_metadata):
         'run_id': sample_run_id, 'source_database': 'sales_data',
         'dest_database': 'sales_data_s3', 'dest_bucket': 's3a://test-bucket',
         'tables': sample_table_metadata, '_task_duration': 12.5,
+        '_map_index': 0,
     }
 
 @pytest.fixture
