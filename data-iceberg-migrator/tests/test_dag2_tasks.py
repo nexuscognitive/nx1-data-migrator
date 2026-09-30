@@ -2036,3 +2036,39 @@ class TestMigrateTextTableInplace:
         mock_spark.sql.side_effect = self._router(fail_on='drop table if exists db.logs_backup_')
         result = self._call(mock_spark, drop_backup=True)
         assert result['backup_table'] == 'db.logs_backup_'
+
+
+# ---------------------------------------------------------------------------
+# classify_migration_error
+# ---------------------------------------------------------------------------
+
+_JAVA_FRAMES = (
+    "\n\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)"
+    "\n\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)"
+)
+
+
+class TestClassifyMigrationError:
+
+    def _code(self, err):
+        return m.classify_migration_error(err, 'db_s3', 'orders', 'db_s3_iceberg.orders', False)[0]
+
+    def test_unreadable_parquet_is_not_a_commit_conflict(self):
+        err = ("org.apache.spark.SparkException: Job aborted due to stage failure: "
+               "org.apache.parquet.io.ParquetDecodingException: Can not read value at 1 in block 0 "
+               "in file s3a://b/db_s3/orders/dt=2026-04-10/part-00000.snappy.parquet"
+               "\nCaused by: java.lang.UnsupportedOperationException: "
+               "org.apache.hadoop.hive.ql.io.parquet.convert.ETypeConverter$8$1" + _JAVA_FRAMES)
+        assert self._code(err) == 'SOURCE_DATA_UNREADABLE'
+
+    def test_java_concurrent_frames_alone_are_not_a_commit_conflict(self):
+        assert self._code("java.lang.IllegalStateException: boom" + _JAVA_FRAMES) == 'MIGRATION_ERROR'
+
+    @pytest.mark.parametrize("err", [
+        "org.apache.iceberg.exceptions.CommitFailedException: Cannot commit: stale metadata",
+        "ValidationException: Found conflicting files that can contain records matching true",
+        "Commit failed: metadata location has changed from a to b",
+    ])
+    def test_real_commit_conflicts_still_classified(self, err):
+        assert self._code(err + _JAVA_FRAMES) == 'CONCURRENT_COMMIT_CONFLICT'
+
