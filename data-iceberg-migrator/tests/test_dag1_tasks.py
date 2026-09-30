@@ -337,6 +337,19 @@ class TestClassifyDiscoveryError:
         ) == 'FAILED'
 
 
+    def test_corrupted_metastore_schema_is_skippable(self):
+        """Spark fails before the location is read, so existence is unknown — the
+        message alone decides. Retrying cannot help; the owner must repair it."""
+        assert m._classify_discovery_error(
+            "u'Could not read schema from the hive metastore because it is corrupted. (missing part 0 of the schema, 1 parts are expected).;'", None
+        ) == 'TABLE_CORRUPTED'
+
+    def test_corrupted_schema_wins_over_intact_root_location(self):
+        assert m._classify_discovery_error(
+            'Could not read schema from the Hive Metastore because it is corrupted.', True
+        ) == 'TABLE_CORRUPTED'
+
+
 class TestDiscoverTablesViaSshSpark:
 
     def _make_discovery_output(self, metadata_json):
@@ -597,6 +610,30 @@ class TestDiscoverTablesViaSshSpark:
         assert by_table['good_one'].get('error_type') is None
         assert by_table['good_two'].get('error_type') is None
 
+    def test_corrupted_table_does_not_abort_sibling_tables(self, mock_ssh_hook, sample_run_id):
+        """A corrupted metastore schema fails even SHOW TBLPROPERTIES. Mark the table
+        and migrate its siblings instead of failing the whole database."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record('good_one'),
+            self._make_metadata_record(
+                'system_exception_detail',
+                file_format='UNKNOWN', table_type='UNKNOWN', source_location='',
+                error="u'Could not read schema from the hive metastore because it is corrupted. (missing part 0 of the schema, 1 parts are expected).;'",
+                error_type='FAILED',
+                source_path_exists=None,
+            ),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['good_one', 'system_exception_detail'],
+        )
+
+        by_table = {t['source_table']: t for t in result['tables']}
+        assert by_table['system_exception_detail']['error_type'] == 'TABLE_CORRUPTED'
+        assert 'corrupted' in by_table['system_exception_detail']['error']
+        assert by_table['good_one'].get('error_type') is None
+
     def test_orphan_that_never_threw_is_still_classified(self, mock_ssh_hook, sample_run_id):
         """A TEXTFILE/Avro orphan never throws — its schema comes from the catalog —
         so it emits as a success record and would reach DistCp with 0 files and be
@@ -804,6 +841,23 @@ class TestRecordDiscoveredTables:
         assert "o'brien'" not in all_sql
 
 
+    def test_writes_table_corrupted_status(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        self._setup_count(mock_spark, 0)
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': "u'Could not read schema from the hive metastore because it is corrupted. (missing part 0 of the schema, 1 parts are expected).;'",
+                'error_type': 'TABLE_CORRUPTED',
+            }],
+        }
+        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
+        assert "'TABLE_CORRUPTED'" in all_sql
+        # The u'...' wrapper's quotes must be escaped inside the SQL literal.
+        assert "u''Could not read schema" in all_sql
+
+
 class TestRunDistcpSsh:
 
     def _make_distcp_stdout(self, incremental=False):
@@ -866,6 +920,24 @@ class TestRunDistcpSsh:
             ti=MagicMock(),
         )
         assert result['distcp_results'][0]['status'] == 'SOURCE_PATH_NOT_FOUND'
+        client.exec_command.assert_not_called()
+
+    def test_skips_table_corrupted_without_ssh(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': 'Could not read schema from the hive metastore because it is corrupted.',
+                'error_type': 'TABLE_CORRUPTED',
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'TABLE_CORRUPTED'
         client.exec_command.assert_not_called()
 
     def test_skips_database_not_found_without_ssh(self, mock_ssh_hook, sample_discovery):
@@ -2286,6 +2358,55 @@ class TestGenerateHtmlReport:
         assert 'maprfs:/datalake/cap/curated/mktg/target/&lt;t_ce_phonepref_ref&gt;' in html
         assert '<t_ce_phonepref_ref>' not in html
         assert 'It is possible the underlying files' not in html
+
+    def test_table_corrupted_gets_its_own_card_and_badge(self, mock_spark, sample_run_id):
+        """A corrupted table is skipped, not failed, so the report must say why —
+        the owner has to repair it before it can be migrated."""
+        run_row = SimpleNamespace(dag_run_id='dag_run_test')
+        tbl_row = SimpleNamespace(
+            source_database='dev_homelending_blend_sanitized', source_table='system_exception_detail',
+            overall_status='TABLE_CORRUPTED', discovery_duration_seconds=1.0,
+            distcp_duration_seconds=None, distcp_bytes_copied=0,
+            distcp_files_copied=0, distcp_is_incremental=False,
+            table_create_duration_seconds=None, validation_duration_seconds=None,
+            validation_status=None, row_count_match=None,
+            partition_count_match=None, schema_match=None,
+            source_row_count=0, dest_hive_row_count=0,
+            source_partition_count=0, dest_partition_count=0,
+            source_total_size_bytes=0, s3_total_size_bytes_before=0,
+            s3_total_size_bytes_after=0, s3_bytes_transferred=0,
+            file_size_match=None, source_file_count=0,
+            s3_file_count_before=0, s3_file_count_after=0,
+            s3_files_transferred=0, file_count_match=None,
+            distcp_status=None, file_format='UNKNOWN',
+            partition_filter=None, filtered_partition_count=None,
+            source_location='',
+            error_message='Could not read schema from the hive metastore because it is '
+                          'corrupted. (missing part 0 of the schema, 1 parts are expected).<x>',
+        )
+
+        def sql_router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'migration_runs' in sl and 'where' in sl:
+                df.collect.return_value = [run_row]
+            elif 'order by' in sl:
+                df.collect.return_value = [tbl_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = sql_router
+        m.generate_html_report.function(run_id=sample_run_id, spark=mock_spark)
+
+        stream = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value.create.return_value
+        html = stream.write.call_args[0][0].decode('utf-8')
+        assert 'TABLE CORRUPTED' in html
+        assert 'status-corrupted' in html
+        assert 'TABLE_CORRUPTED' in html
+        assert 'missing part 0 of the schema' in html
+        assert '1 parts are expected).&lt;x&gt;' in html
+        assert '<x>' not in html
 
 
 class TestSendMigrationReportEmail:
