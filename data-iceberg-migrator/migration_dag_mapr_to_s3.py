@@ -2898,6 +2898,28 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 task_label=f"update_distcp_status:failure_patch:{r['source_table']}",
             )
 
+    # A slice whose filter matched no partitions gets no copy, but it was processed:
+    # leaving distcp_status NULL made reconcile_unprocessed_tables mark it FAILED.
+    for r in distcp_result.get("distcp_results", []):
+        if r.get("status") != "SKIPPED":
+            continue
+        skip_reason = str(r.get("error") or "skipped by DistCp")[:2000].replace("'", "''")
+        execute_with_iceberg_retry(
+            spark,
+            f"""
+            UPDATE {tracking_db}.migration_table_status
+            SET distcp_status = 'SKIPPED',
+                error_message = COALESCE(error_message, '{skip_reason}'),
+                updated_at = current_timestamp()
+            WHERE run_id = '{run_id}'
+              AND source_database = '{r['source_database']}'
+              AND source_table = '{r['source_table']}'
+              AND dest_database = '{r['dest_database']}'
+              AND distcp_status IS NULL
+        """,
+            task_label=f"update_distcp_status:skipped:{r['source_table']}",
+        )
+
     for r in distcp_result.get("distcp_results", []):
         if r.get("status") != "EMPTY_SOURCE":
             continue
@@ -4828,7 +4850,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         if t.overall_status in SKIPPABLE_DISCOVERY_ERRORS:
             html += _not_found_row(t, 10)
             continue
-        if not t.distcp_status:
+        if not t.distcp_status or t.distcp_status == "SKIPPED":
             html += f"""
                     <tr>
                         <td>{t.source_database}</td>

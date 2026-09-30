@@ -1776,6 +1776,27 @@ class TestUpdateDistcpStatus:
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
         assert any('FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
+    def test_filter_matching_no_partitions_records_skipped(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry
+    ):
+        """A slice whose filter matched 0 partitions was left with distcp_status NULL,
+        which reconcile_unprocessed_tables reads as "no batch processed it" and marks
+        FAILED (sales_db.orders year=2099 in the regression suite)."""
+        sample_distcp_result['distcp_results'][0].update({
+            'status': 'SKIPPED',
+            'error': "partition_filter matched 0 partitions: year=2099",
+        })
+        m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
+        skipped = [
+            c.args[1] for c in mock_iceberg_retry.call_args_list
+            if c.kwargs.get('task_label') == 'update_distcp_status:skipped:transactions'
+        ]
+        assert len(skipped) == 1
+        assert "distcp_status = 'SKIPPED'" in skipped[0]
+        assert 'matched 0 partitions: year=2099' in skipped[0]
+        assert 'distcp_status IS NULL' in skipped[0]
+        assert 'overall_status' not in skipped[0]
+
     def test_budget_skip_row_survives_the_tracking_update(
         self, mock_spark, sample_distcp_result, mock_iceberg_retry
     ):
@@ -2862,6 +2883,62 @@ class TestGenerateHtmlReport:
         assert 'dt=2024-01-02' in html
         assert 'dt=2024-01-03' in html
 
+
+    @pytest.mark.parametrize('distcp_status', [None, 'SKIPPED'])
+    def test_skipped_slice_renders_as_skipped(self, mock_spark, sample_run_id, distcp_status):
+        """update_distcp_status now records SKIPPED for a filter that matched nothing,
+        where it used to leave NULL; the report must still show the skip reason."""
+        run_row = SimpleNamespace(dag_run_id='dag_run_test')
+        tbl_row = SimpleNamespace(
+            source_database='sales_db', source_table='orders',
+            overall_status='SKIPPED', discovery_duration_seconds=1.0,
+            distcp_duration_seconds=None, distcp_bytes_copied=0,
+            distcp_files_copied=0, distcp_is_incremental=False,
+            table_create_duration_seconds=None, validation_duration_seconds=None,
+            validation_status='SKIPPED', row_count_match=None,
+            partition_count_match=None, schema_match=None,
+            source_row_count=0, dest_hive_row_count=0,
+            source_partition_count=0, dest_partition_count=0,
+            source_total_size_bytes=0, s3_total_size_bytes_before=0,
+            s3_total_size_bytes_after=0, s3_bytes_transferred=0,
+            file_size_match=None, source_file_count=0,
+            s3_file_count_before=0, s3_file_count_after=0,
+            s3_files_transferred=0, file_count_match=None,
+            distcp_status=distcp_status,
+            file_format='PARQUET',
+            partition_filter='year=2099',
+            filtered_partition_count=0,
+            error_message='partition_filter matched 0 partitions: year=2099',
+        )
+
+        def sql_router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'migration_runs' in sl and 'where' in sl:
+                df.collect.return_value = [run_row]
+            elif 'order by' in sl:
+                df.collect.return_value = [tbl_row]
+            elif 'sum(case when row_count_match' in sl or 'sum(case when file_size_match' in sl:
+                summary = MagicMock()
+                summary.__getitem__ = lambda self, k: 0
+                for attr in ('total_tables_validated', 'tables_passed_validation',
+                             'tables_failed_validation', 'total_row_count_mismatches',
+                             'total_partition_count_mismatches', 'total_schema_mismatches',
+                             'tables_size_match', 'tables_size_mismatch',
+                             'tables_file_count_match', 'tables_file_count_mismatch',
+                             'total_source_bytes', 'total_dest_bytes'):
+                    setattr(summary, attr, 0)
+                df.collect.return_value = [summary]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = sql_router
+        m.generate_html_report.function(run_id=sample_run_id, spark=mock_spark)
+
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        html = fs_mock.create.return_value.write.call_args[0][0].decode('utf-8')
+        assert 'Skipped: partition_filter matched 0 partitions: year=2099' in html
 
     def test_source_path_not_found_gets_its_own_card_and_badge(self, mock_spark, sample_run_id):
         """An orphaned metastore entry must be visible in the report as its own
