@@ -603,6 +603,80 @@ class TestDiscoverTablesViaSshSpark:
         # again — WF-343 restored with the rest of this suite green.
         assert script.index(probe) < script.index('spark.table("{0}.{1}"')
 
+    def _remote_resolve_tokens(self, client, sample_run_id):
+        """Run discovery once and return the edge script's resolve_tokens function."""
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        body = script[script.index('def resolve_tokens'):script.index('\nmetadata = []')]
+
+        class AnalysisException(Exception):
+            pass
+
+        namespace = {'AnalysisException': AnalysisException, 'fnmatch': __import__('fnmatch')}
+        exec(body, namespace)
+        return namespace['resolve_tokens'], AnalysisException
+
+    @staticmethod
+    def _spark_failing_with(exc):
+        spark = MagicMock()
+        spark.sql.side_effect = exc
+        return spark
+
+    @pytest.mark.parametrize('message', [
+        "Database 'sales' not found;",
+        '[SCHEMA_NOT_FOUND] The schema `sales` cannot be found.',
+    ])
+    def test_missing_database_marks_tokens_missing(self, mock_ssh_hook, sample_run_id, capsys, message):
+        _, client, _, _ = mock_ssh_hook
+        resolve_tokens, analysis_exception = self._remote_resolve_tokens(client, sample_run_id)
+        capsys.readouterr()
+
+        resolved, missing = resolve_tokens(
+            self._spark_failing_with(analysis_exception(message)), 'sales', ['orders', '*'])
+
+        assert (resolved, missing) == ([], ['orders'])
+        assert '===DISCOVERY_ABORT===' not in capsys.readouterr().out
+
+    def test_unreadable_metastore_aborts_instead_of_marking_tokens_missing(
+        self, mock_ssh_hook, sample_run_id, capsys
+    ):
+        """A NameNode in safe mode after an edge restart made SHOW TABLES fail; every table
+        was recorded TABLE_NOT_FOUND and the task succeeded."""
+        _, client, _, _ = mock_ssh_hook
+        resolve_tokens, analysis_exception = self._remote_resolve_tokens(client, sample_run_id)
+        capsys.readouterr()
+        error = analysis_exception(
+            'java.lang.RuntimeException: org.apache.hadoop.ipc.RemoteException(org.apache.hadoop.'
+            'hdfs.server.namenode.SafeModeException): Cannot create directory /tmp/hive/root/x')
+
+        with pytest.raises(analysis_exception):
+            resolve_tokens(self._spark_failing_with(error), 'sales', ['orders'])
+
+        assert '===DISCOVERY_ABORT=== SHOW TABLES IN sales failed' in capsys.readouterr().out
+
+    def test_abort_marker_fails_the_task_even_with_json_present(self, mock_ssh_hook, sample_run_id):
+        """pyspark keeps running after the raise and still prints the JSON; the marker wins."""
+        import json
+        _, client, _, _ = mock_ssh_hook
+        output = (
+            '===DISCOVERY_ABORT=== SHOW TABLES IN sales failed: SafeModeException\n'
+            + self._make_discovery_output(json.dumps([])).decode()
+        )
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, output.encode()), MagicMock()),
+        ]
+
+        with pytest.raises(Exception, match='Table discovery for sales aborted: .*SafeModeException'):
+            m.discover_tables_via_spark_ssh.function.__wrapped__(db_config={
+                'run_id': sample_run_id, 'source_database': 'sales',
+                'table_tokens': ['*'], 'dest_database': 'sales_s3',
+                'dest_bucket': 's3a://bucket',
+            })
+
     def test_orphaned_metastore_entry_does_not_abort_sibling_tables(
         self, mock_ssh_hook, sample_run_id
     ):
