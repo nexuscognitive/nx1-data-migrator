@@ -96,6 +96,27 @@ class TestParseExcel:
         assert result[0]['dest_database'] == 'sales_s3'
         assert result[0]['run_id'] == 'run_test'
 
+    def test_unreadable_excel_fails_permanently(self, mock_spark):
+        """A corrupt upload fails identically on every retry (P-06: BadZipFile retried
+        twice over ~12 minutes before this)."""
+        from airflow.exceptions import AirflowFailException
+        setup_spark_excel(mock_spark, b'this is not an xlsx file')
+        with pytest.raises(AirflowFailException, match='parse_excel failed permanently.*BadZipFile'):
+            m.parse_excel.function('s3a://bucket/file.xlsx', 'run_test', spark=mock_spark)
+
+    def test_missing_required_column_fails_permanently(self, mock_spark):
+        from airflow.exceptions import AirflowFailException
+        setup_spark_excel(mock_spark, make_excel_bytes([{'database': 'sales', 'table': '*'}]))
+        with pytest.raises(AirflowFailException, match='dest_database,bucket'):
+            m.parse_excel.function('s3a://bucket/file.xlsx', 'run_test', spark=mock_spark)
+
+    def test_s3_read_error_keeps_its_retries(self, mock_spark):
+        from airflow.exceptions import AirflowFailException
+        mock_spark.read.format.return_value.load.side_effect = RuntimeError('S3 503 Slow Down')
+        with pytest.raises(RuntimeError) as err:
+            m.parse_excel.function('s3a://bucket/file.xlsx', 'run_test', spark=mock_spark)
+        assert not isinstance(err.value, AirflowFailException)
+
     @pytest.mark.parametrize("raw_bucket,expected_prefix", [
         ('s3://mybucket', 's3a://'),
         ('s3n://mybucket', 's3a://'),

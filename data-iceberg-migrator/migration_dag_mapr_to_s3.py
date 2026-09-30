@@ -44,6 +44,7 @@ from migrator_utils.migrations.shared import (
     get_config,
     hive_type_to_spark_ddl,
     normalize_s3,
+    permanent_fail,
     size_distcp_job,
     track_duration,
     validate_bucket_endpoint_pairs,
@@ -647,16 +648,21 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     binary_df = spark.read.format("binaryFile").load(excel_file_path)
     row = binary_df.select("content").first()
     excel_bytes = bytes(row.content)
-    df = ps.read_excel(BytesIO(excel_bytes), engine="openpyxl")
+    # A read error above may be transient and keeps its retries; a file that does
+    # not parse, or lacks a required column, fails the same way on every retry.
+    try:
+        df = ps.read_excel(BytesIO(excel_bytes), engine="openpyxl")
+    except Exception as e:
+        permanent_fail("parse_excel", e)
 
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
     required_columns = ["database", "table", "dest_database", "bucket"]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
-        raise ValueError(
-                f"parse_excel failed, Missing required Excel columns(s): {','.join(missing_columns)}"
-        )
+        permanent_fail("parse_excel", ValueError(
+            f"Missing required Excel columns(s): {','.join(missing_columns)}"
+        ))
     # Convert to list of dicts
     grouped = {}
     for _, row in df.iterrows():
