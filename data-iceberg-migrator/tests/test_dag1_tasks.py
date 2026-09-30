@@ -1361,6 +1361,19 @@ class TestRunDistcpSsh:
         assert "-strategy 'dynamic; rm -rf /'" in ssh_cmd
         assert '-strategy dynamic; rm' not in ssh_cmd
 
+    def test_s3_secret_is_never_echoed(self, mock_ssh_hook, sample_discovery):
+        """The retry wrapper's output is logged verbatim, so it must not expand the
+        distcp argument list, which carries -Dfs.s3a.secret.key."""
+        ssh_cmd = self._run_per_partition_sized(
+            mock_ssh_hook, sample_discovery,
+            config_overrides={'s3_endpoint': 'https://s3.example.com',
+                              's3_access_key': 'AKIAEXAMPLE', 's3_secret_key': 'TOPSECRET123'},
+        )
+        assert 'TOPSECRET123' in ssh_cmd  # passed to distcp as intended
+        echo_lines = [ln for ln in ssh_cmd.splitlines() if ln.strip().startswith('echo')]
+        assert echo_lines
+        assert not any('$*' in ln or '$@' in ln or 'TOPSECRET123' in ln for ln in echo_lines)
+
     def test_default_strategy_emits_no_quotes(self, mock_ssh_hook, sample_discovery):
         ssh_cmd = self._run_per_partition_sized(mock_ssh_hook, sample_discovery)
         assert '-strategy dynamic ' in ssh_cmd
