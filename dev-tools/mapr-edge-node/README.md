@@ -390,10 +390,24 @@ to exercise a specific scenario in the migration DAG, the `hive_type_to_spark_dd
 struct/complex-type converter, or the error-based-retry (transient/permanent
 failure) test suite.
 
-The exact row/partition counts this script seeds and verifies (and the DistCp
-byte/file counts `setup-distcp-test-data.sh` seeds) are not hardcoded here: both
-scripts, and the `regression_test_suite.ipynb` notebook that grades against them,
-read them from `dev-tools/fixtures/scenarios.yaml`, so the three can't drift apart.
+The exact row/partition counts this script seeds and verifies are not hardcoded
+here: both this script and the `regression_test_suite.ipynb` notebook that grades
+against it read them from `dev-tools/fixtures/scenarios.yaml`, so the two can't
+drift apart. `setup-distcp-test-data.sh` still seeds its own DistCp byte/file
+counts, but checks them against the same file and exits non-zero on drift.
+
+`scenarios.yaml` lives in `dev-tools/fixtures/`, outside this image's
+`dev-tools/mapr-edge-node` build context, so the Dockerfile pulls it from a second
+build context named `fixtures`. `docker compose build` passes that automatically
+(`additional_contexts` in `docker-compose.yml`). Building with plain `docker build`
+from this directory needs the same context passed explicitly:
+
+```powershell
+docker build --build-context fixtures=../fixtures -t mapr-edge-node .
+```
+
+Without it, the build fails at the `COPY --from=fixtures` step instead of
+producing an image that seeds without the file.
 
 ## PART A — Migration DAG scenarios + struct/complex-type tests
 

@@ -69,6 +69,7 @@ WH="hdfs://localhost:9000/user/hive/warehouse"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -z "${FIXTURES_FILE:-}" ]; then
+  FIXTURES_CANDIDATES="${SCRIPT_DIR}/scenarios.yaml ${SCRIPT_DIR}/../../fixtures/scenarios.yaml /scenarios.yaml"
   if [ -f "${SCRIPT_DIR}/scenarios.yaml" ]; then
     FIXTURES_FILE="${SCRIPT_DIR}/scenarios.yaml"
   elif [ -f "${SCRIPT_DIR}/../../fixtures/scenarios.yaml" ]; then
@@ -76,8 +77,16 @@ if [ -z "${FIXTURES_FILE:-}" ]; then
   else
     FIXTURES_FILE="/scenarios.yaml"
   fi
+else
+  FIXTURES_CANDIDATES="$FIXTURES_FILE (from \$FIXTURES_FILE)"
 fi
 export FIXTURES_FILE
+
+if [ ! -f "$FIXTURES_FILE" ]; then
+  echo "ERROR: scenarios.yaml not found. Looked at: ${FIXTURES_CANDIDATES}" >&2
+  echo "Set FIXTURES_FILE to its path, or rebuild the image with the fixtures build context." >&2
+  exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "============================================================"

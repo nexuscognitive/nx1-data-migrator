@@ -51,26 +51,26 @@ RUN wget -q --tries=5 --waitretry=10 \
     && mv /opt/spark-2.3.4-bin-hadoop2.7 /opt/spark \
     && rm spark-2.3.4-bin-hadoop2.7.tgz
 
-COPY mapr-edge-node/conf/core-site.xml   $HADOOP_HOME/etc/hadoop/core-site.xml
-COPY mapr-edge-node/conf/hdfs-site.xml   $HADOOP_HOME/etc/hadoop/hdfs-site.xml
-COPY mapr-edge-node/conf/mapred-site.xml $HADOOP_HOME/etc/hadoop/mapred-site.xml
-COPY mapr-edge-node/conf/yarn-site.xml   $HADOOP_HOME/etc/hadoop/yarn-site.xml
-COPY mapr-edge-node/conf/hive-site.xml   $HIVE_HOME/conf/hive-site.xml
+COPY conf/core-site.xml   $HADOOP_HOME/etc/hadoop/core-site.xml
+COPY conf/hdfs-site.xml   $HADOOP_HOME/etc/hadoop/hdfs-site.xml
+COPY conf/mapred-site.xml $HADOOP_HOME/etc/hadoop/mapred-site.xml
+COPY conf/yarn-site.xml   $HADOOP_HOME/etc/hadoop/yarn-site.xml
+COPY conf/hive-site.xml   $HIVE_HOME/conf/hive-site.xml
 
 # Bake the target namespace into fs.defaultFS (see ARG EDGE_NAMESPACE above).
 # No-op when building the default hadoop-ssh image.
 RUN sed -i "s#hadoop-edge\.hadoop-ssh\.svc\.cluster\.local#hadoop-edge.${EDGE_NAMESPACE}.svc.cluster.local#g" \
     $HADOOP_HOME/etc/hadoop/core-site.xml
 
-COPY mapr-edge-node/scripts/entrypoint.sh        /entrypoint.sh
-COPY mapr-edge-node/scripts/bootstrap-hdfs.sh   /bootstrap-hdfs.sh
-COPY mapr-edge-node/scripts/profile-additions.sh /etc/profile.d/hadoop.sh
-COPY mapr-edge-node/scripts/setup-test-data.sh   /setup-test-data.sh
-COPY mapr-edge-node/scripts/setup-distcp-test-data.sh /setup-distcp-test-data.sh
-COPY mapr-edge-node/scripts/pod-restart-setup.sh /pod-restart-setup.sh
-COPY mapr-edge-node/scripts/test-discover.sh     /test-discover.sh
-COPY mapr-edge-node/scripts/test-distcp.sh       /test-distcp.sh
-COPY fixtures/scenarios.yaml                     /scenarios.yaml
+COPY scripts/entrypoint.sh        /entrypoint.sh
+COPY scripts/bootstrap-hdfs.sh   /bootstrap-hdfs.sh
+COPY scripts/profile-additions.sh /etc/profile.d/hadoop.sh
+COPY scripts/setup-test-data.sh   /setup-test-data.sh
+COPY scripts/setup-distcp-test-data.sh /setup-distcp-test-data.sh
+COPY scripts/pod-restart-setup.sh /pod-restart-setup.sh
+COPY scripts/test-discover.sh     /test-discover.sh
+COPY scripts/test-distcp.sh       /test-distcp.sh
+COPY --from=fixtures scenarios.yaml /scenarios.yaml
 
 RUN chmod +x /entrypoint.sh /bootstrap-hdfs.sh /etc/profile.d/hadoop.sh \
     /setup-test-data.sh /setup-distcp-test-data.sh /pod-restart-setup.sh \
