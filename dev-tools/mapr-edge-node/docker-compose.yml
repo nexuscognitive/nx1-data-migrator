@@ -1,6 +1,8 @@
 services:
   mapr-edge:
-    build: .
+    build:
+      context: ..
+      dockerfile: mapr-edge-node/Dockerfile
     container_name: mapr-edge-node
     hostname: mapr-edge-node
     ports:

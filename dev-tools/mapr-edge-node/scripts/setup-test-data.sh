@@ -67,6 +67,18 @@ export PYSPARK_DRIVER_PYTHON=python3
 BEELINE="/opt/hive/bin/beeline -u jdbc:hive2://localhost:10000 --silent=true"
 WH="hdfs://localhost:9000/user/hive/warehouse"
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "${FIXTURES_FILE:-}" ]; then
+  if [ -f "${SCRIPT_DIR}/scenarios.yaml" ]; then
+    FIXTURES_FILE="${SCRIPT_DIR}/scenarios.yaml"
+  elif [ -f "${SCRIPT_DIR}/../../fixtures/scenarios.yaml" ]; then
+    FIXTURES_FILE="${SCRIPT_DIR}/../../fixtures/scenarios.yaml"
+  else
+    FIXTURES_FILE="/scenarios.yaml"
+  fi
+fi
+export FIXTURES_FILE
+
 # ─────────────────────────────────────────────────────────────────────────────
 echo "============================================================"
 echo " [1/11] Creating HDFS directory structure"
@@ -2339,37 +2351,52 @@ spark = SparkSession.builder \
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
 
+import json
+import os
+
+with open(os.environ["FIXTURES_FILE"]) as f:
+    FIXTURES = json.load(f)
+
+
+def _rows(suite, sid):
+    return FIXTURES[suite][sid]["rows"]
+
+
+def _parts(suite, sid):
+    return FIXTURES[suite][sid]["parts"]
+
+
 checks = [
-    ("migration_db.customers",         "R-01",  10, None),
-    ("migration_db.products",          "R-02",  10, None),
-    ("migration_db.transactions",      "R-03",  15, None),
-    ("metrics_db.daily_active_users",  "R-04a",  4, None),
-    ("metrics_db.conversion_rates",    "R-04b",  4, None),
-    ("metrics_db.revenue_summary",     "R-04c",  4, None),
-    ("audit_db.access_log",            "R-05a",  5, None),
-    ("audit_db.change_log",            "R-05b",  4, None),
-    ("hr_db_tz.employees",                "R-06a",  6, None),
-    ("hr_db_tz.departments",              "R-06b",  4, None),
-    ("sales_db_tz.orders",                "R-07",   9, ("dt",3)),
-    ("sales_db_tz.returns",               "R-08",   4, ("dt",3)),
-    ("sales_db_tz.daily_summary",         "R-09",   6, ("year,month",3)),
-    ("analytics_db_tz.events",            "R-10",   9, ("region,year,month",3)),
-    ("analytics_db_tz.sessions",          "R-19",   6, ("year,month",2)),
-    ("logs_db_tz.app_logs",               "R-11",  10, ("dt",3)),
-    ("edge_cases_db.empty_table",      "R-12",   0, None),
-    ("edge_cases_db.nulls_table",      "R-13",   5, None),
-    ("edge_cases_db.complex_types",    "R-14",   3, None),
-    ("edge_cases_db.wide_table",       "R-15",   5, None),
-    ("formats_db.parquet_table",       "R-18",   5, None),
-    ("formats_db.orc_table",           "R-16",   5, None),
-    ("formats_db.text_table",          "R-17",   5, None),
-    ("tz_db.events_with_ts_la",        "R-20a",  8, None),
-    ("tz_db.orders_with_ts_la",        "R-20b",  8, ("dt",2)),
-    ("tz_db.sessions_with_ts_la",      "R-20c",  6, ("year,month",2)),
-    ("retry_test_db.yarn_oom_table",   "T-01",  20, None),
-    ("corrupt_test_db.table_a",        "P-04a",  3, None),
-    ("corrupt_test_db.corrupt_table",  "P-04b",  2, None),
-    ("corrupt_test_db.table_c",        "P-04c",  4, None),
+    ("migration_db.customers",         "R-01",  _rows("REGRESSION", "R-01"), None),
+    ("migration_db.products",          "R-02",  _rows("REGRESSION", "R-02"), None),
+    ("migration_db.transactions",      "R-03",  _rows("REGRESSION", "R-03"), None),
+    ("metrics_db.daily_active_users",  "R-04a", _rows("REGRESSION", "R-04a"), None),
+    ("metrics_db.conversion_rates",    "R-04b", _rows("REGRESSION", "R-04b"), None),
+    ("metrics_db.revenue_summary",     "R-04c", _rows("REGRESSION", "R-04c"), None),
+    ("audit_db.access_log",            "R-05a", _rows("REGRESSION", "R-05a"), None),
+    ("audit_db.change_log",            "R-05b", _rows("REGRESSION", "R-05b"), None),
+    ("hr_db_tz.employees",                "R-06a", _rows("REGRESSION", "R-06a"), None),
+    ("hr_db_tz.departments",              "R-06b", _rows("REGRESSION", "R-06b"), None),
+    ("sales_db_tz.orders",                "R-07",  _rows("REGRESSION", "R-07"), ("dt", _parts("REGRESSION", "R-07"))),
+    ("sales_db_tz.returns",               "R-08",  _rows("REGRESSION", "R-08"), ("dt", _parts("REGRESSION", "R-08"))),
+    ("sales_db_tz.daily_summary",         "R-09",  _rows("REGRESSION", "R-09"), ("year,month", _parts("REGRESSION", "R-09"))),
+    ("analytics_db_tz.events",            "R-10",  _rows("REGRESSION", "R-10"), ("region,year,month", _parts("REGRESSION", "R-10"))),
+    ("analytics_db_tz.sessions",          "R-19",  _rows("REGRESSION", "R-19"), ("year,month", _parts("REGRESSION", "R-19"))),
+    ("logs_db_tz.app_logs",               "R-11",  _rows("REGRESSION", "R-11"), ("dt", _parts("REGRESSION", "R-11"))),
+    ("edge_cases_db.empty_table",      "R-12",  _rows("REGRESSION", "R-12"), None),
+    ("edge_cases_db.nulls_table",      "R-13",  _rows("REGRESSION", "R-13"), None),
+    ("edge_cases_db.complex_types",    "R-14",  _rows("REGRESSION", "R-14"), None),
+    ("edge_cases_db.wide_table",       "R-15",  _rows("REGRESSION", "R-15"), None),
+    ("formats_db.parquet_table",       "R-18",  _rows("REGRESSION", "R-18"), None),
+    ("formats_db.orc_table",           "R-16",  _rows("REGRESSION", "R-16"), None),
+    ("formats_db.text_table",          "R-17",  _rows("REGRESSION", "R-17"), None),
+    ("tz_db.events_with_ts_la",        "R-20a", _rows("REGRESSION", "R-20a"), None),
+    ("tz_db.orders_with_ts_la",        "R-20b", _rows("REGRESSION", "R-20b"), ("dt", _parts("REGRESSION", "R-20b"))),
+    ("tz_db.sessions_with_ts_la",      "R-20c", _rows("REGRESSION", "R-20c"), ("year,month", _parts("REGRESSION", "R-20c"))),
+    ("retry_test_db.yarn_oom_table",   "T-01",  _rows("TRANSIENT-RETRY", "T-01"), None),
+    ("corrupt_test_db.table_a",        "P-04a", _rows("PERMANENT-FAIL", "P-04-source-a"), None),
+    ("corrupt_test_db.corrupt_table",  "P-04b", _rows("PERMANENT-FAIL", "P-04-source-b"), None),
+    ("corrupt_test_db.table_c",        "P-04c", _rows("PERMANENT-FAIL", "P-04-source-c"), None),
 ]
 
 all_pass = True

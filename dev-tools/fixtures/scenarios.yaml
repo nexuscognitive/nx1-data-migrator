@@ -1,0 +1,62 @@
+{
+  "DAG-SCENARIO": {
+    "TC-1b": {"rows": 0},
+    "TC-3b": {"rows": 0},
+    "TC-6": {"rows": 0, "parts": 0},
+    "TC-9": {"rows": 0},
+    "TC-10": {"rows": 0},
+    "TC-11": {"rows": 0, "parts": 3},
+    "TC-11b": {"rows": 0, "parts": 3},
+    "TC-12": {"rows": 0},
+    "TC-18b": {"rows": 0},
+    "TC-21b": {"rows": 0},
+    "TC-21c": {"rows": 0},
+    "TC-22a": {"rows": 0}
+  },
+  "REGRESSION": {
+    "R-01": {"rows": 10},
+    "R-02": {"rows": 10},
+    "R-03": {"rows": 15},
+    "R-04a": {"rows": 4},
+    "R-04b": {"rows": 4},
+    "R-04c": {"rows": 4},
+    "R-05a": {"rows": 5},
+    "R-05b": {"rows": 4},
+    "R-06a": {"rows": 6},
+    "R-06b": {"rows": 4},
+    "R-07": {"rows": 9, "parts": 3},
+    "R-08": {"rows": 4, "parts": 3},
+    "R-09": {"rows": 6, "parts": 3},
+    "R-10": {"rows": 9, "parts": 3},
+    "R-11": {"rows": 10, "parts": 3},
+    "R-12": {"rows": 0},
+    "R-13": {"rows": 5},
+    "R-14": {"rows": 3},
+    "R-15": {"rows": 5},
+    "R-16": {"rows": 5},
+    "R-17": {"rows": 5},
+    "R-18": {"rows": 5},
+    "R-19": {"rows": 6, "parts": 2},
+    "R-20a": {"rows": 8},
+    "R-20b": {"rows": 8, "parts": 2},
+    "R-20c": {"rows": 6, "parts": 2}
+  },
+  "TRANSIENT-RETRY": {
+    "T-01": {"rows": 20}
+  },
+  "PERMANENT-FAIL": {
+    "P-04-source-a": {"rows": 3},
+    "P-04-source-b": {"rows": 2},
+    "P-04-source-c": {"rows": 4}
+  },
+  "DISTCP-SIZING": {
+    "t_tiny": {"bytes": 4096, "files": 1},
+    "t_size_bound": {"bytes": 6291456, "files": 6},
+    "t_max_clamp": {"bytes": 12582912, "files": 12},
+    "t_file_clamp": {"bytes": 10485760, "files": 2},
+    "t_partitioned": {"bytes": 7340032, "files": 7, "parts": 3},
+    "t_partitioned/dt=2024-01-01": {"bytes": 1048576, "files": 1},
+    "t_partitioned/dt=2024-01-02": {"bytes": 6291456, "files": 6},
+    "t_empty": {"rows": 0}
+  }
+}

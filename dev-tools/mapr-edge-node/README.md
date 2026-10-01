@@ -390,6 +390,11 @@ to exercise a specific scenario in the migration DAG, the `hive_type_to_spark_dd
 struct/complex-type converter, or the error-based-retry (transient/permanent
 failure) test suite.
 
+The exact row/partition counts this script seeds and verifies (and the DistCp
+byte/file counts `setup-distcp-test-data.sh` seeds) are not hardcoded here: both
+scripts, and the `regression_test_suite.ipynb` notebook that grades against them,
+read them from `dev-tools/fixtures/scenarios.yaml`, so the three can't drift apart.
+
 ## PART A — Migration DAG scenarios + struct/complex-type tests
 
 ### `sales_db`
