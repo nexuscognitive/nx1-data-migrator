@@ -318,8 +318,10 @@ echo "============================================================"
 
 fixture_field() {
   local sid=$1 field=$2
-  grep -o "\"${sid}\": *{[^}]*}" "$FIXTURES_FILE" | grep -o "\"${field}\": *[0-9]*" | grep -o '[0-9]*$'
+  grep -o "\"${sid}\": *{[^}]*}" "$FIXTURES_FILE" | grep -o "\"${field}\": *[0-9]*" | grep -o '[0-9]*$' || true
 }
+
+DRIFT_COUNT=0
 
 check_fixture() {
   local sid=$1 files=$2 bytes=$3 exp_files exp_bytes
@@ -334,6 +336,7 @@ check_fixture() {
   else
     printf "  %-34s DRIFT: seeded files=%s bytes=%s, scenarios.yaml expects files=%s bytes=%s\n" \
       "$sid" "$files" "$bytes" "${exp_files:-?}" "${exp_bytes:-?}"
+    DRIFT_COUNT=$((DRIFT_COUNT + 1))
   fi
 }
 
@@ -350,6 +353,12 @@ read -r p1_files p1_bytes <<< "$(probe "${DBDIR}/t_partitioned/dt=2024-01-01")"
 check_fixture "t_partitioned/dt=2024-01-01" "$p1_files" "$p1_bytes"
 read -r p2_files p2_bytes <<< "$(probe "${DBDIR}/t_partitioned/dt=2024-01-02")"
 check_fixture "t_partitioned/dt=2024-01-02" "$p2_files" "$p2_bytes"
+
+echo
+if [ "$DRIFT_COUNT" -gt 0 ]; then
+  echo "${DRIFT_COUNT} scenario(s) drifted from ${FIXTURES_FILE}."
+  exit 1
+fi
 
 echo
 echo "Done. Compare these against the '[DistCp] Sized' lines and the emitted"

@@ -390,10 +390,17 @@ to exercise a specific scenario in the migration DAG, the `hive_type_to_spark_dd
 struct/complex-type converter, or the error-based-retry (transient/permanent
 failure) test suite.
 
-The exact row/partition counts this script seeds and verifies (and the DistCp
-byte/file counts `setup-distcp-test-data.sh` seeds) are not hardcoded here: both
-scripts, and the `regression_test_suite.ipynb` notebook that grades against them,
-read them from `dev-tools/fixtures/scenarios.yaml`, so the three can't drift apart.
+The exact row/partition counts this script seeds and verifies are not hardcoded
+here: both this script and the `regression_test_suite.ipynb` notebook that grades
+against it read them from `dev-tools/fixtures/scenarios.yaml`, so the two can't
+drift apart. `setup-distcp-test-data.sh` still seeds its own DistCp byte/file
+counts, but checks them against the same file and exits non-zero on drift.
+
+`scenarios.yaml` is not baked into this image (the Docker build context is
+`dev-tools/mapr-edge-node`, one level above the shared `dev-tools/fixtures/`
+directory). Running either script from a full repo checkout already finds it;
+running it from inside a standalone container needs `FIXTURES_FILE` pointed at
+a copy, e.g. `docker cp dev-tools/fixtures/scenarios.yaml mapr-edge-node:/scenarios.yaml`.
 
 ## PART A — Migration DAG scenarios + struct/complex-type tests
 
