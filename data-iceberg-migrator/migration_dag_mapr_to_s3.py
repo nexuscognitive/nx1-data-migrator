@@ -35,7 +35,6 @@ from migrator_utils.migrations.partition_utils import (
 )
 from migrator_utils.migrations.shared import (
     _BATCH_BUDGET_FRACTION,
-    _BUDGET_SLACK,
     SSH_COMMAND_TIMEOUT,
     _hive_scratch_dir,
     _login_shell,
@@ -1928,14 +1927,13 @@ def flatten_and_batch(discoveries) -> list[dict]:
 
     descriptors = []
     for batch_index, (bin_cost, g, bin_tables) in enumerate(bins):
-        # max() gives a single over-cap monster a budget matching its own cost
-        # rather than the cap it already blew through; min() then stops that
-        # budget landing past the point where execution_timeout SIGKILLs the
-        # task, which would discard the XCom before any FAILED row is written.
-        budget = min(
-            max(bin_cost, cap) * _BUDGET_SLACK,
-            _BATCH_BUDGET_FRACTION * backstop,
-        )
+        # The budget guards only against execution_timeout SIGKILLing the task,
+        # which would discard the XCom before any FAILED row is written. It is
+        # not scaled to the estimate: the cost model ignores YARN queueing and
+        # SSH/scan overhead, so an estimate-sized budget ran out mid-batch and
+        # skipped healthy tables. A stuck copy is caught per table by
+        # _call_timeout_seconds instead.
+        budget = _BATCH_BUDGET_FRACTION * backstop
         if bin_cost > budget:
             logger.warning(
                 f"[Batching] batch {batch_index} estimates {bin_cost:.0f}s but "
@@ -2092,8 +2090,13 @@ def run_distcp_ssh(
 
         if budget_secs and (time.monotonic() - batch_started_at) >= budget_secs:
             logger.warning(
-                f"[DistCp] budget of {budget_secs:.0f}s exhausted — not starting "
-                f"{t['source_database']}.{t['source_table']}"
+                f"[DistCp] SKIPPED {t['source_database']}.{t['source_table']} "
+                f"(batch {batch.get('batch_index')}) — reason: batch budget of "
+                f"{budget_secs:.0f}s exhausted after "
+                f"{time.monotonic() - batch_started_at:.0f}s; starting it would "
+                f"risk the {_DISTCP_EXECUTION_TIMEOUT.total_seconds():.0f}s "
+                f"execution_timeout. Marked FAILED; the batch retry resumes it "
+                f"with -update."
             )
             # FAILED (unlike SKIPPED above) is not in update_distcp_status's
             # skip-list, so this row is read by direct key indexing there —
