@@ -1682,6 +1682,48 @@ class TestCreateHiveTables:
         )
         assert result['table_results'][0]['existed'] is True
 
+    def _existing_table_at(self, mock_spark, location):
+        """DESCRIBE succeeds (table exists) and DESCRIBE FORMATTED reports `location`."""
+        sql_calls = []
+
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            df = MagicMock()
+            if 'DESCRIBE FORMATTED' in sql.upper():
+                row = MagicMock()
+                row.col_name, row.data_type = 'Location', location
+                df.collect.return_value = [row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+        return sql_calls
+
+    def test_refuses_to_repair_table_at_another_location(self, mock_spark, sample_distcp_result):
+        """A same-named table elsewhere (another user's) must fail, not be repaired."""
+        sql_calls = self._existing_table_at(
+            mock_spark, 's3a://test-bucket/someone_else/sales_data_s3/transactions')
+        ti = MagicMock()
+        with pytest.raises(Exception, match="Hive table creation failed"):
+            m.create_hive_tables.function.__wrapped__(
+                distcp_result=sample_distcp_result, spark=mock_spark, ti=ti,
+            )
+        row = ti.xcom_push.call_args.kwargs['value']['table_results'][0]
+        assert row['status'] == 'FAILED'
+        assert row['action'] == 'location_mismatch'
+        assert 's3a://test-bucket/sales_data_s3/transactions' in row['error']
+        assert not any('MSCK REPAIR' in s.upper() for s in sql_calls)
+
+    def test_repairs_table_at_its_own_location(self, mock_spark, sample_distcp_result):
+        """Same location written with s3:// and a trailing slash still counts as ours."""
+        self._existing_table_at(mock_spark, 's3://test-bucket/sales_data_s3/transactions/')
+        result = m.create_hive_tables.function.__wrapped__(
+            distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+        assert result['table_results'][0]['status'] == 'COMPLETED'
+        assert result['table_results'][0]['action'] == 'repaired'
+
     def test_recreate_tables_drops_and_recreates_existing(self, mock_spark, sample_distcp_result):
         """migration_recreate_tables=true must DROP an existing destination table
         (metadata only — EXTERNAL keeps S3 data) and recreate it from scratch
