@@ -2461,8 +2461,16 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         src_t = _tables_by_key.get(key)
         if src_t is None:
             continue
+        # Zero bytes copied alone proves nothing on an incremental copy whose files are
+        # already at the destination, and a source with unregistered partitions counts 0
+        # rows while holding data, so the source must also be empty on disk.
+        if src_t.get("partition_filter_active"):
+            src_size = src_t.get("filtered_source_size_bytes", src_t.get("source_total_size_bytes", 0))
+        else:
+            src_size = src_t.get("source_total_size_bytes", 0)
         if (
             src_t.get("row_count", 0) == 0
+            and not src_size
             and r.get("bytes_copied", 0) == 0
             and r.get("files_copied", 0) == 0
         ):
@@ -3657,6 +3665,17 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 "VALIDATED_WITH_WARNINGS" if has_mismatch_only else "VALIDATION_FAILED"
             )
         )
+        # A zero-row table is EMPTY_SOURCE whether or not DistCp copied a schema-only file.
+        # update_distcp_status normalizes only when nothing was copied, so the first run into
+        # an empty destination ended VALIDATED and every re-run EMPTY_SOURCE. Zero rows on
+        # both sides is the run-independent test; a source with unregistered partitions
+        # counts 0 in the metastore but its destination does not, so it stays as it was.
+        if (
+            is_validated
+            and v.get("source_row_count") == 0
+            and v.get("dest_hive_row_count") == 0
+        ):
+            final_overall_status = "EMPTY_SOURCE"
 
         if v["status"] == "FAILED":
             error_message_sql = f"'{error_msg}'"
