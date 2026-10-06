@@ -41,6 +41,19 @@ set -euo pipefail
 
 BEELINE="/opt/hive/bin/beeline -u jdbc:hive2://localhost:10000 --silent=true"
 WH="hdfs://localhost:9000/user/hive/warehouse"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "${FIXTURES_FILE:-}" ]; then
+  if [ -f "${SCRIPT_DIR}/scenarios.yaml" ]; then
+    FIXTURES_FILE="${SCRIPT_DIR}/scenarios.yaml"
+  elif [ -f "${SCRIPT_DIR}/../../fixtures/scenarios.yaml" ]; then
+    FIXTURES_FILE="${SCRIPT_DIR}/../../fixtures/scenarios.yaml"
+  else
+    FIXTURES_FILE="/scenarios.yaml"
+  fi
+fi
+export FIXTURES_FILE
+
 DB="distcp_sizing_db"
 DBDIR="${WH}/${DB}.db"
 FOLDER_SRC="hdfs://localhost:9000/user/testdata/distcp_sizing_folder"
@@ -296,6 +309,60 @@ else
     echo "  EXCLUDED by the filter: ${p} — ${pfiles:-0} file(s), ${pbytes:-0} bytes."
     echo "  Must not appear in any emitted distcp command or at the destination."
   done
+fi
+
+echo
+echo "============================================================"
+echo " [5/5b] Fixture drift check against ${FIXTURES_FILE}"
+echo "============================================================"
+
+if [ ! -f "$FIXTURES_FILE" ]; then
+  echo "ERROR: scenarios.yaml not found at ${FIXTURES_FILE}. Set FIXTURES_FILE to its path." >&2
+  exit 1
+fi
+
+fixture_field() {
+  local sid=$1 field=$2
+  grep -o "\"${sid}\": *{[^}]*}" "$FIXTURES_FILE" | grep -o "\"${field}\": *[0-9]*" | grep -o '[0-9]*$' || true
+}
+
+DRIFT_COUNT=0
+
+check_fixture() {
+  local sid=$1 files=$2 bytes=$3 exp_files exp_bytes
+  exp_files=$(fixture_field "$sid" "files")
+  exp_bytes=$(fixture_field "$sid" "bytes")
+  if [ -z "$exp_files" ] && [ -z "$exp_bytes" ]; then
+    printf "  %-34s no fixture entry to compare against\n" "$sid"
+    return
+  fi
+  if [ "${files:-0}" -eq "${exp_files:-${files:-0}}" ] && [ "${bytes:-0}" -eq "${exp_bytes:-${bytes:-0}}" ]; then
+    printf "  %-34s OK (files=%s bytes=%s)\n" "$sid" "$files" "$bytes"
+  else
+    printf "  %-34s DRIFT: seeded files=%s bytes=%s, scenarios.yaml expects files=%s bytes=%s\n" \
+      "$sid" "$files" "$bytes" "${exp_files:-?}" "${exp_bytes:-?}"
+    DRIFT_COUNT=$((DRIFT_COUNT + 1))
+  fi
+}
+
+read -r tiny_files tiny_bytes <<< "$(probe "${DBDIR}/t_tiny")"
+check_fixture "t_tiny" "$tiny_files" "$tiny_bytes"
+read -r sb_files sb_bytes <<< "$(probe "${DBDIR}/t_size_bound")"
+check_fixture "t_size_bound" "$sb_files" "$sb_bytes"
+read -r mc_files mc_bytes <<< "$(probe "${DBDIR}/t_max_clamp")"
+check_fixture "t_max_clamp" "$mc_files" "$mc_bytes"
+read -r fc_files fc_bytes <<< "$(probe "${DBDIR}/t_file_clamp")"
+check_fixture "t_file_clamp" "$fc_files" "$fc_bytes"
+check_fixture "t_partitioned" "${tfiles:-0}" "${tbytes:-0}"
+read -r p1_files p1_bytes <<< "$(probe "${DBDIR}/t_partitioned/dt=2024-01-01")"
+check_fixture "t_partitioned/dt=2024-01-01" "$p1_files" "$p1_bytes"
+read -r p2_files p2_bytes <<< "$(probe "${DBDIR}/t_partitioned/dt=2024-01-02")"
+check_fixture "t_partitioned/dt=2024-01-02" "$p2_files" "$p2_bytes"
+
+echo
+if [ "$DRIFT_COUNT" -gt 0 ]; then
+  echo "${DRIFT_COUNT} scenario(s) drifted from ${FIXTURES_FILE}."
+  exit 1
 fi
 
 echo

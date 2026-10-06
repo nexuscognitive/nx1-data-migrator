@@ -1,6 +1,9 @@
 services:
   mapr-edge:
-    build: .
+    build:
+      context: .
+      additional_contexts:
+        fixtures: ../fixtures
     container_name: mapr-edge-node
     hostname: mapr-edge-node
     ports:

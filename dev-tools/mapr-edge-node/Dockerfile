@@ -66,12 +66,15 @@ COPY scripts/entrypoint.sh        /entrypoint.sh
 COPY scripts/bootstrap-hdfs.sh   /bootstrap-hdfs.sh
 COPY scripts/profile-additions.sh /etc/profile.d/hadoop.sh
 COPY scripts/setup-test-data.sh   /setup-test-data.sh
+COPY scripts/setup-distcp-test-data.sh /setup-distcp-test-data.sh
 COPY scripts/pod-restart-setup.sh /pod-restart-setup.sh
 COPY scripts/test-discover.sh     /test-discover.sh
 COPY scripts/test-distcp.sh       /test-distcp.sh
+COPY --from=fixtures scenarios.yaml /scenarios.yaml
 
 RUN chmod +x /entrypoint.sh /bootstrap-hdfs.sh /etc/profile.d/hadoop.sh \
-    /setup-test-data.sh /pod-restart-setup.sh /test-discover.sh /test-distcp.sh
+    /setup-test-data.sh /setup-distcp-test-data.sh /pod-restart-setup.sh \
+    /test-discover.sh /test-distcp.sh
 
 RUN mkdir -p /opt/spark/conf \
     && cp /opt/hive/conf/hive-site.xml /opt/spark/conf/hive-site.xml \
