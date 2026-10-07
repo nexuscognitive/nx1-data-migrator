@@ -99,6 +99,7 @@ REASON_LABELS = {
     'FORMAT_UNDETECTED_INPLACE': 'Storage format could not be determined',
     'UNSUPPORTED_SOURCE_FORMAT': 'Unsupported source file format',
     'UNSUPPORTED_DATA_TYPE': 'Unsupported column data type',
+    'SOURCE_DATA_UNREADABLE': 'Source data files could not be read',
     'METADATA_READ_ERROR': 'Table metadata could not be read',
     'PERMISSION_DENIED': 'Permission denied on table or storage path',
     'DATA_PATH_MISSING': 'Data location missing in storage',
@@ -188,6 +189,12 @@ def classify_migration_error(err_text: str, src_db: str, tbl: str, dest_table: s
         return ('UNSUPPORTED_SOURCE_FORMAT',
                 f"The source files of {src_db}.{tbl} are in a format Iceberg cannot register or read "
                 f"(only Parquet/ORC/Avro data files can be migrated). {tail}")
+    if _err_has(e, 'parquetdecodingexception', 'can not read value at', 'could not read footer',
+                'corruptrecordexception', 'org.apache.hadoop.hive.ql.io.parquet.convert'):
+        return ('SOURCE_DATA_UNREADABLE',
+                f"The data files of {src_db}.{tbl} could not be read: they are corrupt, or a column's "
+                f"type in the files does not match the table definition (for example DECIMAL files "
+                f"under a DOUBLE column). {tail}")
     if _err_has(e, 'unsupported data type', 'unsupported type', 'cannot convert', 'cannot be cast',
                 'cannot up cast'):
         return ('UNSUPPORTED_DATA_TYPE',
@@ -196,7 +203,11 @@ def classify_migration_error(err_text: str, src_db: str, tbl: str, dest_table: s
                 'gc overhead limit', 'executor lost'):
         return ('RESOURCE_ERROR',
                 f"Spark ran out of memory/disk while migrating {target}. {tail}")
-    if _err_has(e, 'commitfailedexception', 'concurrent', 'conflict', 'metadata location has changed'):
+    # Specific markers only: a bare 'concurrent' matches the java.util.concurrent frames in
+    # almost every Java stack trace, which labelled unrelated failures as commit conflicts.
+    if _err_has(e, 'commitfailedexception', 'cannot commit', 'metadata location has changed',
+                'found conflicting files', 'found conflicting deleted files',
+                'found new conflicting delete files'):
         return ('CONCURRENT_COMMIT_CONFLICT',
                 f"An Iceberg commit for {target} conflicted with another writer. {tail}")
     return ('MIGRATION_ERROR', f"Migration of {target} failed. {tail}")
