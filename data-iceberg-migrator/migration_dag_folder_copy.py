@@ -38,6 +38,7 @@ from migrator_utils.migrations.shared import (
     normalize_s3,
     permanent_fail,
     size_distcp_job,
+    sql_quote,
 )
 
 _dag_stem = Path(__file__).stem
@@ -375,10 +376,10 @@ def create_data_copy_run(excel_file_path: str, spark, dag_run_id: str = '') -> s
 
     sa_user = str(config.get('service_account_user_id') or '').strip()
     sa_source = 'config:service_account_user_id' if sa_user else 'pending (.profile fallback)'
-    esc_excel = str(excel_file_path or '').replace("'", "''")
-    esc_dag_run_id = str(dag_run_id or '').replace("'", "''")
-    esc_sa_user = sa_user.replace("'", "''")
-    esc_sa_source = sa_source.replace("'", "''")
+    esc_excel = sql_quote(str(excel_file_path or ''))
+    esc_dag_run_id = sql_quote(str(dag_run_id or ''))
+    esc_sa_user = sql_quote(sa_user)
+    esc_sa_source = sql_quote(sa_source)
 
     spark.sql(f"""
         INSERT INTO {tracking_db}.data_copy_runs (
@@ -984,13 +985,13 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
     tracking_db = config['tracking_database']
 
     run_id        = distcp_result['run_id']
-    source_path   = distcp_result['source_path'].replace("'", "''")
-    dest_bucket   = distcp_result['dest_bucket'].replace("'", "''")
-    dest_path     = distcp_result['dest_path'].replace("'", "''")
-    status        = str(distcp_result['status']).replace("'", "''")
-    started_at    = str(distcp_result.get('started_at', '') or '').replace("'", "''")
-    completed_at  = str(distcp_result.get('completed_at', '') or '').replace("'", "''")
-    error_msg     = (distcp_result.get('error') or '').replace("'", "''")[:2000]
+    source_path   = sql_quote(distcp_result['source_path'])
+    dest_bucket   = sql_quote(distcp_result['dest_bucket'])
+    dest_path     = sql_quote(distcp_result['dest_path'])
+    status        = sql_quote(str(distcp_result['status']))
+    started_at    = sql_quote(str(distcp_result.get('started_at', '') or ''))
+    completed_at  = sql_quote(str(distcp_result.get('completed_at', '') or ''))
+    error_msg     = sql_quote(distcp_result.get('error') or '', 2000)
 
     src_file_count  = distcp_result.get('source_file_count', 0) or 0
     src_size_bytes  = distcp_result.get('source_size_bytes', 0) or 0
@@ -1005,7 +1006,7 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
     yarn_ids = distcp_result.get('yarn_application_ids') or (
         [distcp_result['yarn_application_id']] if distcp_result.get('yarn_application_id') else []
     )
-    yarn_app_id = ','.join(str(x) for x in yarn_ids).replace("'", "''")
+    yarn_app_id = sql_quote(','.join(str(x) for x in yarn_ids))
     distcp_duration = float(distcp_result.get('distcp_duration_seconds', 0.0) or 0.0)
     distcp_bytes = int(distcp_result.get('distcp_bytes_copied', 0) or 0)
     distcp_files = int(distcp_result.get('distcp_files_copied', 0) or 0)
@@ -1198,24 +1199,24 @@ def update_data_copy_validation(validation_result: dict, spark) -> dict:
     tracking_db = config['tracking_database']
 
     run_id      = validation_result['run_id']
-    source_path = validation_result['source_path'].replace("'", "''")
-    dest_bucket = validation_result['dest_bucket'].replace("'", "''")
-    dest_path   = validation_result['dest_path'].replace("'", "''")
+    source_path = sql_quote(validation_result['source_path'])
+    dest_bucket = sql_quote(validation_result['dest_bucket'])
+    dest_path   = sql_quote(validation_result['dest_path'])
 
-    validation_status = str(
+    validation_status = sql_quote(str(
         validation_result.get('validation_status', 'VALIDATION_FAILED')
-    ).replace("'", "''")
+    ))
     dest_file_count   = validation_result.get('dest_file_count', 0) or 0
     dest_size_bytes   = validation_result.get('dest_size_bytes', 0) or 0
     file_count_match  = str(validation_result.get('file_count_match', False)).lower()
     size_match        = str(validation_result.get('size_match', False)).lower()
-    val_error         = str(validation_result.get('validation_error') or '').replace("'", "''")[:2000]
+    val_error         = sql_quote(str(validation_result.get('validation_error') or ''), 2000)
 
     yarn_ids = validation_result.get('yarn_application_ids') or (
         [validation_result['yarn_application_id']]
         if validation_result.get('yarn_application_id') else []
     )
-    yarn_app_id = ','.join(str(x) for x in yarn_ids).replace("'", "''")
+    yarn_app_id = sql_quote(','.join(str(x) for x in yarn_ids))
     distcp_duration = float(validation_result.get('distcp_duration_seconds', 0.0) or 0.0)
     distcp_bytes = int(validation_result.get('distcp_bytes_copied', 0) or 0)
     distcp_files = int(validation_result.get('distcp_files_copied', 0) or 0)
@@ -1305,8 +1306,8 @@ def finalize_data_copy_run(run_id: str, spark, cluster_setup: dict = None) -> di
     """, task_label="finalize_data_copy_run")
 
     if isinstance(cluster_setup, dict) and cluster_setup.get('service_account_user_id'):
-        _sa = str(cluster_setup['service_account_user_id']).replace("'", "''")
-        _sa_src = str(cluster_setup.get('service_account_source') or 'unknown').replace("'", "''")
+        _sa = sql_quote(str(cluster_setup['service_account_user_id']))
+        _sa_src = sql_quote(str(cluster_setup.get('service_account_source') or 'unknown'))
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.data_copy_runs
             SET service_account_user_id = '{_sa}',

@@ -178,6 +178,20 @@ def cell_str(val, default=''):
     return str(val).strip() or default
 
 
+def sql_quote(value, limit=None) -> str:
+    """Escape text for a single-quoted Spark SQL string literal.
+
+    Spark 3.x reads \\' as an escaped quote but '' as two adjacent literals, which it
+    concatenates, silently dropping the quote (dt>='2024-01-15' was stored as
+    dt>=2024-01-15). Backslashes are doubled first so a value's own backslash cannot
+    start an escape. `limit` truncates before escaping, so an escape is never cut in half.
+    """
+    text = "" if value is None else str(value)
+    if limit is not None:
+        text = text[:limit]
+    return text.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def normalize_s3(path: str) -> str:
     """Normalize S3 path prefixes to s3a://."""
     if not path:

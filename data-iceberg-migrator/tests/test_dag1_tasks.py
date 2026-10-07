@@ -932,7 +932,7 @@ class TestRecordDiscoveredTables:
         assert 'Path does not exist' in all_sql
         # A quote in the location must not break out of the SQL literal. Failure rows
         # only started carrying a location in this change, so nothing pinned this.
-        assert "o''brien" in all_sql
+        assert "o\\'brien" in all_sql
         assert "o'brien'" not in all_sql
 
 
@@ -1944,6 +1944,73 @@ class TestCreateHiveTables:
         for i in range(30):
             assert f'FIELD_{i} string' in create_ddl
         assert 'more fields' not in create_ddl
+
+
+class TestPartitionFilterSlices:
+    """One table migrated in two filter slices has two tracking rows; status updates for
+    one slice must not rewrite the other slice's row."""
+
+    def _two_slices(self, sample_table_result):
+        base = sample_table_result['tables'][0]
+        sample_table_result['tables'] = [
+            {**base, 'partition_filter': "year=2024 AND month=1"},
+            {**base, 'partition_filter': "year=2099"},
+        ]
+        return sample_table_result
+
+    def _sql(self, retry):
+        return [c.args[1] for c in retry.call_args_list]
+
+    def test_slice_clause(self):
+        assert m._slice_clause(None) == "AND (partition_filter IS NULL OR partition_filter = '')"
+        assert m._slice_clause("a'b") == "AND partition_filter = 'a\\'b'"
+
+    def test_create_status_update_is_scoped_to_its_slice(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        result = self._two_slices(sample_table_result)
+        result['table_results'] = [
+            {'source_table': 'transactions', 'dest_database': 'sales_data_s3',
+             'partition_filter': 'year=2099', 'status': 'SKIPPED',
+             'existed': False, 'error': 'DistCp status was SKIPPED'},
+        ]
+        m.update_table_create_status.function(table_result=result, spark=mock_spark)
+        per_row = [s for s in self._sql(mock_iceberg_retry)
+                   if "table_create_status = 'SKIPPED'" in s]
+        assert len(per_row) == 1
+        assert "AND partition_filter = 'year=2099'" in per_row[0]
+
+    def test_catchall_accounts_for_each_slice_separately(
+        self, mock_spark, sample_table_result, mock_iceberg_retry
+    ):
+        """Only the year=2099 slice was processed: the other slice is still swept up."""
+        result = self._two_slices(sample_table_result)
+        result['table_results'] = [
+            {'source_table': 'transactions', 'dest_database': 'sales_data_s3',
+             'partition_filter': 'year=2099', 'status': 'COMPLETED',
+             'existed': False, 'error': None},
+        ]
+        m.update_table_create_status.function(table_result=result, spark=mock_spark)
+        catchalls = [s for s in self._sql(mock_iceberg_retry)
+                     if 'did not process this table' in s]
+        by_slice = {("year=2099" in s): s for s in catchalls}
+        assert "NOT IN ('transactions')" in by_slice[True]
+        assert "NOT IN ('__no_tables__')" in by_slice[False]
+        assert "AND partition_filter = 'year=2024 AND month=1'" in by_slice[False]
+
+    def test_distcp_and_validation_updates_are_scoped(
+        self, mock_spark, sample_validation_result, mock_iceberg_retry
+    ):
+        result = self._two_slices(sample_validation_result)
+        result['distcp_results'] = [{**result['distcp_results'][0], 'partition_filter': 'year=2099'}]
+        result['validation_results'] = [
+            {**result['validation_results'][0], 'partition_filter': 'year=2099'}]
+        m.update_distcp_status.function(distcp_result=result, spark=mock_spark)
+        m.update_validation_status.function(validation_result=result, spark=mock_spark)
+        per_row = [s for s in self._sql(mock_iceberg_retry)
+                   if "source_table = 'transactions'" in s]
+        assert per_row
+        assert all("AND partition_filter = 'year=2099'" in s for s in per_row)
 
 
 class TestUpdateTableCreateStatus:

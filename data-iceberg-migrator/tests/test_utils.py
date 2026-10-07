@@ -520,6 +520,25 @@ class TestTrackDuration:
         assert result['_task_duration'] >= 0.01
 
 
+class TestSqlQuote:
+    """Spark 3.x concatenates adjacent literals, so '' silently drops a quote; \\' does not."""
+
+    def test_quotes_are_backslash_escaped(self):
+        assert m.sql_quote("dt>='2024-01-15'") == "dt>=\\'2024-01-15\\'"
+
+    def test_backslashes_are_doubled_before_quotes(self):
+        assert m.sql_quote("C:\\tmp\\x") == "C:\\\\tmp\\\\x"
+        assert m.sql_quote("a\\'b") == "a\\\\\\'b"
+
+    def test_limit_truncates_before_escaping(self):
+        """Truncating after escaping could cut \\' in half and leave a trailing backslash."""
+        assert m.sql_quote("abc'def", 4) == "abc\\'"
+        assert m.sql_quote("abc'def", 3) == "abc"
+
+    def test_none_is_empty(self):
+        assert m.sql_quote(None) == ""
+
+
 class TestExecuteWithIcebergRetry:
 
     def test_succeeds_immediately_or_after_retries(self, mock_spark):

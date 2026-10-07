@@ -33,6 +33,7 @@ from migrator_utils.migrations.shared import (
     is_permanent_error,
     normalize_s3,
     permanent_fail,
+    sql_quote,
     track_duration,
 )
 
@@ -117,7 +118,7 @@ def reason(code: str, detail: str) -> str:
 
 def sql_lit(text, limit: int = 2000) -> str:
     """Escape a value so it can be inlined into a single-quoted Spark SQL literal."""
-    return str(text)[:limit].replace("\\", "\\\\").replace("'", "''")
+    return sql_quote(text, limit)
 
 
 def _err_has(err_lower: str, *needles: str) -> bool:
@@ -301,7 +302,7 @@ def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark) -
             NULL,
             'RUNNING',
             0, 0, 0,
-            '{json.dumps(config).replace("'", "''")}'
+            '{sql_quote(json.dumps(config))}'
         )
     """)
 
@@ -1657,7 +1658,7 @@ def update_migration_durations(migration_result: dict, spark) -> dict:
 
     for r in migration_result.get('results', []):
         if r.get('status') == 'FAILED' and r.get('error'):
-            per_table_error = str(r['error'])[:2000].replace("'", "''")
+            per_table_error = sql_quote(str(r['error'])[:2000])
             tbl_name = r['source_table'].split('.')[-1]
             src_db_name = r['source_table'].split('.')[0]
             execute_with_iceberg_retry(spark, f"""
@@ -1813,7 +1814,7 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
         if v['status'] != 'COMPLETED':
             continue
 
-        schema_diffs = (v.get('schema_differences', '') or '').replace("'", "''")[:2000]
+        schema_diffs = sql_quote(v.get('schema_differences', '') or '', 2000)
 
         overall_status = 'VALIDATED' if (
             v.get('row_count_match', False) and
@@ -1887,7 +1888,7 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
 
     for v in validation_result.get('validation_results', []):
         if v.get('status') == 'FAILED' and v.get('error'):
-            per_table_error = str(v['error'])[:2000].replace("'", "''")
+            per_table_error = sql_quote(str(v['error'])[:2000])
             execute_with_iceberg_retry(spark, f"""
                 UPDATE {tracking_db}.iceberg_migration_table_status
                 SET validation_status = 'FAILED',
