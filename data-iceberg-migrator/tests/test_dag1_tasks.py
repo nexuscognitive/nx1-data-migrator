@@ -949,8 +949,9 @@ class TestRecordDiscoveredTables:
         m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
         all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
         assert "'TABLE_CORRUPTED'" in all_sql
-        # The u'...' wrapper's quotes must be escaped inside the SQL literal.
-        assert "u''Could not read schema" in all_sql
+        # The u'...' wrapper's quotes must be escaped inside the SQL literal
+        # (backslash form, per sql_quote in shared.py).
+        assert "u\\'Could not read schema" in all_sql
 
 
 class TestRunDistcpSsh:
