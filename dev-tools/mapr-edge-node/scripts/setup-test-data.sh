@@ -2342,6 +2342,22 @@ spark.stop()
 print("  All PySpark data written.")
 PYEOF
 
+echo ""
+echo "============================================================"
+echo " [9b/11] Registering partitions"
+echo "============================================================"
+$BEELINE -e "
+MSCK REPAIR TABLE sales_db_tz.orders;
+MSCK REPAIR TABLE sales_db_tz.returns;
+MSCK REPAIR TABLE sales_db_tz.daily_summary;
+MSCK REPAIR TABLE analytics_db_tz.events;
+MSCK REPAIR TABLE analytics_db_tz.sessions;
+MSCK REPAIR TABLE logs_db_tz.app_logs;
+MSCK REPAIR TABLE tz_db.orders_with_ts_la;
+MSCK REPAIR TABLE tz_db.sessions_with_ts_la;
+"
+echo "  Partitions registered for 8 tz tables."
+
 
 # =============================================================================
 # [10/11]  Verification
