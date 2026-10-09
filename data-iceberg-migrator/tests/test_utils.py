@@ -228,6 +228,76 @@ class TestVarPrecedence:
                 f'in PORTAL_OWNED_KEYS but never read by get_config: {key}'
 
 
+class TestServiceAccountAlias:
+    """The portal stores service_account_user_id as nx1_service_acc_user_id:
+    Airflow's REST API masks any Variable whose key contains 'service_account',
+    so the old name always read back as '***'. Everything saved before the
+    rename (prod settings, in-flight runs) still lives under the old name.
+    """
+
+    RUN = 'data_migration_1'
+
+    @staticmethod
+    def _resolve(mapping, triggered_by=m.PORTAL_TRIGGER):
+        with TestVarPrecedence._context(TestServiceAccountAlias.RUN, triggered_by), \
+                TestVarPrecedence._variables(mapping):
+            return m.get_config()['service_account_user_id']
+
+    def test_alias_is_the_unmasked_name(self):
+        assert m.PORTAL_VARIABLE_ALIASES == {'service_account_user_id': 'service_acc_user_id'}
+        assert 'service_account' not in m.PORTAL_VARIABLE_ALIASES['service_account_user_id']
+
+    def test_portal_run_reads_the_new_run_scoped_name(self):
+        assert self._resolve({
+            f'nx1_service_acc_user_id__{self.RUN}': 'per_run',
+            'nx1_service_acc_user_id': 'global',
+        }) == 'per_run'
+
+    def test_portal_run_reads_the_new_global_name(self):
+        assert self._resolve({'nx1_service_acc_user_id': 'root'}) == 'root'
+
+    def test_new_name_wins_over_the_old_name(self):
+        assert self._resolve({
+            'nx1_service_acc_user_id': 'root',
+            'nx1_service_account_user_id': 'legacy_user',
+        }) == 'root'
+
+    def test_falls_back_to_the_old_run_scoped_name(self):
+        """A run started before the rename wrote only the old run-scoped name."""
+        assert self._resolve({
+            f'nx1_service_account_user_id__{self.RUN}': 'inflight_user',
+            'nx1_service_acc_user_id': 'global',
+        }) == 'inflight_user'
+
+    def test_falls_back_to_the_old_global_name(self):
+        """Prod settings saved before the rename keep working until re-saved."""
+        assert self._resolve({'nx1_service_account_user_id': 'legacy_user'}) == 'legacy_user'
+
+    def test_masked_value_is_skipped(self):
+        """Runs created from the masked prefill stored '***' as the identity."""
+        assert self._resolve({
+            f'nx1_service_account_user_id__{self.RUN}': '***',
+            'nx1_service_account_user_id': 'legacy_user',
+        }) == 'legacy_user'
+
+    def test_nothing_set_resolves_empty(self):
+        assert self._resolve({}) == ''
+
+    def test_manual_run_reads_only_the_plain_variable(self):
+        """Hand-launched runs are unchanged and never see the portal's names."""
+        assert self._resolve({
+            'service_account_user_id': 'manual_user',
+            'nx1_service_acc_user_id': 'root',
+            'nx1_service_account_user_id': 'legacy_user',
+        }, triggered_by=None) == 'manual_user'
+
+    def test_masking_skip_does_not_affect_other_keys(self):
+        """Only the aliased key treats '***' specially."""
+        with TestVarPrecedence._context(self.RUN, m.PORTAL_TRIGGER), \
+                TestVarPrecedence._variables({'nx1_migration_email_recipients': '***'}):
+            assert m.get_config()['email_recipients'] == '***'
+
+
 # ---------------------------------------------------------------------------
 # DistCp knob validation — get_config rejects values that would only fail later
 # ---------------------------------------------------------------------------
