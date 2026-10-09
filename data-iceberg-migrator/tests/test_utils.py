@@ -557,6 +557,19 @@ class TestExecuteWithIcebergRetry:
             m.execute_with_iceberg_retry(mock_spark, "MERGE INTO t USING s", max_retries=3)
         assert mock_spark.sql.call_count == 3
 
+    @pytest.mark.parametrize("message", [
+        # As raised by concurrent update_distcp_status tasks on one tracking-table partition.
+        'ValidationException: Found conflicting files that can contain records matching '
+        '(ref(name="source_database") == "analytics_db"): [s3a://b/t/data/00000-3.parquet]',
+        "ValidationException: Found conflicting deleted files that can contain records matching",
+        "ValidationException: Found new conflicting delete files that can apply to records",
+    ])
+    def test_retries_concurrent_writer_validation_conflict(self, mock_spark, message):
+        mock_spark.sql.side_effect = [Exception(message), None]
+        with patch('time.sleep'):
+            m.execute_with_iceberg_retry(mock_spark, "UPDATE t SET x = 1", max_retries=3)
+        assert mock_spark.sql.call_count == 2
+
     def test_raises_immediately_on_non_retryable_error(self, mock_spark):
         """Errors without a commit-conflict marker raise immediately without retrying."""
         mock_spark.sql.side_effect = Exception("persistent error")

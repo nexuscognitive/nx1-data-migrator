@@ -122,6 +122,12 @@ def track_duration(func):
 _ICEBERG_COMMIT_CONFLICT_MARKERS = (
     "CommitFailedException",
     "Cannot commit:",
+    # Row-level UPDATE/MERGE/DELETE validation against a concurrent writer. Iceberg raises a
+    # ValidationException, not CommitFailedException, when another task committed files to the
+    # same partition first; the retry re-reads the table and succeeds.
+    "Found conflicting files",
+    "Found conflicting deleted files",
+    "Found new conflicting delete files",
 )
 
 
