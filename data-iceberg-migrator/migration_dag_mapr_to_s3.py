@@ -3242,6 +3242,13 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
         )
         return {}
 
+    # The destination row count is scoped to the copied partitions. Spark pushes that
+    # predicate to the Hive metastore for partition pruning, and the tenant metastore
+    # rejects it with a MetaException on a DATE partition key, failing validation of every
+    # filtered DATE-partitioned table. The fallback lists the partitions and filters them
+    # in Spark instead.
+    spark.conf.set("spark.sql.hive.metastorePartitionPruningFallbackOnException", "true")
+
     config = get_config()
     tracking_db = config["tracking_database"]
 

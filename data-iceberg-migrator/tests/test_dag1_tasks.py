@@ -2154,6 +2154,16 @@ class TestValidateDestinationTables:
         assert result['validation_results'][0]['row_count_match'] is True
         assert result['validation_results'][0]['schema_match'] is True
 
+    def test_enables_partition_pruning_fallback(self, mock_spark, sample_table_result):
+        """A filtered count on a DATE partition key must not depend on metastore pruning."""
+        mock_spark.sql.side_effect = self._make_router(1000)
+        self._setup_dest_schema(mock_spark)
+        m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        mock_spark.conf.set.assert_any_call(
+            "spark.sql.hive.metastorePartitionPruningFallbackOnException", "true")
+
     def test_skips_source_path_not_found(self, mock_spark, sample_table_result):
         mock_spark.sql.side_effect = self._make_router(1000)
         self._setup_dest_schema(mock_spark)
