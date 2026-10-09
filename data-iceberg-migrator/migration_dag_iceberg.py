@@ -1453,30 +1453,27 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
 
             iceberg_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_table}").collect()[0]['c']
             # For unpartitioned tables, normalize to 0.
-            # Iceberg's .partitions metadata table counts partitions that have data files.
-            # SHOW PARTITIONS is a Hive-metastore command and returns 0 on Iceberg tables.
-            # Guard: only query .partitions when src partition-counting succeeded; if it
-            # failed (e.g. DESCRIBE FORMATTED returned false-positive partition_columns for
-            # a non-partitioned table), both counts remain 0 → partition_match stays True.
+            # Guard: only count when src partition-counting succeeded; if it failed (e.g.
+            # DESCRIBE FORMATTED returned false-positive partition_columns for a
+            # non-partitioned table), both counts remain 0 → partition_match stays True.
+            #
+            # Counted from the data, the same way as the Hive side above, not from the
+            # Iceberg <table>.partitions metadata table. Kyuubi's Ranger plugin resolves
+            # <db>.<table>.partitions as schema '<db>.<table>', table 'partitions', which a
+            # schema policy on <db> does not match, so on a Ranger tenant that query is
+            # denied and every partitioned table read as 0 partitions.
             dest_iceberg_partition_count = 0
             if is_partitioned and partition_count_ok:
                 try:
                     spark.catalog.refreshTable(dest_table)
-                    try:
-                        dest_iceberg_partition_count = spark.sql(
-                            f"SELECT COUNT(*) as cnt FROM {dest_table}.partitions "
-                            f"WHERE record_count > 0"
-                        ).collect()[0]['cnt']
-                    except Exception as _rc_err:
-                        logger.warning(
-                            f"[IcebergMigrate] {dest_table}: record_count filter unavailable "
-                            f"({_rc_err!r}); falling back to raw .partitions count."
-                        )
-                        dest_iceberg_partition_count = spark.sql(
-                            f"SELECT COUNT(*) as cnt FROM {dest_table}.partitions"
-                        ).collect()[0]['cnt']
-                except Exception:
-                    pass
+                    dest_iceberg_partition_count = len(spark.sql(
+                        f"SELECT DISTINCT {', '.join(partition_columns)} FROM {dest_table}"
+                    ).collect())
+                except Exception as _pc_err:
+                    logger.warning(
+                        f"[IcebergMigrate] {dest_table}: could not count destination "
+                        f"partitions ({_pc_err!r}); reporting 0, which fails the partition check."
+                    )
 
             counts_match = (hive_count == iceberg_count)
             if hive_count == 0:
