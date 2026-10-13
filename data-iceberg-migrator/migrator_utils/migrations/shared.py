@@ -50,6 +50,21 @@ PORTAL_OWNED_KEYS = frozenset({
     'service_account_user_id',
 })
 
+# Config key → the nx1_ Variable name the portal stores it under, where the two
+# differ. Airflow's REST API masks the value of any Variable whose key contains a
+# sensitive keyword ('service_account' among them), so the portal could never
+# read nx1_service_account_user_id back: it came out as '***' and was
+# resubmitted as the identity. Applies to portal-marked runs only; a
+# hand-launched run still reads the plain service_account_user_id. Must stay in
+# step with PORTAL_VARIABLE_ALIASES in nx1-aiapi's migration_service.py.
+PORTAL_VARIABLE_ALIASES = {
+    'service_account_user_id': 'service_acc_user_id',
+}
+
+# What Airflow's REST API returns for a masked Variable. Runs created from a
+# masked prefill stored it literally as their identity.
+_AIRFLOW_MASKED_VALUE = '***'
+
 __all__ = [
     "PORTAL_TRIGGER",
     "PORTAL_OWNED_KEYS",
@@ -333,6 +348,13 @@ def get_config() -> dict:
         common to both. Portal-owned but never written by the portal — see
         service_account_user_id — is simply absent for a portal run.
 
+        A key in PORTAL_VARIABLE_ALIASES is stored by the portal under another
+        name. For a portal run, each nx1_ tier above tries that name first and
+        then the key's own name: service_account_user_id reads
+        nx1_service_acc_user_id[__<run_id>] before
+        nx1_service_account_user_id[__<run_id>]. The hand-launched column is
+        unaffected.
+
         The tenant profile itself is origin-split too: a portal-marked run
         reads ``nx1_migration_tenant_profiles``, a hand-launched run reads
         the plain ``migration_tenant_profiles`` (see `_load_tenant_profile`).
@@ -364,11 +386,27 @@ def get_config() -> dict:
                         return str(_val).strip()
 
         if base_key in PORTAL_OWNED_KEYS and _portal_run:
+            # An aliased key is read under its new name first, then under the
+            # pre-rename name, which still holds everything saved before the
+            # rename (prod settings and in-flight runs). '***' is skipped for
+            # it: that is Airflow's mask, never a real identity. Unaliased keys
+            # resolve exactly as before.
+            alias = PORTAL_VARIABLE_ALIASES.get(base_key)
+            names = [alias, base_key] if alias else [base_key]
+
+            def _usable(value):
+                return not (alias and value == _AIRFLOW_MASKED_VALUE)
+
             if _run_id:
-                scoped = Variable.get(f"nx1_{base_key}__{_run_id}", default_var=None)
-                if scoped is not None:
-                    return scoped
-            return Variable.get(f"nx1_{base_key}", default_var=None) or default
+                for name in names:
+                    scoped = Variable.get(f"nx1_{name}__{_run_id}", default_var=None)
+                    if scoped is not None and _usable(scoped):
+                        return scoped
+            for name in names:
+                value = Variable.get(f"nx1_{name}", default_var=None)
+                if value and _usable(value):
+                    return value
+            return default
 
         # Unchanged from before the origin split: a hand-launched run resolves
         # exactly as it always did, including an empty Variable masking the env
