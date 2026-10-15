@@ -308,8 +308,10 @@ through to the global Variable, so `tenant_2` above uses
 `cluster_edge_temp_path` as normal.
 
 Accepted keys in a profile: `ssh_conn_id`,
-`mapr_ticketfile_location`, `auth_method`, `edge_temp_path`,
-`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`.
+`mapr_ticketfile_location`, `auth_method`, `cluster_type`, `edge_temp_path`,
+`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`. The same keys
+can be set per run in `dag_run.conf` (for example, pointing one run at a Kerberized
+CDP edge node with `ssh_conn_id`, `auth_method=kinit` and `cluster_type=CDP`).
 
 **Resolution order** for these settings:
 

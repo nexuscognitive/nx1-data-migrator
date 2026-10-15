@@ -1199,6 +1199,38 @@ class TestMaprTicketCheckIdentity:
         assert 'grep -qF -- "$MIG_USER"' in script
 
 
+class TestClusterTypePerRun:
+    """cluster_type must be settable per run like ssh_conn_id and auth_method: a run
+    pointed at a CDP edge node otherwise keeps a tenant-wide `cluster_type=MapR`
+    Variable, so it gets MapR's shell wrapper and no S3A committer flags."""
+
+    _VARIABLES = {'cluster_type': 'MapR', 'cluster_ssh_conn_id': 'mapr_edge', 'auth_method': 'mapr'}
+
+    def _config(self, conf: dict, variables: dict):
+        return TestTenantProfileConfKeyPrecedence._context('manual__2026', conf), \
+            TestTenantProfileConfKeyPrecedence._variables(variables)
+
+    def test_dag_run_conf_overrides_the_cluster_type_variable(self):
+        conf = {'ssh_conn_id': 'cdp_edge', 'auth_method': 'kinit', 'cluster_type': 'CDP'}
+        context, variables = self._config(conf, self._VARIABLES)
+        with context, variables:
+            cfg = m.get_config()
+        assert (cfg['ssh_conn_id'], cfg['auth_method'], cfg['cluster_type']) == ('cdp_edge', 'kinit', 'CDP')
+
+    def test_tenant_profile_can_set_cluster_type(self):
+        profile = json.dumps({'cdp': {'ssh_conn_id': 'cdp_edge', 'auth_method': 'kinit', 'cluster_type': 'CDP'}})
+        context, variables = self._config({'tenant': 'cdp'}, {**self._VARIABLES, 'migration_tenant_profiles': profile})
+        with context, variables:
+            cfg = m.get_config()
+        assert cfg['cluster_type'] == 'CDP'
+
+    def test_variable_still_applies_when_the_run_says_nothing(self):
+        context, variables = self._config({}, self._VARIABLES)
+        with context, variables:
+            cfg = m.get_config()
+        assert cfg['cluster_type'] == 'MapR'
+
+
 class TestClusterLoginShellWrapper:
     """cluster_login must wrap its script like every other SSH call: bash -l for
     non-MapR clusters, `source ~/.profile` for MapR."""

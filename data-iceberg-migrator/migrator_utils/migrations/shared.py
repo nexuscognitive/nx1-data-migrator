@@ -233,6 +233,7 @@ TENANT_PROFILE_KEYS = frozenset({
     'ssh_conn_id',
     'mapr_ticketfile_location',
     'auth_method',
+    'cluster_type',
     'edge_temp_path',
     'hive_scratch_dir',
     'service_account_user_id',
@@ -541,7 +542,7 @@ def get_config() -> dict:
         'report_output_location': _var('migration_report_location', 'MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports'),
 
         # Cluster type: report label and S3A committer choice ('MapR', 'HDP' or 'CDP')
-        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
+        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR', conf_key='cluster_type'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
         'service_account_user_id': _var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id').strip(),
