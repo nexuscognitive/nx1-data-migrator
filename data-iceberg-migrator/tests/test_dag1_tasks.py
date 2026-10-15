@@ -2774,3 +2774,20 @@ class TestFinalizeRun:
         ))
         assert "status = 'COMPLETED'" in sqls
         assert 'COMPLETED_WITH_MISSING' not in sqls
+
+
+class TestReportTicketFileLine:
+
+    def test_shown_for_mapr_auth(self):
+        line = m._report_ticket_file_line(
+            {'auth_method': 'mapr', 'mapr_ticketfile_location': '/tmp/maprticket_svc'}
+        )
+        assert 'Mapr Ticket File' in line
+        assert '/tmp/maprticket_svc' in line
+
+    @pytest.mark.parametrize('auth_method', ['kinit', 'none'])
+    def test_hidden_for_other_auth_methods(self, auth_method):
+        line = m._report_ticket_file_line(
+            {'auth_method': auth_method, 'mapr_ticketfile_location': '/tmp/maprticket_svc'}
+        )
+        assert line == ''

@@ -3840,6 +3840,13 @@ def update_validation_status(validation_result: dict, spark) -> dict:
     return validation_result
 
 
+def _report_ticket_file_line(config: dict) -> str:
+    """The report header's MapR ticket-file line; empty unless the run used MapR auth."""
+    if config.get('auth_method', 'mapr') != 'mapr':
+        return ''
+    return f"            Mapr Ticket File: <strong>{config.get('mapr_ticketfile_location', '')}</strong><br>\n"
+
+
 @task.pyspark(conn_id="spark_default")
 def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **context) -> str:
     """Generate comprehensive HTML migration report."""
@@ -4083,8 +4090,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             DAG Run: <strong>{run_info.dag_run_id}</strong><br>
             Tenant: <strong>{config.get('tenant') or 'default'}</strong><br>
             Service Account: <strong>{sa_display}</strong> <span style="opacity:0.7">({sa_source})</span><br>
-            Mapr Ticket File: <strong>{config.get('mapr_ticketfile_location', '')}</strong><br>
-"""
+{_report_ticket_file_line(config)}"""
 
     html += f"""
         </div>

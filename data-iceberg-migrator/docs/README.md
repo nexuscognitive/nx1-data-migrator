@@ -53,7 +53,7 @@ First match wins:
 | `auth_method`              | Authentication method: `mapr`, `kinit`, or `none`                                                                                                                                                                            | MapR/Kerberos    | `source_to_s3_migration`, `folder_only_data_copy` |
 | `service_account_user_id`  | **Recommended.** Tenant service account the DAG runs as on the source cluster. Validates the MapR ticket and builds every user-scoped temp and log path. See [Service account configuration](#service-account-configuration) | All auth methods | `source_to_s3_migration`, `folder_only_data_copy` |
 | `mapr_ticketfile_location` | MapR ticket file path                                                                                                                                                                                                        | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
-| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.                                                                                                                                                                               | HTML reports     | `source_to_s3_migration`                          |
+| `cluster_type`             | Report label and S3A committer choice: `MapR`, `HDP` or `CDP`. `HDP` and `CDP` add the S3A magic-committer flags to DistCp.                                                                                                  | HTML reports     | `source_to_s3_migration`                          |
 
 ### Optional Variables
 

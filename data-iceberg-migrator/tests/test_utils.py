@@ -1196,3 +1196,17 @@ class TestMaprTicketCheckIdentity:
             "branch could never fire"
         )
         assert 'grep -qF -- "$MIG_USER"' in script
+
+
+class TestS3aCommitterOpts:
+    """HDP and CDP both use vanilla S3A, so both get the magic-committer flags."""
+
+    @pytest.mark.parametrize('cluster_type', ['HDP', 'hdp', 'CDP', 'cdp'])
+    def test_vanilla_s3a_clusters_get_the_magic_committer(self, cluster_type):
+        opts = m._s3a_committer_opts({'cluster_type': cluster_type})
+        assert ' -Dfs.s3a.committer.name=magic' in opts
+        assert 'S3ACommitterFactory' in opts
+
+    @pytest.mark.parametrize('config', [{'cluster_type': 'MapR'}, {}])
+    def test_mapr_gets_no_committer_flags(self, config):
+        assert m._s3a_committer_opts(config) == ''

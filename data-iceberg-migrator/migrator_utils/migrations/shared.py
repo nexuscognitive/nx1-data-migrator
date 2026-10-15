@@ -540,7 +540,7 @@ def get_config() -> dict:
         'tracking_location': _var('migration_tracking_location', 'MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking'),
         'report_output_location': _var('migration_report_location', 'MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports'),
 
-        # Cluster type for display/reporting purposes ('MapR' or 'HDP')
+        # Cluster type: report label and S3A committer choice ('MapR', 'HDP' or 'CDP')
         'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
@@ -812,14 +812,15 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 
 
 def _s3a_committer_opts(config: dict) -> str:
-    """Return S3A magic-committer JVM flags for HDP clusters.
+    """Return S3A magic-committer JVM flags for HDP and CDP clusters.
 
     MapR has its own S3 connector and doesn't use FileOutputCommitter, so no
-    flags are needed there. HDP 3.x uses vanilla S3A whose default v1 committer
-    tries an atomic rename on S3 (unsupported), causing CommitterEventHandler
-    failures. The magic committer bypasses that with S3 multipart uploads.
+    flags are needed there. HDP 3.x and CDP 7.x use vanilla S3A whose default v1
+    committer tries an atomic rename on S3 (unsupported), causing
+    CommitterEventHandler failures. The magic committer bypasses that with S3
+    multipart uploads.
     """
-    if config.get('cluster_type', 'MapR').upper() == 'HDP':
+    if config.get('cluster_type', 'MapR').upper() in ('HDP', 'CDP'):
         return (
             " -Dmapreduce.outputcommitter.factory.scheme.s3a="
             "org.apache.hadoop.fs.s3a.commit.S3ACommitterFactory"
