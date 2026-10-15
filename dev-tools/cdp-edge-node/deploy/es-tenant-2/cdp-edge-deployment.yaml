@@ -54,13 +54,16 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 10
             failureThreshold: 60
+          # DAG 1 on main starts one local[*] PySpark discovery per source database at once
+          # (the cap from PR #116 is only on the WF-419 branch); 16 of them OOM-killed an 8Gi
+          # limit. Real edge nodes are far larger.
           resources:
             requests:
               cpu: "2"
-              memory: 4Gi
+              memory: 8Gi
             limits:
               cpu: "4"
-              memory: 8Gi
+              memory: 24Gi
           volumeMounts:
             - mountPath: /hadoop/data
               name: data
