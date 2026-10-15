@@ -1751,13 +1751,9 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             )
 
             all_partitions = t.get("filtered_partitions", [])
-            if all_partitions:
-                mkdir_cmds = " && ".join(
-                    f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}/{p}'"
-                    for p in all_partitions
-                )
-            else:
-                mkdir_cmds = f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}'"
+            # One -mkdir with every path: FsShell tries them all and fails if any failed.
+            prefixes = [f"{t['s3_location']}/{p}" for p in all_partitions] or [t['s3_location']]
+            mkdir_cmds = f"hadoop fs{s3_opts} -mkdir -p " + " ".join(f"'{p}'" for p in prefixes)
             try:
                 with ssh.get_conn() as client:
                     _, stdout, stderr = client.exec_command(

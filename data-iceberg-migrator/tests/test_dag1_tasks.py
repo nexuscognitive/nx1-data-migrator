@@ -1416,6 +1416,32 @@ class TestRunDistcpSsh:
             cmd = client.exec_command.call_args[0][0]
             assert 'distcp' not in cmd.lower(), "distcp should not be called for empty source"
 
+    def test_empty_source_prefixes_for_every_partition_in_one_mkdir(self, mock_ssh_hook, sample_discovery):
+        """One failing partition must not skip the others: all prefixes go to a single
+        `hadoop fs -mkdir -p`, which tries every path (as the old `|| true` chain did)."""
+        hook, client, _, _ = mock_ssh_hook
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'source_file_count': 0,
+                'partition_filter_active': False,
+                'filtered_file_count': 0,
+            }],
+        }
+
+        m.run_distcp_ssh.function.__wrapped__(
+            discovery=discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+
+        mkdir_cmds = [c[0][0] for c in client.exec_command.call_args_list if '-mkdir' in c[0][0]]
+        assert len(mkdir_cmds) == 1
+        assert mkdir_cmds[0].count('hadoop fs') == 1
+        assert '/dt=2024-01-01' in mkdir_cmds[0]
+        assert '/dt=2024-01-02' in mkdir_cmds[0]
+
     def test_empty_source_prefix_runs_in_login_shell_and_reports_failure(self, mock_ssh_hook, sample_discovery):
         """The S3 prefix for an empty source used to be created with a bare exec_command,
         its errors discarded and success logged regardless."""
