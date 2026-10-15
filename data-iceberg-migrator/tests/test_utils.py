@@ -1260,6 +1260,31 @@ class TestClusterAuthCheckCmd:
         assert r.stdout.startswith(marker)
 
 
+class TestClusterLoginUserFallback:
+    """With no service_account_user_id, the user falls back to the SSH login user.
+    The maprlogin lookup may only run on MapR."""
+
+    _BASE = {
+        'ssh_conn_id': 'ssh1',
+        'edge_temp_path': '/tmp/migration',
+        'mapr_ticketfile_location': '/tmp/maprticket_x',
+        'distcp_log_root': '/tmp/logs',
+        'cluster_type': 'CDP',
+        'service_account_user_id': '',
+    }
+
+    def test_kinit_never_runs_the_maprlogin_lookup(self):
+        script = TestMaprTicketCheckIdentity._captured_script({**self._BASE, 'auth_method': 'kinit'})
+        fallback = script.index('if [ -z "$CONFIGURED_SA_USER" ]; then')
+        guard = script.index('if [ "kinit" = "mapr" ]; then', fallback)
+        assert guard < script.index('TICKET_USER=$(maprlogin print')
+        assert 'echo "EFFECTIVE_USER=$MIG_USER"' in script
+
+    def test_unset_user_falls_back_to_the_login_user(self):
+        script = TestMaprTicketCheckIdentity._captured_script({**self._BASE, 'auth_method': 'kinit'})
+        assert 'MIG_USER=$(id -un)' in script
+
+
 class TestS3aCommitterOpts:
     """HDP and CDP both use vanilla S3A, so both get the magic-committer flags."""
 

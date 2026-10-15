@@ -747,17 +747,19 @@ echo "Authentication successful"
 
     auth_script_parts.append(f"""
 if [ -z "$CONFIGURED_SA_USER" ]; then
-    TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
-    if [ -n "$TICKET_USER" ]; then
-        MIG_USER="$TICKET_USER"
-        MIG_USER_SOURCE="active MapR ticket"
+    if [ "{auth_method}" = "mapr" ]; then
+        TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
+        if [ -n "$TICKET_USER" ]; then
+            MIG_USER="$TICKET_USER"
+            MIG_USER_SOURCE="active MapR ticket"
+        fi
     fi
     export MIG_USER
     echo "WARNING: service_account_user_id is not configured. Falling back to"
     echo "WARNING: '$MIG_USER' from $MIG_USER_SOURCE. Set service_account_user_id"
     echo "WARNING: explicitly so temp and log paths do not depend on .profile."
 fi
-echo "MAPR_EFFECTIVE_USER=$MIG_USER"
+echo "EFFECTIVE_USER=$MIG_USER"
 echo "SERVICE_ACCOUNT_SOURCE=$MIG_USER_SOURCE"
 
 echo "=== Creating temp directory ==="
@@ -814,7 +816,7 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_log_dir = val
-        elif line.startswith("MAPR_EFFECTIVE_USER="):
+        elif line.startswith(("EFFECTIVE_USER=", "MAPR_EFFECTIVE_USER=")):
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_sa_user = val

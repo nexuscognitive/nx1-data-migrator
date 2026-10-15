@@ -284,6 +284,19 @@ class TestClusterLoginSetup:
         # DistCp logs must NOT be written under the local edge temp dir.
         assert not result['distcp_log_dir'].startswith(result['temp_dir'])
 
+    def test_effective_user_key_is_parsed(self, mock_ssh_hook):
+        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+        stdout_mock.read.return_value = (
+            b'CLUSTER_LOGIN_SUCCESS\n'
+            b'EFFECTIVE_USER=svc_migration\n'
+            b'SERVICE_ACCOUNT_SOURCE=login shell (.profile)\n'
+            b'TEMP_DIR=/tmp/migration/run_test\n'
+        )
+        stderr_mock.read.return_value = b''
+
+        result = m.cluster_login_setup.function(run_id='run_test')
+        assert result['service_account_user_id'] == 'svc_migration'
+
     def test_configured_service_account_is_not_clobbered_by_ticket(self, mock_ssh_hook):
         """Regression: the generated script must not overwrite a configured SA user."""
         hook, client, stdout_mock, stderr_mock = mock_ssh_hook
