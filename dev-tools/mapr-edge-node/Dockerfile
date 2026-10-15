@@ -65,8 +65,8 @@ RUN sed -i "s#hadoop-edge\.hadoop-ssh\.svc\.cluster\.local#hadoop-edge.${EDGE_NA
 COPY scripts/entrypoint.sh        /entrypoint.sh
 COPY scripts/bootstrap-hdfs.sh   /bootstrap-hdfs.sh
 COPY scripts/profile-additions.sh /etc/profile.d/hadoop.sh
-COPY scripts/setup-test-data.sh   /setup-test-data.sh
-COPY scripts/setup-distcp-test-data.sh /setup-distcp-test-data.sh
+COPY --from=fixtures setup-test-data.sh   /setup-test-data.sh
+COPY --from=fixtures setup-distcp-test-data.sh /setup-distcp-test-data.sh
 COPY scripts/pod-restart-setup.sh /pod-restart-setup.sh
 COPY scripts/test-discover.sh     /test-discover.sh
 COPY scripts/test-distcp.sh       /test-distcp.sh

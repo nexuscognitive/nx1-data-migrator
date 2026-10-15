@@ -50,10 +50,13 @@ dev-tools/mapr-edge-node/
     ├── entrypoint.sh        # container startup — starts SSH, HDFS, YARN, Hive metastore thrift, HiveServer2
     ├── bootstrap-hdfs.sh    # first-run only — formats namenode, inits Hive metastore schema
     ├── profile-additions.sh # sets PATH/PYTHONPATH/HADOOP_CLASSPATH for all SSH sessions
-    ├── setup-test-data.sh   # populates HDFS + Hive with test databases and tables
     ├── test-discover.sh     # runs the exact PySpark discover script from the DAG
     └── test-distcp.sh       # runs the exact distcp shell command from the DAG
 ```
+
+The seeding scripts (`setup-test-data.sh`, `setup-distcp-test-data.sh`) live in
+`dev-tools/fixtures/`, shared with the CDP edge node, and are copied into the image
+from the `fixtures` build context.
 
 ---
 
