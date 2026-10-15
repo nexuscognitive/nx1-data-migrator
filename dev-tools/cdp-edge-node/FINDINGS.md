@@ -32,7 +32,23 @@ Personal `_cdp` DAGs, each run pointed at the node with `dag_run.conf`
 | DAG 3 folder copy, `/user/testdata/distcp_sizing_folder` (5 files, 5 MiB) | `folder_only_data_copy_cdp` / `wf520_dag3_kerberos_1` | Pre-check, cluster login and DistCp on the Kerberized node; COMPLETED, 5 files / 5,242,880 bytes; validation `VALIDATED` (destination exists, file count and size match). |
 | No ticket (keytab moved aside, `kdestroy`) | `wf520_dag1_noticket_2`, `wf520_dag3_noticket_2` | Both pre-checks failed with `Cluster auth: No valid Kerberos TGT found` (DAG 3: P3 confirmed), and the runs stopped there. |
 
-Environment findings from this round (not DAG bugs, but they mislead a test run):
+## End-to-end round 2: full regression suite (es-tenant-2, 2026-10-15)
+
+`data-iceberg-migrator/notebooks/regression_test_suite.ipynb`, run tag `20261015T151923`, against the
+CDP node through the `_cdp` DAGs (`REGRESSION_EXTRA_RUN_CONF` routes every run to the node,
+`REGRESSION_DEST_DB_PREFIX=cdp_`): DAG 1 baseline `regression_20261015T151923_dag1_baseline`
+(30 discovery groups) and DAG 2 baseline `regression_20261015T151923_dag2_baseline`.
+
+**REGRESSION PASSED — 326 PASS, 0 FAIL, 0 ERROR**, 2 WARN, 3 MANUAL, 12 SKIPPED.
+
+- WARN (2): `send_migration_report_email` and `send_iceberg_report_email` — tenant SMTP (E3).
+- MANUAL (3): by design.
+- SKIPPED (12): 9 fault cases off by config (fault run not part of this round), 2 DistCp sizing
+  lines only logged at DEBUG, 1 destination already owned by another test (TC-25).
+
+No new DAG findings. The first attempt of this round hit E4 (edge OOM), not a Kerberos problem.
+
+Environment findings from these rounds (not DAG bugs, but they mislead a test run):
 
 | ID | Symptom | Cause | Handling |
 |---|---|---|---|
