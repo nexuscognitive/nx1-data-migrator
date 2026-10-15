@@ -26,7 +26,14 @@ export EDGE_BEELINE_URL='jdbc:hive2://${FQDN}:10000/default;principal=hive/${FQD
 EOF
 
 if [ -n "${SVC_MIGRATION_PASSWORD:-}" ]; then
-    echo "svc_migration:${SVC_MIGRATION_PASSWORD}" | chpasswd
+    # A Secret made with --from-file usually ends in a newline, which chpasswd would
+    # read as a second, empty entry.
+    pw="${SVC_MIGRATION_PASSWORD%$'\n'}"
+    case "$pw" in
+        *$'\n'*) echo "ERROR: SVC_MIGRATION_PASSWORD contains a newline" >&2; exit 1 ;;
+    esac
+    printf 'svc_migration:%s\n' "$pw" | chpasswd
+    unset pw
 else
     echo "WARNING: SVC_MIGRATION_PASSWORD is not set; svc_migration cannot log in over SSH" >&2
 fi
