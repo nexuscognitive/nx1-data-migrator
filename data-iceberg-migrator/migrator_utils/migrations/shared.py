@@ -745,7 +745,9 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 """)
     full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
-        _, stdout, stderr = client.exec_command(_login_shell(full_script), timeout=300)
+        _, stdout, stderr = client.exec_command(
+            _login_shell(full_script, config.get('cluster_type', 'MapR')), timeout=300
+        )
         output = stdout.read().decode()
         error = stderr.read().decode()
         exit_code = stdout.channel.recv_exit_status()

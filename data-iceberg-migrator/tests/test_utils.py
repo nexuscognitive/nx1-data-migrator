@@ -1198,6 +1198,35 @@ class TestMaprTicketCheckIdentity:
         assert 'grep -qF -- "$MIG_USER"' in script
 
 
+class TestClusterLoginShellWrapper:
+    """cluster_login must wrap its script like every other SSH call: bash -l for
+    non-MapR clusters, `source ~/.profile` for MapR."""
+
+    _BASE = {
+        'ssh_conn_id': 'ssh1',
+        'edge_temp_path': '/tmp/migration',
+        'auth_method': 'kinit',
+        'mapr_ticketfile_location': '/tmp/maprticket_x',
+        'distcp_log_root': '/tmp/logs',
+        'service_account_user_id': 'svc_migration',
+    }
+
+    @pytest.mark.parametrize('cluster_type', ['CDP', 'HDP'])
+    def test_non_mapr_clusters_get_a_login_shell(self, cluster_type):
+        script = TestMaprTicketCheckIdentity._captured_script({**self._BASE, 'cluster_type': cluster_type})
+        assert script.startswith("bash -l <<'__LOGIN_SHELL_EOF__'")
+
+    def test_mapr_keeps_sourcing_the_profile(self):
+        script = TestMaprTicketCheckIdentity._captured_script(
+            {**self._BASE, 'cluster_type': 'MapR', 'auth_method': 'mapr'}
+        )
+        assert script.startswith('source ~/.profile')
+
+    def test_missing_cluster_type_defaults_to_mapr(self):
+        script = TestMaprTicketCheckIdentity._captured_script(dict(self._BASE))
+        assert script.startswith('source ~/.profile')
+
+
 class TestS3aCommitterOpts:
     """HDP and CDP both use vanilla S3A, so both get the magic-committer flags."""
 
