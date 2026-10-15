@@ -6,6 +6,7 @@ Tests for shared utility functions:
 """
 
 import json
+import subprocess
 import time
 from unittest.mock import MagicMock, patch
 
@@ -1225,6 +1226,38 @@ class TestClusterLoginShellWrapper:
     def test_missing_cluster_type_defaults_to_mapr(self):
         script = TestMaprTicketCheckIdentity._captured_script(dict(self._BASE))
         assert script.startswith('source ~/.profile')
+
+
+class TestClusterAuthCheckCmd:
+
+    def test_kinit_checks_for_a_valid_tgt(self):
+        cmd = m._cluster_auth_check_cmd('kinit', '')
+        assert 'klist -s' in cmd
+        assert 'CLUSTER_AUTH_FAIL' in cmd
+
+    def test_mapr_quotes_the_expected_user(self):
+        cmd = m._cluster_auth_check_cmd('mapr', 'x";id;#')
+        assert "EXPECTED_USER='x\";id;#'" in cmd
+        assert 'maprlogin print' in cmd
+
+    @pytest.mark.parametrize('auth_method', ['none', ''])
+    def test_no_auth_always_passes(self, auth_method):
+        assert m._cluster_auth_check_cmd(auth_method, '') == 'echo "CLUSTER_AUTH_OK"'
+
+    @pytest.mark.parametrize('klist_exit, expected_rc, marker', [
+        (0, 0, 'CLUSTER_AUTH_OK'),
+        (1, 1, 'CLUSTER_AUTH_FAIL'),
+    ])
+    def test_kinit_check_follows_klist(self, tmp_path, klist_exit, expected_rc, marker):
+        fake = tmp_path / 'klist'
+        fake.write_text(f'#!/bin/sh\nexit {klist_exit}\n')
+        fake.chmod(0o755)
+        r = subprocess.run(
+            ['bash', '-c', m._cluster_auth_check_cmd('kinit', '')],
+            capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
+        )
+        assert r.returncode == expected_rc
+        assert r.stdout.startswith(marker)
 
 
 class TestS3aCommitterOpts:

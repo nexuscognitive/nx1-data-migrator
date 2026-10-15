@@ -626,6 +626,37 @@ def _login_shell(cmd: str, cluster_type: str = 'MapR') -> str:
         return f"source ~/.profile 2>/dev/null || true\n{cmd}"
     return f"bash -l <<'__LOGIN_SHELL_EOF__'\n{cmd}\n__LOGIN_SHELL_EOF__\n"
 
+
+def _cluster_auth_check_cmd(auth_method: str, expected_user: str) -> str:
+    """Shell check for the edge node's cluster login, shared by the DAG pre-checks.
+
+    Prints CLUSTER_AUTH_OK, or prints CLUSTER_AUTH_FAIL: <reason> and exits 1.
+    MapR needs a `maprlogin print` ticket for expected_user (the login user when
+    empty); Kerberos needs a valid TGT (`klist -s`); anything else needs nothing.
+    """
+    if auth_method == 'mapr':
+        return f"""
+EXPECTED_USER={shlex.quote(expected_user)}
+if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
+if maprlogin print 2>/dev/null | grep -qF -- "$EXPECTED_USER"; then
+    echo "CLUSTER_AUTH_OK"
+else
+    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '$EXPECTED_USER'. Run maprlogin on the edge node."
+    exit 1
+fi
+"""
+    if auth_method == 'kinit':
+        return """
+if klist -s 2>/dev/null; then
+    echo "CLUSTER_AUTH_OK"
+    klist 2>/dev/null | head -4
+else
+    echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
+    exit 1
+fi
+"""
+    return 'echo "CLUSTER_AUTH_OK"'
+
 def _edge_path_template(path: str) -> str:
     if not path:
         return path

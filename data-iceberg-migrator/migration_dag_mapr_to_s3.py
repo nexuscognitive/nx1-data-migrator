@@ -34,6 +34,7 @@ from migrator_utils.migrations.partition_utils import (
 )
 from migrator_utils.migrations.shared import (
     SSH_COMMAND_TIMEOUT,
+    _cluster_auth_check_cmd,
     _hive_scratch_dir,
     _login_shell,
     build_s3_opts,
@@ -315,29 +316,7 @@ def validate_prerequisites(run_id: str) -> dict:
             logger.info(
                 f"[2/4] Testing cluster authentication (auth_method={auth_method})..."
             )
-            if auth_method == "mapr":
-                inner_cmd = f"""
-EXPECTED_USER={shlex.quote(mapr_user)}
-if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
-if maprlogin print 2>/dev/null | grep -qF -- "$EXPECTED_USER"; then
-    echo "CLUSTER_AUTH_OK"
-else
-    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '$EXPECTED_USER'. Run maprlogin on the edge node."
-    exit 1
-fi
-"""
-            elif auth_method == "kinit":
-                inner_cmd = """
-if klist -s 2>/dev/null; then
-    echo "CLUSTER_AUTH_OK"
-    klist 2>/dev/null | head -4
-else
-    echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
-    exit 1
-fi
-"""
-            else:
-                inner_cmd = 'echo "CLUSTER_AUTH_OK"'
+            inner_cmd = _cluster_auth_check_cmd(auth_method, mapr_user)
 
             _, stdout, stderr = client.exec_command(
                 _login_shell(inner_cmd, config.get("cluster_type", "MapR")), timeout=30

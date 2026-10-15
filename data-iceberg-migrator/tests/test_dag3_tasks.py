@@ -31,21 +31,40 @@ EXPECTED_SCHEMA_ADDITIONS = (
 
 class TestValidatePrerequisitesFolderCopy:
 
-    def test_all_checks_pass(self, mock_ssh_hook):
-        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+    @staticmethod
+    def _responses(auth_exit=0, auth_out=b'CLUSTER_AUTH_OK'):
         responses = [
             (MagicMock(), mock_ssh_stdout(0, b'SSH_TEST_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(auth_exit, auth_out), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b'DISTCP_OK'), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b'HADOOP_FS_OK'), MagicMock()),
         ]
         for r in responses:
             r[2].read.return_value = b''
-        client.exec_command.side_effect = responses
+        return responses
+
+    def test_all_checks_pass(self, mock_ssh_hook):
+        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+        client.exec_command.side_effect = self._responses()
 
         result = m.validate_prerequisites_folder_copy.function()
         assert result['ssh_connectivity'] is True
+        assert result['cluster_auth'] is True
         assert result['hadoop_distcp_available'] is True
         assert result['hadoop_fs_available'] is True
+
+    def test_missing_kerberos_ticket_fails_the_precheck(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._responses(
+            auth_exit=1, auth_out=b'CLUSTER_AUTH_FAIL: No valid Kerberos TGT found.'
+        )
+        config = {**m.get_config(), 'auth_method': 'kinit'}
+
+        with patch.object(m, 'get_config', return_value=config), \
+                pytest.raises(Exception, match='Cluster auth: No valid Kerberos TGT found'):
+            m.validate_prerequisites_folder_copy.function()
+        auth_cmd = client.exec_command.call_args_list[1][0][0]
+        assert 'klist -s' in auth_cmd
 
 
 class TestInitFolderCopyTrackingTables:
