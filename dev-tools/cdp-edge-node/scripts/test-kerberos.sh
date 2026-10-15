@@ -43,33 +43,32 @@ for c in "hadoop version" "hdfs dfs -ls /" "beeline --version" "spark-submit --v
 done
 
 echo "== With a ticket =="
-if as_bare "echo hello > /tmp/rt.txt && hdfs dfs -put -f /tmp/rt.txt /user/svc_migration/rt.txt && hdfs dfs -cat /user/svc_migration/rt.txt" | grep -q hello; then
-    pass "hdfs put/get round trip through the DataNode"
-else
-    fail "hdfs put/get round trip through the DataNode"
-fi
-if as_bare "beeline -u '${BEELINE_URL}' --silent=true -e 'SHOW DATABASES;'" 2>&1 | grep -q default; then
-    pass "beeline with principal: SHOW DATABASES"
-else
-    fail "beeline with principal: SHOW DATABASES"
-fi
-if as_bare "$SHOW_DBS" 2>&1 | grep -q default; then
-    pass "pyspark lists databases through the SASL metastore"
-else
-    fail "pyspark lists databases through the SASL metastore"
-fi
+# Output is captured before grepping: under pipefail, `cmd | grep -q` fails at random
+# when grep exits on the first match and cmd dies of SIGPIPE.
+expect_output() {  # description, command, pattern
+    local out
+    out="$(as_bare "$2" 2>&1)"
+    if grep -q -- "$3" <<< "$out"; then pass "$1"; else fail "$1"; fi
+}
+expect_output "hdfs put/get round trip through the DataNode" \
+    "echo hello > /tmp/rt.txt && hdfs dfs -put -f /tmp/rt.txt /user/svc_migration/rt.txt && hdfs dfs -cat /user/svc_migration/rt.txt" hello
+expect_output "beeline with principal: SHOW DATABASES" \
+    "beeline -u '${BEELINE_URL}' --silent=true -e 'SHOW DATABASES;'" default
+expect_output "pyspark lists databases through the SASL metastore" "$SHOW_DBS" default
 
 echo "== Without a ticket (keytab moved aside) =="
 mv "$KEYTAB" "${KEYTAB}.aside"
 as_bare "kdestroy 2>/dev/null"
 if as_login "klist -s"; then fail "login shell still has a ticket"; else pass "no keytab, no ticket"; fi
 expect_auth_failure() {  # description, command
-    local out
+    local out rc
     out="$(as_bare "$2" 2>&1)"
-    if [ $? -ne 0 ] && echo "$out" | grep -qiE 'GSS|Kerberos|SASL|TGT|authentication'; then
+    rc=$?
+    if [ "$rc" -ne 0 ] && grep -qiE 'GSS|Kerberos|SASL|TGT|authentication' <<< "$out"; then
         pass "$1 fails with an authentication error"
     else
-        fail "$1 did not fail with an authentication error"
+        echo "$out" > "/tmp/test-kerberos.failed.log"
+        fail "$1 did not fail with an authentication error (exit $rc; full output in /tmp/test-kerberos.failed.log)"
     fi
 }
 expect_auth_failure "hdfs dfs -ls /" "hdfs dfs -ls /"

@@ -50,6 +50,12 @@ hdfs --daemon start datanode
 # The NameNode's own principal is the HDFS superuser.
 kinit -kt /etc/security/keytabs/hdfs.keytab "hdfs/${FQDN}@CDP.LOCAL"
 hdfs dfsadmin -safemode wait
+# Every boot, so existing volumes pick up new folders. /tmp: DistCp staging and the
+# DAG's distcp_log_root. /tmp/hive: Hive scratch. The warehouse is world-writable so
+# svc_migration can seed tables; /user/testdata holds svc_migration's fixture folders.
+hdfs dfs -mkdir -p /tmp/hive /user/hive/warehouse /user/svc_migration /user/testdata
+hdfs dfs -chmod 1777 /tmp /tmp/hive /user/hive/warehouse
+hdfs dfs -chown svc_migration /user/svc_migration /user/testdata
 kdestroy
 
 JAVA_TOOL_OPTIONS="-Djava.security.egd=file:/dev/./urandom" \
