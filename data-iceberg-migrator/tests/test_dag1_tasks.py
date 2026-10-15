@@ -1403,6 +1403,47 @@ class TestRunDistcpSsh:
             cmd = client.exec_command.call_args[0][0]
             assert 'distcp' not in cmd.lower(), "distcp should not be called for empty source"
 
+    def test_empty_source_prefix_runs_in_login_shell_and_reports_failure(self, mock_ssh_hook, sample_discovery):
+        """The S3 prefix for an empty source used to be created with a bare exec_command,
+        its errors discarded and success logged regardless."""
+        hook, client, _, _ = mock_ssh_hook
+
+        def _exec(cmd, **kwargs):
+            err = MagicMock()
+            if '-mkdir' in cmd:
+                err.read.return_value = b'GSS initiate failed'
+                return (MagicMock(), mock_ssh_stdout(1, b''), err)
+            err.read.return_value = b''
+            return (MagicMock(), mock_ssh_stdout(0, b''), err)
+
+        client.exec_command.side_effect = _exec
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'source_file_count': 0,
+                'partition_filter_active': False,
+                'filtered_file_count': 0,
+            }],
+        }
+
+        with patch.object(m.logger, 'info') as info, patch.object(m.logger, 'warning') as warning:
+            result = m.run_distcp_ssh.function.__wrapped__(
+                discovery=discovery,
+                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+                ti=MagicMock(),
+            )
+
+        mkdir_cmds = [c[0][0] for c in client.exec_command.call_args_list if '-mkdir' in c[0][0]]
+        assert len(mkdir_cmds) == 1
+        assert mkdir_cmds[0].startswith("bash -l <<'__LOGIN_SHELL_EOF__'")  # conftest cluster_type is HDP
+        assert '|| true' not in mkdir_cmds[0]
+        infos = ' '.join(str(c[0][0]) for c in info.call_args_list)
+        warnings = ' '.join(str(c[0][0]) for c in warning.call_args_list)
+        assert 'Created S3 prefix' not in infos
+        assert 'GSS initiate failed' in warnings
+        assert result['distcp_results'][0]['status'] == 'EMPTY_SOURCE'
+
 
 class TestUpdateDistcpStatus:
 

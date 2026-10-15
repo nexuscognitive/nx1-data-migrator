@@ -1753,18 +1753,27 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             all_partitions = t.get("filtered_partitions", [])
             if all_partitions:
                 mkdir_cmds = " && ".join(
-                    f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}/{p}' 2>/dev/null || true"
+                    f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}/{p}'"
                     for p in all_partitions
                 )
             else:
-                mkdir_cmds = f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}' 2>/dev/null || true"
+                mkdir_cmds = f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}'"
             try:
                 with ssh.get_conn() as client:
                     _, stdout, stderr = client.exec_command(
-                        mkdir_cmds, timeout=SSH_COMMAND_TIMEOUT
+                        _login_shell(mkdir_cmds, config.get("cluster_type", "MapR")),
+                        timeout=SSH_COMMAND_TIMEOUT,
                     )
+                    mkdir_out = stdout.read().decode(errors="replace")
+                    mkdir_err = stderr.read().decode(errors="replace")
                     exit_code = stdout.channel.recv_exit_status()
-                logger.info(f"[DistCp] Created S3 prefix: {t['s3_location']}")
+                if exit_code == 0:
+                    logger.info(f"[DistCp] Created S3 prefix: {t['s3_location']}")
+                else:
+                    logger.warning(
+                        f"[DistCp] Could not create S3 prefix for {t['s3_location']} "
+                        f"(exit {exit_code}): {(mkdir_err or mkdir_out).strip()[-500:]}"
+                    )
             except Exception as _me:
                 logger.warning(
                     f"[DistCp] Could not create S3 prefix for {t['s3_location']}: {_me}"
