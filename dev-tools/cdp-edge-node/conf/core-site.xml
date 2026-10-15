@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!-- @EDGE_FQDN@ is replaced with `hostname -f` by entrypoint.sh at startup. -->
+<configuration>
+  <property>
+    <name>fs.defaultFS</name>
+    <value>hdfs://@EDGE_FQDN@:9000</value>
+  </property>
+</configuration>

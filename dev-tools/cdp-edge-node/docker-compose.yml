@@ -1,0 +1,23 @@
+services:
+  cdp-edge:
+    build:
+      context: .
+      additional_contexts:
+        fixtures: ../fixtures
+      args:
+        # e.g. APACHE_MIRROR=https://mirrors.huaweicloud.com/apache docker compose up -d --build
+        APACHE_MIRROR: ${APACHE_MIRROR:-https://archive.apache.org/dist}
+    container_name: cdp-edge-node
+    hostname: cdp-edge
+    ports:
+      - "2225:22"       # SSH (hadoop=2222, mapr=2223, hdp=2224, cdp=2225)
+      - "9873:9870"     # NameNode UI
+      - "10003:10000"   # HiveServer2
+    environment:
+      # Local test-only password; k8s takes it from the cdp-edge-ssh Secret.
+      - SVC_MIGRATION_PASSWORD=svc_migration
+    volumes:
+      - cdp_data:/hadoop/data
+
+volumes:
+  cdp_data:
