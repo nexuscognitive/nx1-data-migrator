@@ -6,4 +6,33 @@
     <name>fs.defaultFS</name>
     <value>hdfs://@EDGE_FQDN@:9000</value>
   </property>
+  <property>
+    <name>hadoop.security.authentication</name>
+    <value>kerberos</value>
+  </property>
+  <property>
+    <name>hadoop.security.authorization</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>hadoop.rpc.protection</name>
+    <value>authentication</value>
+  </property>
+  <!-- Job submission (local DistCp, HiveServer2 sessions) names this principal as the
+       delegation-token renewer and fails without it ("Can't get Master Kerberos
+       principal for use as renewer"). CDP sets it because it runs YARN; this node has no
+       YARN, so the principal only needs to be well-formed, not to exist in the KDC. -->
+  <property>
+    <name>yarn.resourcemanager.principal</name>
+    <value>yarn/@EDGE_FQDN@@CDP.LOCAL</value>
+  </property>
+  <!-- The metastore (hive.metastore.execute.setugi) and HiveServer2 (doAs) act as the calling user. -->
+  <property>
+    <name>hadoop.proxyuser.hive.hosts</name>
+    <value>*</value>
+  </property>
+  <property>
+    <name>hadoop.proxyuser.hive.groups</name>
+    <value>*</value>
+  </property>
 </configuration>

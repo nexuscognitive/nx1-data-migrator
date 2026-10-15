@@ -49,6 +49,17 @@ RUN HADOOP_GUAVA="$(ls /opt/hadoop/share/hadoop/common/lib/guava-*.jar)" \
          guava-2[0-9]*) rm -f /opt/hive/lib/guava-*.jar && cp "$HADOOP_GUAVA" /opt/hive/lib/ ;; \
        esac
 
+# krb5-admin-server only for kadmin.local (principals are managed locally; kadmind never runs).
+RUN apt-get update && apt-get install -y krb5-kdc krb5-admin-server krb5-user \
+    && rm -rf /var/lib/apt/lists/*
+COPY conf/krb5.conf /etc/krb5.conf
+COPY conf/kdc.conf /etc/krb5kdc/kdc.conf
+# The KDC database and keytabs live on the data volume (spec section 4).
+RUN rm -rf /var/lib/krb5kdc /etc/security/keytabs \
+    && mkdir -p /etc/security \
+    && ln -s /hadoop/data/krb5kdc /var/lib/krb5kdc \
+    && ln -s /hadoop/data/keytabs /etc/security/keytabs
+
 # Config lives where CDP keeps it.
 RUN mkdir -p /etc/hadoop/conf /etc/hive/conf /etc/spark/conf \
     && cp -r /opt/hadoop/etc/hadoop/. /etc/hadoop/conf/ \
@@ -69,7 +80,11 @@ RUN chmod 755 /usr/lib/cdp-edge/cli-wrapper \
        done
 COPY scripts/profile-additions.sh /etc/profile.d/hadoop.sh
 
-RUN useradd -m -s /bin/bash svc_migration
+RUN useradd -m -s /bin/bash svc_migration \
+    && printf '%s\n' '' \
+       '# Service-account ticket from its keytab: the edge node holds the ticket, the DAG only checks it.' \
+       '( flock 9; klist -s || kinit -kt /etc/security/keytabs/svc_migration.keytab svc_migration@CDP.LOCAL ) 9>/tmp/.kinit.svc_migration.lock' \
+       >> /home/svc_migration/.profile
 
 RUN mkdir -p /run/sshd && ssh-keygen -A \
     && sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config \
@@ -78,10 +93,12 @@ RUN mkdir -p /run/sshd && ssh-keygen -A \
 COPY scripts/entrypoint.sh /entrypoint.sh
 COPY scripts/bootstrap-hdfs.sh /bootstrap-hdfs.sh
 COPY scripts/test-kerberos.sh /test-kerberos.sh
+COPY scripts/kdc-init.sh /kdc-init.sh
 COPY --from=fixtures scenarios.yaml /scenarios.yaml
 COPY --from=fixtures setup-test-data.sh /setup-test-data.sh
 COPY --from=fixtures setup-distcp-test-data.sh /setup-distcp-test-data.sh
-RUN chmod 755 /entrypoint.sh /bootstrap-hdfs.sh /test-kerberos.sh /setup-test-data.sh /setup-distcp-test-data.sh
+RUN chmod 755 /entrypoint.sh /bootstrap-hdfs.sh /test-kerberos.sh /kdc-init.sh \
+    /setup-test-data.sh /setup-distcp-test-data.sh
 
 EXPOSE 22 9870 10000
 ENTRYPOINT ["/entrypoint.sh"]
