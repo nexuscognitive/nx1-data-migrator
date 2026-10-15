@@ -1,0 +1,70 @@
+# Kerberized CDP-style edge node for es-tenant-2 (WF-520).
+# Spec: docs/superpowers/specs/2026-10-14-cdp-kerberos-edge-node-design.md
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cdp-edge
+  namespace: es-tenant-2
+  labels:
+    app: cdp-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cdp-edge
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: cdp-edge
+    spec:
+      # hostname + subdomain (= the headless Service name) give the pod the stable FQDN
+      # cdp-edge.cdp-edge.es-tenant-2.svc.cluster.local that every Kerberos principal contains.
+      hostname: cdp-edge
+      subdomain: cdp-edge
+      # Required: es-tenant-2's `metastore` Service otherwise injects
+      # METASTORE_PORT=tcp://... which breaks `hive --service metastore`.
+      enableServiceLinks: false
+      containers:
+        - name: cdp-edge
+          # Pinned to the tag built by nx1-full-package's chore/cdp-edge-image-build workflow.
+          image: nx1registry-hgb9hgbwd8baguad.azurecr.io/cdp-edge-node:cdp-edge-2026-10-15
+          imagePullPolicy: Always
+          env:
+            - name: SVC_MIGRATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cdp-edge-ssh
+                  key: password
+          ports:
+            - { name: ssh, containerPort: 22 }
+            - { name: namenode-rpc, containerPort: 9000 }
+            - { name: hdfs-ui, containerPort: 9870 }
+            - { name: hiveserver2, containerPort: 10000 }
+          livenessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          # Ready only once HDFS and Hive are up, so the SSH Service doesn't route the DAG early.
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/edge-ready"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - mountPath: /hadoop/data
+              name: data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: cdp-edge-data

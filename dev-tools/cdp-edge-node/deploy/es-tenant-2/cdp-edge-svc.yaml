@@ -1,0 +1,14 @@
+# Headless Service that gives the pod its DNS name (it must match spec.subdomain).
+# publishNotReadyAddresses: the name resolves during boot, before the pod is Ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cdp-edge
+  namespace: es-tenant-2
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: cdp-edge
+  ports:
+    - { name: namenode-rpc, port: 9000, targetPort: 9000 }
