@@ -64,8 +64,7 @@ expect the edge node to hold the ticket (for example, `kinit -kt` from the servi
 account's keytab in its `~/.profile`); they don't run `kinit` themselves.
 
 `dev-tools/cdp-edge-node/` is a Kerberized CDP 7.1.x-style edge node for testing this end
-to end; see its `README.md` for setup and the DAG settings, and `FINDINGS.md` for what
-testing on it found.
+to end; see its `README.md` for setup and the DAG settings.
 
 ### Optional Variables
 

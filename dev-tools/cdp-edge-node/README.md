@@ -5,9 +5,7 @@ with **Kerberos** turned on. It exists to test the migration DAGs (DAG 1
 `source_to_s3_migration`, DAG 3 `folder_only_data_copy`) on a Kerberized cluster before
 they are handed over to the client.
 
-- Ticket: [WF-520](https://linear.app/nexuscognitive/issue/WF-520)
-- Findings from testing the DAGs on this node: [`FINDINGS.md`](FINDINGS.md)
-- Design: `docs/superpowers/specs/2026-10-14-cdp-kerberos-edge-node-design.md` (local, not in git)
+Ticket: [WF-520](https://linear.app/nexuscognitive/issue/WF-520)
 
 Two rules shape this node:
 
