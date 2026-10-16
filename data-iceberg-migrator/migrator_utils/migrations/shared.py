@@ -233,6 +233,7 @@ TENANT_PROFILE_KEYS = frozenset({
     'ssh_conn_id',
     'mapr_ticketfile_location',
     'auth_method',
+    'cluster_type',
     'edge_temp_path',
     'hive_scratch_dir',
     'service_account_user_id',
@@ -540,8 +541,8 @@ def get_config() -> dict:
         'tracking_location': _var('migration_tracking_location', 'MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking'),
         'report_output_location': _var('migration_report_location', 'MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports'),
 
-        # Cluster type for display/reporting purposes ('MapR' or 'HDP')
-        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
+        # Cluster type: report label and S3A committer choice ('MapR', 'HDP' or 'CDP')
+        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR', conf_key='cluster_type'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
         'service_account_user_id': _var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id').strip(),
@@ -625,6 +626,37 @@ def _login_shell(cmd: str, cluster_type: str = 'MapR') -> str:
     if cluster_type.upper() == 'MAPR':
         return f"source ~/.profile 2>/dev/null || true\n{cmd}"
     return f"bash -l <<'__LOGIN_SHELL_EOF__'\n{cmd}\n__LOGIN_SHELL_EOF__\n"
+
+
+def _cluster_auth_check_cmd(auth_method: str, expected_user: str) -> str:
+    """Shell check for the edge node's cluster login, shared by the DAG pre-checks.
+
+    Prints CLUSTER_AUTH_OK, or prints CLUSTER_AUTH_FAIL: <reason> and exits 1.
+    MapR needs a `maprlogin print` ticket for expected_user (the login user when
+    empty); Kerberos needs a valid TGT (`klist -s`); anything else needs nothing.
+    """
+    if auth_method == 'mapr':
+        return f"""
+EXPECTED_USER={shlex.quote(expected_user)}
+if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
+if maprlogin print 2>/dev/null | grep -qF -- "$EXPECTED_USER"; then
+    echo "CLUSTER_AUTH_OK"
+else
+    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '$EXPECTED_USER'. Run maprlogin on the edge node."
+    exit 1
+fi
+"""
+    if auth_method == 'kinit':
+        return """
+if klist -s 2>/dev/null; then
+    echo "CLUSTER_AUTH_OK"
+    klist 2>/dev/null | head -4
+else
+    echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
+    exit 1
+fi
+"""
+    return 'echo "CLUSTER_AUTH_OK"'
 
 def _edge_path_template(path: str) -> str:
     if not path:
@@ -716,17 +748,19 @@ echo "Authentication successful"
 
     auth_script_parts.append(f"""
 if [ -z "$CONFIGURED_SA_USER" ]; then
-    TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
-    if [ -n "$TICKET_USER" ]; then
-        MIG_USER="$TICKET_USER"
-        MIG_USER_SOURCE="active MapR ticket"
+    if [ "{auth_method}" = "mapr" ]; then
+        TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
+        if [ -n "$TICKET_USER" ]; then
+            MIG_USER="$TICKET_USER"
+            MIG_USER_SOURCE="active MapR ticket"
+        fi
     fi
     export MIG_USER
     echo "WARNING: service_account_user_id is not configured. Falling back to"
     echo "WARNING: '$MIG_USER' from $MIG_USER_SOURCE. Set service_account_user_id"
     echo "WARNING: explicitly so temp and log paths do not depend on .profile."
 fi
-echo "MAPR_EFFECTIVE_USER=$MIG_USER"
+echo "EFFECTIVE_USER=$MIG_USER"
 echo "SERVICE_ACCOUNT_SOURCE=$MIG_USER_SOURCE"
 
 echo "=== Creating temp directory ==="
@@ -745,7 +779,9 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 """)
     full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
-        _, stdout, stderr = client.exec_command(_login_shell(full_script), timeout=300)
+        _, stdout, stderr = client.exec_command(
+            _login_shell(full_script, config.get('cluster_type', 'MapR')), timeout=300
+        )
         output = stdout.read().decode()
         error = stderr.read().decode()
         exit_code = stdout.channel.recv_exit_status()
@@ -781,7 +817,7 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_log_dir = val
-        elif line.startswith("MAPR_EFFECTIVE_USER="):
+        elif line.startswith(("EFFECTIVE_USER=", "MAPR_EFFECTIVE_USER=")):
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_sa_user = val
@@ -812,14 +848,15 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 
 
 def _s3a_committer_opts(config: dict) -> str:
-    """Return S3A magic-committer JVM flags for HDP clusters.
+    """Return S3A magic-committer JVM flags for HDP and CDP clusters.
 
     MapR has its own S3 connector and doesn't use FileOutputCommitter, so no
-    flags are needed there. HDP 3.x uses vanilla S3A whose default v1 committer
-    tries an atomic rename on S3 (unsupported), causing CommitterEventHandler
-    failures. The magic committer bypasses that with S3 multipart uploads.
+    flags are needed there. HDP 3.x and CDP 7.x use vanilla S3A whose default v1
+    committer tries an atomic rename on S3 (unsupported), causing
+    CommitterEventHandler failures. The magic committer bypasses that with S3
+    multipart uploads.
     """
-    if config.get('cluster_type', 'MapR').upper() == 'HDP':
+    if config.get('cluster_type', 'MapR').upper() in ('HDP', 'CDP'):
         return (
             " -Dmapreduce.outputcommitter.factory.scheme.s3a="
             "org.apache.hadoop.fs.s3a.commit.S3ACommitterFactory"

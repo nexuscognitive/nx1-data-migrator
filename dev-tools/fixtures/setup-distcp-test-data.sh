@@ -39,8 +39,14 @@
 
 set -euo pipefail
 
-BEELINE="/opt/hive/bin/beeline -u jdbc:hive2://localhost:10000 --silent=true"
-WH="hdfs://localhost:9000/user/hive/warehouse"
+# Defaults are the MapR edge node's addresses; the CDP node exports its own
+# (dev-tools/cdp-edge-node: /etc/profile.d/cdp-edge-seed.sh).
+EDGE_NAMENODE="${EDGE_NAMENODE:-hdfs://localhost:9000}"
+EDGE_BEELINE_URL="${EDGE_BEELINE_URL:-jdbc:hive2://localhost:10000}"
+export EDGE_NAMENODE EDGE_BEELINE_URL
+
+BEELINE="/opt/hive/bin/beeline -u ${EDGE_BEELINE_URL} --silent=true"
+WH="${EDGE_NAMENODE}/user/hive/warehouse"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -z "${FIXTURES_FILE:-}" ]; then
@@ -56,7 +62,7 @@ export FIXTURES_FILE
 
 DB="distcp_sizing_db"
 DBDIR="${WH}/${DB}.db"
-FOLDER_SRC="hdfs://localhost:9000/user/testdata/distcp_sizing_folder"
+FOLDER_SRC="${EDGE_NAMENODE}/user/testdata/distcp_sizing_folder"
 STAGE="/tmp/distcp_sizing_stage"
 
 # t_partitioned needs a partition the DAG's filter EXCLUDES. mapr_to_s3.py:1128
@@ -170,38 +176,38 @@ echo "============================================================"
 
 $BEELINE -e "
 CREATE DATABASE IF NOT EXISTS ${DB}
-  LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db';
+  LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/${DB}.db';
 
 DROP TABLE IF EXISTS ${DB}.t_tiny;
 CREATE EXTERNAL TABLE ${DB}.t_tiny (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
-  LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_tiny';
+  LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/${DB}.db/t_tiny';
 
 DROP TABLE IF EXISTS ${DB}.t_size_bound;
 CREATE EXTERNAL TABLE ${DB}.t_size_bound (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
-  LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_size_bound';
+  LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/${DB}.db/t_size_bound';
 
 DROP TABLE IF EXISTS ${DB}.t_max_clamp;
 CREATE EXTERNAL TABLE ${DB}.t_max_clamp (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
-  LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_max_clamp';
+  LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/${DB}.db/t_max_clamp';
 
 DROP TABLE IF EXISTS ${DB}.t_file_clamp;
 CREATE EXTERNAL TABLE ${DB}.t_file_clamp (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
-  LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_file_clamp';
+  LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/${DB}.db/t_file_clamp';
 
 DROP TABLE IF EXISTS ${DB}.t_partitioned;
 CREATE EXTERNAL TABLE ${DB}.t_partitioned (line STRING)
   PARTITIONED BY (dt STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
-  LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_partitioned';
+  LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/${DB}.db/t_partitioned';
 ALTER TABLE ${DB}.t_partitioned ADD IF NOT EXISTS PARTITION (dt='2024-01-01');
 ALTER TABLE ${DB}.t_partitioned ADD IF NOT EXISTS PARTITION (dt='2024-01-02');
 ALTER TABLE ${DB}.t_partitioned ADD IF NOT EXISTS PARTITION (dt='2024-01-03');
@@ -210,7 +216,7 @@ DROP TABLE IF EXISTS ${DB}.t_empty;
 CREATE EXTERNAL TABLE ${DB}.t_empty (line STRING)
   ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
   STORED AS TEXTFILE
-  LOCATION 'hdfs://localhost:9000/user/hive/warehouse/${DB}.db/t_empty';
+  LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/${DB}.db/t_empty';
 "
 
 echo "============================================================"

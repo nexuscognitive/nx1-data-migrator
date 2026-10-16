@@ -6,6 +6,7 @@ Tests for shared utility functions:
 """
 
 import json
+import subprocess
 import time
 from unittest.mock import MagicMock, patch
 
@@ -1196,3 +1197,135 @@ class TestMaprTicketCheckIdentity:
             "branch could never fire"
         )
         assert 'grep -qF -- "$MIG_USER"' in script
+
+
+class TestClusterTypePerRun:
+    """cluster_type must be settable per run like ssh_conn_id and auth_method: a run
+    pointed at a CDP edge node otherwise keeps a tenant-wide `cluster_type=MapR`
+    Variable, so it gets MapR's shell wrapper and no S3A committer flags."""
+
+    _VARIABLES = {'cluster_type': 'MapR', 'cluster_ssh_conn_id': 'mapr_edge', 'auth_method': 'mapr'}
+
+    def _config(self, conf: dict, variables: dict):
+        return TestTenantProfileConfKeyPrecedence._context('manual__2026', conf), \
+            TestTenantProfileConfKeyPrecedence._variables(variables)
+
+    def test_dag_run_conf_overrides_the_cluster_type_variable(self):
+        conf = {'ssh_conn_id': 'cdp_edge', 'auth_method': 'kinit', 'cluster_type': 'CDP'}
+        context, variables = self._config(conf, self._VARIABLES)
+        with context, variables:
+            cfg = m.get_config()
+        assert (cfg['ssh_conn_id'], cfg['auth_method'], cfg['cluster_type']) == ('cdp_edge', 'kinit', 'CDP')
+
+    def test_tenant_profile_can_set_cluster_type(self):
+        profile = json.dumps({'cdp': {'ssh_conn_id': 'cdp_edge', 'auth_method': 'kinit', 'cluster_type': 'CDP'}})
+        context, variables = self._config({'tenant': 'cdp'}, {**self._VARIABLES, 'migration_tenant_profiles': profile})
+        with context, variables:
+            cfg = m.get_config()
+        assert cfg['cluster_type'] == 'CDP'
+
+    def test_variable_still_applies_when_the_run_says_nothing(self):
+        context, variables = self._config({}, self._VARIABLES)
+        with context, variables:
+            cfg = m.get_config()
+        assert cfg['cluster_type'] == 'MapR'
+
+
+class TestClusterLoginShellWrapper:
+    """cluster_login must wrap its script like every other SSH call: bash -l for
+    non-MapR clusters, `source ~/.profile` for MapR."""
+
+    _BASE = {
+        'ssh_conn_id': 'ssh1',
+        'edge_temp_path': '/tmp/migration',
+        'auth_method': 'kinit',
+        'mapr_ticketfile_location': '/tmp/maprticket_x',
+        'distcp_log_root': '/tmp/logs',
+        'service_account_user_id': 'svc_migration',
+    }
+
+    @pytest.mark.parametrize('cluster_type', ['CDP', 'HDP'])
+    def test_non_mapr_clusters_get_a_login_shell(self, cluster_type):
+        script = TestMaprTicketCheckIdentity._captured_script({**self._BASE, 'cluster_type': cluster_type})
+        assert script.startswith("bash -l <<'__LOGIN_SHELL_EOF__'")
+
+    def test_mapr_keeps_sourcing_the_profile(self):
+        script = TestMaprTicketCheckIdentity._captured_script(
+            {**self._BASE, 'cluster_type': 'MapR', 'auth_method': 'mapr'}
+        )
+        assert script.startswith('source ~/.profile')
+
+    def test_missing_cluster_type_defaults_to_mapr(self):
+        script = TestMaprTicketCheckIdentity._captured_script(dict(self._BASE))
+        assert script.startswith('source ~/.profile')
+
+
+class TestClusterAuthCheckCmd:
+
+    def test_kinit_checks_for_a_valid_tgt(self):
+        cmd = m._cluster_auth_check_cmd('kinit', '')
+        assert 'klist -s' in cmd
+        assert 'CLUSTER_AUTH_FAIL' in cmd
+
+    def test_mapr_quotes_the_expected_user(self):
+        cmd = m._cluster_auth_check_cmd('mapr', 'x";id;#')
+        assert "EXPECTED_USER='x\";id;#'" in cmd
+        assert 'maprlogin print' in cmd
+
+    @pytest.mark.parametrize('auth_method', ['none', ''])
+    def test_no_auth_always_passes(self, auth_method):
+        assert m._cluster_auth_check_cmd(auth_method, '') == 'echo "CLUSTER_AUTH_OK"'
+
+    @pytest.mark.parametrize('klist_exit, expected_rc, marker', [
+        (0, 0, 'CLUSTER_AUTH_OK'),
+        (1, 1, 'CLUSTER_AUTH_FAIL'),
+    ])
+    def test_kinit_check_follows_klist(self, tmp_path, klist_exit, expected_rc, marker):
+        fake = tmp_path / 'klist'
+        fake.write_text(f'#!/bin/sh\nexit {klist_exit}\n')
+        fake.chmod(0o755)
+        r = subprocess.run(
+            ['bash', '-c', m._cluster_auth_check_cmd('kinit', '')],
+            capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
+        )
+        assert r.returncode == expected_rc
+        assert r.stdout.startswith(marker)
+
+
+class TestClusterLoginUserFallback:
+    """With no service_account_user_id, the user falls back to the SSH login user.
+    The maprlogin lookup may only run on MapR."""
+
+    _BASE = {
+        'ssh_conn_id': 'ssh1',
+        'edge_temp_path': '/tmp/migration',
+        'mapr_ticketfile_location': '/tmp/maprticket_x',
+        'distcp_log_root': '/tmp/logs',
+        'cluster_type': 'CDP',
+        'service_account_user_id': '',
+    }
+
+    def test_kinit_never_runs_the_maprlogin_lookup(self):
+        script = TestMaprTicketCheckIdentity._captured_script({**self._BASE, 'auth_method': 'kinit'})
+        fallback = script.index('if [ -z "$CONFIGURED_SA_USER" ]; then')
+        guard = script.index('if [ "kinit" = "mapr" ]; then', fallback)
+        assert guard < script.index('TICKET_USER=$(maprlogin print')
+        assert 'echo "EFFECTIVE_USER=$MIG_USER"' in script
+
+    def test_unset_user_falls_back_to_the_login_user(self):
+        script = TestMaprTicketCheckIdentity._captured_script({**self._BASE, 'auth_method': 'kinit'})
+        assert 'MIG_USER=$(id -un)' in script
+
+
+class TestS3aCommitterOpts:
+    """HDP and CDP both use vanilla S3A, so both get the magic-committer flags."""
+
+    @pytest.mark.parametrize('cluster_type', ['HDP', 'hdp', 'CDP', 'cdp'])
+    def test_vanilla_s3a_clusters_get_the_magic_committer(self, cluster_type):
+        opts = m._s3a_committer_opts({'cluster_type': cluster_type})
+        assert ' -Dfs.s3a.committer.name=magic' in opts
+        assert 'S3ACommitterFactory' in opts
+
+    @pytest.mark.parametrize('config', [{'cluster_type': 'MapR'}, {}])
+    def test_mapr_gets_no_committer_flags(self, config):
+        assert m._s3a_committer_opts(config) == ''

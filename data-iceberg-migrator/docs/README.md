@@ -53,7 +53,18 @@ First match wins:
 | `auth_method`              | Authentication method: `mapr`, `kinit`, or `none`                                                                                                                                                                            | MapR/Kerberos    | `source_to_s3_migration`, `folder_only_data_copy` |
 | `service_account_user_id`  | **Recommended.** Tenant service account the DAG runs as on the source cluster. Validates the MapR ticket and builds every user-scoped temp and log path. See [Service account configuration](#service-account-configuration) | All auth methods | `source_to_s3_migration`, `folder_only_data_copy` |
 | `mapr_ticketfile_location` | MapR ticket file path                                                                                                                                                                                                        | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
-| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.                                                                                                                                                                               | HTML reports     | `source_to_s3_migration`                          |
+| `cluster_type`             | Report label and S3A committer choice: `MapR`, `HDP` or `CDP`. `HDP` and `CDP` add the S3A magic-committer flags to DistCp.                                                                                                  | HTML reports     | `source_to_s3_migration`                          |
+
+#### Testing against a Kerberized CDP edge node
+
+With `auth_method=kinit`, both pre-checks (DAG 1 `validate_prerequisites`, DAG 3
+`validate_prerequisites_folder_copy`) run `klist -s` on the edge node and fail with
+`Cluster auth: No valid Kerberos TGT found` when the SSH user has no ticket. The DAGs
+expect the edge node to hold the ticket (for example, `kinit -kt` from the service
+account's keytab in its `~/.profile`); they don't run `kinit` themselves.
+
+`dev-tools/cdp-edge-node/` is a Kerberized CDP 7.1.x-style edge node for testing this end
+to end; see its `README.md` for setup and the DAG settings.
 
 ### Optional Variables
 
@@ -115,18 +126,18 @@ drives all of the following:
 
 **Resolution order**
 
-| Order | Source                                 | When used                           |
-| ----- | -------------------------------------- | ----------------------------------- |
-| 1     | `service_account_user_id` config       | Whenever it is set — always wins    |
-| 3     | Active MapR ticket (`maprlogin print`) | Neither is set, and a ticket exists |
-| 4     | Login shell user (`id -un`)            | Nothing else available              |
+| Order | Source                                 | When used                                                  |
+| ----- | -------------------------------------- | ---------------------------------------------------------- |
+| 1     | `service_account_user_id` config       | Whenever it is set — always wins                           |
+| 2     | Active MapR ticket (`maprlogin print`) | Not set, `auth_method=mapr`, and a ticket exists           |
+| 3     | Login shell user (`id -un`)            | Nothing else available (always the case for Kerberos runs) |
 
 **When it is configured (recommended)**
 
 Paths are deterministic and reviewable before the run. The value appears in the
 `cluster_login_setup` task log as:
 
-    MAPR_EFFECTIVE_USER=`USER_NAME`
+    EFFECTIVE_USER=`USER_NAME`
     SERVICE_ACCOUNT_SOURCE=config:service_account_user_id
 
 It is also used to validate the MapR ticket, so if the configured account and the
@@ -158,7 +169,7 @@ Example for a tenant service account:
 
     cluster_edge_temp_path = /user/${USER}/tmp/migration
 
-The resolved path is echoed as `TEMP_DIR=` and the identity as `MAPR_EFFECTIVE_USER=`
+The resolved path is echoed as `TEMP_DIR=` and the identity as `EFFECTIVE_USER=`
 in the `cluster_login_setup` task log.
 
 `cluster_edge_discovery_temp_path` does **not** support placeholders — the discovery
@@ -196,7 +207,7 @@ It is the resolved service account — `service_account_user_id` when set, other
 the `.profile` fallback. The resolved value is echoed in the
 `cluster_login_setup` task log as:
 
-    MAPR_EFFECTIVE_USER=<user>
+    EFFECTIVE_USER=<user>
     SERVICE_ACCOUNT_SOURCE=<where it came from>
     DISTCP_LOG_DIR=<full path>
 
@@ -296,8 +307,10 @@ through to the global Variable, so `tenant_2` above uses
 `cluster_edge_temp_path` as normal.
 
 Accepted keys in a profile: `ssh_conn_id`,
-`mapr_ticketfile_location`, `auth_method`, `edge_temp_path`,
-`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`.
+`mapr_ticketfile_location`, `auth_method`, `cluster_type`, `edge_temp_path`,
+`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`. The same keys
+can be set per run in `dag_run.conf` (for example, pointing one run at a Kerberized
+CDP edge node with `ssh_conn_id`, `auth_method=kinit` and `cluster_type=CDP`).
 
 **Resolution order** for these settings:
 
@@ -678,7 +691,7 @@ finalize_run
   1. **Kerberos authentication** - Assumes a valid Kerberos ticket sourced via the login shell
   2. **Existing MapR ticket** - Validates existing valid ticket with `maprlogin print`
 - Verifies ticket validity with `maprlogin print` or `klist`
-- Resolves the effective cluster identity from `maprlogin print` (falling back to `id -un`) and logs it as `MAPR_EFFECTIVE_USER=`
+- Resolves the effective cluster identity (on MapR from `maprlogin print`, otherwise `id -un`) and logs it as `EFFECTIVE_USER=` (runs before this change logged `MAPR_EFFECTIVE_USER=`)
 - Creates the local working directory on the edge node (`{cluster_edge_temp_path}/{run_id}`, default `/tmp/migration/{run_id}`)
 - Creates the DistCp log directory on the cluster filesystem (`{cluster_distcp_log_root}/{cluster_user}/distcp_logs/{run_id}`, default root `/tmp`) and logs it as `DISTCP_LOG_DIR=`
 - Ensures all subsequent SSH operations can access the source filesystem
