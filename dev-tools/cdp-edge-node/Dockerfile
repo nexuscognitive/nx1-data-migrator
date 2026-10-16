@@ -1,5 +1,5 @@
 # CDP-style edge node (Hadoop 3.1.1 / Hive 3.1.3 / Spark 2.4.8 as in CDP Private Cloud
-# Base 7.1.x). Spec: docs/superpowers/specs/2026-10-14-cdp-kerberos-edge-node-design.md
+# Base 7.1.x). See README.md.
 FROM ubuntu:18.04
 
 LABEL cdp.simulated="7.1.x" hadoop.version="3.1.1" hive.version="3.1.3" spark.version="2.4.8"
