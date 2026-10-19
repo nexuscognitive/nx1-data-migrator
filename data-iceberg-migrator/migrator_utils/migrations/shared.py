@@ -655,12 +655,14 @@ if ! klist -s 2>/dev/null; then
     echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
     exit 1
 fi
-PRINCIPAL=$(klist 2>/dev/null | sed -n 's/^Default principal: //p')
-# Like Hadoop's default auth_to_local: primary[/instance]@REALM maps to primary.
-TICKET_USER=${{PRINCIPAL%%@*}}
-TICKET_USER=${{TICKET_USER%%/*}}
-if [ "$(printf '%s' "$TICKET_USER" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$EXPECTED_USER" | tr '[:upper:]' '[:lower:]')" ]; then
-    echo "CLUSTER_AUTH_FAIL: Kerberos ticket is for '$PRINCIPAL', expected service account '$EXPECTED_USER'. Run kinit as the service account on the edge node."
+# MIT prints "Default principal:", Heimdal "Principal:".
+PRINCIPAL=$(klist 2>/dev/null | sed -n -e 's/^Default principal: //p' -e 's/^[[:space:]]*Principal: //p' | head -1)
+# Bare lowercase name, like Hadoop's default auth_to_local. Also applied to the expected
+# user, which can be DOMAIN\\user or user@domain on AD-joined hosts.
+_bare_user() {{ u=${{1##*\\\\}}; u=${{u%%@*}}; u=${{u%%/*}}; printf '%s' "$u" | tr '[:upper:]' '[:lower:]'; }}
+TICKET_USER=$(_bare_user "$PRINCIPAL")
+if [ -z "$TICKET_USER" ] || [ "$TICKET_USER" != "$(_bare_user "$EXPECTED_USER")" ]; then
+    echo "CLUSTER_AUTH_FAIL: Kerberos ticket is for '$PRINCIPAL', expected service account '$EXPECTED_USER'. Run kinit as the service account on the edge node, or set service_account_user_id."
     exit 1
 fi
 echo "CLUSTER_AUTH_OK"
@@ -670,8 +672,10 @@ klist 2>/dev/null | head -4
 
 
 # `hadoop distcp` with no arguments prints its usage and exits non-zero, so match the
-# usage line itself: a missing DistCp class also prints "distcp" in its error.
-DISTCP_CHECK_CMD = "hadoop distcp 2>&1 | grep -qi '^usage: distcp' && echo DISTCP_OK || echo DISTCP_FAIL"
+# usage line itself: a missing DistCp class also prints "distcp" in its error. hadoop
+# stays out of the pipeline so a profile's pipefail/errexit can't turn usage into a fail.
+DISTCP_CHECK_CMD = """DISTCP_USAGE=$(hadoop distcp 2>&1 || true)
+if printf '%s\\n' "$DISTCP_USAGE" | grep -i '^usage: distcp' >/dev/null; then echo DISTCP_OK; else echo DISTCP_FAIL; fi"""
 
 def _edge_path_template(path: str) -> str:
     if not path:

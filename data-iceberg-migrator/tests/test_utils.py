@@ -1278,21 +1278,22 @@ class TestClusterAuthCheckCmd:
 
     @staticmethod
     def _run_kinit_check(tmp_path, expected_user, principal='svc_migration@CDP.LOCAL',
-                         has_tgt=True, login_user='svc_migration'):
-        """Runs the kinit check against a fake MIT klist and id."""
+                         has_tgt=True, login_user='svc_migration',
+                         principal_line='Default principal: {}', bash_opts=()):
+        """Runs the kinit check against a fake klist (MIT format by default) and id."""
         klist = tmp_path / 'klist'
         klist.write_text(
             '#!/bin/sh\n'
             f'[ "$1" = "-s" ] && exit {0 if has_tgt else 1}\n'
             'echo "Ticket cache: FILE:/tmp/krb5cc_1000"\n'
-            f'echo "Default principal: {principal}"\n'
+            f"printf '%s\\n' '{principal_line.format(principal)}'\n"
         )
         id_cmd = tmp_path / 'id'
-        id_cmd.write_text(f'#!/bin/sh\necho {login_user}\n')
+        id_cmd.write_text(f"#!/bin/sh\nprintf '%s\\n' '{login_user}'\n")
         for f in (klist, id_cmd):
             f.chmod(0o755)
         return subprocess.run(
-            ['bash', '-c', m._cluster_auth_check_cmd('kinit', expected_user)],
+            ['bash', *bash_opts, '-c', m._cluster_auth_check_cmd('kinit', expected_user)],
             capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
         )
 
@@ -1322,6 +1323,37 @@ class TestClusterAuthCheckCmd:
         assert f"'{principal}'" in r.stdout
         assert "'svc_migration'" in r.stdout
 
+    def test_kinit_failure_points_at_the_service_account_setting(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', principal='jdoe@CDP.LOCAL')
+        assert 'service_account_user_id' in r.stdout
+
+    @pytest.mark.parametrize('expected_user', [
+        'svc_migration@CORP.EXAMPLE.COM',
+        'CORP\\svc_migration',
+        'svc_migration/edge01@CORP.EXAMPLE.COM',
+    ])
+    def test_kinit_accepts_a_qualified_service_account(self, tmp_path, expected_user):
+        r = self._run_kinit_check(tmp_path, expected_user)
+        assert r.returncode == 0
+
+    def test_kinit_qualified_service_account_still_must_match(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'jdoe@CORP.EXAMPLE.COM')
+        assert r.returncode == 1
+
+    @pytest.mark.parametrize('login_user', ['svc_migration@corp.example.com', 'CORP\\svc_migration'])
+    def test_kinit_accepts_a_domain_qualified_login_user(self, tmp_path, login_user):
+        r = self._run_kinit_check(tmp_path, '', login_user=login_user)
+        assert r.returncode == 0
+
+    def test_kinit_reads_heimdal_klist(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', principal_line='        Principal: {}')
+        assert r.returncode == 0
+
+    def test_kinit_passes_under_errexit_and_pipefail(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', bash_opts=('-e', '-o', 'pipefail'))
+        assert r.returncode == 0
+        assert r.stdout.startswith('CLUSTER_AUTH_OK')
+
     def test_kinit_without_a_tgt_fails(self, tmp_path):
         r = self._run_kinit_check(tmp_path, 'svc_migration', has_tgt=False)
         assert r.returncode == 1
@@ -1337,17 +1369,22 @@ class TestClusterAuthCheckCmd:
 class TestDistcpCheckCmd:
 
     @staticmethod
-    def _run(tmp_path, hadoop_output, hadoop_exit=255):
+    def _run(tmp_path, hadoop_output, hadoop_exit=255, bash_opts=()):
         fake = tmp_path / 'hadoop'
         fake.write_text(f"#!/bin/sh\nprintf '%s\\n' '{hadoop_output}'\nexit {hadoop_exit}\n")
         fake.chmod(0o755)
         return subprocess.run(
-            ['bash', '-c', m.DISTCP_CHECK_CMD],
+            ['bash', *bash_opts, '-c', m.DISTCP_CHECK_CMD],
             capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
         )
 
     def test_usage_text_passes(self, tmp_path):
         r = self._run(tmp_path, 'usage: distcp OPTIONS [source_path...] <target_path>')
+        assert r.stdout.strip() == 'DISTCP_OK'
+
+    def test_usage_text_passes_under_errexit_and_pipefail(self, tmp_path):
+        r = self._run(tmp_path, 'usage: distcp OPTIONS [source_path...] <target_path>',
+                      bash_opts=('-e', '-o', 'pipefail'))
         assert r.stdout.strip() == 'DISTCP_OK'
 
     @pytest.mark.parametrize('hadoop_output', [

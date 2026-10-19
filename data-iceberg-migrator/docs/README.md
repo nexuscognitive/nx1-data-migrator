@@ -61,8 +61,9 @@ With `auth_method=kinit`, both pre-checks (DAG 1 `validate_prerequisites`, DAG 3
 `validate_prerequisites_folder_copy`) check the edge node's Kerberos ticket. They fail
 with `Cluster auth: No valid Kerberos TGT found` when the SSH user has no ticket, and with
 `Cluster auth: Kerberos ticket is for '<principal>', expected service account '<user>'`
-when the ticket's principal (minus `/instance` and `@REALM`, ignoring case) isn't
-`service_account_user_id`, or the SSH login user when that's unset. The DAGs
+when the ticket's principal isn't `service_account_user_id` (or the SSH login user when
+that's unset). Both sides are compared as bare names, ignoring case, `/instance`, `@REALM`
+and a `DOMAIN\` prefix. The DAGs
 expect the edge node to hold the ticket (for example, `kinit -kt` from the service
 account's keytab in its `~/.profile`); they don't run `kinit` themselves.
 
@@ -632,7 +633,7 @@ finalize_run
   1. **SSH Connectivity** - Verifies SSH connection works with a simple echo command
   2. **Cluster Authentication** - Verifies the service account holds a valid ticket before attempting any cluster operations:
      - `mapr`: `maprlogin print | grep -q <service_account_user_id>` — confirms a valid MapR ticket for the configured user
-     - `kinit`: `klist -s`, then `klist`'s default principal — confirms a valid Kerberos TGT in the ccache (populated by the login shell) whose principal is `service_account_user_id` (ignoring `/instance`, `@REALM` and case)
+     - `kinit`: `klist -s`, then `klist`'s default principal — confirms a valid Kerberos TGT in the ccache (populated by the login shell) whose principal is `service_account_user_id`, or the SSH login user when that's unset (ignoring `/instance`, `@REALM`, `DOMAIN\` and case)
      - `none`: skipped (auto-passes)
   3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`. The Hive scratch dir is overridden to `cluster_hive_scratch_dir` so the check passes under a tenant service account
   4. **Hadoop DistCp** - Checks `hadoop distcp` prints its usage, so a missing DistCp fails here rather than at the copy step
