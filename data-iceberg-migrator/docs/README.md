@@ -83,6 +83,8 @@ First match wins:
 | `migration_distcp_client_java_opts` | _(empty)_        | When set, exported as `HADOOP_CLIENT_OPTS` for the DistCp client JVM; empty emits nothing                                                                                                                        | `source_to_s3_migration`, `folder_only_data_copy` |
 | `migration_distcp_extra_hadoop_opts` | _(empty)_        | Extra DistCp flags appended verbatim and unescaped — must already be `-D`-formatted and must be trusted input                                                                                                    | `source_to_s3_migration`, `folder_only_data_copy` |
 | `migration_distcp_preserve_delete` | `true`           | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes))                                                                                  | `source_to_s3_migration`                          |
+| `migration_distcp_checkpoint_location` | `<migration_tracking_location>/_distcp_checkpoints` | S3 prefix for per-table, per-attempt DistCp checkpoint JSON. The edge node writes with Hadoop FS; the Spark status task lists and reads checkpoint objects. | `source_to_s3_migration` |
+| `migration_discovery_driver_memory` | _(empty)_ | Optional `--driver-memory` passed to the remote `pyspark` table-discovery process; empty leaves Spark's default unchanged. | `source_to_s3_migration` |
 | `migration_include_db_in_path`     | `true`           | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted)                                                                  | `source_to_s3_migration`                          |
 | `s3_listing_tool`                  | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`                                                                                                                                                                         | Currently unused                                  |
 | `migration_smtp_conn_id`           | `smtp_default`   | Airflow SMTP connection ID for email reports                                                                                                                                                                     | All DAGs                                          |
@@ -944,6 +946,38 @@ policy, or clear old run directories as part of routine housekeeping. Re-enablin
 automatic cleanup is a possible future enhancement.
 
 ---
+
+### DistCp Checkpoints and Retries
+
+The `source_to_s3_migration` DAG stores one S3 checkpoint object per table attempt.
+The default prefix is `<migration_tracking_location>/_distcp_checkpoints`; override
+it with the `migration_distcp_checkpoint_location` Airflow Variable or
+`MIGRATION_DISTCP_CHECKPOINT_LOCATION` environment variable.
+
+```text
+s3a://<checkpoint-location>/<run-id>/<source-database>/<mapping-hash>/<table-hash>/attempt-<n>.json
+```
+
+This path is a troubleshooting reference; the DAG generates the hashes
+automatically, so they do not need to be configured. The mapping hash separates
+mapped groups by destination and partition-filter configuration; the table hash
+identifies a table and partition-filter slice. Each attempt object is first
+written as `RUNNING`, then overwritten with `COMPLETED`,
+`FAILED`, or `EMPTY_SOURCE`, along with available timing, metrics, YARN application
+IDs, and error detail.
+
+On retry, the edge task reads checkpoints for its mapped group, skips
+`COMPLETED` and `EMPTY_SOURCE` tables, and retries failed, unfinished, or
+unrecorded ones. If the task ends while a checkpoint is still `RUNNING`, the
+downstream `update_distcp_status` task records it as an interrupted failure. That
+task batch-reads checkpoint JSON through Spark's Hadoop filesystem and reconciles
+the latest attempt for each table into `migration_table_status`; checkpoint
+records take precedence over XCom results.
+
+Checkpoint objects are not deleted by the DAG. Configure an S3 lifecycle rule for
+the checkpoint prefix according to your retention needs. The edge node needs
+write access to the configured prefix; the Spark runtime needs list and read
+access.
 
 ### Status Progression
 

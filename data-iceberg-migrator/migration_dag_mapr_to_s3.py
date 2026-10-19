@@ -11,15 +11,18 @@ Orchestrates migration of Hive tables from MapR or HDFS to S3:
 Excel columns: database | table | dest database | bucket | endpoint
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
 import shlex
 import sys
+import uuid
 from datetime import datetime, timedelta
 from html import escape as html_escape  # aliased: generate_html_report binds a local `html`
 from pathlib import Path
+from urllib.parse import quote
 
 from airflow import DAG
 from airflow.decorators import task
@@ -106,6 +109,119 @@ def _slice_clause(partition_filter) -> str:
     if value:
         return f"AND partition_filter = '{value}'"
     return "AND (partition_filter IS NULL OR partition_filter = '')"
+
+
+def _distcp_checkpoint_identity(record: dict) -> str:
+    identity = [
+        record.get("source_database"),
+        record.get("source_table"),
+        record.get("dest_database"),
+        record.get("partition_filter"),
+    ]
+    payload = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _distcp_checkpoint_prefix(root: str, discovery: dict) -> str:
+    mapping_identity = [
+        discovery.get("source_database"),
+        discovery.get("dest_database"),
+        discovery.get("dest_bucket"),
+        discovery.get("dest_endpoint"),
+        sorted({t.get("partition_filter") or "" for t in discovery.get("tables", [])}),
+    ]
+    payload = json.dumps(mapping_identity, ensure_ascii=True, separators=(",", ":"))
+    mapping_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return (
+        f"{root.rstrip('/')}/{quote(str(discovery['run_id']), safe='')}/"
+        f"{quote(str(discovery['source_database']), safe='')}/{mapping_hash}"
+    )
+
+
+def _distcp_checkpoint_path(prefix: str, record: dict) -> str:
+    attempt = int(record["distcp_attempt"])
+    return f"{prefix}/{_distcp_checkpoint_identity(record)}/attempt-{attempt}.json"
+
+
+def _read_edge_distcp_checkpoints(
+    ssh, prefix: str, s3_opts: str, cluster_type: str
+) -> list[dict]:
+    command = f"""set -o pipefail
+hadoop fs{s3_opts} -mkdir -p {shlex.quote(prefix)}
+hadoop fs{s3_opts} -ls -R {shlex.quote(prefix)} | awk '$1 ~ /^-/ {{print $NF}}' | while IFS= read -r checkpoint; do
+    hadoop fs{s3_opts} -cat "$checkpoint" || exit $?
+    printf '\\n'
+done
+"""
+    with ssh.get_conn() as client:
+        _, stdout, stderr = client.exec_command(
+            _login_shell(command, cluster_type), timeout=SSH_COMMAND_TIMEOUT
+        )
+        output = stdout.read().decode()
+        error_output = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0:
+        raise RuntimeError(
+            f"Could not read DistCp checkpoints (exit={exit_code}): "
+            f"{error_output[-1000:]}"
+        )
+    return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+
+def _write_edge_distcp_checkpoint(
+    ssh,
+    record: dict,
+    checkpoint_path: str,
+    s3_opts: str,
+    temp_dir: str,
+    cluster_type: str,
+) -> None:
+    remote_path = f"{temp_dir.rstrip('/')}/.distcp-checkpoint-{uuid.uuid4().hex}.json"
+    payload = json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+    parent = checkpoint_path.rsplit("/", 1)[0]
+    command = f"""hadoop fs{s3_opts} -mkdir -p {shlex.quote(parent)}
+mkdir_status=$?
+if [ "$mkdir_status" -eq 0 ]; then
+    hadoop fs{s3_opts} -put -f {shlex.quote(remote_path)} {shlex.quote(checkpoint_path)}
+    put_status=$?
+else
+    put_status=$mkdir_status
+fi
+rm -f {shlex.quote(remote_path)}
+exit "$put_status"
+"""
+    with ssh.get_conn() as client:
+        sftp = client.open_sftp()
+        try:
+            with sftp.file(remote_path, "wb") as checkpoint_file:
+                checkpoint_file.write(payload.encode("utf-8"))
+            _, stdout, stderr = client.exec_command(
+                _login_shell(command, cluster_type), timeout=60
+            )
+            output = stdout.read().decode()
+            error_output = stderr.read().decode()
+            exit_code = stdout.channel.recv_exit_status()
+        finally:
+            sftp.close()
+    if exit_code != 0:
+        raise RuntimeError(
+            f"Could not persist DistCp checkpoint (exit={exit_code}): "
+            f"{(error_output or output)[-1000:]}"
+        )
+
+
+def _read_spark_distcp_checkpoints(spark, prefix: str) -> list[dict]:
+    hadoop_conf = spark._jsc.hadoopConfiguration()
+    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+        spark._jvm.java.net.URI(prefix), hadoop_conf
+    )
+    if not fs.exists(spark._jvm.org.apache.hadoop.fs.Path(prefix)):
+        return []
+    checkpoint_glob = f"{prefix}/*/attempt-*.json"
+    return [
+        row.asDict(recursive=True)
+        for row in spark.read.json(checkpoint_glob).collect()
+    ]
 
 
 # Later phases roll up their own outcome but must not overwrite a skipped table's
@@ -1358,10 +1474,14 @@ spark.stop()
         sftp.put(str(local_utils), f"{temp_dir}/partition_utils.py")
         sftp.close()
 
+        # local[*] runs executors inside the driver JVM, so --driver-memory is the only heap knob.
+        _drv_mem = str(config.get("discovery_driver_memory") or "").strip()
+        _drv_flag = f" --driver-memory {shlex.quote(_drv_mem)}" if _drv_mem else ""
+
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
 cd {temp_dir}
-pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
+pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
 """
         _, stdout, stderr = client.exec_command(
             _login_shell(cmd, config.get("cluster_type", "MapR")),
@@ -1686,9 +1806,81 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
     s3_opts = build_s3_opts(
         discovery["dest_bucket"], config, discovery.get("dest_endpoint", "")
     )
+    checkpoint_location = normalize_s3(config["distcp_checkpoint_location"]).rstrip("/")
+    checkpoint_prefix = _distcp_checkpoint_prefix(checkpoint_location, discovery)
+    checkpoint_s3_opts = build_s3_opts(checkpoint_location, config)
+    task_instance = context["ti"]
+    try:
+        attempt_number = int(task_instance.try_number)
+    except (AttributeError, TypeError, ValueError):
+        attempt_number = 1
+
+    task_instance.xcom_push(
+        key="return_value",
+        value={**discovery, "distcp_results": [], "_partial": True},
+    )
+
+    previous_results = {}
+    if attempt_number > 1:
+        checkpoint_records = _read_edge_distcp_checkpoints(
+            ssh,
+            checkpoint_prefix,
+            checkpoint_s3_opts,
+            config.get("cluster_type", "MapR"),
+        )
+        for record in sorted(
+            checkpoint_records,
+            key=lambda item: int(item.get("distcp_attempt", 0)),
+        ):
+            previous_results[_distcp_checkpoint_identity(record)] = record
+
+    def persist_checkpoint(result: dict) -> None:
+        record = {
+            **result,
+            "run_id": discovery["run_id"],
+            "distcp_attempt": attempt_number,
+        }
+        _write_edge_distcp_checkpoint(
+            ssh,
+            record,
+            _distcp_checkpoint_path(checkpoint_prefix, record),
+            checkpoint_s3_opts,
+            temp_dir,
+            config.get("cluster_type", "MapR"),
+        )
+
+    def mark_running(t: dict, started_at: str, mappers: int, bandwidth: int) -> None:
+        persist_checkpoint(
+            {
+                "source_database": t["source_database"],
+                "source_table": t["source_table"],
+                "dest_database": t["dest_database"],
+                "partition_filter": t.get("partition_filter"),
+                "status": "RUNNING",
+                "distcp_started_at": started_at,
+                "mappers": mappers,
+                "bandwidth_mbps": bandwidth,
+            }
+        )
 
     results = []
     for t in tables:
+        previous_result = previous_results.get(_distcp_checkpoint_identity(t))
+        if previous_result and previous_result.get("status") in (
+            "COMPLETED",
+            "EMPTY_SOURCE",
+        ):
+            resumed_result = dict(previous_result)
+            resumed_result["resumed_from_attempt"] = previous_result.get(
+                "distcp_attempt"
+            )
+            results.append(resumed_result)
+            logger.info(
+                f"[DistCp] Resuming {t['source_database']}.{t['source_table']} "
+                f"from completed attempt {resumed_result['resumed_from_attempt']}"
+            )
+            continue
+
         if t.get("error_type") in SKIPPABLE_DISCOVERY_ERRORS:
             results.append(
                 {
@@ -1764,6 +1956,12 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             from datetime import datetime as _dt
 
             distcp_started_at = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            mark_running(
+                t,
+                distcp_started_at,
+                mappers,
+                bandwidth,
+            )
 
             (
                 t.get("filtered_partitions", [])
@@ -1824,6 +2022,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                     "partition_filter": t.get("partition_filter"),
                 }
             )
+            persist_checkpoint(results[-1])
             continue
 
         src_db = t["source_database"]
@@ -2206,6 +2405,12 @@ exit 0
         from datetime import datetime as _dt
 
         distcp_started_at = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        mark_running(
+            t,
+            distcp_started_at,
+            mappers,
+            bandwidth,
+        )
         try:
             yarn_application_ids = []
             yarn_application_id = None
@@ -2311,11 +2516,18 @@ exit 0
                     )
 
                 if exit_code != 0:
+                    # get_pty=True merges stderr into stdout, so stderr is usually empty.
+                    failure_detail = error_output[:1000] or output[-1000:]
+                    if exit_code == -1:
+                        failure_detail = (
+                            "SSH channel closed without an exit status (session dropped or "
+                            "remote process killed)\n" + failure_detail
+                        )
                     logger.error(f"=== DistCp Error for {src_db}.{tbl} ===")
-                    logger.error(error_output[:1000])
+                    logger.error(failure_detail)
                     raise Exception(
                         f"DistCp failed for {src_db}.{tbl} with exit code {exit_code}\n"
-                        f"Error: {error_output[:1000]}"
+                        f"Error: {failure_detail}"
                     )
                 _end_dt = _dt.utcnow()
                 distcp_completed_at = _end_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -2396,6 +2608,9 @@ exit 0
                 }
             )
             logger.error(f"ERROR: {error_msg}")
+            persist_checkpoint(results[-1])
+        else:
+            persist_checkpoint(results[-1])
 
     failed_tables = [r for r in results if r["status"] == "FAILED"]
     has_failures = len(failed_tables) > 0
@@ -2442,6 +2657,61 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
     tracking_db = config["tracking_database"]
     run_id = distcp_result["run_id"]
     src_db = distcp_result["source_database"]
+    checkpoint_prefix = _distcp_checkpoint_prefix(
+        normalize_s3(config["distcp_checkpoint_location"]).rstrip("/"),
+        distcp_result,
+    )
+    checkpoint_records = _read_spark_distcp_checkpoints(spark, checkpoint_prefix)
+    merged_results = {
+        _distcp_checkpoint_identity(result): result
+        for result in distcp_result.get("distcp_results", [])
+    }
+    latest_attempts = {
+        identity: int(result.get("distcp_attempt", 0))
+        for identity, result in merged_results.items()
+    }
+    for record in checkpoint_records:
+        identity = _distcp_checkpoint_identity(record)
+        attempt = int(record.get("distcp_attempt", 0))
+        if record.get("status") == "RUNNING":
+            completed_at = datetime.utcnow()
+            started_at = record.get("distcp_started_at") or completed_at.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            try:
+                duration = (
+                    completed_at - datetime.strptime(started_at, "%Y-%m-%d %H:%M:%S")
+                ).total_seconds()
+            except ValueError:
+                duration = 0.0
+            record = {
+                **record,
+                "status": "FAILED",
+                "distcp_started_at": started_at,
+                "distcp_completed_at": completed_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "distcp_duration_secs": duration,
+                "is_incremental": record.get("is_incremental", False),
+                "bytes_copied": record.get("bytes_copied", 0),
+                "files_copied": record.get("files_copied", 0),
+                "s3_total_size_bytes_before": record.get("s3_total_size_bytes_before", 0),
+                "s3_file_count_before": record.get("s3_file_count_before", 0),
+                "s3_total_size_bytes_after": record.get("s3_total_size_bytes_after", 0),
+                "s3_file_count_after": record.get("s3_file_count_after", 0),
+                "s3_bytes_transferred": record.get("s3_bytes_transferred", 0),
+                "s3_files_transferred": record.get("s3_files_transferred", 0),
+                "yarn_application_ids": record.get("yarn_application_ids", []),
+                "error": (
+                    f"DistCp attempt {attempt} was interrupted before a terminal "
+                    "checkpoint was written"
+                ),
+            }
+        if attempt >= latest_attempts.get(identity, -1):
+            merged_results[identity] = record
+            latest_attempts[identity] = attempt
+    distcp_result = {
+        **distcp_result,
+        "distcp_results": list(merged_results.values()),
+    }
 
     # Normalize: a COMPLETED distcp against a source with zero rows is
     # functionally an EMPTY_SOURCE. Keyed on row_count rather than
