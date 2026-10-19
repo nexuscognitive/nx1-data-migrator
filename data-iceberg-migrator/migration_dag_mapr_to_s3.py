@@ -33,7 +33,9 @@ from migrator_utils.migrations.partition_utils import (
     partitions_to_where_clause as _partitions_to_where_clause,
 )
 from migrator_utils.migrations.shared import (
+    DISTCP_CHECK_CMD,
     SSH_COMMAND_TIMEOUT,
+    _cluster_auth_check_cmd,
     _hive_scratch_dir,
     _login_shell,
     build_s3_opts,
@@ -269,6 +271,7 @@ def validate_prerequisites(run_id: str) -> dict:
         "cluster_auth": False,
         "pyspark_available": False,
         "hive_available": False,
+        "hadoop_distcp_available": False,
         "hadoop_fs_available": False,
         "errors": [],
     }
@@ -291,7 +294,7 @@ def validate_prerequisites(run_id: str) -> dict:
         with ssh.get_conn() as client:
 
             # 1. SSH Connectivity
-            logger.info("[1/4] Testing SSH connectivity...")
+            logger.info("[1/5] Testing SSH connectivity...")
             _, stdout, stderr = client.exec_command(
                 _login_shell('echo "SSH_TEST_OK"', config.get("cluster_type", "MapR")),
                 timeout=30,
@@ -308,36 +311,12 @@ def validate_prerequisites(run_id: str) -> dict:
                 validation_results["errors"].append(f"SSH: {error_msg}")
                 logger.error(f"SSH connectivity: FAILED - {error_msg}")
 
-            # 2. Cluster authentication
-            # MapR:     maprlogin print — verifies a valid ticket exists
-            # Kerberos: klist -s       — exits 0 if valid TGT in ccache, 1 if not
-            # none:     skipped
+            # 2. Cluster authentication: a MapR ticket or Kerberos TGT for the
+            # service account (none: skipped)
             logger.info(
-                f"[2/4] Testing cluster authentication (auth_method={auth_method})..."
+                f"[2/5] Testing cluster authentication (auth_method={auth_method})..."
             )
-            if auth_method == "mapr":
-                inner_cmd = f"""
-EXPECTED_USER={shlex.quote(mapr_user)}
-if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
-if maprlogin print 2>/dev/null | grep -qF -- "$EXPECTED_USER"; then
-    echo "CLUSTER_AUTH_OK"
-else
-    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '$EXPECTED_USER'. Run maprlogin on the edge node."
-    exit 1
-fi
-"""
-            elif auth_method == "kinit":
-                inner_cmd = """
-if klist -s 2>/dev/null; then
-    echo "CLUSTER_AUTH_OK"
-    klist 2>/dev/null | head -4
-else
-    echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
-    exit 1
-fi
-"""
-            else:
-                inner_cmd = 'echo "CLUSTER_AUTH_OK"'
+            inner_cmd = _cluster_auth_check_cmd(auth_method, mapr_user)
 
             _, stdout, stderr = client.exec_command(
                 _login_shell(inner_cmd, config.get("cluster_type", "MapR")), timeout=30
@@ -362,7 +341,7 @@ fi
             # 3. PySpark + Hive metastore
             # Runs a real SparkSession with enableHiveSupport() + SHOW DATABASES.
             logger.info(
-                "[3/4] Testing PySpark with Hive metastore support (enableHiveSupport + SHOW DATABASES)..."
+                "[3/5] Testing PySpark with Hive metastore support (enableHiveSupport + SHOW DATABASES)..."
             )
             hive_scratch_dir = _hive_scratch_dir(config)
             pyspark_inner = f"""
@@ -399,9 +378,27 @@ PYSPARK_VALIDATION_EOF
                 validation_results["errors"].append(f"PySpark/Hive: {error_msg}")
                 logger.error(f"PySpark + Hive metastore: FAILED - {error_msg}")
 
-            # 4. Hadoop FS access (works for both MapR-FS and HDFS sources)
+            # 4. Hadoop DistCp, which run_distcp_ssh needs for every copy
+            logger.info("[4/5] Testing hadoop distcp availability...")
+            _, stdout, stderr = client.exec_command(
+                _login_shell(DISTCP_CHECK_CMD, config.get("cluster_type", "MapR")),
+                timeout=60,
+            )
+            output = stdout.read().decode()
+            stderr.read()
+            stdout.channel.recv_exit_status()
+
+            if "DISTCP_OK" in output:
+                validation_results["hadoop_distcp_available"] = True
+                logger.info("Hadoop DistCp: PASSED")
+            else:
+                error_msg = "hadoop distcp not found or not executable"
+                validation_results["errors"].append(f"DistCp: {error_msg}")
+                logger.error(f"Hadoop DistCp: FAILED - {error_msg}")
+
+            # 5. Hadoop FS access (works for both MapR-FS and HDFS sources)
             # For HDFS HA clusters set hdfs_nameservice; MapR/non-HA uses / directly.
-            logger.info("[4/4] Testing Hadoop FS access...")
+            logger.info("[5/5] Testing Hadoop FS access...")
             hdfs_nameservice = config.get("hdfs_nameservice", "")
             fs_root = f"hdfs://{hdfs_nameservice}/" if hdfs_nameservice else "/"
             hadoop_inner = f"""
@@ -445,6 +442,9 @@ fi
                 "PySpark/Hive: Skipped due to SSH failure"
             )
             logger.warning("PySpark/Hive: SKIPPED (SSH failed)")
+        if not validation_results["hadoop_distcp_available"]:
+            validation_results["errors"].append("DistCp: Skipped due to SSH failure")
+            logger.warning("Hadoop DistCp: SKIPPED (SSH failed)")
         if not validation_results["hadoop_fs_available"]:
             validation_results["errors"].append("Hadoop FS: Skipped due to SSH failure")
             logger.warning("Hadoop FS: SKIPPED (SSH failed)")
@@ -460,6 +460,7 @@ fi
             validation_results["cluster_auth"],
             validation_results["pyspark_available"],
             validation_results["hive_available"],
+            validation_results["hadoop_distcp_available"],
             validation_results["hadoop_fs_available"],
         ]
     )
@@ -1772,20 +1773,25 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             )
 
             all_partitions = t.get("filtered_partitions", [])
-            if all_partitions:
-                mkdir_cmds = " && ".join(
-                    f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}/{p}' 2>/dev/null || true"
-                    for p in all_partitions
-                )
-            else:
-                mkdir_cmds = f"hadoop fs{s3_opts} -mkdir -p '{t['s3_location']}' 2>/dev/null || true"
+            # One -mkdir with every path: FsShell tries them all and fails if any failed.
+            prefixes = [f"{t['s3_location']}/{p}" for p in all_partitions] or [t['s3_location']]
+            mkdir_cmds = f"hadoop fs{s3_opts} -mkdir -p " + " ".join(f"'{p}'" for p in prefixes)
             try:
                 with ssh.get_conn() as client:
                     _, stdout, stderr = client.exec_command(
-                        mkdir_cmds, timeout=SSH_COMMAND_TIMEOUT
+                        _login_shell(mkdir_cmds, config.get("cluster_type", "MapR")),
+                        timeout=SSH_COMMAND_TIMEOUT,
                     )
+                    mkdir_out = stdout.read().decode(errors="replace")
+                    mkdir_err = stderr.read().decode(errors="replace")
                     exit_code = stdout.channel.recv_exit_status()
-                logger.info(f"[DistCp] Created S3 prefix: {t['s3_location']}")
+                if exit_code == 0:
+                    logger.info(f"[DistCp] Created S3 prefix: {t['s3_location']}")
+                else:
+                    logger.warning(
+                        f"[DistCp] Could not create S3 prefix for {t['s3_location']} "
+                        f"(exit {exit_code}): {(mkdir_err or mkdir_out).strip()[-500:]}"
+                    )
             except Exception as _me:
                 logger.warning(
                     f"[DistCp] Could not create S3 prefix for {t['s3_location']}: {_me}"
@@ -3840,6 +3846,13 @@ def update_validation_status(validation_result: dict, spark) -> dict:
     return validation_result
 
 
+def _report_ticket_file_line(config: dict) -> str:
+    """The report header's MapR ticket-file line; empty unless the run used MapR auth."""
+    if config.get('auth_method', 'mapr') != 'mapr':
+        return ''
+    return f"            Mapr Ticket File: <strong>{config.get('mapr_ticketfile_location', '')}</strong><br>\n"
+
+
 @task.pyspark(conn_id="spark_default")
 def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **context) -> str:
     """Generate comprehensive HTML migration report."""
@@ -4083,8 +4096,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             DAG Run: <strong>{run_info.dag_run_id}</strong><br>
             Tenant: <strong>{config.get('tenant') or 'default'}</strong><br>
             Service Account: <strong>{sa_display}</strong> <span style="opacity:0.7">({sa_source})</span><br>
-            Mapr Ticket File: <strong>{config.get('mapr_ticketfile_location', '')}</strong><br>
-"""
+{_report_ticket_file_line(config)}"""
 
     html += f"""
         </div>

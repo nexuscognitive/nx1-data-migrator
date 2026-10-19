@@ -1,0 +1,14 @@
+# SSH endpoint for Airflow. Connection host: cdp-edge-ssh.es-tenant-2.svc.cluster.local, user svc_migration.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cdp-edge-ssh
+  namespace: es-tenant-2
+  labels:
+    app: cdp-edge
+spec:
+  type: ClusterIP
+  selector:
+    app: cdp-edge
+  ports:
+    - { name: ssh, port: 22, targetPort: 22 }

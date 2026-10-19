@@ -1,0 +1,15 @@
+# HDFS, the metastore, the KDC database and the keytabs all live on this one volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cdp-edge-data
+  namespace: es-tenant-2
+  labels:
+    app: cdp-edge
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: ebs-encrypted

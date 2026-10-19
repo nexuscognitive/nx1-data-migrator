@@ -31,32 +31,58 @@ def assert_each_overall_status_case_preserves_skippable(calls):
 
 class TestValidatePrerequisites:
 
-    def test_all_checks_pass(self, mock_ssh_hook):
-        hook, client, stdout_mock, _ = mock_ssh_hook
+    @staticmethod
+    def _responses(distcp_out=b'DISTCP_OK'):
         responses = [
             (MagicMock(), mock_ssh_stdout(0, b'SSH_TEST_OK'), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b'CLUSTER_AUTH_OK'), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b'PYSPARK_HIVE_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, distcp_out), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b'HADOOP_FS_OK'), MagicMock()),
         ]
         for r in responses:
             r[2].read.return_value = b''
-        client.exec_command.side_effect = responses
+        return responses
+
+    def test_all_checks_pass(self, mock_ssh_hook):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._responses()
 
         result = m.validate_prerequisites.function(run_id='test_run')
         assert result['ssh_connectivity'] is True
         assert result['cluster_auth'] is True
         assert result['pyspark_available'] is True
         assert result['hive_available'] is True
+        assert result['hadoop_distcp_available'] is True
         assert result['hadoop_fs_available'] is True
         assert result['errors'] == []
+
+    def test_missing_distcp_fails_the_precheck(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._responses(distcp_out=b'DISTCP_FAIL')
+
+        with pytest.raises(Exception, match='DistCp: hadoop distcp not found or not executable'):
+            m.validate_prerequisites.function(run_id='test_run')
+        assert m.DISTCP_CHECK_CMD in client.exec_command.call_args_list[3][0][0]
+
+    def test_kerberos_check_expects_the_service_account(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._responses()
+        config = {**m.get_config(), 'auth_method': 'kinit', 'service_account_user_id': 'svc_wf'}
+
+        with patch.object(m, 'get_config', return_value=config):
+            m.validate_prerequisites.function(run_id='test_run')
+        auth_cmd = client.exec_command.call_args_list[1][0][0]
+        assert 'EXPECTED_USER=svc_wf' in auth_cmd
+        assert 'Default principal' in auth_cmd
 
     def test_ssh_failure_raises(self, mock_ssh_hook):
         hook, client, _, _ = mock_ssh_hook
         hook.get_conn.side_effect = Exception("Connection refused")
 
-        with pytest.raises(Exception, match="Pre-DAG validation failed"):
+        with pytest.raises(Exception, match="Pre-DAG validation failed") as exc:
             m.validate_prerequisites.function(run_id='test_run')
+        assert 'DistCp: Skipped due to SSH failure' in str(exc.value)
 
 
 class TestInitTrackingTables:
@@ -283,6 +309,19 @@ class TestClusterLoginSetup:
         assert result['service_account_source'] == 'config:service_account_user_id'
         # DistCp logs must NOT be written under the local edge temp dir.
         assert not result['distcp_log_dir'].startswith(result['temp_dir'])
+
+    def test_effective_user_key_is_parsed(self, mock_ssh_hook):
+        hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+        stdout_mock.read.return_value = (
+            b'CLUSTER_LOGIN_SUCCESS\n'
+            b'EFFECTIVE_USER=svc_migration\n'
+            b'SERVICE_ACCOUNT_SOURCE=login shell (.profile)\n'
+            b'TEMP_DIR=/tmp/migration/run_test\n'
+        )
+        stderr_mock.read.return_value = b''
+
+        result = m.cluster_login_setup.function(run_id='run_test')
+        assert result['service_account_user_id'] == 'svc_migration'
 
     def test_configured_service_account_is_not_clobbered_by_ticket(self, mock_ssh_hook):
         """Regression: the generated script must not overwrite a configured SA user."""
@@ -1402,6 +1441,73 @@ class TestRunDistcpSsh:
         if client.exec_command.called:
             cmd = client.exec_command.call_args[0][0]
             assert 'distcp' not in cmd.lower(), "distcp should not be called for empty source"
+
+    def test_empty_source_prefixes_for_every_partition_in_one_mkdir(self, mock_ssh_hook, sample_discovery):
+        """One failing partition must not skip the others: all prefixes go to a single
+        `hadoop fs -mkdir -p`, which tries every path (as the old `|| true` chain did)."""
+        hook, client, _, _ = mock_ssh_hook
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'source_file_count': 0,
+                'partition_filter_active': False,
+                'filtered_file_count': 0,
+            }],
+        }
+
+        m.run_distcp_ssh.function.__wrapped__(
+            discovery=discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+
+        mkdir_cmds = [c[0][0] for c in client.exec_command.call_args_list if '-mkdir' in c[0][0]]
+        assert len(mkdir_cmds) == 1
+        assert mkdir_cmds[0].count('hadoop fs') == 1
+        assert '/dt=2024-01-01' in mkdir_cmds[0]
+        assert '/dt=2024-01-02' in mkdir_cmds[0]
+
+    def test_empty_source_prefix_runs_in_login_shell_and_reports_failure(self, mock_ssh_hook, sample_discovery):
+        """The S3 prefix for an empty source used to be created with a bare exec_command,
+        its errors discarded and success logged regardless."""
+        hook, client, _, _ = mock_ssh_hook
+
+        def _exec(cmd, **kwargs):
+            err = MagicMock()
+            if '-mkdir' in cmd:
+                err.read.return_value = b'GSS initiate failed'
+                return (MagicMock(), mock_ssh_stdout(1, b''), err)
+            err.read.return_value = b''
+            return (MagicMock(), mock_ssh_stdout(0, b''), err)
+
+        client.exec_command.side_effect = _exec
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'source_file_count': 0,
+                'partition_filter_active': False,
+                'filtered_file_count': 0,
+            }],
+        }
+
+        with patch.object(m.logger, 'info') as info, patch.object(m.logger, 'warning') as warning:
+            result = m.run_distcp_ssh.function.__wrapped__(
+                discovery=discovery,
+                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+                ti=MagicMock(),
+            )
+
+        mkdir_cmds = [c[0][0] for c in client.exec_command.call_args_list if '-mkdir' in c[0][0]]
+        assert len(mkdir_cmds) == 1
+        assert mkdir_cmds[0].startswith("bash -l <<'__LOGIN_SHELL_EOF__'")  # conftest cluster_type is HDP
+        assert '|| true' not in mkdir_cmds[0]
+        infos = ' '.join(str(c[0][0]) for c in info.call_args_list)
+        warnings = ' '.join(str(c[0][0]) for c in warning.call_args_list)
+        assert 'Created S3 prefix' not in infos
+        assert 'GSS initiate failed' in warnings
+        assert result['distcp_results'][0]['status'] == 'EMPTY_SOURCE'
 
 
 class TestUpdateDistcpStatus:
@@ -2774,3 +2880,20 @@ class TestFinalizeRun:
         ))
         assert "status = 'COMPLETED'" in sqls
         assert 'COMPLETED_WITH_MISSING' not in sqls
+
+
+class TestReportTicketFileLine:
+
+    def test_shown_for_mapr_auth(self):
+        line = m._report_ticket_file_line(
+            {'auth_method': 'mapr', 'mapr_ticketfile_location': '/tmp/maprticket_svc'}
+        )
+        assert 'Mapr Ticket File' in line
+        assert '/tmp/maprticket_svc' in line
+
+    @pytest.mark.parametrize('auth_method', ['kinit', 'none'])
+    def test_hidden_for_other_auth_methods(self, auth_method):
+        line = m._report_ticket_file_line(
+            {'auth_method': auth_method, 'mapr_ticketfile_location': '/tmp/maprticket_svc'}
+        )
+        assert line == ''
