@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from migrator_utils.migrations.shared import (
+    DISTCP_CHECK_CMD,
     SSH_COMMAND_TIMEOUT,
     _cluster_auth_check_cmd,
     _login_shell,
@@ -186,8 +187,9 @@ def validate_prerequisites_folder_copy() -> dict:
 
             # 3. Hadoop DistCp
             logger.info("[3/4] Testing hadoop distcp availability...")
-            test_cmd = "hadoop distcp 2>&1 | grep -qi 'usage\\|distcp\\|options' && echo DISTCP_OK || echo DISTCP_FAIL"
-            _, stdout, stderr = client.exec_command(_login_shell(test_cmd, config.get('cluster_type', 'MapR')), timeout=60)
+            _, stdout, stderr = client.exec_command(
+                _login_shell(DISTCP_CHECK_CMD, config.get('cluster_type', 'MapR')), timeout=60
+            )
             output = stdout.read().decode()
             stderr.read()
             exit_code = stdout.channel.recv_exit_status()

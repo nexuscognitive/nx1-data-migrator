@@ -632,8 +632,9 @@ def _cluster_auth_check_cmd(auth_method: str, expected_user: str) -> str:
     """Shell check for the edge node's cluster login, shared by the DAG pre-checks.
 
     Prints CLUSTER_AUTH_OK, or prints CLUSTER_AUTH_FAIL: <reason> and exits 1.
-    MapR needs a `maprlogin print` ticket for expected_user (the login user when
-    empty); Kerberos needs a valid TGT (`klist -s`); anything else needs nothing.
+    MapR needs a `maprlogin print` ticket for expected_user; Kerberos needs a valid
+    TGT whose principal is expected_user (the login user when empty for both);
+    anything else needs nothing.
     """
     if auth_method == 'mapr':
         return f"""
@@ -647,16 +648,30 @@ else
 fi
 """
     if auth_method == 'kinit':
-        return """
-if klist -s 2>/dev/null; then
-    echo "CLUSTER_AUTH_OK"
-    klist 2>/dev/null | head -4
-else
+        return f"""
+EXPECTED_USER={shlex.quote(expected_user)}
+if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
+if ! klist -s 2>/dev/null; then
     echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
     exit 1
 fi
+PRINCIPAL=$(klist 2>/dev/null | sed -n 's/^Default principal: //p')
+# Like Hadoop's default auth_to_local: primary[/instance]@REALM maps to primary.
+TICKET_USER=${{PRINCIPAL%%@*}}
+TICKET_USER=${{TICKET_USER%%/*}}
+if [ "$(printf '%s' "$TICKET_USER" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$EXPECTED_USER" | tr '[:upper:]' '[:lower:]')" ]; then
+    echo "CLUSTER_AUTH_FAIL: Kerberos ticket is for '$PRINCIPAL', expected service account '$EXPECTED_USER'. Run kinit as the service account on the edge node."
+    exit 1
+fi
+echo "CLUSTER_AUTH_OK"
+klist 2>/dev/null | head -4
 """
     return 'echo "CLUSTER_AUTH_OK"'
+
+
+# `hadoop distcp` with no arguments prints its usage and exits non-zero, so match the
+# usage line itself: a missing DistCp class also prints "distcp" in its error.
+DISTCP_CHECK_CMD = "hadoop distcp 2>&1 | grep -qi '^usage: distcp' && echo DISTCP_OK || echo DISTCP_FAIL"
 
 def _edge_path_template(path: str) -> str:
     if not path:

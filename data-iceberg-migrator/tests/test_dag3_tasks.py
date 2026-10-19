@@ -66,6 +66,23 @@ class TestValidatePrerequisitesFolderCopy:
         auth_cmd = client.exec_command.call_args_list[1][0][0]
         assert 'klist -s' in auth_cmd
 
+    def test_kerberos_check_expects_the_service_account(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._responses()
+        config = {**m.get_config(), 'auth_method': 'kinit', 'service_account_user_id': 'svc_wf'}
+
+        with patch.object(m, 'get_config', return_value=config):
+            m.validate_prerequisites_folder_copy.function()
+        auth_cmd = client.exec_command.call_args_list[1][0][0]
+        assert 'EXPECTED_USER=svc_wf' in auth_cmd
+
+    def test_distcp_check_uses_the_shared_command(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._responses()
+
+        m.validate_prerequisites_folder_copy.function()
+        assert m.DISTCP_CHECK_CMD in client.exec_command.call_args_list[2][0][0]
+
 
 class TestInitFolderCopyTrackingTables:
 

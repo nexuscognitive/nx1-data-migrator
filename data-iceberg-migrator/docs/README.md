@@ -58,8 +58,11 @@ First match wins:
 #### Testing against a Kerberized CDP edge node
 
 With `auth_method=kinit`, both pre-checks (DAG 1 `validate_prerequisites`, DAG 3
-`validate_prerequisites_folder_copy`) run `klist -s` on the edge node and fail with
-`Cluster auth: No valid Kerberos TGT found` when the SSH user has no ticket. The DAGs
+`validate_prerequisites_folder_copy`) check the edge node's Kerberos ticket. They fail
+with `Cluster auth: No valid Kerberos TGT found` when the SSH user has no ticket, and with
+`Cluster auth: Kerberos ticket is for '<principal>', expected service account '<user>'`
+when the ticket's principal (minus `/instance` and `@REALM`, ignoring case) isn't
+`service_account_user_id`, or the SSH login user when that's unset. The DAGs
 expect the edge node to hold the ticket (for example, `kinit -kt` from the service
 account's keytab in its `~/.profile`); they don't run `kinit` themselves.
 
@@ -578,7 +581,7 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 ### Task Flow
 
 ```
-validate_prerequisites (SSH: connectivity, cluster auth, PySpark+Hive, Hadoop FS checks)
+validate_prerequisites (SSH: connectivity, cluster auth, PySpark+Hive, DistCp, Hadoop FS checks)
 ↓
 init_tracking_tables
 ↓
@@ -625,16 +628,17 @@ finalize_run
 **Purpose:** Validate all required components are available before starting migration
 
 - Connects to the cluster edge node via SSH
-- Runs four sequential checks:
+- Runs five sequential checks:
   1. **SSH Connectivity** - Verifies SSH connection works with a simple echo command
-  2. **Cluster Authentication** - Verifies a valid ticket/TGT exists before attempting any cluster operations:
+  2. **Cluster Authentication** - Verifies the service account holds a valid ticket before attempting any cluster operations:
      - `mapr`: `maprlogin print | grep -q <service_account_user_id>` — confirms a valid MapR ticket for the configured user
-     - `kinit`: `klist -s` — confirms a valid Kerberos TGT in the ccache (populated by the login shell)
+     - `kinit`: `klist -s`, then `klist`'s default principal — confirms a valid Kerberos TGT in the ccache (populated by the login shell) whose principal is `service_account_user_id` (ignoring `/instance`, `@REALM` and case)
      - `none`: skipped (auto-passes)
   3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`. The Hive scratch dir is overridden to `cluster_hive_scratch_dir` so the check passes under a tenant service account
-  4. **Hadoop FS** - Runs `hadoop fs -ls /` (MapR) or `hadoop fs -ls hdfs://<nameservice>/` (HDFS HA) to confirm filesystem access
+  4. **Hadoop DistCp** - Checks `hadoop distcp` prints its usage, so a missing DistCp fails here rather than at the copy step
+  5. **Hadoop FS** - Runs `hadoop fs -ls /` (MapR) or `hadoop fs -ls hdfs://<nameservice>/` (HDFS HA) to confirm filesystem access
 - Sources `/etc/profile.d/*.sh` via a bash login shell before each check to ensure cluster auth and environment variables are loaded
-- If **all four checks pass**, proceeds with migration
+- If **all five checks pass**, proceeds with migration
 - If **any check fails**, raises an exception with a detailed summary of which checks failed and why, halting the DAG before any tracking tables or run records are created
 
 ---
@@ -1401,7 +1405,7 @@ Copies raw folders from MapR-FS/HDFS to S3 using Hadoop DistCp via SSH, with no 
 ### Task Flow
 
 ```
-validate_prerequisites_folder_copy  (SSH: check hadoop distcp, hadoop fs)
+validate_prerequisites_folder_copy  (SSH: check cluster auth, hadoop distcp, hadoop fs)
     ↓
 init_folder_copy_tracking_tables
     ↓
@@ -1444,10 +1448,11 @@ send_data_copy_report_email
 **Purpose:** Validate SSH connectivity and Hadoop tooling before starting the folder copy
 
 - Connects to the cluster edge node via SSH
-- Runs three sequential checks:
+- Runs four sequential checks:
   1. **SSH Connectivity** — verifies SSH connection with a simple echo command
-  2. **Hadoop DistCp** — checks `hadoop distcp` is available on the edge node
-  3. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
+  2. **Cluster Authentication** — the same ticket check as DAG 1's `validate_prerequisites`
+  3. **Hadoop DistCp** — checks `hadoop distcp` prints its usage on the edge node
+  4. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
 - Sources environment via the login shell before each check to ensure environment variables are loaded
 - If **all checks pass**, returns a `checks` dict and proceeds
 - If **any check fails**, raises an exception with a detailed summary, halting the DAG before any tracking tables or run records are created

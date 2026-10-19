@@ -31,32 +31,58 @@ def assert_each_overall_status_case_preserves_skippable(calls):
 
 class TestValidatePrerequisites:
 
-    def test_all_checks_pass(self, mock_ssh_hook):
-        hook, client, stdout_mock, _ = mock_ssh_hook
+    @staticmethod
+    def _responses(distcp_out=b'DISTCP_OK'):
         responses = [
             (MagicMock(), mock_ssh_stdout(0, b'SSH_TEST_OK'), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b'CLUSTER_AUTH_OK'), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b'PYSPARK_HIVE_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, distcp_out), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b'HADOOP_FS_OK'), MagicMock()),
         ]
         for r in responses:
             r[2].read.return_value = b''
-        client.exec_command.side_effect = responses
+        return responses
+
+    def test_all_checks_pass(self, mock_ssh_hook):
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._responses()
 
         result = m.validate_prerequisites.function(run_id='test_run')
         assert result['ssh_connectivity'] is True
         assert result['cluster_auth'] is True
         assert result['pyspark_available'] is True
         assert result['hive_available'] is True
+        assert result['hadoop_distcp_available'] is True
         assert result['hadoop_fs_available'] is True
         assert result['errors'] == []
+
+    def test_missing_distcp_fails_the_precheck(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._responses(distcp_out=b'DISTCP_FAIL')
+
+        with pytest.raises(Exception, match='DistCp: hadoop distcp not found or not executable'):
+            m.validate_prerequisites.function(run_id='test_run')
+        assert m.DISTCP_CHECK_CMD in client.exec_command.call_args_list[3][0][0]
+
+    def test_kerberos_check_expects_the_service_account(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._responses()
+        config = {**m.get_config(), 'auth_method': 'kinit', 'service_account_user_id': 'svc_wf'}
+
+        with patch.object(m, 'get_config', return_value=config):
+            m.validate_prerequisites.function(run_id='test_run')
+        auth_cmd = client.exec_command.call_args_list[1][0][0]
+        assert 'EXPECTED_USER=svc_wf' in auth_cmd
+        assert 'Default principal' in auth_cmd
 
     def test_ssh_failure_raises(self, mock_ssh_hook):
         hook, client, _, _ = mock_ssh_hook
         hook.get_conn.side_effect = Exception("Connection refused")
 
-        with pytest.raises(Exception, match="Pre-DAG validation failed"):
+        with pytest.raises(Exception, match="Pre-DAG validation failed") as exc:
             m.validate_prerequisites.function(run_id='test_run')
+        assert 'DistCp: Skipped due to SSH failure' in str(exc.value)
 
 
 class TestInitTrackingTables:

@@ -33,6 +33,7 @@ from migrator_utils.migrations.partition_utils import (
     partitions_to_where_clause as _partitions_to_where_clause,
 )
 from migrator_utils.migrations.shared import (
+    DISTCP_CHECK_CMD,
     SSH_COMMAND_TIMEOUT,
     _cluster_auth_check_cmd,
     _hive_scratch_dir,
@@ -270,6 +271,7 @@ def validate_prerequisites(run_id: str) -> dict:
         "cluster_auth": False,
         "pyspark_available": False,
         "hive_available": False,
+        "hadoop_distcp_available": False,
         "hadoop_fs_available": False,
         "errors": [],
     }
@@ -292,7 +294,7 @@ def validate_prerequisites(run_id: str) -> dict:
         with ssh.get_conn() as client:
 
             # 1. SSH Connectivity
-            logger.info("[1/4] Testing SSH connectivity...")
+            logger.info("[1/5] Testing SSH connectivity...")
             _, stdout, stderr = client.exec_command(
                 _login_shell('echo "SSH_TEST_OK"', config.get("cluster_type", "MapR")),
                 timeout=30,
@@ -309,12 +311,10 @@ def validate_prerequisites(run_id: str) -> dict:
                 validation_results["errors"].append(f"SSH: {error_msg}")
                 logger.error(f"SSH connectivity: FAILED - {error_msg}")
 
-            # 2. Cluster authentication
-            # MapR:     maprlogin print — verifies a valid ticket exists
-            # Kerberos: klist -s       — exits 0 if valid TGT in ccache, 1 if not
-            # none:     skipped
+            # 2. Cluster authentication: a MapR ticket or Kerberos TGT for the
+            # service account (none: skipped)
             logger.info(
-                f"[2/4] Testing cluster authentication (auth_method={auth_method})..."
+                f"[2/5] Testing cluster authentication (auth_method={auth_method})..."
             )
             inner_cmd = _cluster_auth_check_cmd(auth_method, mapr_user)
 
@@ -341,7 +341,7 @@ def validate_prerequisites(run_id: str) -> dict:
             # 3. PySpark + Hive metastore
             # Runs a real SparkSession with enableHiveSupport() + SHOW DATABASES.
             logger.info(
-                "[3/4] Testing PySpark with Hive metastore support (enableHiveSupport + SHOW DATABASES)..."
+                "[3/5] Testing PySpark with Hive metastore support (enableHiveSupport + SHOW DATABASES)..."
             )
             hive_scratch_dir = _hive_scratch_dir(config)
             pyspark_inner = f"""
@@ -378,9 +378,27 @@ PYSPARK_VALIDATION_EOF
                 validation_results["errors"].append(f"PySpark/Hive: {error_msg}")
                 logger.error(f"PySpark + Hive metastore: FAILED - {error_msg}")
 
-            # 4. Hadoop FS access (works for both MapR-FS and HDFS sources)
+            # 4. Hadoop DistCp, which run_distcp_ssh needs for every copy
+            logger.info("[4/5] Testing hadoop distcp availability...")
+            _, stdout, stderr = client.exec_command(
+                _login_shell(DISTCP_CHECK_CMD, config.get("cluster_type", "MapR")),
+                timeout=60,
+            )
+            output = stdout.read().decode()
+            stderr.read()
+            stdout.channel.recv_exit_status()
+
+            if "DISTCP_OK" in output:
+                validation_results["hadoop_distcp_available"] = True
+                logger.info("Hadoop DistCp: PASSED")
+            else:
+                error_msg = "hadoop distcp not found or not executable"
+                validation_results["errors"].append(f"DistCp: {error_msg}")
+                logger.error(f"Hadoop DistCp: FAILED - {error_msg}")
+
+            # 5. Hadoop FS access (works for both MapR-FS and HDFS sources)
             # For HDFS HA clusters set hdfs_nameservice; MapR/non-HA uses / directly.
-            logger.info("[4/4] Testing Hadoop FS access...")
+            logger.info("[5/5] Testing Hadoop FS access...")
             hdfs_nameservice = config.get("hdfs_nameservice", "")
             fs_root = f"hdfs://{hdfs_nameservice}/" if hdfs_nameservice else "/"
             hadoop_inner = f"""
@@ -424,6 +442,9 @@ fi
                 "PySpark/Hive: Skipped due to SSH failure"
             )
             logger.warning("PySpark/Hive: SKIPPED (SSH failed)")
+        if not validation_results["hadoop_distcp_available"]:
+            validation_results["errors"].append("DistCp: Skipped due to SSH failure")
+            logger.warning("Hadoop DistCp: SKIPPED (SSH failed)")
         if not validation_results["hadoop_fs_available"]:
             validation_results["errors"].append("Hadoop FS: Skipped due to SSH failure")
             logger.warning("Hadoop FS: SKIPPED (SSH failed)")
@@ -439,6 +460,7 @@ fi
             validation_results["cluster_auth"],
             validation_results["pyspark_available"],
             validation_results["hive_available"],
+            validation_results["hadoop_distcp_available"],
             validation_results["hadoop_fs_available"],
         ]
     )

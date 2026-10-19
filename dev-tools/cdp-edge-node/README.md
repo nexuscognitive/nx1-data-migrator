@@ -39,7 +39,8 @@ and principal, so the same image runs in docker-compose (`cdp-edge`) and in es-t
 
 The KDC database and keytabs are created on first boot and kept on the data volume
 (`/hadoop/data`), so they survive restarts. `svc_migration`'s `~/.profile` gets a ticket
-from its keytab whenever there isn't one; the DAG only checks for it (`klist -s`).
+from its keytab whenever there isn't one; the DAG only checks that it has one, for
+`service_account_user_id` (`klist`).
 
 ## Run locally
 

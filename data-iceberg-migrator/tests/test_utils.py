@@ -1276,20 +1276,94 @@ class TestClusterAuthCheckCmd:
     def test_no_auth_always_passes(self, auth_method):
         assert m._cluster_auth_check_cmd(auth_method, '') == 'echo "CLUSTER_AUTH_OK"'
 
-    @pytest.mark.parametrize('klist_exit, expected_rc, marker', [
-        (0, 0, 'CLUSTER_AUTH_OK'),
-        (1, 1, 'CLUSTER_AUTH_FAIL'),
-    ])
-    def test_kinit_check_follows_klist(self, tmp_path, klist_exit, expected_rc, marker):
-        fake = tmp_path / 'klist'
-        fake.write_text(f'#!/bin/sh\nexit {klist_exit}\n')
-        fake.chmod(0o755)
-        r = subprocess.run(
-            ['bash', '-c', m._cluster_auth_check_cmd('kinit', '')],
+    @staticmethod
+    def _run_kinit_check(tmp_path, expected_user, principal='svc_migration@CDP.LOCAL',
+                         has_tgt=True, login_user='svc_migration'):
+        """Runs the kinit check against a fake MIT klist and id."""
+        klist = tmp_path / 'klist'
+        klist.write_text(
+            '#!/bin/sh\n'
+            f'[ "$1" = "-s" ] && exit {0 if has_tgt else 1}\n'
+            'echo "Ticket cache: FILE:/tmp/krb5cc_1000"\n'
+            f'echo "Default principal: {principal}"\n'
+        )
+        id_cmd = tmp_path / 'id'
+        id_cmd.write_text(f'#!/bin/sh\necho {login_user}\n')
+        for f in (klist, id_cmd):
+            f.chmod(0o755)
+        return subprocess.run(
+            ['bash', '-c', m._cluster_auth_check_cmd('kinit', expected_user)],
             capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
         )
+
+    def test_kinit_quotes_the_expected_user(self):
+        cmd = m._cluster_auth_check_cmd('kinit', 'x";id;#')
+        assert "EXPECTED_USER='x\";id;#'" in cmd
+
+    @pytest.mark.parametrize('principal', [
+        'svc_migration@CDP.LOCAL',
+        'SVC_MIGRATION@CORP.EXAMPLE.COM',
+        'svc_migration/edge01.corp.example.com@CORP.EXAMPLE.COM',
+    ])
+    def test_kinit_passes_on_the_service_accounts_ticket(self, tmp_path, principal):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', principal=principal)
+        assert r.returncode == 0
+        assert r.stdout.startswith('CLUSTER_AUTH_OK')
+
+    @pytest.mark.parametrize('principal', [
+        'jdoe@CORP.EXAMPLE.COM',
+        'svc_migration_old@CDP.LOCAL',
+        'svc@CDP.LOCAL',
+    ])
+    def test_kinit_fails_on_another_principals_ticket(self, tmp_path, principal):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', principal=principal)
+        assert r.returncode == 1
+        assert r.stdout.startswith('CLUSTER_AUTH_FAIL')
+        assert f"'{principal}'" in r.stdout
+        assert "'svc_migration'" in r.stdout
+
+    def test_kinit_without_a_tgt_fails(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', has_tgt=False)
+        assert r.returncode == 1
+        assert r.stdout.startswith('CLUSTER_AUTH_FAIL: No valid Kerberos TGT found')
+
+    @pytest.mark.parametrize('login_user, expected_rc', [('svc_migration', 0), ('jdoe', 1)])
+    def test_kinit_without_a_service_account_expects_the_login_user(
+            self, tmp_path, login_user, expected_rc):
+        r = self._run_kinit_check(tmp_path, '', login_user=login_user)
         assert r.returncode == expected_rc
-        assert r.stdout.startswith(marker)
+
+
+class TestDistcpCheckCmd:
+
+    @staticmethod
+    def _run(tmp_path, hadoop_output, hadoop_exit=255):
+        fake = tmp_path / 'hadoop'
+        fake.write_text(f"#!/bin/sh\nprintf '%s\\n' '{hadoop_output}'\nexit {hadoop_exit}\n")
+        fake.chmod(0o755)
+        return subprocess.run(
+            ['bash', '-c', m.DISTCP_CHECK_CMD],
+            capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
+        )
+
+    def test_usage_text_passes(self, tmp_path):
+        r = self._run(tmp_path, 'usage: distcp OPTIONS [source_path...] <target_path>')
+        assert r.stdout.strip() == 'DISTCP_OK'
+
+    @pytest.mark.parametrize('hadoop_output', [
+        'Error: Could not find or load main class org.apache.hadoop.tools.DistCp',
+        'ERROR: distcp is not COMMAND nor fully qualified CLASSNAME.',
+    ])
+    def test_missing_distcp_fails(self, tmp_path, hadoop_output):
+        r = self._run(tmp_path, hadoop_output, hadoop_exit=1)
+        assert r.stdout.strip() == 'DISTCP_FAIL'
+
+    def test_missing_hadoop_fails(self, tmp_path):
+        r = subprocess.run(
+            ['bash', '-c', m.DISTCP_CHECK_CMD],
+            capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
+        )
+        assert r.stdout.strip() == 'DISTCP_FAIL'
 
 
 class TestClusterLoginUserFallback:
