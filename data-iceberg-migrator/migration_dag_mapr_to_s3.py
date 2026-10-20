@@ -18,8 +18,8 @@ import os
 import re
 import shlex
 import sys
-import uuid
 import time
+import uuid
 from datetime import datetime, timedelta
 from html import escape as html_escape  # aliased: generate_html_report binds a local `html`
 from pathlib import Path
