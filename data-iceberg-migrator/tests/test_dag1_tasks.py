@@ -129,6 +129,27 @@ class TestParseExcel:
         assert result[0]['dest_database'] == 'sales_s3'
         assert result[0]['run_id'] == 'run_test'
 
+    def test_unreadable_excel_fails_permanently(self, mock_spark):
+        """A corrupt upload fails identically on every retry (P-06: BadZipFile retried
+        twice over ~12 minutes before this)."""
+        from airflow.exceptions import AirflowFailException
+        setup_spark_excel(mock_spark, b'this is not an xlsx file')
+        with pytest.raises(AirflowFailException, match='parse_excel failed permanently.*BadZipFile'):
+            m.parse_excel.function('s3a://bucket/file.xlsx', 'run_test', spark=mock_spark)
+
+    def test_missing_required_column_fails_permanently(self, mock_spark):
+        from airflow.exceptions import AirflowFailException
+        setup_spark_excel(mock_spark, make_excel_bytes([{'database': 'sales', 'table': '*'}]))
+        with pytest.raises(AirflowFailException, match='dest_database,bucket'):
+            m.parse_excel.function('s3a://bucket/file.xlsx', 'run_test', spark=mock_spark)
+
+    def test_s3_read_error_keeps_its_retries(self, mock_spark):
+        from airflow.exceptions import AirflowFailException
+        mock_spark.read.format.return_value.load.side_effect = RuntimeError('S3 503 Slow Down')
+        with pytest.raises(RuntimeError) as err:
+            m.parse_excel.function('s3a://bucket/file.xlsx', 'run_test', spark=mock_spark)
+        assert not isinstance(err.value, AirflowFailException)
+
     @pytest.mark.parametrize("raw_bucket,expected_prefix", [
         ('s3://mybucket', 's3a://'),
         ('s3n://mybucket', 's3a://'),
@@ -370,6 +391,19 @@ class TestClassifyDiscoveryError:
         ) == 'FAILED'
 
 
+    def test_corrupted_metastore_schema_is_skippable(self):
+        """Spark fails before the location is read, so existence is unknown — the
+        message alone decides. Retrying cannot help; the owner must repair it."""
+        assert m._classify_discovery_error(
+            "u'Could not read schema from the hive metastore because it is corrupted. (missing part 0 of the schema, 1 parts are expected).;'", None
+        ) == 'TABLE_CORRUPTED'
+
+    def test_corrupted_schema_wins_over_intact_root_location(self):
+        assert m._classify_discovery_error(
+            'Could not read schema from the Hive Metastore because it is corrupted.', True
+        ) == 'TABLE_CORRUPTED'
+
+
 class TestDiscoverTablesViaSshSpark:
 
     def _make_discovery_output(self, metadata_json):
@@ -602,6 +636,80 @@ class TestDiscoverTablesViaSshSpark:
         # again — WF-343 restored with the rest of this suite green.
         assert script.index(probe) < script.index('spark.table("{0}.{1}"')
 
+    def _remote_resolve_tokens(self, client, sample_run_id):
+        """Run discovery once and return the edge script's resolve_tokens function."""
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        body = script[script.index('def resolve_tokens'):script.index('\nmetadata = []')]
+
+        class AnalysisException(Exception):
+            pass
+
+        namespace = {'AnalysisException': AnalysisException, 'fnmatch': __import__('fnmatch')}
+        exec(body, namespace)
+        return namespace['resolve_tokens'], AnalysisException
+
+    @staticmethod
+    def _spark_failing_with(exc):
+        spark = MagicMock()
+        spark.sql.side_effect = exc
+        return spark
+
+    @pytest.mark.parametrize('message', [
+        "Database 'sales' not found;",
+        '[SCHEMA_NOT_FOUND] The schema `sales` cannot be found.',
+    ])
+    def test_missing_database_marks_tokens_missing(self, mock_ssh_hook, sample_run_id, capsys, message):
+        _, client, _, _ = mock_ssh_hook
+        resolve_tokens, analysis_exception = self._remote_resolve_tokens(client, sample_run_id)
+        capsys.readouterr()
+
+        resolved, missing = resolve_tokens(
+            self._spark_failing_with(analysis_exception(message)), 'sales', ['orders', '*'])
+
+        assert (resolved, missing) == ([], ['orders'])
+        assert '===DISCOVERY_ABORT===' not in capsys.readouterr().out
+
+    def test_unreadable_metastore_aborts_instead_of_marking_tokens_missing(
+        self, mock_ssh_hook, sample_run_id, capsys
+    ):
+        """A NameNode in safe mode after an edge restart made SHOW TABLES fail; every table
+        was recorded TABLE_NOT_FOUND and the task succeeded."""
+        _, client, _, _ = mock_ssh_hook
+        resolve_tokens, analysis_exception = self._remote_resolve_tokens(client, sample_run_id)
+        capsys.readouterr()
+        error = analysis_exception(
+            'java.lang.RuntimeException: org.apache.hadoop.ipc.RemoteException(org.apache.hadoop.'
+            'hdfs.server.namenode.SafeModeException): Cannot create directory /tmp/hive/root/x')
+
+        with pytest.raises(analysis_exception):
+            resolve_tokens(self._spark_failing_with(error), 'sales', ['orders'])
+
+        assert '===DISCOVERY_ABORT=== SHOW TABLES IN sales failed' in capsys.readouterr().out
+
+    def test_abort_marker_fails_the_task_even_with_json_present(self, mock_ssh_hook, sample_run_id):
+        """pyspark keeps running after the raise and still prints the JSON; the marker wins."""
+        import json
+        _, client, _, _ = mock_ssh_hook
+        output = (
+            '===DISCOVERY_ABORT=== SHOW TABLES IN sales failed: SafeModeException\n'
+            + self._make_discovery_output(json.dumps([])).decode()
+        )
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, output.encode()), MagicMock()),
+        ]
+
+        with pytest.raises(Exception, match='Table discovery for sales aborted: .*SafeModeException'):
+            m.discover_tables_via_spark_ssh.function.__wrapped__(db_config={
+                'run_id': sample_run_id, 'source_database': 'sales',
+                'table_tokens': ['*'], 'dest_database': 'sales_s3',
+                'dest_bucket': 's3a://bucket',
+            })
+
     def test_orphaned_metastore_entry_does_not_abort_sibling_tables(
         self, mock_ssh_hook, sample_run_id
     ):
@@ -629,6 +737,30 @@ class TestDiscoverTablesViaSshSpark:
         assert by_table['t_ce_phonepref_ref']['error_type'] == 'SOURCE_PATH_NOT_FOUND'
         assert by_table['good_one'].get('error_type') is None
         assert by_table['good_two'].get('error_type') is None
+
+    def test_corrupted_table_does_not_abort_sibling_tables(self, mock_ssh_hook, sample_run_id):
+        """A corrupted metastore schema fails even SHOW TBLPROPERTIES. Mark the table
+        and migrate its siblings instead of failing the whole database."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record('good_one'),
+            self._make_metadata_record(
+                'system_exception_detail',
+                file_format='UNKNOWN', table_type='UNKNOWN', source_location='',
+                error="u'Could not read schema from the hive metastore because it is corrupted. (missing part 0 of the schema, 1 parts are expected).;'",
+                error_type='FAILED',
+                source_path_exists=None,
+            ),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['good_one', 'system_exception_detail'],
+        )
+
+        by_table = {t['source_table']: t for t in result['tables']}
+        assert by_table['system_exception_detail']['error_type'] == 'TABLE_CORRUPTED'
+        assert 'corrupted' in by_table['system_exception_detail']['error']
+        assert by_table['good_one'].get('error_type') is None
 
     def test_orphan_that_never_threw_is_still_classified(self, mock_ssh_hook, sample_run_id):
         """A TEXTFILE/Avro orphan never throws — its schema comes from the catalog —
@@ -716,6 +848,20 @@ class TestRecordDiscoveredTables:
             c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
         )
         assert 'empty_partition_names' in insert_sql
+
+    def test_insert_covers_distcp_sizing_columns(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        """Regression: distcp_mappers/distcp_bandwidth_mbps were added to the
+        tracking table's CREATE TABLE DDL for the auto-sizing feature but were
+        initially forgotten from this explicit-column-list INSERT — same class
+        of bug as empty_partition_names, and column-count parity alone doesn't
+        catch it, since both the list and VALUES were short by the same amount."""
+        self._setup_count(mock_spark, 0)
+        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        insert_sql = next(
+            c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
+        )
+        for col in ('distcp_mappers', 'distcp_bandwidth_mbps'):
+            assert col in insert_sql
 
     def test_insert_column_list_matches_values_count(self, mock_spark, sample_discovery, mock_iceberg_retry):
         """Generic guard: the explicit column list and the VALUES tuple in the
@@ -855,6 +1001,23 @@ class TestRecordDiscoveredTables:
         assert result == {}
 
 
+    def test_writes_table_corrupted_status(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        self._setup_count(mock_spark, 0)
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': "u'Could not read schema from the hive metastore because it is corrupted. (missing part 0 of the schema, 1 parts are expected).;'",
+                'error_type': 'TABLE_CORRUPTED',
+            }],
+        }
+        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
+        assert "'TABLE_CORRUPTED'" in all_sql
+        # The u'...' wrapper's quotes must be escaped inside the SQL literal.
+        assert "u''Could not read schema" in all_sql
+
+
 class TestRunDistcpSsh:
 
     def test_successful_copy_detects_incremental(self, mock_ssh_hook, sample_discovery):
@@ -896,6 +1059,24 @@ class TestRunDistcpSsh:
         assert result['distcp_results'][0]['status'] == 'SOURCE_PATH_NOT_FOUND'
         client.exec_command.assert_not_called()
 
+    def test_skips_table_corrupted_without_ssh(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'error': 'Could not read schema from the hive metastore because it is corrupted.',
+                'error_type': 'TABLE_CORRUPTED',
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'TABLE_CORRUPTED'
+        client.exec_command.assert_not_called()
+
     def test_skips_database_not_found_without_ssh(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
         discovery = {
@@ -920,6 +1101,33 @@ class TestRunDistcpSsh:
 
         with pytest.raises(Exception, match="DistCp failed"):
             m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
+
+    def test_master_switch_default_off_uses_fixed_defaults_for_full_table(
+        self, mock_ssh_hook, sample_discovery,
+    ):
+        """E2E: with migration_distcp_enable_auto_sizing unset, the real
+        get_config() resolves distcp_enable_auto_sizing=False. MOCK_VARIABLES
+        also carries a forced override pair (migration_distcp_mappers=10,
+        migration_distcp_bandwidth=50) — that must be ignored too. The
+        table's own source_total_size_bytes/source_file_count (10MB/5 files)
+        would auto-size to (1, 500) if the switch were on, so landing on
+        (50, 100) here proves the switch — not a coincidence of the inputs —
+        is what picked the value."""
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+        )
+
+        m.run_distcp_ssh.function.__wrapped__(
+            discovery=sample_discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        ssh_cmd = client.exec_command.call_args[0][0]
+        assert '-m 50 -bandwidth 100' in ssh_cmd
+        assert '-m 10 -bandwidth 50' not in ssh_cmd
 
     def test_partition_filter_active_uses_per_partition_distcp(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
@@ -1111,11 +1319,30 @@ class TestRunDistcpSsh:
             m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
         return client.exec_command.call_args[0][0]
 
+    def test_master_switch_default_off_uses_fixed_defaults_per_partition(
+        self, mock_ssh_hook, sample_discovery,
+    ):
+        """E2E: nothing overridden — real get_config() resolves
+        distcp_enable_auto_sizing=False (unset) and a forced override pair of
+        (10, 50) from MOCK_VARIABLES. Both partitions (100 vs. 200 of the
+        300 files) would size differently under auto-sizing (see
+        test_per_partition_mappers_scale_with_partition_file_share, which
+        gets [7, 14] for the same split with the switch on) — landing on the
+        same (50, 100) pair for both here proves the master switch, not the
+        forced pair or the partition split, decided the outcome."""
+        ssh_cmd = self._run_per_partition_sized(mock_ssh_hook, sample_discovery)
+        pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
+        assert len(pairs) == 2
+        assert set(pairs) == {('50', '100')}
+
     def test_per_partition_mappers_scale_with_partition_file_share(self, mock_ssh_hook,
                                                                    sample_discovery):
         ssh_cmd = self._run_per_partition_sized(
             mock_ssh_hook, sample_discovery,
-            config_overrides={'distcp_mappers': '', 'distcp_bandwidth': ''},
+            config_overrides={
+                'distcp_enable_auto_sizing': True,
+                'distcp_mappers': '', 'distcp_bandwidth': '',
+            },
         )
         pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
         assert len(pairs) == 2
@@ -1130,7 +1357,10 @@ class TestRunDistcpSsh:
                                                                  sample_discovery):
         ssh_cmd = self._run_per_partition_sized(
             mock_ssh_hook, sample_discovery,
-            config_overrides={'distcp_mappers': '50', 'distcp_bandwidth': '100'},
+            config_overrides={
+                'distcp_enable_auto_sizing': True,
+                'distcp_mappers': '50', 'distcp_bandwidth': '100',
+            },
         )
         pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
         assert len(pairs) == 2
@@ -1144,6 +1374,19 @@ class TestRunDistcpSsh:
         )
         assert "-strategy 'dynamic; rm -rf /'" in ssh_cmd
         assert '-strategy dynamic; rm' not in ssh_cmd
+
+    def test_s3_secret_is_never_echoed(self, mock_ssh_hook, sample_discovery):
+        """The retry wrapper's output is logged verbatim, so it must not expand the
+        distcp argument list, which carries -Dfs.s3a.secret.key."""
+        ssh_cmd = self._run_per_partition_sized(
+            mock_ssh_hook, sample_discovery,
+            config_overrides={'s3_endpoint': 'https://s3.example.com',
+                              's3_access_key': 'AKIAEXAMPLE', 's3_secret_key': 'TOPSECRET123'},
+        )
+        assert 'TOPSECRET123' in ssh_cmd  # passed to distcp as intended
+        echo_lines = [ln for ln in ssh_cmd.splitlines() if ln.strip().startswith('echo')]
+        assert echo_lines
+        assert not any('$*' in ln or '$@' in ln or 'TOPSECRET123' in ln for ln in echo_lines)
 
     def test_default_strategy_emits_no_quotes(self, mock_ssh_hook, sample_discovery):
         ssh_cmd = self._run_per_partition_sized(mock_ssh_hook, sample_discovery)
@@ -2991,6 +3234,55 @@ class TestGenerateHtmlReport:
         assert 'maprfs:/datalake/cap/curated/mktg/target/&lt;t_ce_phonepref_ref&gt;' in html
         assert '<t_ce_phonepref_ref>' not in html
         assert 'It is possible the underlying files' not in html
+
+    def test_table_corrupted_gets_its_own_card_and_badge(self, mock_spark, sample_run_id):
+        """A corrupted table is skipped, not failed, so the report must say why —
+        the owner has to repair it before it can be migrated."""
+        run_row = SimpleNamespace(dag_run_id='dag_run_test')
+        tbl_row = SimpleNamespace(
+            source_database='dev_homelending_blend_sanitized', source_table='system_exception_detail',
+            overall_status='TABLE_CORRUPTED', discovery_duration_seconds=1.0,
+            distcp_duration_seconds=None, distcp_bytes_copied=0,
+            distcp_files_copied=0, distcp_is_incremental=False,
+            table_create_duration_seconds=None, validation_duration_seconds=None,
+            validation_status=None, row_count_match=None,
+            partition_count_match=None, schema_match=None,
+            source_row_count=0, dest_hive_row_count=0,
+            source_partition_count=0, dest_partition_count=0,
+            source_total_size_bytes=0, s3_total_size_bytes_before=0,
+            s3_total_size_bytes_after=0, s3_bytes_transferred=0,
+            file_size_match=None, source_file_count=0,
+            s3_file_count_before=0, s3_file_count_after=0,
+            s3_files_transferred=0, file_count_match=None,
+            distcp_status=None, file_format='UNKNOWN',
+            partition_filter=None, filtered_partition_count=None,
+            source_location='',
+            error_message='Could not read schema from the hive metastore because it is '
+                          'corrupted. (missing part 0 of the schema, 1 parts are expected).<x>',
+        )
+
+        def sql_router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'migration_runs' in sl and 'where' in sl:
+                df.collect.return_value = [run_row]
+            elif 'order by' in sl:
+                df.collect.return_value = [tbl_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = sql_router
+        m.generate_html_report.function(run_id=sample_run_id, spark=mock_spark)
+
+        stream = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value.create.return_value
+        html = stream.write.call_args[0][0].decode('utf-8')
+        assert 'TABLE CORRUPTED' in html
+        assert 'status-corrupted' in html
+        assert 'TABLE_CORRUPTED' in html
+        assert 'missing part 0 of the schema' in html
+        assert '1 parts are expected).&lt;x&gt;' in html
+        assert '<x>' not in html
 
 
 class TestSendMigrationReportEmail:

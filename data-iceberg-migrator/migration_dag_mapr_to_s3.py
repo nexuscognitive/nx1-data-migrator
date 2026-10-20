@@ -35,7 +35,6 @@ from migrator_utils.migrations.partition_utils import (
 )
 from migrator_utils.migrations.shared import (
     _BATCH_BUDGET_FRACTION,
-    _BUDGET_SLACK,
     SSH_COMMAND_TIMEOUT,
     _hive_scratch_dir,
     _login_shell,
@@ -50,6 +49,7 @@ from migrator_utils.migrations.shared import (
     get_config,
     hive_type_to_spark_ddl,
     normalize_s3,
+    permanent_fail,
     pack_tables_into_batches,
     resolve_batch_cap,
     size_distcp_job,
@@ -78,6 +78,14 @@ SKIPPABLE_DISCOVERY_ERRORS = (
     "TABLE_NOT_FOUND",
     "DATABASE_NOT_FOUND",
     "SOURCE_PATH_NOT_FOUND",
+    "TABLE_CORRUPTED",
+)
+
+# Spark's HiveExternalCatalog raises this when the spark.sql.sources.schema.* table
+# properties are missing or incomplete. Any read of the table — even SHOW TBLPROPERTIES —
+# fails the same way, so a retry cannot help; the owner has to repair the table.
+_CORRUPTED_SCHEMA_MARKERS = (
+    "could not read schema from the hive metastore because it is corrupted",
 )
 
 # "Not allowed to see it" is not "not there". Belt-and-braces: an ACL problem
@@ -108,9 +116,13 @@ _DISTCP_EXECUTION_TIMEOUT = timedelta(hours=8)
 
 def _classify_discovery_error(error: str, source_path_exists: bool | None) -> str:
     """Refine the remote script's blanket FAILED into a skippable status when the
-    table's LOCATION root is verifiably gone (orphaned metastore entry).
+    table's LOCATION root is verifiably gone (orphaned metastore entry), or when its
+    metastore schema is corrupted.
 
-    Keyed off the remote fs.exists() on the root, not the exception wording, which
+    Corruption is keyed off the exception wording: Spark fails before the location is
+    read, so source_path_exists is None, and the message is specific enough to trust.
+
+    A missing root is keyed off the remote fs.exists() on the root, not the exception wording, which
     cannot tell the root being gone from a path *under* it being gone — Spark's file
     index names leaf files, so a compaction or one missing partition raises the same
     FileNotFoundException on a table that is still migratable.
@@ -119,9 +131,11 @@ def _classify_discovery_error(error: str, source_path_exists: bool | None) -> st
 
     Blind spot: a table whose partitions live outside the root reads as absent. DistCp
     copies from the root, so it was already unmigratable — now it is flagged as such."""
+    err = (error or "").lower()
+    if any(marker in err for marker in _CORRUPTED_SCHEMA_MARKERS):
+        return "TABLE_CORRUPTED"
     if source_path_exists is not False:
         return "FAILED"
-    err = (error or "").lower()
     if any(marker in err for marker in _PERMISSION_DENIED_MARKERS):
         return "FAILED"
     return "SOURCE_PATH_NOT_FOUND"
@@ -749,6 +763,8 @@ def init_tracking_tables(spark) -> dict:
                 distcp_is_incremental BOOLEAN,
                 distcp_bytes_copied BIGINT,
                 distcp_files_copied BIGINT,
+                distcp_mappers INT,
+                distcp_bandwidth_mbps INT,
                 yarn_application_id STRING,
                 table_create_status STRING,
                 table_create_completed_at TIMESTAMP,
@@ -786,6 +802,8 @@ def init_tracking_tables(spark) -> dict:
         ("partition_schema_match", "BOOLEAN"),
         ("partition_schema_differences", "STRING"),
         ("empty_partition_names", "STRING"),
+        ("distcp_mappers", "INT"),
+        ("distcp_bandwidth_mbps", "INT"),
     ):
         try:
             spark.sql(
@@ -868,16 +886,21 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     binary_df = spark.read.format("binaryFile").load(excel_file_path)
     row = binary_df.select("content").first()
     excel_bytes = bytes(row.content)
-    df = ps.read_excel(BytesIO(excel_bytes), engine="openpyxl")
+    # A read error above may be transient and keeps its retries; a file that does
+    # not parse, or lacks a required column, fails the same way on every retry.
+    try:
+        df = ps.read_excel(BytesIO(excel_bytes), engine="openpyxl")
+    except Exception as e:
+        permanent_fail("parse_excel", e)
 
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
     required_columns = ["database", "table", "dest_database", "bucket"]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
-        raise ValueError(
-                f"parse_excel failed, Missing required Excel columns(s): {','.join(missing_columns)}"
-        )
+        permanent_fail("parse_excel", ValueError(
+            f"Missing required Excel columns(s): {','.join(missing_columns)}"
+        ))
     # Convert to list of dicts
     grouped = {}
     for _, row in df.iterrows():
@@ -1151,6 +1174,12 @@ def resolve_tokens(spark, db, tokens):
         existing_rows = spark.sql("SHOW TABLES IN {{0}}".format(db)).collect()
         existing_lower = {{r.tableName.lower(): r.tableName for r in existing_rows}}
     except AnalysisException as e:
+        # Only a missing database (Spark 2 "not found", Spark 3.4+ "cannot be found") means the
+        # tokens are missing. Any other failure (metastore down, NameNode in safe mode) aborts so
+        # the task retries; the marker is needed because a raise in stdin-fed pyspark doesn't stop it.
+        if not any(m in str(e).lower() for m in ("not found", "cannot be found", "nosuchdatabase")):
+            print("===DISCOVERY_ABORT=== SHOW TABLES IN {{0}} failed: {{1}}".format(db, str(e)[:500]))
+            raise
         print("WARNING: SHOW TABLES IN {{0}} failed with AnalysisException ({{1}}). Treating all explicit tokens as missing.".format(db, str(e)[:200]))
         existing_lower = {{}}
 
@@ -1565,6 +1594,11 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
                 f"Output: {output[-500:]}"
             )
 
+        abort_at = output.find("===DISCOVERY_ABORT===")
+        if abort_at != -1:
+            reason = output[abort_at:].splitlines()[0]
+            raise Exception(f"Table discovery for {src_db} aborted: {reason}")
+
         json_start = output.find("===JSON_START===")
         json_end = output.find("===JSON_END===")
 
@@ -1610,6 +1644,12 @@ pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}
             logger.error(
                 f"  Source data path missing for {src_db}.{t['source_table']} — orphaned "
                 f"metastore entry, will be skipped in downstream phases | "
+                f"error={t.get('error', '')[:200]}"
+            )
+        elif t.get("error_type") == "TABLE_CORRUPTED":
+            logger.error(
+                f"  Table metadata corrupted for {src_db}.{t['source_table']} — the "
+                f"table owner must repair it; will be skipped in downstream phases | "
                 f"error={t.get('error', '')[:200]}"
             )
         else:
@@ -1781,6 +1821,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     discovery_status, discovery_completed_at, discovery_duration_seconds,
                     distcp_status, distcp_started_at, distcp_completed_at, distcp_duration_seconds,
                     distcp_is_incremental, distcp_bytes_copied, distcp_files_copied,
+                    distcp_mappers, distcp_bandwidth_mbps,
                     table_create_status, table_create_completed_at, table_create_duration_seconds,
                     table_already_existed,
                     validation_status, validation_completed_at, validation_duration_seconds,
@@ -1806,6 +1847,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     '{disc_status}', current_timestamp(), {discovery_duration},
                     NULL, NULL, NULL, NULL,
                     NULL, NULL, NULL,
+                    NULL, NULL,
                     NULL, NULL, NULL,
                     NULL,
                     NULL, NULL, NULL,
@@ -1885,14 +1927,13 @@ def flatten_and_batch(discoveries) -> list[dict]:
 
     descriptors = []
     for batch_index, (bin_cost, g, bin_tables) in enumerate(bins):
-        # max() gives a single over-cap monster a budget matching its own cost
-        # rather than the cap it already blew through; min() then stops that
-        # budget landing past the point where execution_timeout SIGKILLs the
-        # task, which would discard the XCom before any FAILED row is written.
-        budget = min(
-            max(bin_cost, cap) * _BUDGET_SLACK,
-            _BATCH_BUDGET_FRACTION * backstop,
-        )
+        # The budget guards only against execution_timeout SIGKILLing the task,
+        # which would discard the XCom before any FAILED row is written. It is
+        # not scaled to the estimate: the cost model ignores YARN queueing and
+        # SSH/scan overhead, so an estimate-sized budget ran out mid-batch and
+        # skipped healthy tables. A stuck copy is caught per table by
+        # _call_timeout_seconds instead.
+        budget = _BATCH_BUDGET_FRACTION * backstop
         if bin_cost > budget:
             logger.warning(
                 f"[Batching] batch {batch_index} estimates {bin_cost:.0f}s but "
@@ -2049,8 +2090,13 @@ def run_distcp_ssh(
 
         if budget_secs and (time.monotonic() - batch_started_at) >= budget_secs:
             logger.warning(
-                f"[DistCp] budget of {budget_secs:.0f}s exhausted — not starting "
-                f"{t['source_database']}.{t['source_table']}"
+                f"[DistCp] SKIPPED {t['source_database']}.{t['source_table']} "
+                f"(batch {batch.get('batch_index')}) — reason: batch budget of "
+                f"{budget_secs:.0f}s exhausted after "
+                f"{time.monotonic() - batch_started_at:.0f}s; starting it would "
+                f"risk the {_DISTCP_EXECUTION_TIMEOUT.total_seconds():.0f}s "
+                f"execution_timeout. Marked FAILED; the batch retry resumes it "
+                f"with -update."
             )
             # FAILED (unlike SKIPPED above) is not in update_distcp_status's
             # skip-list, so this row is read by direct key indexing there —
@@ -2167,6 +2213,8 @@ def run_distcp_ssh(
                     "distcp_started_at": distcp_started_at,
                     "distcp_duration_secs": distcp_duration_secs,
                     "distcp_completed_at": distcp_completed_at,
+                    "mappers": mappers,
+                    "bandwidth_mbps": bandwidth,
                     "is_incremental": False,
                     "bytes_copied": 0,
                     "files_copied": 0,
@@ -2301,6 +2349,7 @@ fi
 
                 cmd = f"""set -e
 {client_opts_export}
+
 {_distcp_shell_prelude(s3_opts, deadline_epoch, elapsed)}
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
@@ -2677,6 +2726,8 @@ exit 0
                         "distcp_started_at": distcp_started_at,
                         "distcp_duration_secs": distcp_duration_secs,
                         "distcp_completed_at": distcp_completed_at,
+                        "mappers": mappers,
+                        "bandwidth_mbps": bandwidth,
                         "is_incremental": is_incr,
                         "bytes_copied": bytes_copied,
                         "files_copied": files_copied,
@@ -2713,6 +2764,8 @@ exit 0
                     "distcp_duration_secs": (
                         _fail_dt - _dt.strptime(distcp_started_at, "%Y-%m-%d %H:%M:%S")
                     ).total_seconds(),
+                    "mappers": mappers,
+                    "bandwidth_mbps": bandwidth,
                     "is_incremental": False,
                     "bytes_copied": 0,
                     "files_copied": 0,
@@ -2854,6 +2907,8 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 distcp_is_incremental = {str(r['is_incremental']).lower()},
                 distcp_bytes_copied = {r.get('bytes_copied', 0)},
                 distcp_files_copied = {r.get('files_copied', 0)},
+                distcp_mappers = {r.get('mappers') if r.get('mappers') is not None else 'NULL'},
+                distcp_bandwidth_mbps = {r.get('bandwidth_mbps') if r.get('bandwidth_mbps') is not None else 'NULL'},
                 yarn_application_id = '{yarn_app_id}',
                 s3_total_size_bytes_before = {s3_size_before},
                 s3_file_count_before = {s3_files_before},
@@ -2883,6 +2938,8 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 f"""
                 UPDATE {tracking_db}.migration_table_status
                 SET distcp_status = 'FAILED',
+                    distcp_mappers = {r.get('mappers') if r.get('mappers') is not None else 'NULL'},
+                    distcp_bandwidth_mbps = {r.get('bandwidth_mbps') if r.get('bandwidth_mbps') is not None else 'NULL'},
                     overall_status = CASE
                         WHEN overall_status = 'EMPTY_SOURCE'       THEN 'EMPTY_SOURCE'
                         {_PRESERVE_SKIPPABLE_STATUS_SQL}
@@ -2934,6 +2991,8 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 distcp_is_incremental = false,
                 distcp_bytes_copied = 0,
                 distcp_files_copied = 0,
+                distcp_mappers = {r.get('mappers') if r.get('mappers') is not None else 'NULL'},
+                distcp_bandwidth_mbps = {r.get('bandwidth_mbps') if r.get('bandwidth_mbps') is not None else 'NULL'},
                 s3_total_size_bytes_before = 0,
                 s3_file_count_before = 0,
                 s3_total_size_bytes_after = 0,
@@ -4224,6 +4283,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     path_not_found_tables = sum(
         1 for t in table_status if t.overall_status == "SOURCE_PATH_NOT_FOUND"
     )
+    corrupted_tables = sum(1 for t in table_status if t.overall_status == "TABLE_CORRUPTED")
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (
         1024**3
     )
@@ -4355,6 +4415,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             background-color: #f3e5f5;
             color: #6a1b9a;
         }}
+        .status-corrupted {{
+            background-color: #fce4ec;
+            color: #ad1457;
+        }}
         .status-warning {{
             background-color: #fff3cd;
             color: #856404;
@@ -4441,6 +4505,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             <div class="summary-card">
                 <h3>SOURCE PATH MISSING</h3>
                 <p class="value">{path_not_found_tables}</p>
+            </div>
+            <div class="summary-card">
+                <h3>TABLE CORRUPTED</h3>
+                <p class="value">{corrupted_tables}</p>
             </div>
             <div class="summary-card info">
                 <h3>TOTAL DATA</h3>
@@ -4597,6 +4665,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif status == "SOURCE_PATH_NOT_FOUND":
             status_class = "status-path-not-found"
             status_label = status
+        elif status == "TABLE_CORRUPTED":
+            status_class = "status-corrupted"
+            status_label = status
         elif "VALIDATED_WITH_WARNINGS" in status:
             status_class = "status-warning"
             status_label = status
@@ -4626,6 +4697,13 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             if t.distcp_bytes_copied
             else ""
         )
+        _distcp_mappers = getattr(t, "distcp_mappers", None)
+        _distcp_bandwidth = getattr(t, "distcp_bandwidth_mbps", None)
+        if _distcp_mappers is not None and _distcp_bandwidth is not None:
+            distcp_detail += (
+                f"<br><small style='color:#7f8c8d;'>{_distcp_mappers} mappers "
+                f"&times; {_distcp_bandwidth} MB/s</small>"
+            )
         if t.distcp_is_incremental:
             distcp_dur += " <span style='background-color: #fff3cd; padding: 2px 6px; border-radius: 4px; font-size: 10px;'>INCREMENTAL</span>"
         yarn_app_id_val = getattr(t, "yarn_application_id", None) or ""
@@ -4726,6 +4804,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif t.overall_status == "SOURCE_PATH_NOT_FOUND":
             badge_class = "status-path-not-found"
             badge_label = "SOURCE_PATH_NOT_FOUND"
+        elif t.overall_status == "TABLE_CORRUPTED":
+            badge_class = "status-corrupted"
+            badge_label = "TABLE_CORRUPTED"
         else:
             badge_class = "status-not-found"
             badge_label = "TABLE_NOT_FOUND"
@@ -4739,6 +4820,13 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                     ' <span style="color:#6c757d;font-size:11px;">'
                     f"{html_escape(str(reason))}</span>"
                 )
+        elif t.overall_status == "TABLE_CORRUPTED" and t.error_message:
+            # Spark's message names the missing schema part, which the owner needs
+            # to repair the table.
+            detail = (
+                ' <span style="color:#6c757d;font-size:11px;">'
+                f"{html_escape(str(t.error_message))}</span>"
+            )
         return f"""
                     <tr>
                         <td>{t.source_database}</td>
