@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+  <property>
+    <name>dfs.replication</name>
+    <value>1</value>
+  </property>
+  <property>
+    <name>dfs.namenode.name.dir</name>
+    <value>/hadoop/data/namenode</value>
+  </property>
+  <property>
+    <name>dfs.datanode.data.dir</name>
+    <value>/hadoop/data/datanode</value>
+  </property>
+  <!-- CDP keeps HDFS permissions on (the MapR node turns them off). -->
+  <property>
+    <name>dfs.permissions.enabled</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>dfs.namenode.rpc-bind-host</name>
+    <value>0.0.0.0</value>
+  </property>
+  <property>
+    <name>dfs.namenode.http-bind-host</name>
+    <value>0.0.0.0</value>
+  </property>
+  <!-- Principals are written out in full (no _HOST) to avoid Java's own hostname
+       lookup in the pod. "@EDGE_FQDN@@CDP.LOCAL" becomes "<fqdn>@CDP.LOCAL". -->
+  <property>
+    <name>dfs.block.access.token.enable</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>dfs.namenode.kerberos.principal</name>
+    <value>hdfs/@EDGE_FQDN@@CDP.LOCAL</value>
+  </property>
+  <property>
+    <name>dfs.namenode.keytab.file</name>
+    <value>/etc/security/keytabs/hdfs.keytab</value>
+  </property>
+  <property>
+    <name>dfs.namenode.kerberos.internal.spnego.principal</name>
+    <value>HTTP/@EDGE_FQDN@@CDP.LOCAL</value>
+  </property>
+  <property>
+    <name>dfs.datanode.kerberos.principal</name>
+    <value>hdfs/@EDGE_FQDN@@CDP.LOCAL</value>
+  </property>
+  <property>
+    <name>dfs.datanode.keytab.file</name>
+    <value>/etc/security/keytabs/hdfs.keytab</value>
+  </property>
+  <property>
+    <name>dfs.web.authentication.kerberos.principal</name>
+    <value>HTTP/@EDGE_FQDN@@CDP.LOCAL</value>
+  </property>
+  <property>
+    <name>dfs.web.authentication.kerberos.keytab</name>
+    <value>/etc/security/keytabs/spnego.keytab</value>
+  </property>
+  <!-- A secure DataNode otherwise needs SASL data transfer protection with HTTPS_ONLY
+       web UIs, or privileged ports. Clients still need a Kerberos ticket for the
+       NameNode to get the block tokens a DataNode demands (spec section 2). -->
+  <property>
+    <name>ignore.secure.ports.for.testing</name>
+    <value>true</value>
+  </property>
+</configuration>

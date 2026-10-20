@@ -53,7 +53,22 @@ First match wins:
 | `auth_method`              | Authentication method: `mapr`, `kinit`, or `none`                                                                                                                                                                            | MapR/Kerberos    | `source_to_s3_migration`, `folder_only_data_copy` |
 | `service_account_user_id`  | **Recommended.** Tenant service account the DAG runs as on the source cluster. Validates the MapR ticket and builds every user-scoped temp and log path. See [Service account configuration](#service-account-configuration) | All auth methods | `source_to_s3_migration`, `folder_only_data_copy` |
 | `mapr_ticketfile_location` | MapR ticket file path                                                                                                                                                                                                        | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
-| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.                                                                                                                                                                               | HTML reports     | `source_to_s3_migration`                          |
+| `cluster_type`             | Report label and S3A committer choice: `MapR`, `HDP` or `CDP`. `HDP` and `CDP` add the S3A magic-committer flags to DistCp.                                                                                                  | HTML reports     | `source_to_s3_migration`                          |
+
+#### Testing against a Kerberized CDP edge node
+
+With `auth_method=kinit`, both pre-checks (DAG 1 `validate_prerequisites`, DAG 3
+`validate_prerequisites_folder_copy`) check the edge node's Kerberos ticket. They fail
+with `Cluster auth: No valid Kerberos TGT found` when the SSH user has no ticket, and with
+`Cluster auth: Kerberos ticket is for '<principal>', expected service account '<user>'`
+when the ticket's principal isn't `service_account_user_id` (or the SSH login user when
+that's unset). Both sides are compared as bare names, ignoring case, `/instance`, `@REALM`
+and a `DOMAIN\` prefix. The DAGs
+expect the edge node to hold the ticket (for example, `kinit -kt` from the service
+account's keytab in its `~/.profile`); they don't run `kinit` themselves.
+
+`dev-tools/cdp-edge-node/` is a Kerberized CDP 7.1.x-style edge node for testing this end
+to end; see its `README.md` for setup and the DAG settings.
 
 ### Optional Variables
 
@@ -83,6 +98,11 @@ First match wins:
 | `migration_distcp_client_java_opts` | _(empty)_        | When set, exported as `HADOOP_CLIENT_OPTS` for the DistCp client JVM; empty emits nothing                                                                                                                        | `source_to_s3_migration`, `folder_only_data_copy` |
 | `migration_distcp_extra_hadoop_opts` | _(empty)_        | Extra DistCp flags appended verbatim and unescaped — must already be `-D`-formatted and must be trusted input                                                                                                    | `source_to_s3_migration`, `folder_only_data_copy` |
 | `migration_distcp_preserve_delete` | `true`           | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes))                                                                                  | `source_to_s3_migration`                          |
+| `migration_distcp_max_tables_per_batch` | `25`        | Hard cap on tables per batch                                                                                                                                                                                      | `source_to_s3_migration`                          |
+| `migration_distcp_call_timeout_max_seconds` | `21600` | Ceiling on one DistCp call's timeout, in seconds                                                                                                                                                                 | `source_to_s3_migration`                          |
+| `MIGRATION_DISTCP_COPY_MAX_CONCURRENT` | `3`         | Concurrent DistCp copies per DAG run. **Env-only** — read at DAG parse time, so it must be set in `env.shared` and redeployed with `deploy.py`; there is no equivalent Airflow Variable                          | `source_to_s3_migration`                          |
+| `MIGRATION_VALIDATION_MAX_CONCURRENT` | `3`          | Concurrent destination-validation tasks per DAG run. **Env-only**, same reason as above                                                                                                                          | `source_to_s3_migration`                          |
+| `MIGRATION_DISCOVERY_MAX_CONCURRENT` | `3`          | Concurrent table-discovery tasks per DAG run. Each runs a `pyspark` driver on the edge node, so size it to the edge's memory. **Env-only**, same reason as above | `source_to_s3_migration`                          |
 | `migration_distcp_checkpoint_location` | `<migration_tracking_location>/_distcp_checkpoints` | S3 prefix for per-table, per-attempt DistCp checkpoint JSON. The edge node writes with Hadoop FS; the Spark status task lists and reads checkpoint objects. | `source_to_s3_migration` |
 | `migration_discovery_driver_memory` | _(empty)_ | Optional `--driver-memory` passed to the remote `pyspark` table-discovery process; empty leaves Spark's default unchanged. | `source_to_s3_migration` |
 | `migration_include_db_in_path`     | `true`           | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted)                                                                  | `source_to_s3_migration`                          |
@@ -117,18 +137,18 @@ drives all of the following:
 
 **Resolution order**
 
-| Order | Source                                 | When used                           |
-| ----- | -------------------------------------- | ----------------------------------- |
-| 1     | `service_account_user_id` config       | Whenever it is set — always wins    |
-| 3     | Active MapR ticket (`maprlogin print`) | Neither is set, and a ticket exists |
-| 4     | Login shell user (`id -un`)            | Nothing else available              |
+| Order | Source                                 | When used                                                  |
+| ----- | -------------------------------------- | ---------------------------------------------------------- |
+| 1     | `service_account_user_id` config       | Whenever it is set — always wins                           |
+| 2     | Active MapR ticket (`maprlogin print`) | Not set, `auth_method=mapr`, and a ticket exists           |
+| 3     | Login shell user (`id -un`)            | Nothing else available (always the case for Kerberos runs) |
 
 **When it is configured (recommended)**
 
 Paths are deterministic and reviewable before the run. The value appears in the
 `cluster_login_setup` task log as:
 
-    MAPR_EFFECTIVE_USER=`USER_NAME`
+    EFFECTIVE_USER=`USER_NAME`
     SERVICE_ACCOUNT_SOURCE=config:service_account_user_id
 
 It is also used to validate the MapR ticket, so if the configured account and the
@@ -160,7 +180,7 @@ Example for a tenant service account:
 
     cluster_edge_temp_path = /user/${USER}/tmp/migration
 
-The resolved path is echoed as `TEMP_DIR=` and the identity as `MAPR_EFFECTIVE_USER=`
+The resolved path is echoed as `TEMP_DIR=` and the identity as `EFFECTIVE_USER=`
 in the `cluster_login_setup` task log.
 
 `cluster_edge_discovery_temp_path` does **not** support placeholders — the discovery
@@ -198,7 +218,7 @@ It is the resolved service account — `service_account_user_id` when set, other
 the `.profile` fallback. The resolved value is echoed in the
 `cluster_login_setup` task log as:
 
-    MAPR_EFFECTIVE_USER=<user>
+    EFFECTIVE_USER=<user>
     SERVICE_ACCOUNT_SOURCE=<where it came from>
     DISTCP_LOG_DIR=<full path>
 
@@ -298,8 +318,10 @@ through to the global Variable, so `tenant_2` above uses
 `cluster_edge_temp_path` as normal.
 
 Accepted keys in a profile: `ssh_conn_id`,
-`mapr_ticketfile_location`, `auth_method`, `edge_temp_path`,
-`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`.
+`mapr_ticketfile_location`, `auth_method`, `cluster_type`, `edge_temp_path`,
+`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`. The same keys
+can be set per run in `dag_run.conf` (for example, pointing one run at a Kerberized
+CDP edge node with `ssh_conn_id`, `auth_method=kinit` and `cluster_type=CDP`).
 
 **Resolution order** for these settings:
 
@@ -523,11 +545,137 @@ Orchestrates the complete migration of Hive tables from a source cluster (MapR-F
 
 - **SSH Operations** - All source (MapR/HDP) cluster interactions via SSH to edge node
 - **Beeline Discovery** - Automated metadata extraction using HiveServer2
-- **Hadoop DistCp** - Efficient bulk data transfer with 24-hour timeout
+- **Hadoop DistCp** - Efficient bulk data transfer; each copy gets its own timeout, sized from its cost estimate (see [batching](#how-the-s3-copy-is-split-into-batches))
 - **Incremental Support** - Automatic detection and `update` flag usage
 - **Partition Support** - Automatic partition discovery and repair
 - **Format Preservation** - Supports Parquet, ORC, and Avro
 - **Comprehensive Validation** - Row counts, partition counts, schema comparison
+
+---
+
+### How the S3 copy is split into batches
+
+The copy stage used to run one Airflow task per database, copying that
+database's tables one after another. A single stuck copy could freeze every
+other table in the same database for up to 24 hours, and an Airflow retry
+re-ran all of them. The copy stage now runs one task per *batch* of tables, so
+a stuck copy fails its own batch and the others keep going.
+
+**Finding your table.** The `flatten_and_batch` task logs the whole plan before
+any copying starts — one line per batch with its index, its estimated duration
+and the tables in it. Search its log for the table name to find which
+`run_distcp_ssh` map index to open. The HTML report is unchanged: it reads the
+tracking tables, so it still lists every table individually.
+
+**How the split is decided.** Nothing to configure and nothing to measure.
+Five steps, all finished before the first copy starts.
+
+**1. Estimate each table, in seconds.** Discovery already recorded size, file
+count and partition list, so the estimate is:
+
+```
+30s  +  size / 150 MB/s  +  45s per DistCp job  +  24s per partition directory
+     +  0.002s per file
+```
+
+A partition-filtered table with `MIGRATION_DISTCP_PRESERVE_DELETE=true` (the
+default) runs **one DistCp job per partition** and scans each partition
+directory twice, so a 365-partition table costs far more than its size alone
+suggests. A table that failed discovery estimates 0.
+
+**2. Set one size limit for every batch** — the smaller of these two:
+
+- **5.76 hours** — the largest batch whose budget can still fire before the
+  8-hour `execution_timeout` kills the task.
+- **total estimated work / 6** — twice `MIGRATION_DISTCP_COPY_MAX_CONCURRENT`
+  (default 3), so the work spreads across the copy slots available to it.
+
+Below roughly 35 hours of total work the second is smaller and you get about
+six to ten batches. Above that the 5.76-hour limit takes over and holds, for a
+run of any size.
+
+**3. Fill the batches.** Tables are sorted most expensive first, and each one
+goes into the first batch with room left — under the size limit, and under
+`migration_distcp_max_tables_per_batch` (25). A table whose own estimate
+exceeds the limit gets a batch to itself, because one table cannot be split. A
+batch never spans two source databases.
+
+**4. Budget each batch:** `max(its own estimate, the size limit) x 1.25`,
+capped at 7.2 hours. The `max` stops a small batch being starved by its own low
+estimate, the 1.25 is slack for a wrong estimate, and the 7.2-hour cap — nine
+tenths of the task timeout — keeps the budget firing *before* the task is
+killed. That last part matters: a batch killed by the task timeout writes no
+status rows at all, which is why no batch is ever budgeted past it.
+
+**5. Order batches most expensive first,** so the long ones start first and the
+whole run finishes sooner.
+
+So batch count follows from total work — expect roughly one batch per four to
+six hours of estimated work, depending on how evenly the tables pack.
+
+**A copy that starts late.** The budget only stops new tables from starting; a
+copy already running when it runs out keeps going. So every copy attempt,
+retries included, is also cut off half an hour before the eight-hour task
+timeout, whatever its own timeout says, leaving that half hour for the checks
+that run after a copy. A copy cut off this way is recorded as timed out, its
+YARN job is killed, and the automatic retry resumes it with `-update`. Without
+this, the task timeout would kill the whole batch, lose its status rows, and
+leave the copy's YARN job writing while the retry started a second one.
+
+The weights above are fixed in code, and deliberately not configurable. What
+drives the plan is the *ratio* between a table's size and its partition count,
+not the absolute numbers, and that ratio barely moves between clusters.
+Planning as though the cluster ran at 150 MB/s when it actually runs at 5 MB/s
+changes total runtime by under 5% on the table-population shapes this was
+measured against — which is why tuning them would not repay the calibration
+runs it would cost.
+
+Each copy still logs `[DistCp] cost estimate Xs vs actual Ys`; it is
+informational only — there is nothing to adjust in response to it.
+
+**One caveat.** Estimates assume a full first copy. Re-runs use DistCp's
+incremental mode, where most of the time goes on directory scans rather than
+transfer, so estimates come out high and batches correspondingly small. This is
+safe, just conservative.
+
+**A table larger than one attempt.** Two limits matter, and they are not the
+same number. Any single copy call is abandoned after six hours
+(`migration_distcp_call_timeout_max_seconds`), so a table needing longer than
+that will always take more than one attempt. The batching log only warns about
+it once the estimate passes 7.2 hours — nine tenths of the eight-hour task
+timeout, which is the most any batch can be budgeted. Between those two figures
+a table retries silently: expect it to succeed on a later attempt rather than to
+be announced in advance. Either way it is not stuck, because every copy runs
+`-update` and each attempt resumes where the last stopped. Past roughly three
+attempts' worth of work, split the table at the source. Raising that ceiling
+past 28200 seconds requires raising `SSH_COMMAND_TIMEOUT` with it, or an
+abandoned copy can leave an orphaned YARN job writing to the destination.
+
+**Concurrency.** `MIGRATION_DISTCP_COPY_MAX_CONCURRENT` (default 3) caps
+concurrent copies per DAG run. It is read from `env.shared` at parse time, so
+changing it means redeploying with `deploy.py`, not editing an Airflow
+Variable. With `max_active_runs=5`, up to five runs can each use that many
+slots, so the true ceiling is five times the value — but Airflow's default of
+16 task slots per DAG binds first: at 3 × 5 = 15 the copies leave almost
+nothing for the rest of the pipeline.
+
+**Three errors you may see in the report.** `batch budget exhausted before this
+table started` means the batch ran out of time before reaching this table at
+all — nothing was copied. `batch budget exhausted while copying this table`
+means the copy had started; how much landed is in the row's own byte and file
+counts. Both are followed by an automatic retry, and because every copy runs
+`-update`, each attempt resumes where the last stopped rather than starting
+over. If a table still fails after all three attempts, it needs more time than
+one task can be given — split it at the source, or have the eight-hour task
+timeout raised in the DAG source — unlike the settings above, it is a constant
+in code rather than a configurable value. `not processed by any batch` means no
+copy task ever reported on the table — its batch was killed before it could
+report — so re-run the DAG for that database.
+
+**Before deploying this version.** Let in-flight `source_to_s3_migration` runs
+finish, or clear them. A run whose discovery completed under the previous
+version carries no batch index, so the new batching task raises by design
+rather than risk copying the wrong tables.
 
 ---
 
@@ -567,7 +715,7 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 ### Task Flow
 
 ```
-validate_prerequisites (SSH: connectivity, cluster auth, PySpark+Hive, Hadoop FS checks)
+validate_prerequisites (SSH: connectivity, cluster auth, PySpark+Hive, DistCp, Hadoop FS checks)
 ↓
 init_tracking_tables
 ↓
@@ -614,16 +762,17 @@ finalize_run
 **Purpose:** Validate all required components are available before starting migration
 
 - Connects to the cluster edge node via SSH
-- Runs four sequential checks:
+- Runs five sequential checks:
   1. **SSH Connectivity** - Verifies SSH connection works with a simple echo command
-  2. **Cluster Authentication** - Verifies a valid ticket/TGT exists before attempting any cluster operations:
+  2. **Cluster Authentication** - Verifies the service account holds a valid ticket before attempting any cluster operations:
      - `mapr`: `maprlogin print | grep -q <service_account_user_id>` — confirms a valid MapR ticket for the configured user
-     - `kinit`: `klist -s` — confirms a valid Kerberos TGT in the ccache (populated by the login shell)
+     - `kinit`: `klist -s`, then `klist`'s default principal — confirms a valid Kerberos TGT in the ccache (populated by the login shell) whose principal is `service_account_user_id`, or the SSH login user when that's unset (ignoring `/instance`, `@REALM`, `DOMAIN\` and case)
      - `none`: skipped (auto-passes)
   3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`. The Hive scratch dir is overridden to `cluster_hive_scratch_dir` so the check passes under a tenant service account
-  4. **Hadoop FS** - Runs `hadoop fs -ls /` (MapR) or `hadoop fs -ls hdfs://<nameservice>/` (HDFS HA) to confirm filesystem access
+  4. **Hadoop DistCp** - Checks `hadoop distcp` prints its usage, so a missing DistCp fails here rather than at the copy step
+  5. **Hadoop FS** - Runs `hadoop fs -ls /` (MapR) or `hadoop fs -ls hdfs://<nameservice>/` (HDFS HA) to confirm filesystem access
 - Sources `/etc/profile.d/*.sh` via a bash login shell before each check to ensure cluster auth and environment variables are loaded
-- If **all four checks pass**, proceeds with migration
+- If **all five checks pass**, proceeds with migration
 - If **any check fails**, raises an exception with a detailed summary of which checks failed and why, halting the DAG before any tracking tables or run records are created
 
 ---
@@ -680,7 +829,7 @@ finalize_run
   1. **Kerberos authentication** - Assumes a valid Kerberos ticket sourced via the login shell
   2. **Existing MapR ticket** - Validates existing valid ticket with `maprlogin print`
 - Verifies ticket validity with `maprlogin print` or `klist`
-- Resolves the effective cluster identity from `maprlogin print` (falling back to `id -un`) and logs it as `MAPR_EFFECTIVE_USER=`
+- Resolves the effective cluster identity (on MapR from `maprlogin print`, otherwise `id -un`) and logs it as `EFFECTIVE_USER=` (runs before this change logged `MAPR_EFFECTIVE_USER=`)
 - Creates the local working directory on the edge node (`{cluster_edge_temp_path}/{run_id}`, default `/tmp/migration/{run_id}`)
 - Creates the DistCp log directory on the cluster filesystem (`{cluster_distcp_log_root}/{cluster_user}/distcp_logs/{run_id}`, default root `/tmp`) and logs it as `DISTCP_LOG_DIR=`
 - Ensures all subsequent SSH operations can access the source filesystem
@@ -1422,7 +1571,7 @@ Copies raw folders from MapR-FS/HDFS to S3 using Hadoop DistCp via SSH, with no 
 ### Task Flow
 
 ```
-validate_prerequisites_folder_copy  (SSH: check hadoop distcp, hadoop fs)
+validate_prerequisites_folder_copy  (SSH: check cluster auth, hadoop distcp, hadoop fs)
     ↓
 init_folder_copy_tracking_tables
     ↓
@@ -1465,10 +1614,11 @@ send_data_copy_report_email
 **Purpose:** Validate SSH connectivity and Hadoop tooling before starting the folder copy
 
 - Connects to the cluster edge node via SSH
-- Runs three sequential checks:
+- Runs four sequential checks:
   1. **SSH Connectivity** — verifies SSH connection with a simple echo command
-  2. **Hadoop DistCp** — checks `hadoop distcp` is available on the edge node
-  3. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
+  2. **Cluster Authentication** — the same ticket check as DAG 1's `validate_prerequisites`
+  3. **Hadoop DistCp** — checks `hadoop distcp` prints its usage on the edge node
+  4. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
 - Sources environment via the login shell before each check to ensure environment variables are loaded
 - If **all checks pass**, returns a `checks` dict and proceeds
 - If **any check fails**, raises an exception with a detailed summary, halting the DAG before any tracking tables or run records are created

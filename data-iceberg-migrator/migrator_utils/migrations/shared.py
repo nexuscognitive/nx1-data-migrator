@@ -65,6 +65,20 @@ PORTAL_VARIABLE_ALIASES = {
 # masked prefill stored it literally as their identity.
 _AIRFLOW_MASKED_VALUE = '***'
 
+# Keys retired by the calibration-free batching change. Warned about rather
+# than ignored: all five are commented out in env.shared.example, so a value
+# here means someone deliberately set it and is owed an explanation.
+_RETIRED_DISTCP_KEYS = {
+    'migration_distcp_cost_mbps': 'throughput is a fixed constant',
+    'migration_distcp_cost_seconds_per_job': 'per-job cost is a fixed constant',
+    'migration_distcp_cost_seconds_per_path_scan':
+        'per-path-scan cost is a fixed constant',
+    'migration_distcp_batch_target_cost_seconds':
+        'the batch cap derives from execution_timeout',
+    'migration_distcp_max_batches':
+        'the batch cap derives from execution_timeout',
+}
+
 __all__ = [
     "PORTAL_TRIGGER",
     "PORTAL_OWNED_KEYS",
@@ -74,14 +88,19 @@ __all__ = [
     "cell_str",
     "cluster_login",
     "compute_dest_path",
+    "distcp_batching_mode",
     "distcp_jvm_opts",
     "distcp_sizing_mode",
+    "effective_source_metrics",
+    "estimate_distcp_cost",
     "execute_with_iceberg_retry",
     "get_config",
     "hive_type_to_spark_ddl",
     "is_permanent_error",
     "normalize_s3",
+    "pack_tables_into_batches",
     "permanent_fail",
+    "resolve_batch_cap",
     "size_distcp_job",
     "track_duration",
     "validate_bucket_endpoint_pairs",
@@ -233,6 +252,7 @@ TENANT_PROFILE_KEYS = frozenset({
     'ssh_conn_id',
     'mapr_ticketfile_location',
     'auth_method',
+    'cluster_type',
     'edge_temp_path',
     'hive_scratch_dir',
     'service_account_user_id',
@@ -434,6 +454,13 @@ def get_config() -> dict:
             )
         return value
 
+    for _retired_key, _reason in _RETIRED_DISTCP_KEYS.items():
+        if str(_var(_retired_key, _retired_key.upper(), '') or '').strip():
+            logger.warning(
+                f"[Config] {_retired_key} is set but no longer used — "
+                f"{_reason}. Remove it to silence this."
+            )
+
     dag_owner = _var('migration_dag_owner', 'MIGRATION_DAG_OWNER', '') \
                 or _dag_run_conf.get('dag_owner', '') \
                 or _dag_run_conf.get('spark_user', '') \
@@ -533,6 +560,15 @@ def get_config() -> dict:
             )
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
+        'distcp_max_tables_per_batch': _int_var(
+            'migration_distcp_max_tables_per_batch',
+            'MIGRATION_DISTCP_MAX_TABLES_PER_BATCH', '25'
+        ),
+        'distcp_call_timeout_max_seconds': _int_var(
+            'migration_distcp_call_timeout_max_seconds',
+            'MIGRATION_DISTCP_CALL_TIMEOUT_MAX_SECONDS', '21600'
+        ),
+
         # Spark Configuration
         'spark_conn_id': _var('migration_spark_conn_id', 'MIGRATION_SPARK_CONN_ID', 'spark_default'),
 
@@ -541,8 +577,8 @@ def get_config() -> dict:
         'tracking_location': _var('migration_tracking_location', 'MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking'),
         'report_output_location': _var('migration_report_location', 'MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports'),
 
-        # Cluster type for display/reporting purposes ('MapR' or 'HDP')
-        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
+        # Cluster type: report label and S3A committer choice ('MapR', 'HDP' or 'CDP')
+        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR', conf_key='cluster_type'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
         'service_account_user_id': _var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id').strip(),
@@ -635,6 +671,56 @@ def _login_shell(cmd: str, cluster_type: str = 'MapR') -> str:
         return f"source ~/.profile 2>/dev/null || true\n{cmd}"
     return f"bash -l <<'__LOGIN_SHELL_EOF__'\n{cmd}\n__LOGIN_SHELL_EOF__\n"
 
+
+def _cluster_auth_check_cmd(auth_method: str, expected_user: str) -> str:
+    """Shell check for the edge node's cluster login, shared by the DAG pre-checks.
+
+    Prints CLUSTER_AUTH_OK, or prints CLUSTER_AUTH_FAIL: <reason> and exits 1.
+    MapR needs a `maprlogin print` ticket for expected_user; Kerberos needs a valid
+    TGT whose principal is expected_user (the login user when empty for both);
+    anything else needs nothing.
+    """
+    if auth_method == 'mapr':
+        return f"""
+EXPECTED_USER={shlex.quote(expected_user)}
+if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
+if maprlogin print 2>/dev/null | grep -qF -- "$EXPECTED_USER"; then
+    echo "CLUSTER_AUTH_OK"
+else
+    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '$EXPECTED_USER'. Run maprlogin on the edge node."
+    exit 1
+fi
+"""
+    if auth_method == 'kinit':
+        return f"""
+EXPECTED_USER={shlex.quote(expected_user)}
+if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
+if ! klist -s 2>/dev/null; then
+    echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
+    exit 1
+fi
+# MIT prints "Default principal:", Heimdal "Principal:".
+PRINCIPAL=$(klist 2>/dev/null | sed -n -e 's/^Default principal: //p' -e 's/^[[:space:]]*Principal: //p' | head -1)
+# Bare lowercase name, like Hadoop's default auth_to_local. Also applied to the expected
+# user, which can be DOMAIN\\user or user@domain on AD-joined hosts.
+_bare_user() {{ u=${{1##*\\\\}}; u=${{u%%@*}}; u=${{u%%/*}}; printf '%s' "$u" | tr '[:upper:]' '[:lower:]'; }}
+TICKET_USER=$(_bare_user "$PRINCIPAL")
+if [ -z "$TICKET_USER" ] || [ "$TICKET_USER" != "$(_bare_user "$EXPECTED_USER")" ]; then
+    echo "CLUSTER_AUTH_FAIL: Kerberos ticket is for '$PRINCIPAL', expected service account '$EXPECTED_USER'. Run kinit as the service account on the edge node, or set service_account_user_id."
+    exit 1
+fi
+echo "CLUSTER_AUTH_OK"
+klist 2>/dev/null | head -4
+"""
+    return 'echo "CLUSTER_AUTH_OK"'
+
+
+# `hadoop distcp` with no arguments prints its usage and exits non-zero, so match the
+# usage line itself: a missing DistCp class also prints "distcp" in its error. hadoop
+# stays out of the pipeline so a profile's pipefail/errexit can't turn usage into a fail.
+DISTCP_CHECK_CMD = """DISTCP_USAGE=$(hadoop distcp 2>&1 || true)
+if printf '%s\\n' "$DISTCP_USAGE" | grep -i '^usage: distcp' >/dev/null; then echo DISTCP_OK; else echo DISTCP_FAIL; fi"""
+
 def _edge_path_template(path: str) -> str:
     if not path:
         return path
@@ -725,17 +811,19 @@ echo "Authentication successful"
 
     auth_script_parts.append(f"""
 if [ -z "$CONFIGURED_SA_USER" ]; then
-    TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
-    if [ -n "$TICKET_USER" ]; then
-        MIG_USER="$TICKET_USER"
-        MIG_USER_SOURCE="active MapR ticket"
+    if [ "{auth_method}" = "mapr" ]; then
+        TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
+        if [ -n "$TICKET_USER" ]; then
+            MIG_USER="$TICKET_USER"
+            MIG_USER_SOURCE="active MapR ticket"
+        fi
     fi
     export MIG_USER
     echo "WARNING: service_account_user_id is not configured. Falling back to"
     echo "WARNING: '$MIG_USER' from $MIG_USER_SOURCE. Set service_account_user_id"
     echo "WARNING: explicitly so temp and log paths do not depend on .profile."
 fi
-echo "MAPR_EFFECTIVE_USER=$MIG_USER"
+echo "EFFECTIVE_USER=$MIG_USER"
 echo "SERVICE_ACCOUNT_SOURCE=$MIG_USER_SOURCE"
 
 echo "=== Creating temp directory ==="
@@ -754,7 +842,9 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 """)
     full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
-        _, stdout, stderr = client.exec_command(_login_shell(full_script), timeout=300)
+        _, stdout, stderr = client.exec_command(
+            _login_shell(full_script, config.get('cluster_type', 'MapR')), timeout=300
+        )
         output = stdout.read().decode()
         error = stderr.read().decode()
         exit_code = stdout.channel.recv_exit_status()
@@ -790,7 +880,7 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_log_dir = val
-        elif line.startswith("MAPR_EFFECTIVE_USER="):
+        elif line.startswith(("EFFECTIVE_USER=", "MAPR_EFFECTIVE_USER=")):
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_sa_user = val
@@ -821,14 +911,15 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 
 
 def _s3a_committer_opts(config: dict) -> str:
-    """Return S3A magic-committer JVM flags for HDP clusters.
+    """Return S3A magic-committer JVM flags for HDP and CDP clusters.
 
     MapR has its own S3 connector and doesn't use FileOutputCommitter, so no
-    flags are needed there. HDP 3.x uses vanilla S3A whose default v1 committer
-    tries an atomic rename on S3 (unsupported), causing CommitterEventHandler
-    failures. The magic committer bypasses that with S3 multipart uploads.
+    flags are needed there. HDP 3.x and CDP 7.x use vanilla S3A whose default v1
+    committer tries an atomic rename on S3 (unsupported), causing
+    CommitterEventHandler failures. The magic committer bypasses that with S3
+    multipart uploads.
     """
-    if config.get('cluster_type', 'MapR').upper() == 'HDP':
+    if config.get('cluster_type', 'MapR').upper() in ('HDP', 'CDP'):
         return (
             " -Dmapreduce.outputcommitter.factory.scheme.s3a="
             "org.apache.hadoop.fs.s3a.commit.S3ACommitterFactory"
@@ -941,6 +1032,182 @@ def distcp_sizing_mode(config: dict) -> str:
             f"{config['distcp_min_mappers']}-{config['distcp_max_mappers']} mappers, "
             f"{config['distcp_target_aggregate_mbps']} MB/s aggregate, "
             f"{config['distcp_max_mapper_bandwidth']} MB/s per-mapper cap")
+
+
+# =============================================================================
+# DistCp batch planning
+# =============================================================================
+# Cost weights. Deliberately module constants rather than config keys: the
+# ratios between them are what the packer consumes, and a 30x error in the
+# assumed throughput costs under 5% makespan (see the design doc's Evidence),
+# so exposing them bought tuning guidance for terms that do not move the plan.
+_COST_MBPS = 150
+_COST_SECONDS_PER_JOB = 45
+_COST_SECONDS_PER_PATH_SCAN = 12
+_COST_BASE_SECONDS = 30
+_COST_SECONDS_PER_FILE = 0.002
+_COST_MKDIR_SECONDS_PER_PATH = 2
+# A batch is allowed a quarter more than its plan before the deadline bites.
+_BUDGET_SLACK = 1.25
+# The largest share of execution_timeout a batch budget may claim, so the soft
+# budget always fires before Airflow's SIGKILL discards the batch's XCom.
+_BATCH_BUDGET_FRACTION = 0.9
+# Batch-count floor per concurrency lane, so a small run still spreads out.
+_BATCHES_PER_LANE = 2
+
+
+def effective_source_metrics(table: dict) -> tuple[int, int]:
+    """Return (size_bytes, file_count) DistCp will actually move for one table.
+
+    A partition filter narrows the copy, so the filtered totals are the real
+    input. run_distcp_ssh and estimate_distcp_cost must agree on this rule or
+    the plan describes a copy that never happens.
+    """
+    if table.get('partition_filter_active'):
+        size = table.get('filtered_source_size_bytes',
+                         table.get('source_total_size_bytes', 0))
+        files = table.get('filtered_file_count',
+                          table.get('source_file_count', 0))
+    else:
+        size = table.get('source_total_size_bytes', 0)
+        files = table.get('source_file_count', 0)
+    return int(size or 0), int(files or 0)
+
+
+def estimate_distcp_cost(table: dict, config: dict) -> float:
+    """Estimated wall-clock seconds to copy one table.
+
+    Mirrors the three shell paths in run_distcp_ssh rather than size alone.
+    With preserve_delete on (the default) a partition-filtered copy submits one
+    DistCp job per non-empty partition and scans every partition path twice, so
+    for those tables partition count dominates bytes.
+
+    Weights are fixed constants, not config: see the design doc. Calibrated for
+    a full first copy. Every copy runs -update, so on a re-run the real cost is
+    dominated by the before/after directory scans and this overestimates —
+    relative ordering survives, which is what the packer needs.
+    """
+    if table.get('error') or table.get('error_type'):
+        return 0.0
+
+    size_bytes, file_count = effective_source_metrics(table)
+    filtered = bool(table.get('partition_filter_active'))
+    partitions = list(table.get('filtered_partitions') or []) if filtered else []
+
+    if filtered and not partitions:
+        # The loop SKIPs a filter that matched nothing before any copy work.
+        return float(_COST_BASE_SECONDS)
+
+    paths = len(partitions) if filtered else 1
+
+    if file_count == 0:
+        # Empty source: one SSH call of mkdir -p, no job and no metrics scans.
+        return float(_COST_BASE_SECONDS + paths * _COST_MKDIR_SECONDS_PER_PATH)
+
+    if filtered and config.get('distcp_preserve_delete'):
+        counts = table.get('partition_file_counts') or {}
+        # .get(p, 1) mirrors the shell: an absent count means "assume non-empty".
+        jobs = sum(1 for p in partitions if counts.get(p, 1) > 0)
+    else:
+        jobs = 1
+
+    return (
+        _COST_BASE_SECONDS
+        + size_bytes / (_COST_MBPS * 1024 * 1024)
+        + jobs * _COST_SECONDS_PER_JOB
+        + paths * _COST_SECONDS_PER_PATH_SCAN * 2
+        + file_count * _COST_SECONDS_PER_FILE
+    )
+
+
+def _cap_ceiling(backstop_seconds: float) -> float:
+    """Largest per-batch cost whose budget can still fire before the SIGKILL.
+
+    Shared by resolve_batch_cap and distcp_batching_mode so the cap and the
+    label describing which term produced it cannot disagree.
+    """
+    return _BATCH_BUDGET_FRACTION * backstop_seconds / _BUDGET_SLACK
+
+
+def resolve_batch_cap(
+    total_cost: float, lanes: int, backstop_seconds: float
+) -> float:
+    """Per-batch cost ceiling in seconds. No knobs, two terms.
+
+    The backstop term is the largest batch whose budget can still fire before
+    Airflow's execution_timeout SIGKILLs the task; a cap above it produces
+    batches that die without writing their FAILED rows, which is what the
+    retired migration_distcp_max_batches actively caused at 500 tables.
+
+    The lane term is a floor on batch count, so a small run spreads across the
+    concurrency available to it instead of collapsing into a single task. It
+    only binds below roughly lanes * _BATCHES_PER_LANE * ceiling of total work.
+
+    backstop_seconds is a parameter, not a constant, because it belongs to the
+    DAG (_DISTCP_EXECUTION_TIMEOUT) and shared.py must not import the DAG.
+    """
+    ceiling = _cap_ceiling(backstop_seconds)
+    if lanes <= 0:
+        return ceiling
+    return min(ceiling, total_cost / (lanes * _BATCHES_PER_LANE))
+
+
+def pack_tables_into_batches(
+    tables: list[dict], cap_seconds: float, config: dict
+) -> list[tuple[float, list[dict]]]:
+    """First-fit-decreasing pack of one group's tables into cost-capped bins.
+
+    Returns (bin_cost, bin_tables) sorted by cost descending, so the caller can
+    give the expensive batches the low map indexes and let Airflow start them
+    first.
+
+    Never drops a table: one costing more than the cap gets a bin to itself, and
+    max_tables_per_batch is a hard cap that wins over the cost cap. Zero-cost
+    skippable tables are packed too — their SKIPPED status is written by
+    update_distcp_status from whichever element they belong to.
+    """
+    max_tables = int(config['distcp_max_tables_per_batch'])
+    costed = sorted(
+        ((estimate_distcp_cost(t, config), t) for t in tables),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+
+    bins: list[list] = []  # [cost, tables]
+    for cost, table in costed:
+        for b in bins:
+            if len(b[1]) < max_tables and b[0] + cost <= cap_seconds:
+                b[0] += cost
+                b[1].append(table)
+                break
+        else:
+            bins.append([cost, [table]])
+
+    bins.sort(key=lambda b: b[0], reverse=True)
+    return [(b[0], b[1]) for b in bins]
+
+
+def distcp_batching_mode(
+    cap_seconds: float, lanes: int, backstop_seconds: float, config: dict
+) -> str:
+    """Describe the derived batch plan, for the task log.
+
+    Naming which term bound the cap is the point: without it a plan of one
+    giant batch reads identically whether the backstop ceiling bound or the
+    lane floor did.
+    """
+    ceiling = _cap_ceiling(backstop_seconds)
+    bound_by = (
+        'execution_timeout backstop' if cap_seconds >= ceiling
+        else f'{lanes}-lane floor'
+    )
+    return (
+        f"DERIVED-CAP — cap {cap_seconds:.0f}s/batch (bound by the "
+        f"{bound_by}), at most {config['distcp_max_tables_per_batch']} "
+        f"tables/batch; weights fixed at {_COST_MBPS} MB/s, "
+        f"{_COST_SECONDS_PER_JOB}s/job, {_COST_SECONDS_PER_PATH_SCAN}s/"
+        f"path-scan (not configurable)"
+    )
 
 
 def distcp_jvm_opts(config: dict) -> str:

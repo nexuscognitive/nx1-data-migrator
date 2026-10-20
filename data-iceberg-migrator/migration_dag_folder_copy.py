@@ -26,7 +26,9 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from migrator_utils.migrations.shared import (
+    DISTCP_CHECK_CMD,
     SSH_COMMAND_TIMEOUT,
+    _cluster_auth_check_cmd,
     _login_shell,
     build_s3_opts,
     cluster_login,
@@ -140,6 +142,7 @@ def validate_prerequisites_folder_copy() -> dict:
 
     checks = {
         'ssh_connectivity': False,
+        'cluster_auth': False,
         'hadoop_distcp_available': False,
         'hadoop_fs_available': False,
     }
@@ -153,7 +156,7 @@ def validate_prerequisites_folder_copy() -> dict:
         with ssh.get_conn() as client:
 
             # 1. SSH connectivity
-            logger.info("[1/3] Testing SSH connectivity...")
+            logger.info("[1/4] Testing SSH connectivity...")
             _, stdout, stderr = client.exec_command(_login_shell('echo "SSH_TEST_OK"', config.get('cluster_type', 'MapR')), timeout=30)
             output = stdout.read().decode()
             stderr.read()
@@ -166,10 +169,27 @@ def validate_prerequisites_folder_copy() -> dict:
                 errors.append(f"SSH: {msg}")
                 logger.error(f"SSH connectivity: FAILED - {msg}")
 
-            # 2. Hadoop DistCp
-            logger.info("[2/3] Testing hadoop distcp availability...")
-            test_cmd = "hadoop distcp 2>&1 | grep -qi 'usage\\|distcp\\|options' && echo DISTCP_OK || echo DISTCP_FAIL"
-            _, stdout, stderr = client.exec_command(_login_shell(test_cmd, config.get('cluster_type', 'MapR')), timeout=60)
+            # 2. Cluster authentication (MapR ticket or Kerberos TGT), same check as DAG 1
+            auth_method = config.get('auth_method', 'mapr')
+            logger.info(f"[2/4] Testing cluster authentication (auth_method={auth_method})...")
+            auth_cmd = _cluster_auth_check_cmd(auth_method, config.get('service_account_user_id', ''))
+            _, stdout, stderr = client.exec_command(_login_shell(auth_cmd, config.get('cluster_type', 'MapR')), timeout=30)
+            output = stdout.read().decode()
+            stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
+            if exit_code == 0 and "CLUSTER_AUTH_OK" in output:
+                checks['cluster_auth'] = True
+                logger.info(f"Cluster auth ({auth_method}): PASSED")
+            else:
+                msg = output.replace("CLUSTER_AUTH_FAIL: ", "").strip() or f"Auth check failed (exit={exit_code})"
+                errors.append(f"Cluster auth: {msg}")
+                logger.error(f"Cluster auth ({auth_method}): FAILED - {msg}")
+
+            # 3. Hadoop DistCp
+            logger.info("[3/4] Testing hadoop distcp availability...")
+            _, stdout, stderr = client.exec_command(
+                _login_shell(DISTCP_CHECK_CMD, config.get('cluster_type', 'MapR')), timeout=60
+            )
             output = stdout.read().decode()
             stderr.read()
             exit_code = stdout.channel.recv_exit_status()
@@ -181,8 +201,8 @@ def validate_prerequisites_folder_copy() -> dict:
                 errors.append(f"DistCp: {msg}")
                 logger.error(f"Hadoop DistCp: FAILED - {msg}")
 
-            # 3. Hadoop FS
-            logger.info("[3/3] Testing Hadoop FS commands...")
+            # 4. Hadoop FS
+            logger.info("[4/4] Testing Hadoop FS commands...")
             hdfs_nameservice = config.get('hdfs_nameservice', '')
             fs_root = f"hdfs://{hdfs_nameservice}/" if hdfs_nameservice else "/"
             test_cmd = f"if hadoop fs -ls {fs_root} > /dev/null 2>&1; then echo HADOOP_FS_OK; else echo HADOOP_FS_FAIL; fi"
@@ -201,6 +221,7 @@ def validate_prerequisites_folder_copy() -> dict:
     except Exception as e:
         msg = f"SSH connection failed: {str(e)}"
         errors.append(f"SSH: {msg}")
+        errors.append("Cluster auth: Skipped due to SSH failure")
         errors.append("DistCp: Skipped due to SSH failure")
         errors.append("Hadoop FS: Skipped due to SSH failure")
         logger.error(f"SSH connectivity: FAILED - {msg}")
