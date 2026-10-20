@@ -20,10 +20,57 @@ Data platform migration tools (MapR/HDFS to S3/Iceberg) and access control autom
 
 ```bash
 python deploy.py --project migrator --dag iceberg --owner my-name --suffix dev1
+python deploy.py --project migrator --dag hive_metadata --owner my-name --dry-run
 python deploy.py --project ranger --dag ranger --owner my-name --suffix dev1 --dry-run
 ```
 
 Use `--dry-run` to preview the upload plan without uploading.
+
+## Hive Metadata Migration DAG
+
+The `hive_metadata_migration` DAG registers table definitions in the target Hive catalog after the table data has already been migrated to its target location. It reads source Hive metadata through the edge node and creates target metadata through Spark; it does not copy data. Source views are skipped.
+
+### Excel input
+
+Upload an `.xlsx` mapping workbook to a location readable by the target Spark connection. The DAG parameter `excel_file_path` should point to that file (for example, `s3a://<bucket>/<path>/hive_metadata_migration.xlsx`). Use one row per table with these columns:
+
+| Column | Required | Description |
+| --- | --- | --- |
+| `source_database` | Yes | Source Hive database |
+| `source_table` | Yes | Source Hive table |
+| `target_database` | Yes | Target catalog database |
+| `target_table` | Yes | Target table name |
+| `target_location` | Yes | Existing target data directory |
+| `allow_empty` | No | Defaults to `false`. Set `true` only when an existing, intentionally empty directory should be registered. |
+
+Example:
+
+| source_database | source_table | target_database | target_table | target_location | allow_empty |
+| --- | --- | --- | --- | --- | --- |
+| sales | orders | sales | orders | `s3a://<bucket>/warehouse/sales/orders` | false |
+
+Before registration, the DAG verifies the target directory exists and recursively checks for at least one visible file, ignoring hidden and marker files. An empty directory fails by default; `allow_empty=true` permits metadata registration without data. This is only a file-presence check, not a check of data completeness or correctness.
+
+### Airflow setup and run
+
+Configure the Airflow `cluster_edge_ssh` connection (or set `cluster_ssh_conn_id` to another SSH connection) for access to the source Hive edge node. Configure the `spark_default` connection to use the target Spark/Hive catalog and ensure it can read the workbook, list and access target data paths, write tracking tables, and write reports.
+
+Set or confirm these Airflow Variables for the environment:
+
+| Variable | Purpose |
+| --- | --- |
+| `cluster_ssh_conn_id` | Edge-node SSH connection ID; defaults to `cluster_edge_ssh` |
+| `cluster_edge_temp_path` | Edge-node working directory; defaults to `/tmp/migration` |
+| `cluster_hive_scratch_dir` | Source Hive scratch directory; defaults to `/tmp/hive` |
+| `auth_method` | Source cluster authentication (`mapr`, `kinit`, or `none`), as appropriate |
+| `cluster_type` | Source cluster type (`MapR`, `HDP`, or `CDP`) |
+| `migration_tracking_database` | Database for durable run and table tracking |
+| `migration_tracking_location` | Storage location for the tracking Iceberg tables |
+| `migration_report_location` | Storage location for the HTML run report |
+| `migration_email_recipients` | Optional comma-separated report recipients; no email is sent when empty |
+| `migration_smtp_conn_id` | SMTP connection for optional email; defaults to `smtp_default` |
+
+Deploy the DAG with `python deploy.py --project migrator --dag hive_metadata --owner <owner>`, then trigger `hive_metadata_migration` in Airflow and set `excel_file_path` to the workbook path. The DAG tracks per-table discovery, data presence, metadata creation, and schema/location validation, then writes an HTML report. For implementation details and limitations, see [the migrator documentation](data-iceberg-migrator/docs/README.md#hive-metadata-migration).
 
 ## Development Setup
 
