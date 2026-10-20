@@ -53,7 +53,22 @@ First match wins:
 | `auth_method`              | Authentication method: `mapr`, `kinit`, or `none`                                                                                                                                                                            | MapR/Kerberos    | `source_to_s3_migration`, `folder_only_data_copy` |
 | `service_account_user_id`  | **Recommended.** Tenant service account the DAG runs as on the source cluster. Validates the MapR ticket and builds every user-scoped temp and log path. See [Service account configuration](#service-account-configuration) | All auth methods | `source_to_s3_migration`, `folder_only_data_copy` |
 | `mapr_ticketfile_location` | MapR ticket file path                                                                                                                                                                                                        | MapR auth        | `source_to_s3_migration`, `folder_only_data_copy` |
-| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.                                                                                                                                                                               | HTML reports     | `source_to_s3_migration`                          |
+| `cluster_type`             | Report label and S3A committer choice: `MapR`, `HDP` or `CDP`. `HDP` and `CDP` add the S3A magic-committer flags to DistCp.                                                                                                  | HTML reports     | `source_to_s3_migration`                          |
+
+#### Testing against a Kerberized CDP edge node
+
+With `auth_method=kinit`, both pre-checks (DAG 1 `validate_prerequisites`, DAG 3
+`validate_prerequisites_folder_copy`) check the edge node's Kerberos ticket. They fail
+with `Cluster auth: No valid Kerberos TGT found` when the SSH user has no ticket, and with
+`Cluster auth: Kerberos ticket is for '<principal>', expected service account '<user>'`
+when the ticket's principal isn't `service_account_user_id` (or the SSH login user when
+that's unset). Both sides are compared as bare names, ignoring case, `/instance`, `@REALM`
+and a `DOMAIN\` prefix. The DAGs
+expect the edge node to hold the ticket (for example, `kinit -kt` from the service
+account's keytab in its `~/.profile`); they don't run `kinit` themselves.
+
+`dev-tools/cdp-edge-node/` is a Kerberized CDP 7.1.x-style edge node for testing this end
+to end; see its `README.md` for setup and the DAG settings.
 
 ### Optional Variables
 
@@ -120,18 +135,18 @@ drives all of the following:
 
 **Resolution order**
 
-| Order | Source                                 | When used                           |
-| ----- | -------------------------------------- | ----------------------------------- |
-| 1     | `service_account_user_id` config       | Whenever it is set — always wins    |
-| 3     | Active MapR ticket (`maprlogin print`) | Neither is set, and a ticket exists |
-| 4     | Login shell user (`id -un`)            | Nothing else available              |
+| Order | Source                                 | When used                                                  |
+| ----- | -------------------------------------- | ---------------------------------------------------------- |
+| 1     | `service_account_user_id` config       | Whenever it is set — always wins                           |
+| 2     | Active MapR ticket (`maprlogin print`) | Not set, `auth_method=mapr`, and a ticket exists           |
+| 3     | Login shell user (`id -un`)            | Nothing else available (always the case for Kerberos runs) |
 
 **When it is configured (recommended)**
 
 Paths are deterministic and reviewable before the run. The value appears in the
 `cluster_login_setup` task log as:
 
-    MAPR_EFFECTIVE_USER=`USER_NAME`
+    EFFECTIVE_USER=`USER_NAME`
     SERVICE_ACCOUNT_SOURCE=config:service_account_user_id
 
 It is also used to validate the MapR ticket, so if the configured account and the
@@ -163,7 +178,7 @@ Example for a tenant service account:
 
     cluster_edge_temp_path = /user/${USER}/tmp/migration
 
-The resolved path is echoed as `TEMP_DIR=` and the identity as `MAPR_EFFECTIVE_USER=`
+The resolved path is echoed as `TEMP_DIR=` and the identity as `EFFECTIVE_USER=`
 in the `cluster_login_setup` task log.
 
 `cluster_edge_discovery_temp_path` does **not** support placeholders — the discovery
@@ -201,7 +216,7 @@ It is the resolved service account — `service_account_user_id` when set, other
 the `.profile` fallback. The resolved value is echoed in the
 `cluster_login_setup` task log as:
 
-    MAPR_EFFECTIVE_USER=<user>
+    EFFECTIVE_USER=<user>
     SERVICE_ACCOUNT_SOURCE=<where it came from>
     DISTCP_LOG_DIR=<full path>
 
@@ -301,8 +316,10 @@ through to the global Variable, so `tenant_2` above uses
 `cluster_edge_temp_path` as normal.
 
 Accepted keys in a profile: `ssh_conn_id`,
-`mapr_ticketfile_location`, `auth_method`, `edge_temp_path`,
-`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`.
+`mapr_ticketfile_location`, `auth_method`, `cluster_type`, `edge_temp_path`,
+`hive_scratch_dir`, `service_account_user_id`, `hdfs_nameservice`. The same keys
+can be set per run in `dag_run.conf` (for example, pointing one run at a Kerberized
+CDP edge node with `ssh_conn_id`, `auth_method=kinit` and `cluster_type=CDP`).
 
 **Resolution order** for these settings:
 
@@ -696,7 +713,7 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 ### Task Flow
 
 ```
-validate_prerequisites (SSH: connectivity, cluster auth, PySpark+Hive, Hadoop FS checks)
+validate_prerequisites (SSH: connectivity, cluster auth, PySpark+Hive, DistCp, Hadoop FS checks)
 ↓
 init_tracking_tables
 ↓
@@ -743,16 +760,17 @@ finalize_run
 **Purpose:** Validate all required components are available before starting migration
 
 - Connects to the cluster edge node via SSH
-- Runs four sequential checks:
+- Runs five sequential checks:
   1. **SSH Connectivity** - Verifies SSH connection works with a simple echo command
-  2. **Cluster Authentication** - Verifies a valid ticket/TGT exists before attempting any cluster operations:
+  2. **Cluster Authentication** - Verifies the service account holds a valid ticket before attempting any cluster operations:
      - `mapr`: `maprlogin print | grep -q <service_account_user_id>` — confirms a valid MapR ticket for the configured user
-     - `kinit`: `klist -s` — confirms a valid Kerberos TGT in the ccache (populated by the login shell)
+     - `kinit`: `klist -s`, then `klist`'s default principal — confirms a valid Kerberos TGT in the ccache (populated by the login shell) whose principal is `service_account_user_id`, or the SSH login user when that's unset (ignoring `/instance`, `@REALM`, `DOMAIN\` and case)
      - `none`: skipped (auto-passes)
   3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`. The Hive scratch dir is overridden to `cluster_hive_scratch_dir` so the check passes under a tenant service account
-  4. **Hadoop FS** - Runs `hadoop fs -ls /` (MapR) or `hadoop fs -ls hdfs://<nameservice>/` (HDFS HA) to confirm filesystem access
+  4. **Hadoop DistCp** - Checks `hadoop distcp` prints its usage, so a missing DistCp fails here rather than at the copy step
+  5. **Hadoop FS** - Runs `hadoop fs -ls /` (MapR) or `hadoop fs -ls hdfs://<nameservice>/` (HDFS HA) to confirm filesystem access
 - Sources `/etc/profile.d/*.sh` via a bash login shell before each check to ensure cluster auth and environment variables are loaded
-- If **all four checks pass**, proceeds with migration
+- If **all five checks pass**, proceeds with migration
 - If **any check fails**, raises an exception with a detailed summary of which checks failed and why, halting the DAG before any tracking tables or run records are created
 
 ---
@@ -809,7 +827,7 @@ finalize_run
   1. **Kerberos authentication** - Assumes a valid Kerberos ticket sourced via the login shell
   2. **Existing MapR ticket** - Validates existing valid ticket with `maprlogin print`
 - Verifies ticket validity with `maprlogin print` or `klist`
-- Resolves the effective cluster identity from `maprlogin print` (falling back to `id -un`) and logs it as `MAPR_EFFECTIVE_USER=`
+- Resolves the effective cluster identity (on MapR from `maprlogin print`, otherwise `id -un`) and logs it as `EFFECTIVE_USER=` (runs before this change logged `MAPR_EFFECTIVE_USER=`)
 - Creates the local working directory on the edge node (`{cluster_edge_temp_path}/{run_id}`, default `/tmp/migration/{run_id}`)
 - Creates the DistCp log directory on the cluster filesystem (`{cluster_distcp_log_root}/{cluster_user}/distcp_logs/{run_id}`, default root `/tmp`) and logs it as `DISTCP_LOG_DIR=`
 - Ensures all subsequent SSH operations can access the source filesystem
@@ -1519,7 +1537,7 @@ Copies raw folders from MapR-FS/HDFS to S3 using Hadoop DistCp via SSH, with no 
 ### Task Flow
 
 ```
-validate_prerequisites_folder_copy  (SSH: check hadoop distcp, hadoop fs)
+validate_prerequisites_folder_copy  (SSH: check cluster auth, hadoop distcp, hadoop fs)
     ↓
 init_folder_copy_tracking_tables
     ↓
@@ -1562,10 +1580,11 @@ send_data_copy_report_email
 **Purpose:** Validate SSH connectivity and Hadoop tooling before starting the folder copy
 
 - Connects to the cluster edge node via SSH
-- Runs three sequential checks:
+- Runs four sequential checks:
   1. **SSH Connectivity** — verifies SSH connection with a simple echo command
-  2. **Hadoop DistCp** — checks `hadoop distcp` is available on the edge node
-  3. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
+  2. **Cluster Authentication** — the same ticket check as DAG 1's `validate_prerequisites`
+  3. **Hadoop DistCp** — checks `hadoop distcp` prints its usage on the edge node
+  4. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
 - Sources environment via the login shell before each check to ensure environment variables are loaded
 - If **all checks pass**, returns a `checks` dict and proceeds
 - If **any check fails**, raises an exception with a detailed summary, halting the DAG before any tracking tables or run records are created

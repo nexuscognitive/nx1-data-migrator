@@ -61,11 +61,38 @@
 
 set -euo pipefail
 
+# Defaults are the MapR edge node's addresses; the CDP node exports its own
+# (dev-tools/cdp-edge-node: /etc/profile.d/cdp-edge-seed.sh).
+EDGE_NAMENODE="${EDGE_NAMENODE:-hdfs://localhost:9000}"
+EDGE_BEELINE_URL="${EDGE_BEELINE_URL:-jdbc:hive2://localhost:10000}"
+export EDGE_NAMENODE EDGE_BEELINE_URL
+
 export PYSPARK_PYTHON=python3
 export PYSPARK_DRIVER_PYTHON=python3
 
-BEELINE="/opt/hive/bin/beeline -u jdbc:hive2://localhost:10000 --silent=true"
-WH="hdfs://localhost:9000/user/hive/warehouse"
+BEELINE="/opt/hive/bin/beeline -u ${EDGE_BEELINE_URL} --silent=true"
+WH="${EDGE_NAMENODE}/user/hive/warehouse"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "${FIXTURES_FILE:-}" ]; then
+  FIXTURES_CANDIDATES="${SCRIPT_DIR}/scenarios.yaml ${SCRIPT_DIR}/../../fixtures/scenarios.yaml /scenarios.yaml"
+  if [ -f "${SCRIPT_DIR}/scenarios.yaml" ]; then
+    FIXTURES_FILE="${SCRIPT_DIR}/scenarios.yaml"
+  elif [ -f "${SCRIPT_DIR}/../../fixtures/scenarios.yaml" ]; then
+    FIXTURES_FILE="${SCRIPT_DIR}/../../fixtures/scenarios.yaml"
+  else
+    FIXTURES_FILE="/scenarios.yaml"
+  fi
+else
+  FIXTURES_CANDIDATES="$FIXTURES_FILE (from \$FIXTURES_FILE)"
+fi
+export FIXTURES_FILE
+
+if [ ! -f "$FIXTURES_FILE" ]; then
+  echo "ERROR: scenarios.yaml not found. Looked at: ${FIXTURES_CANDIDATES}" >&2
+  echo "Set FIXTURES_FILE to its path, or rebuild the image with the fixtures build context." >&2
+  exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "============================================================"
@@ -238,7 +265,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 spark = SparkSession.builder.enableHiveSupport().getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
-WH = "hdfs://localhost:9000/user/hive/warehouse"
+import os
+WH = os.environ["EDGE_NAMENODE"] + "/user/hive/warehouse"
 data = [
     ("e1","click","US","US",2024,1),
     ("e2","view","US","US",2024,1),
@@ -269,7 +297,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
 spark = SparkSession.builder.enableHiveSupport().getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
-WH = "hdfs://localhost:9000/user/hive/warehouse"
+import os
+WH = os.environ["EDGE_NAMENODE"] + "/user/hive/warehouse"
 data = [
     (1,"Alice","Engineering",75000.0),
     (2,"Bob","HR",50000.0),
@@ -299,7 +328,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType
 spark = SparkSession.builder.enableHiveSupport().getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
-WH = "hdfs://localhost:9000/user/hive/warehouse"
+import os
+WH = os.environ["EDGE_NAMENODE"] + "/user/hive/warehouse"
 
 # Schema matches the Hive DDL defined in [4/11] below.
 # Uses a realistic employee-profile shape with several common column types
@@ -390,7 +420,7 @@ with open(local_path, "wb") as f:
     f.write(avro_bytes)
 ret = subprocess.call([
     "hdfs", "dfs", "-put", "-f", local_path,
-    "hdfs://localhost:9000/user/hive/warehouse/hr_db.db/employees_avro/employees.avro"
+    os.environ["EDGE_NAMENODE"] + "/user/hive/warehouse/hr_db.db/employees_avro/employees.avro"
 ])
 print("AVRO written ({} bytes), hdfs exit={}".format(len(avro_bytes), ret))
 PYEOF
@@ -409,7 +439,8 @@ from pyspark.sql.types import (
 from decimal import Decimal
 spark = SparkSession.builder.enableHiveSupport().getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
-WH = "hdfs://localhost:9000/user/hive/warehouse"
+import os
+WH = os.environ["EDGE_NAMENODE"] + "/user/hive/warehouse"
 
 # ── TC-6/7: simple_struct  struct<a:int,b:string> ─────────────────────────────
 # Hive metastore will return "struct<a:int,b:string>" from DESCRIBE.
@@ -796,7 +827,8 @@ from pyspark.sql.types import (
 )
 spark = SparkSession.builder.enableHiveSupport().getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
-WH = "hdfs://localhost:9000/user/hive/warehouse"
+import os
+WH = os.environ["EDGE_NAMENODE"] + "/user/hive/warehouse"
 
 # Non-partition columns first; partition columns (business_date, cyc_num) last.
 schema = StructType([
@@ -827,7 +859,7 @@ echo "============================================================"
 echo " [4/11] Creating Hive databases and tables"
 echo "============================================================"
 
-cat > /tmp/setup-test-data.sql << 'SQL_EOF'
+cat > /tmp/setup-test-data.sql << SQL_EOF
 -- =============================================================================
 -- sales_db
 -- =============================================================================
@@ -839,7 +871,7 @@ CREATE TABLE IF NOT EXISTS sales_db.orders (
 PARTITIONED BY (year INT, month INT)
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/sales_db.db/orders';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/sales_db.db/orders';
 
 ALTER TABLE sales_db.orders ADD IF NOT EXISTS PARTITION (year=2024, month=1);
 ALTER TABLE sales_db.orders ADD IF NOT EXISTS PARTITION (year=2024, month=2);
@@ -851,21 +883,21 @@ CREATE TABLE IF NOT EXISTS sales_db.orders_empty (
 PARTITIONED BY (year INT, month INT)
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/sales_db.db/orders_empty';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/sales_db.db/orders_empty';
 
 CREATE TABLE IF NOT EXISTS sales_db.customers (
   cust_id INT, name STRING, email STRING
 )
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/sales_db.db/customers';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/sales_db.db/customers';
 
 CREATE TABLE IF NOT EXISTS sales_db.transactions (
   txn_id INT, order_id INT, txn_date STRING, amount DOUBLE
 )
 ROW FORMAT DELIMITED FIELDS TERMINATED BY '|'
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/sales_db.db/transactions';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/sales_db.db/transactions';
 
 -- =============================================================================
 -- hr_db
@@ -878,26 +910,26 @@ CREATE TABLE IF NOT EXISTS hr_db.employees (
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 NULL DEFINED AS '\N'
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/hr_db.db/employees';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/hr_db.db/employees';
 
 CREATE TABLE IF NOT EXISTS hr_db.departments (
   dept_id INT, dept_name STRING
 )
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/hr_db.db/departments';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/hr_db.db/departments';
 
 CREATE TABLE IF NOT EXISTS hr_db.employees_parquet (
   emp_id INT, name STRING, dept STRING, salary DOUBLE
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/hr_db.db/employees_parquet';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/hr_db.db/employees_parquet';
 
 CREATE TABLE IF NOT EXISTS hr_db.employees_avro (
   emp_id INT, name STRING, dept STRING, salary DOUBLE
 )
 STORED AS AVRO
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/hr_db.db/employees_avro';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/hr_db.db/employees_avro';
 
 -- TC-33: empty Parquet table with a known schema and zero data files.
 -- Tests that the DAG correctly detects EMPTY_SOURCE for a Parquet-format table,
@@ -916,7 +948,7 @@ CREATE TABLE IF NOT EXISTS hr_db.employees_parquet_empty (
   cost_centre STRING
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/hr_db.db/employees_parquet_empty';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/hr_db.db/employees_parquet_empty';
 
 -- =============================================================================
 -- analytics_db
@@ -929,7 +961,7 @@ CREATE TABLE IF NOT EXISTS analytics_db.events (
 PARTITIONED BY (region STRING, year INT, month INT)
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/analytics_db.db/events';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/analytics_db.db/events';
 
 ALTER TABLE analytics_db.events ADD IF NOT EXISTS PARTITION (region='US', year=2024, month=1);
 ALTER TABLE analytics_db.events ADD IF NOT EXISTS PARTITION (region='EU', year=2024, month=1);
@@ -942,7 +974,7 @@ CREATE TABLE IF NOT EXISTS analytics_db.sessions (
 PARTITIONED BY (year INT, month INT)
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/analytics_db.db/sessions';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/analytics_db.db/sessions';
 -- Intentionally: no ALTER TABLE (unregistered partitions test)
 
 CREATE TABLE IF NOT EXISTS analytics_db.events_orc (
@@ -950,7 +982,7 @@ CREATE TABLE IF NOT EXISTS analytics_db.events_orc (
 )
 PARTITIONED BY (region STRING, year INT, month INT)
 STORED AS ORC
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/analytics_db.db/events_orc';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/analytics_db.db/events_orc';
 
 ALTER TABLE analytics_db.events_orc ADD IF NOT EXISTS PARTITION (region='US', year=2024, month=1);
 ALTER TABLE analytics_db.events_orc ADD IF NOT EXISTS PARTITION (region='EU', year=2024, month=1);
@@ -968,7 +1000,7 @@ CREATE TABLE IF NOT EXISTS analytics_db.events_empty_partitioned (
 PARTITIONED BY (region STRING, year INT, month INT)
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/analytics_db.db/events_empty_partitioned';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/analytics_db.db/events_empty_partitioned';
 
 ALTER TABLE analytics_db.events_empty_partitioned ADD IF NOT EXISTS PARTITION (region='US', year=2024, month=1);
 ALTER TABLE analytics_db.events_empty_partitioned ADD IF NOT EXISTS PARTITION (region='EU', year=2024, month=1);
@@ -985,7 +1017,7 @@ CREATE TABLE IF NOT EXISTS analytics_db.events_parquet_empty_partitioned (
 )
 PARTITIONED BY (region STRING, year INT, month INT)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/analytics_db.db/events_parquet_empty_partitioned';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/analytics_db.db/events_parquet_empty_partitioned';
 
 ALTER TABLE analytics_db.events_parquet_empty_partitioned ADD IF NOT EXISTS PARTITION (region='US', year=2024, month=1);
 ALTER TABLE analytics_db.events_parquet_empty_partitioned ADD IF NOT EXISTS PARTITION (region='EU', year=2024, month=1);
@@ -1002,7 +1034,7 @@ CREATE TABLE IF NOT EXISTS logs_db.app_logs (
 PARTITIONED BY (dt STRING)
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/logs_db.db/app_logs';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/logs_db.db/app_logs';
 
 ALTER TABLE logs_db.app_logs ADD IF NOT EXISTS PARTITION (dt='2024-01-01');
 ALTER TABLE logs_db.app_logs ADD IF NOT EXISTS PARTITION (dt='2024-01-15');
@@ -1014,14 +1046,14 @@ CREATE TABLE IF NOT EXISTS logs_db.error_logs_empty (
 PARTITIONED BY (dt STRING)
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/logs_db.db/error_logs_empty';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/logs_db.db/error_logs_empty';
 
 CREATE TABLE IF NOT EXISTS logs_db.metrics_empty_nonpartitioned (
   metric_id INT, name STRING, value DOUBLE, ts BIGINT
 )
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/logs_db.db/metrics_empty_nonpartitioned';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/logs_db.db/metrics_empty_nonpartitioned';
 
 -- =============================================================================
 -- struct_db  (NEW — hive_type_to_spark_ddl test cases)
@@ -1035,7 +1067,7 @@ CREATE TABLE IF NOT EXISTS struct_db.simple_struct (
   info struct<a:int,b:string>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/simple_struct';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/simple_struct';
 
 -- TC-9: array of struct — array<struct<x:int,y:string>>
 CREATE TABLE IF NOT EXISTS struct_db.array_of_struct (
@@ -1043,7 +1075,7 @@ CREATE TABLE IF NOT EXISTS struct_db.array_of_struct (
   items array<struct<x:int,y:string>>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/array_of_struct';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/array_of_struct';
 
 -- TC-11: map of struct — map<string,struct<a:int>>
 CREATE TABLE IF NOT EXISTS struct_db.map_of_struct (
@@ -1051,7 +1083,7 @@ CREATE TABLE IF NOT EXISTS struct_db.map_of_struct (
   tags map<string,struct<a:int>>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/map_of_struct';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/map_of_struct';
 
 -- TC-12: deeply nested — struct<a:array<struct<b:map<string,int>>>>
 CREATE TABLE IF NOT EXISTS struct_db.deep_nested_struct (
@@ -1059,7 +1091,7 @@ CREATE TABLE IF NOT EXISTS struct_db.deep_nested_struct (
   payload struct<a:array<struct<b:map<string,int>>>>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/deep_nested_struct';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/deep_nested_struct';
 
 -- TC-13: array of array of struct — array<array<struct<x:int>>>
 CREATE TABLE IF NOT EXISTS struct_db.array_of_array_struct (
@@ -1067,7 +1099,7 @@ CREATE TABLE IF NOT EXISTS struct_db.array_of_array_struct (
   grid array<array<struct<x:int>>>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/array_of_array_struct';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/array_of_array_struct';
 
 -- TC-14: struct with decimal — decimal(18,4) comma must not split field list
 CREATE TABLE IF NOT EXISTS struct_db.struct_with_decimal (
@@ -1075,7 +1107,7 @@ CREATE TABLE IF NOT EXISTS struct_db.struct_with_decimal (
   price_info struct<amount:decimal(18,4),qty:int>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/struct_with_decimal';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/struct_with_decimal';
 
 -- TC-15: struct with varchar/char — parameterised types must pass through unchanged
 CREATE TABLE IF NOT EXISTS struct_db.struct_with_varchar (
@@ -1083,7 +1115,7 @@ CREATE TABLE IF NOT EXISTS struct_db.struct_with_varchar (
   labels struct<name:varchar(255),code:char(10)>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/struct_with_varchar';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/struct_with_varchar';
 
 -- TC-16: idempotency — uses colon notation (required by HiveQL).
 -- Idempotency is verified at the DAG level: hive_type_to_spark_ddl applied to
@@ -1095,7 +1127,7 @@ CREATE TABLE IF NOT EXISTS struct_db.already_converted (
   info struct<a:int,b:string>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/already_converted';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/already_converted';
 
 -- TC-20: mixed case — STRUCT<A:INT,B:STRING> uppercase keywords
 CREATE TABLE IF NOT EXISTS struct_db.mixed_case_struct (
@@ -1103,7 +1135,7 @@ CREATE TABLE IF NOT EXISTS struct_db.mixed_case_struct (
   info STRUCT<A:INT,B:STRING>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/mixed_case_struct';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/mixed_case_struct';
 
 -- TC-26/27: flex_rules_result_mini — realistic nested struct + array-of-struct
 -- Single-line struct definition to avoid Hive parser whitespace issues
@@ -1116,7 +1148,7 @@ CREATE TABLE IF NOT EXISTS struct_db.flex_rules_result_mini (
   response struct<eligibilities:array<struct<category:string,result:string,status:string,effectiveDate:string,derivedElements:array<struct<elementName:string,elementType:string,elementValue:string>>,attributes:array<struct<type:string,value:string>>>>,decisions:array<struct<category:string,status:string,rules:array<struct<ruleId:string,status:string>>>>>
 )
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/flex_rules_result_mini';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/flex_rules_result_mini';
 
 -- TC-28/29: flex_rules_result_full — full production-width struct, partitioned
 -- Single-line struct definition to avoid Hive parser whitespace issues
@@ -1130,7 +1162,7 @@ CREATE TABLE IF NOT EXISTS struct_db.flex_rules_result_full (
 )
 PARTITIONED BY (capbusinesseffectivedate STRING)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/struct_db.db/flex_rules_result_full';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/struct_db.db/flex_rules_result_full';
 
 ALTER TABLE struct_db.flex_rules_result_full
   ADD IF NOT EXISTS PARTITION (capbusinesseffectivedate='2024-01-01');
@@ -1154,7 +1186,7 @@ CREATE TABLE IF NOT EXISTS part_types_db.sales_by_date (
 )
 PARTITIONED BY (business_date DATE, cyc_num SMALLINT)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/part_types_db.db/sales_by_date';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/part_types_db.db/sales_by_date';
 
 MSCK REPAIR TABLE part_types_db.sales_by_date;
 
@@ -1593,7 +1625,7 @@ echo "============================================================"
 echo " [8/11] Hive DDL"
 echo "============================================================"
 
-cat > /tmp/setup-ebr.sql << 'SQL_EOF'
+cat > /tmp/setup-ebr.sql << SQL_EOF
 
 -- =============================================================================
 -- All tables: DROP IF EXISTS first so stale schemas never block re-creation.
@@ -1608,21 +1640,21 @@ CREATE TABLE migration_db.customers (
     customer_id INT, name STRING, email STRING,
     country STRING, credit_score DOUBLE, is_active BOOLEAN
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/migration_db.db/customers';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/migration_db.db/customers';
 
 DROP TABLE IF EXISTS migration_db.products;
 CREATE TABLE migration_db.products (
     product_id INT, name STRING, category STRING,
     price DOUBLE, stock_qty INT
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/migration_db.db/products';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/migration_db.db/products';
 
 DROP TABLE IF EXISTS migration_db.transactions;
 CREATE TABLE migration_db.transactions (
     txn_id INT, customer_id INT, product_id INT,
     amount DOUBLE, status STRING, created_at TIMESTAMP
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/migration_db.db/transactions';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/migration_db.db/transactions';
 
 -- metrics_db ------------------------------------------------------------------
 CREATE DATABASE IF NOT EXISTS metrics_db;
@@ -1630,17 +1662,17 @@ CREATE DATABASE IF NOT EXISTS metrics_db;
 DROP TABLE IF EXISTS metrics_db.daily_active_users;
 CREATE TABLE metrics_db.daily_active_users (metric_date STRING, value DOUBLE, region STRING)
     STORED AS PARQUET
-    LOCATION 'hdfs://localhost:9000/user/hive/warehouse/metrics_db.db/daily_active_users';
+    LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/metrics_db.db/daily_active_users';
 
 DROP TABLE IF EXISTS metrics_db.conversion_rates;
 CREATE TABLE metrics_db.conversion_rates (metric_date STRING, value DOUBLE, region STRING)
     STORED AS PARQUET
-    LOCATION 'hdfs://localhost:9000/user/hive/warehouse/metrics_db.db/conversion_rates';
+    LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/metrics_db.db/conversion_rates';
 
 DROP TABLE IF EXISTS metrics_db.revenue_summary;
 CREATE TABLE metrics_db.revenue_summary (metric_date STRING, value DOUBLE, region STRING)
     STORED AS PARQUET
-    LOCATION 'hdfs://localhost:9000/user/hive/warehouse/metrics_db.db/revenue_summary';
+    LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/metrics_db.db/revenue_summary';
 
 -- audit_db --------------------------------------------------------------------
 CREATE DATABASE IF NOT EXISTS audit_db;
@@ -1649,14 +1681,14 @@ DROP TABLE IF EXISTS audit_db.access_log;
 CREATE TABLE audit_db.access_log (
     event_time STRING, user_id STRING, action STRING, ip_address STRING, result STRING
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/audit_db.db/access_log';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/audit_db.db/access_log';
 
 DROP TABLE IF EXISTS audit_db.change_log;
 CREATE TABLE audit_db.change_log (
     change_time STRING, changed_by STRING, table_name STRING,
     operation STRING, record_key STRING, column_changed STRING
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/audit_db.db/change_log';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/audit_db.db/change_log';
 
 -- hr_db_tz -----------------------------------------------------------------------
 CREATE DATABASE IF NOT EXISTS hr_db_tz;
@@ -1665,13 +1697,13 @@ DROP TABLE IF EXISTS hr_db_tz.employees;
 CREATE TABLE hr_db_tz.employees (
     emp_id INT, name STRING, department STRING, salary DOUBLE, hire_date TIMESTAMP
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/hr_db_tz.db/employees';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/hr_db_tz.db/employees';
 
 DROP TABLE IF EXISTS hr_db_tz.departments;
 CREATE TABLE hr_db_tz.departments (
     dept_id INT, name STRING, head STRING, headcount INT
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/hr_db_tz.db/departments';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/hr_db_tz.db/departments';
 
 -- sales_db_tz (partitioned) ------------------------------------------------------
 CREATE DATABASE IF NOT EXISTS sales_db_tz;
@@ -1681,7 +1713,7 @@ CREATE TABLE sales_db_tz.orders (
     order_id INT, customer_id INT, product_id INT, qty INT, total_price DOUBLE
 ) PARTITIONED BY (dt STRING)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/sales_db_tz.db/orders';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/sales_db_tz.db/orders';
 MSCK REPAIR TABLE sales_db_tz.orders;
 
 DROP TABLE IF EXISTS sales_db_tz.returns;
@@ -1689,7 +1721,7 @@ CREATE TABLE sales_db_tz.returns (
     return_id INT, txn_id INT, reason STRING, refund_amt DOUBLE
 ) PARTITIONED BY (dt STRING)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/sales_db_tz.db/returns';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/sales_db_tz.db/returns';
 MSCK REPAIR TABLE sales_db_tz.returns;
 
 DROP TABLE IF EXISTS sales_db_tz.daily_summary;
@@ -1697,7 +1729,7 @@ CREATE TABLE sales_db_tz.daily_summary (
     summary_date STRING, total_orders INT, total_revenue DOUBLE, avg_order_value DOUBLE
 ) PARTITIONED BY (year INT, month INT)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/sales_db_tz.db/daily_summary';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/sales_db_tz.db/daily_summary';
 MSCK REPAIR TABLE sales_db_tz.daily_summary;
 
 -- analytics_db_tz (partitioned) --------------------------------------------------
@@ -1708,7 +1740,7 @@ CREATE TABLE analytics_db_tz.events (
     event_id STRING, user_id STRING, event_type STRING, properties STRING
 ) PARTITIONED BY (region STRING, year INT, month INT)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/analytics_db_tz.db/events';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/analytics_db_tz.db/events';
 MSCK REPAIR TABLE analytics_db_tz.events;
 
 DROP TABLE IF EXISTS analytics_db_tz.sessions;
@@ -1717,7 +1749,7 @@ CREATE TABLE analytics_db_tz.sessions (
     end_ts TIMESTAMP, duration_sec INT, page_views INT
 ) PARTITIONED BY (year INT, month INT)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/analytics_db_tz.db/sessions';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/analytics_db_tz.db/sessions';
 MSCK REPAIR TABLE analytics_db_tz.sessions;
 
 -- logs_db_tz (partitioned) -------------------------------------------------------
@@ -1728,7 +1760,7 @@ CREATE TABLE logs_db_tz.app_logs (
     log_time STRING, level STRING, service STRING, message STRING, trace_id STRING
 ) PARTITIONED BY (dt STRING)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/logs_db_tz.db/app_logs';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/logs_db_tz.db/app_logs';
 MSCK REPAIR TABLE logs_db_tz.app_logs;
 
 -- edge_cases_db ---------------------------------------------------------------
@@ -1737,13 +1769,13 @@ CREATE DATABASE IF NOT EXISTS edge_cases_db;
 DROP TABLE IF EXISTS edge_cases_db.empty_table;
 CREATE TABLE edge_cases_db.empty_table (id INT, label STRING, value DOUBLE)
     STORED AS PARQUET
-    LOCATION 'hdfs://localhost:9000/user/hive/warehouse/edge_cases_db.db/empty_table';
+    LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/edge_cases_db.db/empty_table';
 
 DROP TABLE IF EXISTS edge_cases_db.nulls_table;
 CREATE TABLE edge_cases_db.nulls_table (
     id INT, str_col STRING, int_col INT, double_col DOUBLE, bool_col BOOLEAN, ts_col TIMESTAMP
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/edge_cases_db.db/nulls_table';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/edge_cases_db.db/nulls_table';
 
 DROP TABLE IF EXISTS edge_cases_db.complex_types;
 CREATE TABLE edge_cases_db.complex_types (
@@ -1751,7 +1783,7 @@ CREATE TABLE edge_cases_db.complex_types (
     address STRUCT<street:STRING,city:STRING,zip:STRING>,
     metrics ARRAY<STRUCT<name:STRING,value:DOUBLE>>
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/edge_cases_db.db/complex_types';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/edge_cases_db.db/complex_types';
 
 -- edge_cases_db.wide_table created separately in [7b/11] (50-col SQL too long)
 
@@ -1761,18 +1793,18 @@ CREATE DATABASE IF NOT EXISTS formats_db;
 DROP TABLE IF EXISTS formats_db.parquet_table;
 CREATE TABLE formats_db.parquet_table (id INT, name STRING, amount DOUBLE)
     STORED AS PARQUET
-    LOCATION 'hdfs://localhost:9000/user/hive/warehouse/formats_db.db/parquet_table';
+    LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/formats_db.db/parquet_table';
 
 DROP TABLE IF EXISTS formats_db.orc_table;
 CREATE TABLE formats_db.orc_table (id INT, name STRING, amount DOUBLE)
     STORED AS ORC
-    LOCATION 'hdfs://localhost:9000/user/hive/warehouse/formats_db.db/orc_table';
+    LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/formats_db.db/orc_table';
 
 DROP TABLE IF EXISTS formats_db.text_table;
 CREATE TABLE formats_db.text_table (id INT, name STRING, amount DOUBLE)
     ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
     STORED AS TEXTFILE
-    LOCATION 'hdfs://localhost:9000/user/hive/warehouse/formats_db.db/text_table';
+    LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/formats_db.db/text_table';
 
 -- tz_db (partitioned) ---------------------------------------------------------
 CREATE DATABASE IF NOT EXISTS tz_db;
@@ -1783,7 +1815,7 @@ CREATE TABLE tz_db.events_with_ts_la (
     application_dt TIMESTAMP, ln_registration_dt TIMESTAMP,
     bus_date STRING, event_type STRING
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/tz_db.db/events_with_ts_la';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/tz_db.db/events_with_ts_la';
 
 DROP TABLE IF EXISTS tz_db.orders_with_ts_la;
 CREATE TABLE tz_db.orders_with_ts_la (
@@ -1792,7 +1824,7 @@ CREATE TABLE tz_db.orders_with_ts_la (
     status STRING, amount DOUBLE
 ) PARTITIONED BY (dt STRING)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/tz_db.db/orders_with_ts_la';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/tz_db.db/orders_with_ts_la';
 MSCK REPAIR TABLE tz_db.orders_with_ts_la;
 
 DROP TABLE IF EXISTS tz_db.sessions_with_ts_la;
@@ -1801,7 +1833,7 @@ CREATE TABLE tz_db.sessions_with_ts_la (
     start_ts TIMESTAMP, end_ts TIMESTAMP, duration_sec INT
 ) PARTITIONED BY (year INT, month INT)
 STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/tz_db.db/sessions_with_ts_la';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/tz_db.db/sessions_with_ts_la';
 MSCK REPAIR TABLE tz_db.sessions_with_ts_la;
 
 -- retry_test_db (T-01) --------------------------------------------------------
@@ -1811,7 +1843,7 @@ DROP TABLE IF EXISTS retry_test_db.yarn_oom_table;
 CREATE TABLE retry_test_db.yarn_oom_table (
     id INT, payload STRING, value DOUBLE
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/retry_test_db.db/yarn_oom_table';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/retry_test_db.db/yarn_oom_table';
 
 -- corrupt_test_db (P-03 / P-04 multi-table batch test) -----------------------
 -- IMPORTANT: After DAG1 copies these to S3, corrupt_table's Parquet files
@@ -1822,19 +1854,19 @@ DROP TABLE IF EXISTS corrupt_test_db.table_a;
 CREATE TABLE corrupt_test_db.table_a (
     id INT, name STRING, amount DOUBLE
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/corrupt_test_db.db/table_a';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/corrupt_test_db.db/table_a';
 
 DROP TABLE IF EXISTS corrupt_test_db.corrupt_table;
 CREATE TABLE corrupt_test_db.corrupt_table (
     id INT, name STRING, amount DOUBLE
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/corrupt_test_db.db/corrupt_table';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/corrupt_test_db.db/corrupt_table';
 
 DROP TABLE IF EXISTS corrupt_test_db.table_c;
 CREATE TABLE corrupt_test_db.table_c (
     id INT, name STRING, amount DOUBLE
 ) STORED AS PARQUET
-LOCATION 'hdfs://localhost:9000/user/hive/warehouse/corrupt_test_db.db/table_c';
+LOCATION '${EDGE_NAMENODE}/user/hive/warehouse/corrupt_test_db.db/table_c';
 
 SQL_EOF
 
@@ -1852,7 +1884,7 @@ echo " [7b/11] wide_table DDL (50 columns)"
 echo "============================================================"
 
 python3 - << 'PYEOF'
-import subprocess
+import os, subprocess
 
 cols = "id INT"
 for i in range(1, 50):
@@ -1864,14 +1896,14 @@ sql = (
     "    {}\n"
     ")\n"
     "STORED AS PARQUET\n"
-    "LOCATION 'hdfs://localhost:9000/user/hive/warehouse/edge_cases_db.db/wide_table';\n"
+    "LOCATION '" + os.environ["EDGE_NAMENODE"] + "/user/hive/warehouse/edge_cases_db.db/wide_table';\n"
 ).format(cols)
 
 with open("/tmp/wide_table.sql", "w") as f:
     f.write(sql)
 
 r = subprocess.run(
-    ["/opt/hive/bin/beeline", "-u", "jdbc:hive2://localhost:10000",
+    ["/opt/hive/bin/beeline", "-u", os.environ["EDGE_BEELINE_URL"],
      "--silent=true", "-f", "/tmp/wide_table.sql"],
     stdout=subprocess.PIPE, stderr=subprocess.PIPE
 )
@@ -1920,7 +1952,8 @@ spark = SparkSession.builder \
     .enableHiveSupport() \
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
-WH = "hdfs://localhost:9000/user/hive/warehouse"
+import os
+WH = os.environ["EDGE_NAMENODE"] + "/user/hive/warehouse"
 
 def w(df, path, fmt="parquet"):
     df.write.mode("overwrite").format(fmt).save(path)
@@ -2256,16 +2289,19 @@ spark.sql("""
 spark.table("events_la").write.mode("overwrite").parquet(
     "{}/tz_db.db/events_with_ts_la".format(WH))
 
+# amount is written as DOUBLE (the D suffix) to match the table's `amount DOUBLE`; a
+# bare 250.00 is a DECIMAL literal, and Hive's Parquet reader cannot read DECIMAL
+# files into a DOUBLE column, so any full read of the table fails.
 spark.sql("""
     CREATE OR REPLACE TEMP VIEW orders_la AS SELECT * FROM VALUES
-        ('ORD001','0575890215',TIMESTAMP('2026-04-07 17:00:00'),TIMESTAMP('2026-04-07 17:00:00'),'ACTIVE',250.00,'2026-04-10'),
-        ('ORD002','0575890496',TIMESTAMP('2026-04-07 17:00:00'),TIMESTAMP('2026-04-07 17:00:00'),'PENDING',175.50,'2026-04-10'),
-        ('ORD003','0575954763',TIMESTAMP('2026-04-06 17:00:00'),TIMESTAMP('2026-04-06 17:00:00'),'ACTIVE',320.00,'2026-04-10'),
-        ('ORD004','0576014294',TIMESTAMP('2026-04-07 17:00:00'),TIMESTAMP('2026-04-07 17:00:00'),'CLOSED',89.99,'2026-04-10'),
-        ('ORD005','0576136782',TIMESTAMP('2026-03-17 17:00:00'),TIMESTAMP('2026-03-17 17:00:00'),'ACTIVE',540.25,'2026-04-10'),
-        ('ORD006','0576200001',TIMESTAMP('2026-04-08 09:30:00'),TIMESTAMP('2026-04-08 09:30:00'),'ACTIVE',110.00,'2026-04-11'),
-        ('ORD007','0576200002',TIMESTAMP('2026-04-08 14:15:00'),TIMESTAMP('2026-04-08 14:15:00'),'PENDING',225.75,'2026-04-11'),
-        ('ORD008','0576200003',TIMESTAMP('2026-04-09 08:00:00'),TIMESTAMP('2026-04-09 08:00:00'),'ACTIVE',399.00,'2026-04-11')
+        ('ORD001','0575890215',TIMESTAMP('2026-04-07 17:00:00'),TIMESTAMP('2026-04-07 17:00:00'),'ACTIVE',250.00D,'2026-04-10'),
+        ('ORD002','0575890496',TIMESTAMP('2026-04-07 17:00:00'),TIMESTAMP('2026-04-07 17:00:00'),'PENDING',175.50D,'2026-04-10'),
+        ('ORD003','0575954763',TIMESTAMP('2026-04-06 17:00:00'),TIMESTAMP('2026-04-06 17:00:00'),'ACTIVE',320.00D,'2026-04-10'),
+        ('ORD004','0576014294',TIMESTAMP('2026-04-07 17:00:00'),TIMESTAMP('2026-04-07 17:00:00'),'CLOSED',89.99D,'2026-04-10'),
+        ('ORD005','0576136782',TIMESTAMP('2026-03-17 17:00:00'),TIMESTAMP('2026-03-17 17:00:00'),'ACTIVE',540.25D,'2026-04-10'),
+        ('ORD006','0576200001',TIMESTAMP('2026-04-08 09:30:00'),TIMESTAMP('2026-04-08 09:30:00'),'ACTIVE',110.00D,'2026-04-11'),
+        ('ORD007','0576200002',TIMESTAMP('2026-04-08 14:15:00'),TIMESTAMP('2026-04-08 14:15:00'),'PENDING',225.75D,'2026-04-11'),
+        ('ORD008','0576200003',TIMESTAMP('2026-04-09 08:00:00'),TIMESTAMP('2026-04-09 08:00:00'),'ACTIVE',399.00D,'2026-04-11')
     AS t(order_id,ln_nbr_10,application_dt,ln_registration_dt,status,amount,dt)
 """)
 spark.table("orders_la").filter("dt='2026-04-10'").drop("dt").write.mode("overwrite").parquet(
@@ -2321,6 +2357,22 @@ spark.stop()
 print("  All PySpark data written.")
 PYEOF
 
+echo ""
+echo "============================================================"
+echo " [9b/11] Registering partitions"
+echo "============================================================"
+$BEELINE -e "
+MSCK REPAIR TABLE sales_db_tz.orders;
+MSCK REPAIR TABLE sales_db_tz.returns;
+MSCK REPAIR TABLE sales_db_tz.daily_summary;
+MSCK REPAIR TABLE analytics_db_tz.events;
+MSCK REPAIR TABLE analytics_db_tz.sessions;
+MSCK REPAIR TABLE logs_db_tz.app_logs;
+MSCK REPAIR TABLE tz_db.orders_with_ts_la;
+MSCK REPAIR TABLE tz_db.sessions_with_ts_la;
+"
+echo "  Partitions registered for 8 tz tables."
+
 
 # =============================================================================
 # [10/11]  Verification
@@ -2339,37 +2391,52 @@ spark = SparkSession.builder \
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
 
+import json
+import os
+
+with open(os.environ["FIXTURES_FILE"]) as f:
+    FIXTURES = json.load(f)
+
+
+def _rows(suite, sid):
+    return FIXTURES[suite][sid]["rows"]
+
+
+def _parts(suite, sid):
+    return FIXTURES[suite][sid]["parts"]
+
+
 checks = [
-    ("migration_db.customers",         "R-01",  10, None),
-    ("migration_db.products",          "R-02",  10, None),
-    ("migration_db.transactions",      "R-03",  15, None),
-    ("metrics_db.daily_active_users",  "R-04a",  4, None),
-    ("metrics_db.conversion_rates",    "R-04b",  4, None),
-    ("metrics_db.revenue_summary",     "R-04c",  4, None),
-    ("audit_db.access_log",            "R-05a",  5, None),
-    ("audit_db.change_log",            "R-05b",  4, None),
-    ("hr_db_tz.employees",                "R-06a",  6, None),
-    ("hr_db_tz.departments",              "R-06b",  4, None),
-    ("sales_db_tz.orders",                "R-07",   9, ("dt",3)),
-    ("sales_db_tz.returns",               "R-08",   4, ("dt",3)),
-    ("sales_db_tz.daily_summary",         "R-09",   6, ("year,month",3)),
-    ("analytics_db_tz.events",            "R-10",   9, ("region,year,month",3)),
-    ("analytics_db_tz.sessions",          "R-19",   6, ("year,month",2)),
-    ("logs_db_tz.app_logs",               "R-11",  10, ("dt",3)),
-    ("edge_cases_db.empty_table",      "R-12",   0, None),
-    ("edge_cases_db.nulls_table",      "R-13",   5, None),
-    ("edge_cases_db.complex_types",    "R-14",   3, None),
-    ("edge_cases_db.wide_table",       "R-15",   5, None),
-    ("formats_db.parquet_table",       "R-18",   5, None),
-    ("formats_db.orc_table",           "R-16",   5, None),
-    ("formats_db.text_table",          "R-17",   5, None),
-    ("tz_db.events_with_ts_la",        "R-20a",  8, None),
-    ("tz_db.orders_with_ts_la",        "R-20b",  8, ("dt",2)),
-    ("tz_db.sessions_with_ts_la",      "R-20c",  6, ("year,month",2)),
-    ("retry_test_db.yarn_oom_table",   "T-01",  20, None),
-    ("corrupt_test_db.table_a",        "P-04a",  3, None),
-    ("corrupt_test_db.corrupt_table",  "P-04b",  2, None),
-    ("corrupt_test_db.table_c",        "P-04c",  4, None),
+    ("migration_db.customers",         "R-01",  _rows("REGRESSION", "R-01"), None),
+    ("migration_db.products",          "R-02",  _rows("REGRESSION", "R-02"), None),
+    ("migration_db.transactions",      "R-03",  _rows("REGRESSION", "R-03"), None),
+    ("metrics_db.daily_active_users",  "R-04a", _rows("REGRESSION", "R-04a"), None),
+    ("metrics_db.conversion_rates",    "R-04b", _rows("REGRESSION", "R-04b"), None),
+    ("metrics_db.revenue_summary",     "R-04c", _rows("REGRESSION", "R-04c"), None),
+    ("audit_db.access_log",            "R-05a", _rows("REGRESSION", "R-05a"), None),
+    ("audit_db.change_log",            "R-05b", _rows("REGRESSION", "R-05b"), None),
+    ("hr_db_tz.employees",                "R-06a", _rows("REGRESSION", "R-06a"), None),
+    ("hr_db_tz.departments",              "R-06b", _rows("REGRESSION", "R-06b"), None),
+    ("sales_db_tz.orders",                "R-07",  _rows("REGRESSION", "R-07"), ("dt", _parts("REGRESSION", "R-07"))),
+    ("sales_db_tz.returns",               "R-08",  _rows("REGRESSION", "R-08"), ("dt", _parts("REGRESSION", "R-08"))),
+    ("sales_db_tz.daily_summary",         "R-09",  _rows("REGRESSION", "R-09"), ("year,month", _parts("REGRESSION", "R-09"))),
+    ("analytics_db_tz.events",            "R-10",  _rows("REGRESSION", "R-10"), ("region,year,month", _parts("REGRESSION", "R-10"))),
+    ("analytics_db_tz.sessions",          "R-19",  _rows("REGRESSION", "R-19"), ("year,month", _parts("REGRESSION", "R-19"))),
+    ("logs_db_tz.app_logs",               "R-11",  _rows("REGRESSION", "R-11"), ("dt", _parts("REGRESSION", "R-11"))),
+    ("edge_cases_db.empty_table",      "R-12",  _rows("REGRESSION", "R-12"), None),
+    ("edge_cases_db.nulls_table",      "R-13",  _rows("REGRESSION", "R-13"), None),
+    ("edge_cases_db.complex_types",    "R-14",  _rows("REGRESSION", "R-14"), None),
+    ("edge_cases_db.wide_table",       "R-15",  _rows("REGRESSION", "R-15"), None),
+    ("formats_db.parquet_table",       "R-18",  _rows("REGRESSION", "R-18"), None),
+    ("formats_db.orc_table",           "R-16",  _rows("REGRESSION", "R-16"), None),
+    ("formats_db.text_table",          "R-17",  _rows("REGRESSION", "R-17"), None),
+    ("tz_db.events_with_ts_la",        "R-20a", _rows("REGRESSION", "R-20a"), None),
+    ("tz_db.orders_with_ts_la",        "R-20b", _rows("REGRESSION", "R-20b"), ("dt", _parts("REGRESSION", "R-20b"))),
+    ("tz_db.sessions_with_ts_la",      "R-20c", _rows("REGRESSION", "R-20c"), ("year,month", _parts("REGRESSION", "R-20c"))),
+    ("retry_test_db.yarn_oom_table",   "T-01",  _rows("TRANSIENT-RETRY", "T-01"), None),
+    ("corrupt_test_db.table_a",        "P-04a", _rows("PERMANENT-FAIL", "P-04-source-a"), None),
+    ("corrupt_test_db.corrupt_table",  "P-04b", _rows("PERMANENT-FAIL", "P-04-source-b"), None),
+    ("corrupt_test_db.table_c",        "P-04c", _rows("PERMANENT-FAIL", "P-04-source-c"), None),
 ]
 
 all_pass = True
@@ -2485,13 +2552,13 @@ TRANSIENT RETRY TESTS:
 PERMANENT FAIL TESTS (run AFTER DAG 1 completes for these tables):
 
   P-01 Source path missing -> permanent_fail, 0 retries:
-    hdfs dfs -rm -r hdfs://localhost:9000/user/hive/warehouse/migration_db.db/products
+    hdfs dfs -rm -r ${EDGE_NAMENODE}/user/hive/warehouse/migration_db.db/products
     Re-run DAG1 for migration_db/products.
     Expected: run_distcp_ssh FAILED on attempt 1. Log shows [PermanentFail].
     Error contains "Input path does not exist" or "File does not exist:".
 
   P-02 Permission denied -> permanent_fail, 0 retries:
-    hdfs dfs -chmod 000 hdfs://localhost:9000/user/hive/warehouse/migration_db.db/transactions
+    hdfs dfs -chmod 000 ${EDGE_NAMENODE}/user/hive/warehouse/migration_db.db/transactions
     Re-run DAG1 for migration_db.transactions.
     Expected: permanent_fail fires on attempt 1. Log shows [PermanentFail].
     Restore after: hdfs dfs -chmod 755 .../migration_db.db/transactions

@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from migrator_utils.migrations.shared import (
     execute_with_iceberg_retry,
     get_config,
+    sql_quote,
     track_duration,
 )
 
@@ -198,7 +199,7 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
             '{run_id}', '{dag_run_id}', '{excel_file_path}',
             current_timestamp(), NULL, 'RUNNING',
             0, 0, 0, 0,
-            '{json.dumps(config).replace("'", "''")}'
+            '{sql_quote(json.dumps(config))}'
         )
     """)
     logger.info(f"[create_migration_run] Run created: {run_id}")
@@ -435,7 +436,7 @@ def update_data_presence_in_tracking(presence_result: dict, spark) -> dict:
             'MISSING': 'DATA_MISSING',
             'FAILED': 'FAILED',
         }.get(r['status'], 'FAILED')
-        error_msg = (r.get('error') or '').replace("'", "''")[:2000]
+        error_msg = sql_quote(r.get('error') or '', 2000)
         source_table = r['source_table']
         dest_path = r.get('dest_path', '')
         source_s3_location = f"{source_s3_prefix}/{source_table}"
@@ -660,8 +661,8 @@ def update_discovered_tables_in_tracking(discovery: dict, spark) -> dict:
     duration = discovery.get('_task_duration', 0.0)
 
     for t in discovery['tables']:
-        schema_json = json.dumps(t.get('schema', [])).replace("'", "''")
-        parts_json = json.dumps(t.get('partitions', [])).replace("'", "''")
+        schema_json = sql_quote(json.dumps(t.get('schema', [])))
+        parts_json = sql_quote(json.dumps(t.get('partitions', [])))
         has_error = 'error' in t
         disc_status = 'FAILED' if has_error else 'COMPLETED'
         disc_error_sql = f"'{t['error'][:2000].replace(chr(39), chr(39)*2)}'" if has_error else 'NULL'
@@ -925,7 +926,7 @@ def update_rewrite_and_register_in_tracking(table_result: dict, spark) -> dict:
             'SKIPPED': 'DATA_MISSING',
             'FAILED': 'FAILED',
         }.get(r['status'], 'FAILED')
-        error_msg = (r.get('error') or '').replace("'", "''")[:2000]
+        error_msg = sql_quote(r.get('error') or '', 2000)
 
         imported_rc = r.get('imported_row_count')
         imported_pc = r.get('imported_partition_count')
@@ -1202,8 +1203,8 @@ def update_validation_in_tracking(validation_result: dict, spark) -> dict:
         if v['status'] != 'COMPLETED':
             continue
 
-        schema_diffs = (v.get('schema_differences') or '').replace("'", "''")[:2000]
-        error_msg = (v.get('error') or '').replace("'", "''")[:2000]
+        schema_diffs = sql_quote(v.get('schema_differences') or '', 2000)
+        error_msg = sql_quote(v.get('error') or '', 2000)
 
         is_validated = (
             v.get('row_count_match', False) and
@@ -1248,7 +1249,7 @@ def update_validation_in_tracking(validation_result: dict, spark) -> dict:
 
     for v in validation_result.get('validation_results', []):
         if v.get('status') == 'FAILED' and v.get('error'):
-            per_err = str(v['error'])[:2000].replace("'", "''")
+            per_err = sql_quote(str(v['error'])[:2000])
             execute_with_iceberg_retry(spark, f"""
                 UPDATE {tracking_db}.rewrite_migration_table_status
                 SET validation_status = 'FAILED',

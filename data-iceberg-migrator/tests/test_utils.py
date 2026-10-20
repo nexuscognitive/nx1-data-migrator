@@ -6,6 +6,7 @@ Tests for shared utility functions:
 """
 
 import json
+import subprocess
 import time
 from unittest.mock import MagicMock, patch
 
@@ -226,6 +227,76 @@ class TestVarPrecedence:
                 cfg = m.get_config()
             assert f'value_of_{key}' in {str(v) for v in cfg.values()}, \
                 f'in PORTAL_OWNED_KEYS but never read by get_config: {key}'
+
+
+class TestServiceAccountAlias:
+    """The portal stores service_account_user_id as nx1_service_acc_user_id:
+    Airflow's REST API masks any Variable whose key contains 'service_account',
+    so the old name always read back as '***'. Everything saved before the
+    rename (prod settings, in-flight runs) still lives under the old name.
+    """
+
+    RUN = 'data_migration_1'
+
+    @staticmethod
+    def _resolve(mapping, triggered_by=m.PORTAL_TRIGGER):
+        with TestVarPrecedence._context(TestServiceAccountAlias.RUN, triggered_by), \
+                TestVarPrecedence._variables(mapping):
+            return m.get_config()['service_account_user_id']
+
+    def test_alias_is_the_unmasked_name(self):
+        assert m.PORTAL_VARIABLE_ALIASES == {'service_account_user_id': 'service_acc_user_id'}
+        assert 'service_account' not in m.PORTAL_VARIABLE_ALIASES['service_account_user_id']
+
+    def test_portal_run_reads_the_new_run_scoped_name(self):
+        assert self._resolve({
+            f'nx1_service_acc_user_id__{self.RUN}': 'per_run',
+            'nx1_service_acc_user_id': 'global',
+        }) == 'per_run'
+
+    def test_portal_run_reads_the_new_global_name(self):
+        assert self._resolve({'nx1_service_acc_user_id': 'root'}) == 'root'
+
+    def test_new_name_wins_over_the_old_name(self):
+        assert self._resolve({
+            'nx1_service_acc_user_id': 'root',
+            'nx1_service_account_user_id': 'legacy_user',
+        }) == 'root'
+
+    def test_falls_back_to_the_old_run_scoped_name(self):
+        """A run started before the rename wrote only the old run-scoped name."""
+        assert self._resolve({
+            f'nx1_service_account_user_id__{self.RUN}': 'inflight_user',
+            'nx1_service_acc_user_id': 'global',
+        }) == 'inflight_user'
+
+    def test_falls_back_to_the_old_global_name(self):
+        """Prod settings saved before the rename keep working until re-saved."""
+        assert self._resolve({'nx1_service_account_user_id': 'legacy_user'}) == 'legacy_user'
+
+    def test_masked_value_is_skipped(self):
+        """Runs created from the masked prefill stored '***' as the identity."""
+        assert self._resolve({
+            f'nx1_service_account_user_id__{self.RUN}': '***',
+            'nx1_service_account_user_id': 'legacy_user',
+        }) == 'legacy_user'
+
+    def test_nothing_set_resolves_empty(self):
+        assert self._resolve({}) == ''
+
+    def test_manual_run_reads_only_the_plain_variable(self):
+        """Hand-launched runs are unchanged and never see the portal's names."""
+        assert self._resolve({
+            'service_account_user_id': 'manual_user',
+            'nx1_service_acc_user_id': 'root',
+            'nx1_service_account_user_id': 'legacy_user',
+        }, triggered_by=None) == 'manual_user'
+
+    def test_masking_skip_does_not_affect_other_keys(self):
+        """Only the aliased key treats '***' specially."""
+        with TestVarPrecedence._context(self.RUN, m.PORTAL_TRIGGER), \
+                TestVarPrecedence._variables({'nx1_migration_email_recipients': '***'}):
+            assert m.get_config()['email_recipients'] == '***'
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +591,25 @@ class TestTrackDuration:
         assert result['_task_duration'] >= 0.01
 
 
+class TestSqlQuote:
+    """Spark 3.x concatenates adjacent literals, so '' silently drops a quote; \\' does not."""
+
+    def test_quotes_are_backslash_escaped(self):
+        assert m.sql_quote("dt>='2024-01-15'") == "dt>=\\'2024-01-15\\'"
+
+    def test_backslashes_are_doubled_before_quotes(self):
+        assert m.sql_quote("C:\\tmp\\x") == "C:\\\\tmp\\\\x"
+        assert m.sql_quote("a\\'b") == "a\\\\\\'b"
+
+    def test_limit_truncates_before_escaping(self):
+        """Truncating after escaping could cut \\' in half and leave a trailing backslash."""
+        assert m.sql_quote("abc'def", 4) == "abc\\'"
+        assert m.sql_quote("abc'def", 3) == "abc"
+
+    def test_none_is_empty(self):
+        assert m.sql_quote(None) == ""
+
+
 class TestExecuteWithIcebergRetry:
 
     def test_succeeds_immediately_or_after_retries(self, mock_spark):
@@ -537,6 +627,19 @@ class TestExecuteWithIcebergRetry:
         with patch('time.sleep'):
             m.execute_with_iceberg_retry(mock_spark, "MERGE INTO t USING s", max_retries=3)
         assert mock_spark.sql.call_count == 3
+
+    @pytest.mark.parametrize("message", [
+        # As raised by concurrent update_distcp_status tasks on one tracking-table partition.
+        'ValidationException: Found conflicting files that can contain records matching '
+        '(ref(name="source_database") == "analytics_db"): [s3a://b/t/data/00000-3.parquet]',
+        "ValidationException: Found conflicting deleted files that can contain records matching",
+        "ValidationException: Found new conflicting delete files that can apply to records",
+    ])
+    def test_retries_concurrent_writer_validation_conflict(self, mock_spark, message):
+        mock_spark.sql.side_effect = [Exception(message), None]
+        with patch('time.sleep'):
+            m.execute_with_iceberg_retry(mock_spark, "UPDATE t SET x = 1", max_retries=3)
+        assert mock_spark.sql.call_count == 2
 
     def test_raises_immediately_on_non_retryable_error(self, mock_spark):
         """Errors without a commit-conflict marker raise immediately without retrying."""
@@ -1094,3 +1197,246 @@ class TestMaprTicketCheckIdentity:
             "branch could never fire"
         )
         assert 'grep -qF -- "$MIG_USER"' in script
+
+
+class TestClusterTypePerRun:
+    """cluster_type must be settable per run like ssh_conn_id and auth_method: a run
+    pointed at a CDP edge node otherwise keeps a tenant-wide `cluster_type=MapR`
+    Variable, so it gets MapR's shell wrapper and no S3A committer flags."""
+
+    _VARIABLES = {'cluster_type': 'MapR', 'cluster_ssh_conn_id': 'mapr_edge', 'auth_method': 'mapr'}
+
+    def _config(self, conf: dict, variables: dict):
+        return TestTenantProfileConfKeyPrecedence._context('manual__2026', conf), \
+            TestTenantProfileConfKeyPrecedence._variables(variables)
+
+    def test_dag_run_conf_overrides_the_cluster_type_variable(self):
+        conf = {'ssh_conn_id': 'cdp_edge', 'auth_method': 'kinit', 'cluster_type': 'CDP'}
+        context, variables = self._config(conf, self._VARIABLES)
+        with context, variables:
+            cfg = m.get_config()
+        assert (cfg['ssh_conn_id'], cfg['auth_method'], cfg['cluster_type']) == ('cdp_edge', 'kinit', 'CDP')
+
+    def test_tenant_profile_can_set_cluster_type(self):
+        profile = json.dumps({'cdp': {'ssh_conn_id': 'cdp_edge', 'auth_method': 'kinit', 'cluster_type': 'CDP'}})
+        context, variables = self._config({'tenant': 'cdp'}, {**self._VARIABLES, 'migration_tenant_profiles': profile})
+        with context, variables:
+            cfg = m.get_config()
+        assert cfg['cluster_type'] == 'CDP'
+
+    def test_variable_still_applies_when_the_run_says_nothing(self):
+        context, variables = self._config({}, self._VARIABLES)
+        with context, variables:
+            cfg = m.get_config()
+        assert cfg['cluster_type'] == 'MapR'
+
+
+class TestClusterLoginShellWrapper:
+    """cluster_login must wrap its script like every other SSH call: bash -l for
+    non-MapR clusters, `source ~/.profile` for MapR."""
+
+    _BASE = {
+        'ssh_conn_id': 'ssh1',
+        'edge_temp_path': '/tmp/migration',
+        'auth_method': 'kinit',
+        'mapr_ticketfile_location': '/tmp/maprticket_x',
+        'distcp_log_root': '/tmp/logs',
+        'service_account_user_id': 'svc_migration',
+    }
+
+    @pytest.mark.parametrize('cluster_type', ['CDP', 'HDP'])
+    def test_non_mapr_clusters_get_a_login_shell(self, cluster_type):
+        script = TestMaprTicketCheckIdentity._captured_script({**self._BASE, 'cluster_type': cluster_type})
+        assert script.startswith("bash -l <<'__LOGIN_SHELL_EOF__'")
+
+    def test_mapr_keeps_sourcing_the_profile(self):
+        script = TestMaprTicketCheckIdentity._captured_script(
+            {**self._BASE, 'cluster_type': 'MapR', 'auth_method': 'mapr'}
+        )
+        assert script.startswith('source ~/.profile')
+
+    def test_missing_cluster_type_defaults_to_mapr(self):
+        script = TestMaprTicketCheckIdentity._captured_script(dict(self._BASE))
+        assert script.startswith('source ~/.profile')
+
+
+class TestClusterAuthCheckCmd:
+
+    def test_kinit_checks_for_a_valid_tgt(self):
+        cmd = m._cluster_auth_check_cmd('kinit', '')
+        assert 'klist -s' in cmd
+        assert 'CLUSTER_AUTH_FAIL' in cmd
+
+    def test_mapr_quotes_the_expected_user(self):
+        cmd = m._cluster_auth_check_cmd('mapr', 'x";id;#')
+        assert "EXPECTED_USER='x\";id;#'" in cmd
+        assert 'maprlogin print' in cmd
+
+    @pytest.mark.parametrize('auth_method', ['none', ''])
+    def test_no_auth_always_passes(self, auth_method):
+        assert m._cluster_auth_check_cmd(auth_method, '') == 'echo "CLUSTER_AUTH_OK"'
+
+    @staticmethod
+    def _run_kinit_check(tmp_path, expected_user, principal='svc_migration@CDP.LOCAL',
+                         has_tgt=True, login_user='svc_migration',
+                         principal_line='Default principal: {}', bash_opts=()):
+        """Runs the kinit check against a fake klist (MIT format by default) and id."""
+        klist = tmp_path / 'klist'
+        klist.write_text(
+            '#!/bin/sh\n'
+            f'[ "$1" = "-s" ] && exit {0 if has_tgt else 1}\n'
+            'echo "Ticket cache: FILE:/tmp/krb5cc_1000"\n'
+            f"printf '%s\\n' '{principal_line.format(principal)}'\n"
+        )
+        id_cmd = tmp_path / 'id'
+        id_cmd.write_text(f"#!/bin/sh\nprintf '%s\\n' '{login_user}'\n")
+        for f in (klist, id_cmd):
+            f.chmod(0o755)
+        return subprocess.run(
+            ['bash', *bash_opts, '-c', m._cluster_auth_check_cmd('kinit', expected_user)],
+            capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
+        )
+
+    def test_kinit_quotes_the_expected_user(self):
+        cmd = m._cluster_auth_check_cmd('kinit', 'x";id;#')
+        assert "EXPECTED_USER='x\";id;#'" in cmd
+
+    @pytest.mark.parametrize('principal', [
+        'svc_migration@CDP.LOCAL',
+        'SVC_MIGRATION@CORP.EXAMPLE.COM',
+        'svc_migration/edge01.corp.example.com@CORP.EXAMPLE.COM',
+    ])
+    def test_kinit_passes_on_the_service_accounts_ticket(self, tmp_path, principal):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', principal=principal)
+        assert r.returncode == 0
+        assert r.stdout.startswith('CLUSTER_AUTH_OK')
+
+    @pytest.mark.parametrize('principal', [
+        'jdoe@CORP.EXAMPLE.COM',
+        'svc_migration_old@CDP.LOCAL',
+        'svc@CDP.LOCAL',
+    ])
+    def test_kinit_fails_on_another_principals_ticket(self, tmp_path, principal):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', principal=principal)
+        assert r.returncode == 1
+        assert r.stdout.startswith('CLUSTER_AUTH_FAIL')
+        assert f"'{principal}'" in r.stdout
+        assert "'svc_migration'" in r.stdout
+
+    def test_kinit_failure_points_at_the_service_account_setting(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', principal='jdoe@CDP.LOCAL')
+        assert 'service_account_user_id' in r.stdout
+
+    @pytest.mark.parametrize('expected_user', [
+        'svc_migration@CORP.EXAMPLE.COM',
+        'CORP\\svc_migration',
+        'svc_migration/edge01@CORP.EXAMPLE.COM',
+    ])
+    def test_kinit_accepts_a_qualified_service_account(self, tmp_path, expected_user):
+        r = self._run_kinit_check(tmp_path, expected_user)
+        assert r.returncode == 0
+
+    def test_kinit_qualified_service_account_still_must_match(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'jdoe@CORP.EXAMPLE.COM')
+        assert r.returncode == 1
+
+    @pytest.mark.parametrize('login_user', ['svc_migration@corp.example.com', 'CORP\\svc_migration'])
+    def test_kinit_accepts_a_domain_qualified_login_user(self, tmp_path, login_user):
+        r = self._run_kinit_check(tmp_path, '', login_user=login_user)
+        assert r.returncode == 0
+
+    def test_kinit_reads_heimdal_klist(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', principal_line='        Principal: {}')
+        assert r.returncode == 0
+
+    def test_kinit_passes_under_errexit_and_pipefail(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', bash_opts=('-e', '-o', 'pipefail'))
+        assert r.returncode == 0
+        assert r.stdout.startswith('CLUSTER_AUTH_OK')
+
+    def test_kinit_without_a_tgt_fails(self, tmp_path):
+        r = self._run_kinit_check(tmp_path, 'svc_migration', has_tgt=False)
+        assert r.returncode == 1
+        assert r.stdout.startswith('CLUSTER_AUTH_FAIL: No valid Kerberos TGT found')
+
+    @pytest.mark.parametrize('login_user, expected_rc', [('svc_migration', 0), ('jdoe', 1)])
+    def test_kinit_without_a_service_account_expects_the_login_user(
+            self, tmp_path, login_user, expected_rc):
+        r = self._run_kinit_check(tmp_path, '', login_user=login_user)
+        assert r.returncode == expected_rc
+
+
+class TestDistcpCheckCmd:
+
+    @staticmethod
+    def _run(tmp_path, hadoop_output, hadoop_exit=255, bash_opts=()):
+        fake = tmp_path / 'hadoop'
+        fake.write_text(f"#!/bin/sh\nprintf '%s\\n' '{hadoop_output}'\nexit {hadoop_exit}\n")
+        fake.chmod(0o755)
+        return subprocess.run(
+            ['bash', *bash_opts, '-c', m.DISTCP_CHECK_CMD],
+            capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
+        )
+
+    def test_usage_text_passes(self, tmp_path):
+        r = self._run(tmp_path, 'usage: distcp OPTIONS [source_path...] <target_path>')
+        assert r.stdout.strip() == 'DISTCP_OK'
+
+    def test_usage_text_passes_under_errexit_and_pipefail(self, tmp_path):
+        r = self._run(tmp_path, 'usage: distcp OPTIONS [source_path...] <target_path>',
+                      bash_opts=('-e', '-o', 'pipefail'))
+        assert r.stdout.strip() == 'DISTCP_OK'
+
+    @pytest.mark.parametrize('hadoop_output', [
+        'Error: Could not find or load main class org.apache.hadoop.tools.DistCp',
+        'ERROR: distcp is not COMMAND nor fully qualified CLASSNAME.',
+    ])
+    def test_missing_distcp_fails(self, tmp_path, hadoop_output):
+        r = self._run(tmp_path, hadoop_output, hadoop_exit=1)
+        assert r.stdout.strip() == 'DISTCP_FAIL'
+
+    def test_missing_hadoop_fails(self, tmp_path):
+        r = subprocess.run(
+            ['bash', '-c', m.DISTCP_CHECK_CMD],
+            capture_output=True, text=True, env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
+        )
+        assert r.stdout.strip() == 'DISTCP_FAIL'
+
+
+class TestClusterLoginUserFallback:
+    """With no service_account_user_id, the user falls back to the SSH login user.
+    The maprlogin lookup may only run on MapR."""
+
+    _BASE = {
+        'ssh_conn_id': 'ssh1',
+        'edge_temp_path': '/tmp/migration',
+        'mapr_ticketfile_location': '/tmp/maprticket_x',
+        'distcp_log_root': '/tmp/logs',
+        'cluster_type': 'CDP',
+        'service_account_user_id': '',
+    }
+
+    def test_kinit_never_runs_the_maprlogin_lookup(self):
+        script = TestMaprTicketCheckIdentity._captured_script({**self._BASE, 'auth_method': 'kinit'})
+        fallback = script.index('if [ -z "$CONFIGURED_SA_USER" ]; then')
+        guard = script.index('if [ "kinit" = "mapr" ]; then', fallback)
+        assert guard < script.index('TICKET_USER=$(maprlogin print')
+        assert 'echo "EFFECTIVE_USER=$MIG_USER"' in script
+
+    def test_unset_user_falls_back_to_the_login_user(self):
+        script = TestMaprTicketCheckIdentity._captured_script({**self._BASE, 'auth_method': 'kinit'})
+        assert 'MIG_USER=$(id -un)' in script
+
+
+class TestS3aCommitterOpts:
+    """HDP and CDP both use vanilla S3A, so both get the magic-committer flags."""
+
+    @pytest.mark.parametrize('cluster_type', ['HDP', 'hdp', 'CDP', 'cdp'])
+    def test_vanilla_s3a_clusters_get_the_magic_committer(self, cluster_type):
+        opts = m._s3a_committer_opts({'cluster_type': cluster_type})
+        assert ' -Dfs.s3a.committer.name=magic' in opts
+        assert 'S3ACommitterFactory' in opts
+
+    @pytest.mark.parametrize('config', [{'cluster_type': 'MapR'}, {}])
+    def test_mapr_gets_no_committer_flags(self, config):
+        assert m._s3a_committer_opts(config) == ''

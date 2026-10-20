@@ -50,10 +50,13 @@ dev-tools/mapr-edge-node/
     ├── entrypoint.sh        # container startup — starts SSH, HDFS, YARN, Hive metastore thrift, HiveServer2
     ├── bootstrap-hdfs.sh    # first-run only — formats namenode, inits Hive metastore schema
     ├── profile-additions.sh # sets PATH/PYTHONPATH/HADOOP_CLASSPATH for all SSH sessions
-    ├── setup-test-data.sh   # populates HDFS + Hive with test databases and tables
     ├── test-discover.sh     # runs the exact PySpark discover script from the DAG
     └── test-distcp.sh       # runs the exact distcp shell command from the DAG
 ```
+
+The seeding scripts (`setup-test-data.sh`, `setup-distcp-test-data.sh`) live in
+`dev-tools/fixtures/`, shared with the CDP edge node, and are copied into the image
+from the `fixtures` build context.
 
 ---
 
@@ -389,6 +392,25 @@ docker exec -u root `
 to exercise a specific scenario in the migration DAG, the `hive_type_to_spark_ddl`
 struct/complex-type converter, or the error-based-retry (transient/permanent
 failure) test suite.
+
+The exact row/partition counts this script seeds and verifies are not hardcoded
+here: both this script and the `regression_test_suite.ipynb` notebook that grades
+against it read them from `dev-tools/fixtures/scenarios.yaml`, so the two can't
+drift apart. `setup-distcp-test-data.sh` still seeds its own DistCp byte/file
+counts, but checks them against the same file and exits non-zero on drift.
+
+`scenarios.yaml` lives in `dev-tools/fixtures/`, outside this image's
+`dev-tools/mapr-edge-node` build context, so the Dockerfile pulls it from a second
+build context named `fixtures`. `docker compose build` passes that automatically
+(`additional_contexts` in `docker-compose.yml`). Building with plain `docker build`
+from this directory needs the same context passed explicitly:
+
+```powershell
+docker build --build-context fixtures=../fixtures -t mapr-edge-node .
+```
+
+Without it, the build fails at the `COPY --from=fixtures` step instead of
+producing an image that seeds without the file.
 
 ## PART A — Migration DAG scenarios + struct/complex-type tests
 

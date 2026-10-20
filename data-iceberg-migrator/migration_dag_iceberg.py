@@ -33,6 +33,7 @@ from migrator_utils.migrations.shared import (
     is_permanent_error,
     normalize_s3,
     permanent_fail,
+    sql_quote,
     track_duration,
 )
 
@@ -98,6 +99,7 @@ REASON_LABELS = {
     'FORMAT_UNDETECTED_INPLACE': 'Storage format could not be determined',
     'UNSUPPORTED_SOURCE_FORMAT': 'Unsupported source file format',
     'UNSUPPORTED_DATA_TYPE': 'Unsupported column data type',
+    'SOURCE_DATA_UNREADABLE': 'Source data files could not be read',
     'METADATA_READ_ERROR': 'Table metadata could not be read',
     'PERMISSION_DENIED': 'Permission denied on table or storage path',
     'DATA_PATH_MISSING': 'Data location missing in storage',
@@ -117,7 +119,7 @@ def reason(code: str, detail: str) -> str:
 
 def sql_lit(text, limit: int = 2000) -> str:
     """Escape a value so it can be inlined into a single-quoted Spark SQL literal."""
-    return str(text)[:limit].replace("\\", "\\\\").replace("'", "''")
+    return sql_quote(text, limit)
 
 
 def _err_has(err_lower: str, *needles: str) -> bool:
@@ -187,6 +189,12 @@ def classify_migration_error(err_text: str, src_db: str, tbl: str, dest_table: s
         return ('UNSUPPORTED_SOURCE_FORMAT',
                 f"The source files of {src_db}.{tbl} are in a format Iceberg cannot register or read "
                 f"(only Parquet/ORC/Avro data files can be migrated). {tail}")
+    if _err_has(e, 'parquetdecodingexception', 'can not read value at', 'could not read footer',
+                'corruptrecordexception', 'org.apache.hadoop.hive.ql.io.parquet.convert'):
+        return ('SOURCE_DATA_UNREADABLE',
+                f"The data files of {src_db}.{tbl} could not be read: they are corrupt, or a column's "
+                f"type in the files does not match the table definition (for example DECIMAL files "
+                f"under a DOUBLE column). {tail}")
     if _err_has(e, 'unsupported data type', 'unsupported type', 'cannot convert', 'cannot be cast',
                 'cannot up cast'):
         return ('UNSUPPORTED_DATA_TYPE',
@@ -195,7 +203,11 @@ def classify_migration_error(err_text: str, src_db: str, tbl: str, dest_table: s
                 'gc overhead limit', 'executor lost'):
         return ('RESOURCE_ERROR',
                 f"Spark ran out of memory/disk while migrating {target}. {tail}")
-    if _err_has(e, 'commitfailedexception', 'concurrent', 'conflict', 'metadata location has changed'):
+    # Specific markers only: a bare 'concurrent' matches the java.util.concurrent frames in
+    # almost every Java stack trace, which labelled unrelated failures as commit conflicts.
+    if _err_has(e, 'commitfailedexception', 'cannot commit', 'metadata location has changed',
+                'found conflicting files', 'found conflicting deleted files',
+                'found new conflicting delete files'):
         return ('CONCURRENT_COMMIT_CONFLICT',
                 f"An Iceberg commit for {target} conflicted with another writer. {tail}")
     return ('MIGRATION_ERROR', f"Migration of {target} failed. {tail}")
@@ -301,7 +313,7 @@ def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark) -
             NULL,
             'RUNNING',
             0, 0, 0,
-            '{json.dumps(config).replace("'", "''")}'
+            '{sql_quote(json.dumps(config))}'
         )
     """)
 
@@ -1441,30 +1453,27 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
 
             iceberg_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_table}").collect()[0]['c']
             # For unpartitioned tables, normalize to 0.
-            # Iceberg's .partitions metadata table counts partitions that have data files.
-            # SHOW PARTITIONS is a Hive-metastore command and returns 0 on Iceberg tables.
-            # Guard: only query .partitions when src partition-counting succeeded; if it
-            # failed (e.g. DESCRIBE FORMATTED returned false-positive partition_columns for
-            # a non-partitioned table), both counts remain 0 → partition_match stays True.
+            # Guard: only count when src partition-counting succeeded; if it failed (e.g.
+            # DESCRIBE FORMATTED returned false-positive partition_columns for a
+            # non-partitioned table), both counts remain 0 → partition_match stays True.
+            #
+            # Counted from the data, the same way as the Hive side above, not from the
+            # Iceberg <table>.partitions metadata table. Kyuubi's Ranger plugin resolves
+            # <db>.<table>.partitions as schema '<db>.<table>', table 'partitions', which a
+            # schema policy on <db> does not match, so on a Ranger tenant that query is
+            # denied and every partitioned table read as 0 partitions.
             dest_iceberg_partition_count = 0
             if is_partitioned and partition_count_ok:
                 try:
                     spark.catalog.refreshTable(dest_table)
-                    try:
-                        dest_iceberg_partition_count = spark.sql(
-                            f"SELECT COUNT(*) as cnt FROM {dest_table}.partitions "
-                            f"WHERE record_count > 0"
-                        ).collect()[0]['cnt']
-                    except Exception as _rc_err:
-                        logger.warning(
-                            f"[IcebergMigrate] {dest_table}: record_count filter unavailable "
-                            f"({_rc_err!r}); falling back to raw .partitions count."
-                        )
-                        dest_iceberg_partition_count = spark.sql(
-                            f"SELECT COUNT(*) as cnt FROM {dest_table}.partitions"
-                        ).collect()[0]['cnt']
-                except Exception:
-                    pass
+                    dest_iceberg_partition_count = len(spark.sql(
+                        f"SELECT DISTINCT {', '.join(partition_columns)} FROM {dest_table}"
+                    ).collect())
+                except Exception as _pc_err:
+                    logger.warning(
+                        f"[IcebergMigrate] {dest_table}: could not count destination "
+                        f"partitions ({_pc_err!r}); reporting 0, which fails the partition check."
+                    )
 
             counts_match = (hive_count == iceberg_count)
             if hive_count == 0:
@@ -1657,7 +1666,7 @@ def update_migration_durations(migration_result: dict, spark) -> dict:
 
     for r in migration_result.get('results', []):
         if r.get('status') == 'FAILED' and r.get('error'):
-            per_table_error = str(r['error'])[:2000].replace("'", "''")
+            per_table_error = sql_quote(str(r['error'])[:2000])
             tbl_name = r['source_table'].split('.')[-1]
             src_db_name = r['source_table'].split('.')[0]
             execute_with_iceberg_retry(spark, f"""
@@ -1813,7 +1822,7 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
         if v['status'] != 'COMPLETED':
             continue
 
-        schema_diffs = (v.get('schema_differences', '') or '').replace("'", "''")[:2000]
+        schema_diffs = sql_quote(v.get('schema_differences', '') or '', 2000)
 
         overall_status = 'VALIDATED' if (
             v.get('row_count_match', False) and
@@ -1887,7 +1896,7 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
 
     for v in validation_result.get('validation_results', []):
         if v.get('status') == 'FAILED' and v.get('error'):
-            per_table_error = str(v['error'])[:2000].replace("'", "''")
+            per_table_error = sql_quote(str(v['error'])[:2000])
             execute_with_iceberg_retry(spark, f"""
                 UPDATE {tracking_db}.iceberg_migration_table_status
                 SET validation_status = 'FAILED',

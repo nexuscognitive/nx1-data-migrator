@@ -29,6 +29,7 @@ from migrator_utils.migrations.shared import (
     execute_with_iceberg_retry,
     get_config,
     normalize_s3,
+    sql_quote,
     track_duration,
 )
 
@@ -317,7 +318,7 @@ def register_parquet_tables(table_config: dict, dag_run_id: str, spark, **contex
 
     def _record(status: str, partition_cols: list, error: str | None):
         duration = (_dt.utcnow() - started).total_seconds()
-        error_sql = "'" + error[:2000].replace("'", "''") + "'" if error else "NULL"
+        error_sql = "'" + sql_quote(error[:2000]) + "'" if error else "NULL"
         execute_with_iceberg_retry(
             spark,
             f"""
@@ -558,7 +559,7 @@ def update_hms_validation_status(validation_result: dict, spark) -> dict:
         )
         overall_status = "VALIDATED" if validated else "VALIDATION_FAILED"
         error = validation_result.get("validation_error")
-        error_sql = "'" + str(error)[:2000].replace("'", "''") + "'" if error else "NULL"
+        error_sql = "'" + sql_quote(str(error)[:2000]) + "'" if error else "NULL"
         execute_with_iceberg_retry(
             spark,
             f"""
@@ -581,7 +582,7 @@ def update_hms_validation_status(validation_result: dict, spark) -> dict:
             task_label=f"hms_validation_status:{database}.{table}",
         )
     else:
-        error = str(validation_result.get("validation_error", "unknown validation error"))[:2000].replace("'", "''")
+        error = sql_quote(str(validation_result.get("validation_error", "unknown validation error"))[:2000])
         execute_with_iceberg_retry(
             spark,
             f"""

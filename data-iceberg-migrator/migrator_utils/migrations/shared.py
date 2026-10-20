@@ -50,6 +50,21 @@ PORTAL_OWNED_KEYS = frozenset({
     'service_account_user_id',
 })
 
+# Config key → the nx1_ Variable name the portal stores it under, where the two
+# differ. Airflow's REST API masks the value of any Variable whose key contains a
+# sensitive keyword ('service_account' among them), so the portal could never
+# read nx1_service_account_user_id back: it came out as '***' and was
+# resubmitted as the identity. Applies to portal-marked runs only; a
+# hand-launched run still reads the plain service_account_user_id. Must stay in
+# step with PORTAL_VARIABLE_ALIASES in nx1-aiapi's migration_service.py.
+PORTAL_VARIABLE_ALIASES = {
+    'service_account_user_id': 'service_acc_user_id',
+}
+
+# What Airflow's REST API returns for a masked Variable. Runs created from a
+# masked prefill stored it literally as their identity.
+_AIRFLOW_MASKED_VALUE = '***'
+
 # Keys retired by the calibration-free batching change. Warned about rather
 # than ignored: all five are commented out in env.shared.example, so a value
 # here means someone deliberately set it and is owed an explanation.
@@ -141,6 +156,12 @@ def track_duration(func):
 _ICEBERG_COMMIT_CONFLICT_MARKERS = (
     "CommitFailedException",
     "Cannot commit:",
+    # Row-level UPDATE/MERGE/DELETE validation against a concurrent writer. Iceberg raises a
+    # ValidationException, not CommitFailedException, when another task committed files to the
+    # same partition first; the retry re-reads the table and succeeds.
+    "Found conflicting files",
+    "Found conflicting deleted files",
+    "Found new conflicting delete files",
 )
 
 
@@ -197,6 +218,20 @@ def cell_str(val, default=''):
     return str(val).strip() or default
 
 
+def sql_quote(value, limit=None) -> str:
+    """Escape text for a single-quoted Spark SQL string literal.
+
+    Spark 3.x reads \\' as an escaped quote but '' as two adjacent literals, which it
+    concatenates, silently dropping the quote (dt>='2024-01-15' was stored as
+    dt>=2024-01-15). Backslashes are doubled first so a value's own backslash cannot
+    start an escape. `limit` truncates before escaping, so an escape is never cut in half.
+    """
+    text = "" if value is None else str(value)
+    if limit is not None:
+        text = text[:limit]
+    return text.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def normalize_s3(path: str) -> str:
     """Normalize S3 path prefixes to s3a://."""
     if not path:
@@ -217,6 +252,7 @@ TENANT_PROFILE_KEYS = frozenset({
     'ssh_conn_id',
     'mapr_ticketfile_location',
     'auth_method',
+    'cluster_type',
     'edge_temp_path',
     'hive_scratch_dir',
     'service_account_user_id',
@@ -332,6 +368,13 @@ def get_config() -> dict:
         common to both. Portal-owned but never written by the portal — see
         service_account_user_id — is simply absent for a portal run.
 
+        A key in PORTAL_VARIABLE_ALIASES is stored by the portal under another
+        name. For a portal run, each nx1_ tier above tries that name first and
+        then the key's own name: service_account_user_id reads
+        nx1_service_acc_user_id[__<run_id>] before
+        nx1_service_account_user_id[__<run_id>]. The hand-launched column is
+        unaffected.
+
         The tenant profile itself is origin-split too: a portal-marked run
         reads ``nx1_migration_tenant_profiles``, a hand-launched run reads
         the plain ``migration_tenant_profiles`` (see `_load_tenant_profile`).
@@ -363,11 +406,27 @@ def get_config() -> dict:
                         return str(_val).strip()
 
         if base_key in PORTAL_OWNED_KEYS and _portal_run:
+            # An aliased key is read under its new name first, then under the
+            # pre-rename name, which still holds everything saved before the
+            # rename (prod settings and in-flight runs). '***' is skipped for
+            # it: that is Airflow's mask, never a real identity. Unaliased keys
+            # resolve exactly as before.
+            alias = PORTAL_VARIABLE_ALIASES.get(base_key)
+            names = [alias, base_key] if alias else [base_key]
+
+            def _usable(value):
+                return not (alias and value == _AIRFLOW_MASKED_VALUE)
+
             if _run_id:
-                scoped = Variable.get(f"nx1_{base_key}__{_run_id}", default_var=None)
-                if scoped is not None:
-                    return scoped
-            return Variable.get(f"nx1_{base_key}", default_var=None) or default
+                for name in names:
+                    scoped = Variable.get(f"nx1_{name}__{_run_id}", default_var=None)
+                    if scoped is not None and _usable(scoped):
+                        return scoped
+            for name in names:
+                value = Variable.get(f"nx1_{name}", default_var=None)
+                if value and _usable(value):
+                    return value
+            return default
 
         # Unchanged from before the origin split: a hand-launched run resolves
         # exactly as it always did, including an empty Variable masking the env
@@ -517,8 +576,8 @@ def get_config() -> dict:
         'tracking_location': _var('migration_tracking_location', 'MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking'),
         'report_output_location': _var('migration_report_location', 'MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports'),
 
-        # Cluster type for display/reporting purposes ('MapR' or 'HDP')
-        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR'),
+        # Cluster type: report label and S3A committer choice ('MapR', 'HDP' or 'CDP')
+        'cluster_type': _var('cluster_type', 'CLUSTER_TYPE', 'MapR', conf_key='cluster_type'),
         # Cluster Authentication ('mapr', 'kinit', or 'none')
         'auth_method': _var('auth_method', 'AUTH_METHOD', 'mapr', conf_key='auth_method'),  # 'mapr' or 'kinit'
         'service_account_user_id': _var('service_account_user_id', 'SERVICE_ACCOUNT_USER_ID', '', conf_key='service_account_user_id').strip(),
@@ -602,6 +661,56 @@ def _login_shell(cmd: str, cluster_type: str = 'MapR') -> str:
     if cluster_type.upper() == 'MAPR':
         return f"source ~/.profile 2>/dev/null || true\n{cmd}"
     return f"bash -l <<'__LOGIN_SHELL_EOF__'\n{cmd}\n__LOGIN_SHELL_EOF__\n"
+
+
+def _cluster_auth_check_cmd(auth_method: str, expected_user: str) -> str:
+    """Shell check for the edge node's cluster login, shared by the DAG pre-checks.
+
+    Prints CLUSTER_AUTH_OK, or prints CLUSTER_AUTH_FAIL: <reason> and exits 1.
+    MapR needs a `maprlogin print` ticket for expected_user; Kerberos needs a valid
+    TGT whose principal is expected_user (the login user when empty for both);
+    anything else needs nothing.
+    """
+    if auth_method == 'mapr':
+        return f"""
+EXPECTED_USER={shlex.quote(expected_user)}
+if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
+if maprlogin print 2>/dev/null | grep -qF -- "$EXPECTED_USER"; then
+    echo "CLUSTER_AUTH_OK"
+else
+    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '$EXPECTED_USER'. Run maprlogin on the edge node."
+    exit 1
+fi
+"""
+    if auth_method == 'kinit':
+        return f"""
+EXPECTED_USER={shlex.quote(expected_user)}
+if [ -z "$EXPECTED_USER" ]; then EXPECTED_USER=$(id -un); fi
+if ! klist -s 2>/dev/null; then
+    echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
+    exit 1
+fi
+# MIT prints "Default principal:", Heimdal "Principal:".
+PRINCIPAL=$(klist 2>/dev/null | sed -n -e 's/^Default principal: //p' -e 's/^[[:space:]]*Principal: //p' | head -1)
+# Bare lowercase name, like Hadoop's default auth_to_local. Also applied to the expected
+# user, which can be DOMAIN\\user or user@domain on AD-joined hosts.
+_bare_user() {{ u=${{1##*\\\\}}; u=${{u%%@*}}; u=${{u%%/*}}; printf '%s' "$u" | tr '[:upper:]' '[:lower:]'; }}
+TICKET_USER=$(_bare_user "$PRINCIPAL")
+if [ -z "$TICKET_USER" ] || [ "$TICKET_USER" != "$(_bare_user "$EXPECTED_USER")" ]; then
+    echo "CLUSTER_AUTH_FAIL: Kerberos ticket is for '$PRINCIPAL', expected service account '$EXPECTED_USER'. Run kinit as the service account on the edge node, or set service_account_user_id."
+    exit 1
+fi
+echo "CLUSTER_AUTH_OK"
+klist 2>/dev/null | head -4
+"""
+    return 'echo "CLUSTER_AUTH_OK"'
+
+
+# `hadoop distcp` with no arguments prints its usage and exits non-zero, so match the
+# usage line itself: a missing DistCp class also prints "distcp" in its error. hadoop
+# stays out of the pipeline so a profile's pipefail/errexit can't turn usage into a fail.
+DISTCP_CHECK_CMD = """DISTCP_USAGE=$(hadoop distcp 2>&1 || true)
+if printf '%s\\n' "$DISTCP_USAGE" | grep -i '^usage: distcp' >/dev/null; then echo DISTCP_OK; else echo DISTCP_FAIL; fi"""
 
 def _edge_path_template(path: str) -> str:
     if not path:
@@ -693,17 +802,19 @@ echo "Authentication successful"
 
     auth_script_parts.append(f"""
 if [ -z "$CONFIGURED_SA_USER" ]; then
-    TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
-    if [ -n "$TICKET_USER" ]; then
-        MIG_USER="$TICKET_USER"
-        MIG_USER_SOURCE="active MapR ticket"
+    if [ "{auth_method}" = "mapr" ]; then
+        TICKET_USER=$(maprlogin print 2>/dev/null | sed -n 's/.*user = \\([^,]*\\),.*/\\1/p' | head -1)
+        if [ -n "$TICKET_USER" ]; then
+            MIG_USER="$TICKET_USER"
+            MIG_USER_SOURCE="active MapR ticket"
+        fi
     fi
     export MIG_USER
     echo "WARNING: service_account_user_id is not configured. Falling back to"
     echo "WARNING: '$MIG_USER' from $MIG_USER_SOURCE. Set service_account_user_id"
     echo "WARNING: explicitly so temp and log paths do not depend on .profile."
 fi
-echo "MAPR_EFFECTIVE_USER=$MIG_USER"
+echo "EFFECTIVE_USER=$MIG_USER"
 echo "SERVICE_ACCOUNT_SOURCE=$MIG_USER_SOURCE"
 
 echo "=== Creating temp directory ==="
@@ -722,7 +833,9 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 """)
     full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
-        _, stdout, stderr = client.exec_command(_login_shell(full_script), timeout=300)
+        _, stdout, stderr = client.exec_command(
+            _login_shell(full_script, config.get('cluster_type', 'MapR')), timeout=300
+        )
         output = stdout.read().decode()
         error = stderr.read().decode()
         exit_code = stdout.channel.recv_exit_status()
@@ -758,7 +871,7 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_log_dir = val
-        elif line.startswith("MAPR_EFFECTIVE_USER="):
+        elif line.startswith(("EFFECTIVE_USER=", "MAPR_EFFECTIVE_USER=")):
             val = line.split("=", 1)[1].strip()
             if val:
                 resolved_sa_user = val
@@ -789,14 +902,15 @@ echo "DISTCP_LOG_DIR=$RESOLVED_DISTCP_LOG_DIR"
 
 
 def _s3a_committer_opts(config: dict) -> str:
-    """Return S3A magic-committer JVM flags for HDP clusters.
+    """Return S3A magic-committer JVM flags for HDP and CDP clusters.
 
     MapR has its own S3 connector and doesn't use FileOutputCommitter, so no
-    flags are needed there. HDP 3.x uses vanilla S3A whose default v1 committer
-    tries an atomic rename on S3 (unsupported), causing CommitterEventHandler
-    failures. The magic committer bypasses that with S3 multipart uploads.
+    flags are needed there. HDP 3.x and CDP 7.x use vanilla S3A whose default v1
+    committer tries an atomic rename on S3 (unsupported), causing
+    CommitterEventHandler failures. The magic committer bypasses that with S3
+    multipart uploads.
     """
-    if config.get('cluster_type', 'MapR').upper() == 'HDP':
+    if config.get('cluster_type', 'MapR').upper() in ('HDP', 'CDP'):
         return (
             " -Dmapreduce.outputcommitter.factory.scheme.s3a="
             "org.apache.hadoop.fs.s3a.commit.S3ACommitterFactory"

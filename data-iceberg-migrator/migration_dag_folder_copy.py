@@ -26,7 +26,9 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from migrator_utils.migrations.shared import (
+    DISTCP_CHECK_CMD,
     SSH_COMMAND_TIMEOUT,
+    _cluster_auth_check_cmd,
     _login_shell,
     build_s3_opts,
     cluster_login,
@@ -38,6 +40,7 @@ from migrator_utils.migrations.shared import (
     normalize_s3,
     permanent_fail,
     size_distcp_job,
+    sql_quote,
 )
 
 _dag_stem = Path(__file__).stem
@@ -139,6 +142,7 @@ def validate_prerequisites_folder_copy() -> dict:
 
     checks = {
         'ssh_connectivity': False,
+        'cluster_auth': False,
         'hadoop_distcp_available': False,
         'hadoop_fs_available': False,
     }
@@ -152,7 +156,7 @@ def validate_prerequisites_folder_copy() -> dict:
         with ssh.get_conn() as client:
 
             # 1. SSH connectivity
-            logger.info("[1/3] Testing SSH connectivity...")
+            logger.info("[1/4] Testing SSH connectivity...")
             _, stdout, stderr = client.exec_command(_login_shell('echo "SSH_TEST_OK"', config.get('cluster_type', 'MapR')), timeout=30)
             output = stdout.read().decode()
             stderr.read()
@@ -165,10 +169,27 @@ def validate_prerequisites_folder_copy() -> dict:
                 errors.append(f"SSH: {msg}")
                 logger.error(f"SSH connectivity: FAILED - {msg}")
 
-            # 2. Hadoop DistCp
-            logger.info("[2/3] Testing hadoop distcp availability...")
-            test_cmd = "hadoop distcp 2>&1 | grep -qi 'usage\\|distcp\\|options' && echo DISTCP_OK || echo DISTCP_FAIL"
-            _, stdout, stderr = client.exec_command(_login_shell(test_cmd, config.get('cluster_type', 'MapR')), timeout=60)
+            # 2. Cluster authentication (MapR ticket or Kerberos TGT), same check as DAG 1
+            auth_method = config.get('auth_method', 'mapr')
+            logger.info(f"[2/4] Testing cluster authentication (auth_method={auth_method})...")
+            auth_cmd = _cluster_auth_check_cmd(auth_method, config.get('service_account_user_id', ''))
+            _, stdout, stderr = client.exec_command(_login_shell(auth_cmd, config.get('cluster_type', 'MapR')), timeout=30)
+            output = stdout.read().decode()
+            stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
+            if exit_code == 0 and "CLUSTER_AUTH_OK" in output:
+                checks['cluster_auth'] = True
+                logger.info(f"Cluster auth ({auth_method}): PASSED")
+            else:
+                msg = output.replace("CLUSTER_AUTH_FAIL: ", "").strip() or f"Auth check failed (exit={exit_code})"
+                errors.append(f"Cluster auth: {msg}")
+                logger.error(f"Cluster auth ({auth_method}): FAILED - {msg}")
+
+            # 3. Hadoop DistCp
+            logger.info("[3/4] Testing hadoop distcp availability...")
+            _, stdout, stderr = client.exec_command(
+                _login_shell(DISTCP_CHECK_CMD, config.get('cluster_type', 'MapR')), timeout=60
+            )
             output = stdout.read().decode()
             stderr.read()
             exit_code = stdout.channel.recv_exit_status()
@@ -180,8 +201,8 @@ def validate_prerequisites_folder_copy() -> dict:
                 errors.append(f"DistCp: {msg}")
                 logger.error(f"Hadoop DistCp: FAILED - {msg}")
 
-            # 3. Hadoop FS
-            logger.info("[3/3] Testing Hadoop FS commands...")
+            # 4. Hadoop FS
+            logger.info("[4/4] Testing Hadoop FS commands...")
             hdfs_nameservice = config.get('hdfs_nameservice', '')
             fs_root = f"hdfs://{hdfs_nameservice}/" if hdfs_nameservice else "/"
             test_cmd = f"if hadoop fs -ls {fs_root} > /dev/null 2>&1; then echo HADOOP_FS_OK; else echo HADOOP_FS_FAIL; fi"
@@ -200,6 +221,7 @@ def validate_prerequisites_folder_copy() -> dict:
     except Exception as e:
         msg = f"SSH connection failed: {str(e)}"
         errors.append(f"SSH: {msg}")
+        errors.append("Cluster auth: Skipped due to SSH failure")
         errors.append("DistCp: Skipped due to SSH failure")
         errors.append("Hadoop FS: Skipped due to SSH failure")
         logger.error(f"SSH connectivity: FAILED - {msg}")
@@ -375,10 +397,10 @@ def create_data_copy_run(excel_file_path: str, spark, dag_run_id: str = '') -> s
 
     sa_user = str(config.get('service_account_user_id') or '').strip()
     sa_source = 'config:service_account_user_id' if sa_user else 'pending (.profile fallback)'
-    esc_excel = str(excel_file_path or '').replace("'", "''")
-    esc_dag_run_id = str(dag_run_id or '').replace("'", "''")
-    esc_sa_user = sa_user.replace("'", "''")
-    esc_sa_source = sa_source.replace("'", "''")
+    esc_excel = sql_quote(str(excel_file_path or ''))
+    esc_dag_run_id = sql_quote(str(dag_run_id or ''))
+    esc_sa_user = sql_quote(sa_user)
+    esc_sa_source = sql_quote(sa_source)
 
     spark.sql(f"""
         INSERT INTO {tracking_db}.data_copy_runs (
@@ -984,13 +1006,13 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
     tracking_db = config['tracking_database']
 
     run_id        = distcp_result['run_id']
-    source_path   = distcp_result['source_path'].replace("'", "''")
-    dest_bucket   = distcp_result['dest_bucket'].replace("'", "''")
-    dest_path     = distcp_result['dest_path'].replace("'", "''")
-    status        = str(distcp_result['status']).replace("'", "''")
-    started_at    = str(distcp_result.get('started_at', '') or '').replace("'", "''")
-    completed_at  = str(distcp_result.get('completed_at', '') or '').replace("'", "''")
-    error_msg     = (distcp_result.get('error') or '').replace("'", "''")[:2000]
+    source_path   = sql_quote(distcp_result['source_path'])
+    dest_bucket   = sql_quote(distcp_result['dest_bucket'])
+    dest_path     = sql_quote(distcp_result['dest_path'])
+    status        = sql_quote(str(distcp_result['status']))
+    started_at    = sql_quote(str(distcp_result.get('started_at', '') or ''))
+    completed_at  = sql_quote(str(distcp_result.get('completed_at', '') or ''))
+    error_msg     = sql_quote(distcp_result.get('error') or '', 2000)
 
     src_file_count  = distcp_result.get('source_file_count', 0) or 0
     src_size_bytes  = distcp_result.get('source_size_bytes', 0) or 0
@@ -1005,7 +1027,7 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
     yarn_ids = distcp_result.get('yarn_application_ids') or (
         [distcp_result['yarn_application_id']] if distcp_result.get('yarn_application_id') else []
     )
-    yarn_app_id = ','.join(str(x) for x in yarn_ids).replace("'", "''")
+    yarn_app_id = sql_quote(','.join(str(x) for x in yarn_ids))
     distcp_duration = float(distcp_result.get('distcp_duration_seconds', 0.0) or 0.0)
     distcp_bytes = int(distcp_result.get('distcp_bytes_copied', 0) or 0)
     distcp_files = int(distcp_result.get('distcp_files_copied', 0) or 0)
@@ -1198,24 +1220,24 @@ def update_data_copy_validation(validation_result: dict, spark) -> dict:
     tracking_db = config['tracking_database']
 
     run_id      = validation_result['run_id']
-    source_path = validation_result['source_path'].replace("'", "''")
-    dest_bucket = validation_result['dest_bucket'].replace("'", "''")
-    dest_path   = validation_result['dest_path'].replace("'", "''")
+    source_path = sql_quote(validation_result['source_path'])
+    dest_bucket = sql_quote(validation_result['dest_bucket'])
+    dest_path   = sql_quote(validation_result['dest_path'])
 
-    validation_status = str(
+    validation_status = sql_quote(str(
         validation_result.get('validation_status', 'VALIDATION_FAILED')
-    ).replace("'", "''")
+    ))
     dest_file_count   = validation_result.get('dest_file_count', 0) or 0
     dest_size_bytes   = validation_result.get('dest_size_bytes', 0) or 0
     file_count_match  = str(validation_result.get('file_count_match', False)).lower()
     size_match        = str(validation_result.get('size_match', False)).lower()
-    val_error         = str(validation_result.get('validation_error') or '').replace("'", "''")[:2000]
+    val_error         = sql_quote(str(validation_result.get('validation_error') or ''), 2000)
 
     yarn_ids = validation_result.get('yarn_application_ids') or (
         [validation_result['yarn_application_id']]
         if validation_result.get('yarn_application_id') else []
     )
-    yarn_app_id = ','.join(str(x) for x in yarn_ids).replace("'", "''")
+    yarn_app_id = sql_quote(','.join(str(x) for x in yarn_ids))
     distcp_duration = float(validation_result.get('distcp_duration_seconds', 0.0) or 0.0)
     distcp_bytes = int(validation_result.get('distcp_bytes_copied', 0) or 0)
     distcp_files = int(validation_result.get('distcp_files_copied', 0) or 0)
@@ -1305,8 +1327,8 @@ def finalize_data_copy_run(run_id: str, spark, cluster_setup: dict = None) -> di
     """, task_label="finalize_data_copy_run")
 
     if isinstance(cluster_setup, dict) and cluster_setup.get('service_account_user_id'):
-        _sa = str(cluster_setup['service_account_user_id']).replace("'", "''")
-        _sa_src = str(cluster_setup.get('service_account_source') or 'unknown').replace("'", "''")
+        _sa = sql_quote(str(cluster_setup['service_account_user_id']))
+        _sa_src = sql_quote(str(cluster_setup.get('service_account_source') or 'unknown'))
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.data_copy_runs
             SET service_account_user_id = '{_sa}',
