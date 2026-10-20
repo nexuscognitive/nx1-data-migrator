@@ -986,36 +986,101 @@ def generate_metadata_migration_report(run_id: str, spark) -> dict:
 
     run = run_rows[0]
     report_path = f"{str(config['report_output_location']).rstrip('/')}/{run_id}_hive_metadata_report.html"
+
+    def status_badge(value: object) -> str:
+        label = str(value or "UNKNOWN")
+        normalized = label.upper()
+        if normalized in ("VALIDATED", "COMPLETED", "CREATED"):
+            status_class = "success"
+        elif normalized in ("SKIPPED", "COMPLETED_WITH_SKIPS", "EMPTY_ALLOWED"):
+            status_class = "skipped"
+        elif normalized in ("FAILED", "CONFLICT", "VALIDATION_FAILED", "COMPLETED_WITH_FAILURES"):
+            status_class = "failed"
+        else:
+            status_class = "neutral"
+        return f'<span class="badge {status_class}">{html.escape(label)}</span>'
+
     row_html = []
     for item in object_rows:
-        values = [
+        values = (
             item["source_database"],
             item["source_object"],
             item["target_database"],
             item["target_object"],
             item["object_type"],
             item["target_location"],
-            item["data_presence_status"],
-            item["allow_empty"],
-            item["overall_status"],
-            item["validation_status"],
-            item["error_message"],
-        ]
-        row_html.append("<tr>" + "".join(f"<td>{html.escape(str(value or ''))}</td>" for value in values) + "</tr>")
+        )
+        cells = [f"<td>{html.escape(str(value or ''))}</td>" for value in values]
+        cells.extend(
+            (
+                f"<td>{status_badge(item['data_presence_status'])}</td>",
+                f"<td>{'Yes' if item['allow_empty'] else 'No'}</td>",
+                f"<td>{status_badge(item['overall_status'])}</td>",
+                f"<td>{status_badge(item['validation_status'])}</td>",
+                f"<td>{html.escape(str(item['error_message'] or ''))}</td>",
+            )
+        )
+        row_html.append("<tr>" + "".join(cells) + "</tr>")
+
+    status = str(run["status"] or "UNKNOWN")
+    summary_cards = [
+        ("Total tables", run["total_objects"] or 0, "info"),
+        ("Created & validated", run["created_objects"] or 0, "success"),
+        ("Already present", run["existing_objects"] or 0, "info"),
+        ("Skipped", run["skipped_objects"] or 0, "skipped"),
+        ("Failed", run["failed_objects"] or 0, "failed"),
+    ]
+    cards_html = "".join(
+        f'<div class="summary-card {style}"><h2>{html.escape(label)}</h2><p class="value">{value}</p></div>'
+        for label, value, style in summary_cards
+    )
+    dag_run_id = html.escape(str(run["dag_run_id"] or ""))
 
     content = f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Hive Metadata Migration {html.escape(run_id)}</title>
-<style>body{{font-family:Arial,sans-serif;margin:24px;color:#243447}}table{{border-collapse:collapse;width:100%}}
-th,td{{border:1px solid #d8dee8;padding:8px;text-align:left;vertical-align:top}}th{{background:#34495e;color:white}}
-tr:nth-child(even){{background:#f4f6f8}}.summary{{padding:12px;background:#eef4fa;margin-bottom:16px}}</style></head>
-<body><h1>Hive Metadata Migration Report</h1>
-<div class="summary"><b>Run:</b> {html.escape(run_id)} &nbsp; <b>Status:</b> {html.escape(str(run["status"] or ""))}
-&nbsp; <b>Total:</b> {run["total_objects"] or 0} &nbsp; <b>Validated:</b> {run["created_objects"] or 0}
-&nbsp; <b>Skipped:</b> {run["skipped_objects"] or 0} &nbsp; <b>Failed:</b> {run["failed_objects"] or 0}</div>
-<table><thead><tr><th>Source database</th><th>Source table</th><th>Target database</th><th>Target table</th>
-<th>Object type</th><th>Target location</th><th>Data presence</th><th>Allow empty</th>
-<th>Status</th><th>Validation</th><th>Details</th></tr></thead>
-<tbody>{"".join(row_html)}</tbody></table></body></html>"""
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hive Metadata Migration Report - {html.escape(run_id)}</title>
+<style>
+*{{box-sizing:border-box}}
+body{{font-family:'Segoe UI',Tahoma,Arial,sans-serif;margin:0;padding:24px;background:#f5f6fa;color:#243447}}
+.container{{max-width:1500px;margin:0 auto;background:#fff;padding:30px;border-radius:10px;box-shadow:0 3px 14px rgba(0,0,0,.10)}}
+h1{{margin:0 0 8px;color:#2c3e50;border-bottom:3px solid #3498db;padding-bottom:14px}}
+.subtitle{{color:#68788a;margin:0 0 20px}}
+.run-meta{{display:flex;flex-wrap:wrap;gap:8px 24px;color:#637184;font-size:13px;margin:18px 0 28px}}
+.run-meta strong{{color:#34495e}}
+h2.section-title{{font-size:20px;color:#34495e;margin:24px 0 14px}}
+.summary-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px}}
+.summary-card{{padding:18px;border-radius:8px;color:#fff;background:linear-gradient(135deg,#4facfe,#2878c7);box-shadow:0 3px 8px rgba(0,0,0,.10)}}
+.summary-card.success{{background:linear-gradient(135deg,#11998e,#38a879)}}
+.summary-card.skipped{{background:linear-gradient(135deg,#f6a742,#e87932)}}
+.summary-card.failed{{background:linear-gradient(135deg,#f16b70,#c83e55)}}
+.summary-card h2{{font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 10px;opacity:.95}}
+.summary-card .value{{font-size:30px;font-weight:700;margin:0}}
+.table-wrap{{overflow-x:auto;border:1px solid #e2e7ed;border-radius:8px}}
+table{{width:100%;border-collapse:collapse;min-width:1200px;font-size:13px}}
+th{{position:sticky;top:0;background:#34495e;color:#fff;padding:12px 10px;text-align:left;white-space:nowrap}}
+td{{padding:10px;border-bottom:1px solid #e8edf2;vertical-align:top}}
+tbody tr:nth-child(even){{background:#f8fafc}}tbody tr:hover{{background:#eef6fc}}
+td:nth-child(6),td:last-child{{overflow-wrap:anywhere;max-width:300px}}
+.badge{{display:inline-block;padding:4px 9px;border-radius:14px;font-size:11px;font-weight:700;white-space:nowrap;background:#e8edf2;color:#526171}}
+.badge.success{{background:#d8f3e7;color:#13764c}}.badge.failed{{background:#fde2e2;color:#a52834}}
+.badge.skipped{{background:#fff0d5;color:#93600c}}.badge.neutral{{background:#e8edf2;color:#526171}}
+.empty{{text-align:center;color:#718096;padding:26px}}
+@media(max-width:700px){{body{{padding:10px}}.container{{padding:18px}}}}
+</style></head>
+<body><main class="container">
+<h1>Hive Metadata Migration Report</h1>
+<p class="subtitle">Table metadata registration and target validation summary</p>
+<div class="run-meta"><span><strong>Run ID:</strong> {html.escape(run_id)}</span>
+<span><strong>Airflow run:</strong> {dag_run_id}</span>
+<span><strong>Run status:</strong> {status_badge(status)}</span></div>
+<h2 class="section-title">Migration Summary</h2>
+<section class="summary-grid">{cards_html}</section>
+<h2 class="section-title">Table Results</h2>
+<div class="table-wrap"><table><thead><tr><th>Source database</th><th>Source table</th>
+<th>Target database</th><th>Target table</th><th>Object type</th><th>Target location</th>
+<th>Data presence</th><th>Allow empty</th><th>Status</th><th>Validation</th><th>Details</th></tr></thead>
+<tbody>{"".join(row_html) if row_html else '<tr><td class="empty" colspan="11">No table results recorded for this run.</td></tr>'}</tbody>
+</table></div></main></body></html>"""
 
     jvm = spark._jvm
     fs = jvm.org.apache.hadoop.fs.FileSystem.get(jvm.java.net.URI(report_path), spark._jsc.hadoopConfiguration())
@@ -1083,7 +1148,7 @@ with DAG(
             default="s3a://config-bucket/hive_metadata_migration.xlsx",
             type="string",
             description="S3 path to the source-to-target Hive table mapping workbook",
-        )
+        ),
     },
     render_template_as_native_obj=True,
 ) as dag_hive_metadata:

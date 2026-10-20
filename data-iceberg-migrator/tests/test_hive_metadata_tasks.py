@@ -90,6 +90,29 @@ class TestParseMetadataExcel:
             m.parse_metadata_excel.function("s3a://config/mapping.xlsx", run_id="run-123", spark=mock_spark)
 
 
+class TestCreateMetadataMigrationRun:
+    def test_persists_run_configuration(self, mock_spark):
+        with (
+            patch.object(
+                m,
+                "get_config",
+                return_value={
+                    "tracking_database": "migration_tracking",
+                    "cluster_type": "HDP",
+                },
+            ),
+            patch.object(m, "execute_with_iceberg_retry") as execute,
+        ):
+            m.create_metadata_migration_run.function(
+                "s3a://config/mapping.xlsx",
+                "airflow-run-1",
+                spark=mock_spark,
+            )
+
+        insert_sql = execute.call_args.args[1]
+        assert '"cluster_type": "HDP"' in insert_sql
+
+
 class TestRewriteCreateTableDdl:
     def test_rewrites_table_name_and_location_only(self):
         source_ddl = """CREATE EXTERNAL TABLE `sales`.`orders` (
@@ -431,8 +454,11 @@ class TestMetadataMigrationReport:
     def test_writes_escaped_run_and_object_details(self, mock_spark):
         run = {
             "status": "COMPLETED",
+            "config_json": "{}",
+            "dag_run_id": "scheduled__2026-10-20",
             "total_objects": 1,
             "created_objects": 1,
+            "existing_objects": 0,
             "skipped_objects": 0,
             "failed_objects": 0,
         }
@@ -468,6 +494,11 @@ class TestMetadataMigrationReport:
 
         assert result["report_path"] == "s3a://reports/hive/run-123_hive_metadata_report.html"
         report_html = output_stream.write.call_args.args[0].decode()
+        assert "<title>Hive Metadata Migration Report - run-123</title>" in report_html
+        assert "<h1>Hive Metadata Migration Report</h1>" in report_html
+        assert "Migration Summary" in report_html
+        assert "Created &amp; validated" in report_html
+        assert 'class="badge success">VALIDATED</span>' in report_html
         assert "&lt;orders&gt;" in report_html
         assert "COMPLETED" in report_html
 
