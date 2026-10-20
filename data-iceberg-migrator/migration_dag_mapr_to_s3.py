@@ -34,8 +34,8 @@ from migrator_utils.migrations.partition_utils import (
     partitions_to_where_clause as _partitions_to_where_clause,
 )
 from migrator_utils.migrations.shared import (
-    DISTCP_CHECK_CMD,
     _BATCH_BUDGET_FRACTION,
+    DISTCP_CHECK_CMD,
     SSH_COMMAND_TIMEOUT,
     _cluster_auth_check_cmd,
     _hive_scratch_dir,
@@ -51,8 +51,8 @@ from migrator_utils.migrations.shared import (
     get_config,
     hive_type_to_spark_ddl,
     normalize_s3,
-    permanent_fail,
     pack_tables_into_batches,
+    permanent_fail,
     resolve_batch_cap,
     size_distcp_job,
     sql_quote,
