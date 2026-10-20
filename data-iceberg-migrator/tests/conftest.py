@@ -201,6 +201,7 @@ def _install_airflow_stubs():
     sys.modules.pop("migration_dag_iceberg", None)
     sys.modules.pop("migration_dag_folder_copy", None)
     sys.modules.pop("migration_dag_parquet_hms", None)
+    sys.modules.pop("migration_dag_hive_metadata", None)
     sys.modules.pop("migrator_utils.migrations.partition_utils", None)
     sys.modules.pop("migrator_utils.migrations.shared", None)
     sys.modules.pop("migrator_utils.migrations", None)

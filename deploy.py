@@ -23,8 +23,8 @@ PROJECTS = {
             "mapr": {
                 "file": "migration_dag_mapr_to_s3.py",
                 "dag_id": "source_to_s3_migration",
-                "owner_marker": "return 'data-migration'",
-                "owner_replacement": "return '{owner}'",
+                "owner_marker": 'return "data-migration"',
+                "owner_replacement": 'return "{owner}"',
             },
             "iceberg": {
                 "file": "migration_dag_iceberg.py",
@@ -41,6 +41,12 @@ PROJECTS = {
             "parquet_hms": {
                 "file": "migration_dag_parquet_hms.py",
                 "dag_id": "parquet_hms_registration",
+                "owner_marker": "return 'data-migration'",
+                "owner_replacement": "return '{owner}'",
+            },
+            "hive_metadata": {
+                "file": "migration_dag_hive_metadata.py",
+                "dag_id": "hive_metadata_migration",
                 "owner_marker": "return 'data-migration'",
                 "owner_replacement": "return '{owner}'",
             },
@@ -166,9 +172,7 @@ def resolve_interactive(args):
 
     if not args.project:
         interactive = True
-        args.project = prompt_choice(
-            "Select project:", list(PROJECTS.keys())
-        )
+        args.project = prompt_choice("Select project:", list(PROJECTS.keys()))
 
     project = PROJECTS[args.project]
     dag_shortcuts = list(project["dags"].keys())
@@ -274,7 +278,7 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
 
         content = local_path.read_text()
         content, dag_id_subs = re.subn(
-            rf"""dag_id=["']{re.escape(dag_info['dag_id'])}["']""",
+            rf"""dag_id=["']{re.escape(dag_info["dag_id"])}["']""",
             f'dag_id="{dag_info["dag_id"]}_{args.suffix}"',
             content,
         )
@@ -316,8 +320,7 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
     if not args.skip_env_shared:
         env_shared_path = SCRIPT_DIR / "env.shared"
         if not env_shared_path.exists():
-            print(f"Error: env.shared not found: {env_shared_path}\n"
-                  f"Use --skip-env-shared to skip uploading it.")
+            print(f"Error: env.shared not found: {env_shared_path}\nUse --skip-env-shared to skip uploading it.")
             sys.exit(1)
         s3_key = f"{args.dags_prefix}{project['package']}/migration_configs/env.shared"
         uploads.append((str(env_shared_path), s3_key, None))
@@ -388,13 +391,15 @@ def main():
     print("\nUploading...")
     try:
         upload_to_s3(
-            uploads, args.s3_bucket,
+            uploads,
+            args.s3_bucket,
             getattr(args, "s3_endpoint", None),
             getattr(args, "s3_access_key", None),
             getattr(args, "s3_secret_key", None),
         )
     except Exception as exc:
         from botocore.exceptions import NoCredentialsError
+
         if isinstance(exc, NoCredentialsError):
             print(
                 "\nNo S3 credentials found. Provide them via:\n"

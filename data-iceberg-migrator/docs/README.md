@@ -1,17 +1,40 @@
 # Source (MapR-FS/HDP-HDFS) to S3 Migration DAG
 
-An automated **Airflow TaskFlow-based migration pipeline** consisting of four independent DAGs for orchestrating large-scale Hive table migrations from source (MapR-FS or HDP-HDFS) to S3 and converting existing tables to Iceberg format.
+An automated **Airflow TaskFlow-based migration pipeline** consisting of six independent DAGs for orchestrating large-scale Hive table migrations from source (MapR-FS or HDP-HDFS) to S3 and converting existing tables to Iceberg format.
 
 ---
 
 ## Overview
 
-This implementation provides four independent but complementary migration DAGs:
+This implementation provides six independent but complementary migration DAGs:
 
 1. **`source_to_s3_migration`** - Migrates Hive tables from source (MapR-FS/HDP-HDFS) to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
 3. **`folder_only_data_copy`** - Copies raw folders from source cluster (MapR-FS/HDP-HDFS) to S3 via DistCp — no Hive metadata
 4. **`iceberg_catalog_migration`** - Migrates existing Iceberg tables from a Hadoop catalog to a Hive (HMS) catalog via the `rewrite_table_path` procedure — full snapshot history preserved
+5. **`parquet_hms_registration`** - Registers existing Parquet data on S3 as external Hive tables
+6. **`hive_metadata_migration`** - Registers already-migrated Hive tables in a target catalog without copying data
+
+### Hive metadata migration
+
+`hive_metadata_migration` reads source table definitions through Hive on the edge node, then creates table metadata using Spark in Airflow. The source metastore backend is accessed through Hive; the DAG does not connect directly to its PostgreSQL or Oracle database. Data must already exist at each configured target location. This initial version migrates **tables only**; source views are skipped for a later increment.
+
+Excel requires one row per table:
+
+| Column | Required | Purpose |
+|---|---|---|
+| `source_database` | Yes | Source Hive database |
+| `source_table` | Yes | Physical source Hive table |
+| `target_database` | Yes | Database to create/use in the target catalog |
+| `target_table` | Yes | Target table name |
+| `target_location` | Yes | Existing target data location, such as `s3a://bucket/path/table` |
+| `allow_empty` | No | Set to `true` only for an intentionally empty table; defaults to `false` |
+
+Before creating or accepting target table metadata, the DAG checks that the configured location exists and recursively finds at least one visible file. Hadoop/Spark marker files such as `_SUCCESS` and hidden files are ignored. If no data file is found, registration fails by default; set `allow_empty=true` only when the table is intentionally empty. This is a presence check, not a content or completeness check, and recursive object listing may add time/cost for large locations.
+
+The DAG uses source `SHOW CREATE TABLE` output and changes only the target object name and `LOCATION`. It currently requires exactly one `LOCATION` clause in the source DDL. It never overwrites a target object: an existing object at the requested location is schema- and location-validated; an object at a different or unknown location is a conflict. A missing target data location or unsupported source DDL fails the migration. View-definition extraction and dependency/reference rewriting are intentionally out of scope for this first version.
+
+Each run and source object is recorded in Iceberg tracking tables under the configured migration tracking database. The data-presence result and `allow_empty` setting are also recorded and shown in the report. After processing, the DAG aggregates object statuses, writes an HTML report to the configured migration report location, and emails it when migration email recipients are configured. Validation compares source/target column names and Spark types plus the target table location; it does not scan or compare table contents.
 
 ---
 
