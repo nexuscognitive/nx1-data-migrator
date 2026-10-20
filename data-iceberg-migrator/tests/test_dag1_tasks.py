@@ -895,7 +895,9 @@ class TestRecordDiscoveredTables:
         of bug as empty_partition_names, and column-count parity alone doesn't
         catch it, since both the list and VALUES were short by the same amount."""
         self._setup_count(mock_spark, 0)
-        m.record_discovered_tables.function(discovery=sample_discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         insert_sql = next(
             c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
         )
@@ -1050,7 +1052,9 @@ class TestRecordDiscoveredTables:
                 'error_type': 'TABLE_CORRUPTED',
             }],
         }
-        m.record_discovered_tables.function(discovery=discovery, spark=mock_spark)
+        m.record_discovered_tables.function(
+            discovery=discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
         all_sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
         assert "'TABLE_CORRUPTED'" in all_sql
         # The u'...' wrapper's quotes must be escaped inside the SQL literal
@@ -1109,11 +1113,7 @@ class TestRunDistcpSsh:
                 'error_type': 'TABLE_CORRUPTED',
             }],
         }
-        result = m.run_distcp_ssh.function.__wrapped__(
-            discovery=discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
         assert result['distcp_results'][0]['status'] == 'TABLE_CORRUPTED'
         client.exec_command.assert_not_called()
 
@@ -1157,14 +1157,10 @@ class TestRunDistcpSsh:
         stderr = MagicMock()
         stderr.read.return_value = b''
         client.exec_command.return_value = (
-            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
         )
 
-        m.run_distcp_ssh.function.__wrapped__(
-            discovery=sample_discovery,
-            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
-            ti=MagicMock(),
-        )
+        m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
         ssh_cmd = client.exec_command.call_args[0][0]
         assert '-m 50 -bandwidth 100' in ssh_cmd
         assert '-m 10 -bandwidth 50' not in ssh_cmd
