@@ -1444,3 +1444,94 @@ class TestS3aCommitterOpts:
     @pytest.mark.parametrize('config', [{'cluster_type': 'MapR'}, {}])
     def test_mapr_gets_no_committer_flags(self, config):
         assert m._s3a_committer_opts(config) == ''
+
+
+class TestSourceRelativePath:
+
+    @pytest.mark.parametrize('raw, expected', [
+        ('hdfs://nn:8020/data//x/', '/data/x'),
+        ('maprfs:///data/x', '/data/x'),
+        ('/data/x', '/data/x'),
+        ('maprfs:/datalake/sales/x', '/datalake/sales/x'),
+        ('hdfs:/data/x', '/data/x'),
+        ('hdfs://nn:8020', ''),
+        ('/', ''),
+        ('', ''),
+        (None, ''),
+    ])
+    def test_normalize_source_path(self, raw, expected):
+        assert m.normalize_source_path(raw) == expected
+
+    def test_parse_strip_prefixes_trims_dedupes_and_drops_blanks(self):
+        raw = ' /mapr/prod/ , ,/warehouse/x,/mapr/prod, / '
+        assert m.parse_strip_prefixes(raw) == ['/mapr/prod', '/warehouse/x']
+
+    def test_no_prefixes_uses_full_path(self):
+        assert m.source_relative_dest_path(
+            'hdfs://nn/data/finance/orders', 's3a://b/', []
+        ) == 's3a://b/data/finance/orders'
+
+    def test_matching_prefix_is_stripped(self):
+        assert m.source_relative_dest_path(
+            'maprfs:///mapr/prod/data/orders', 's3a://b', ['/mapr/prod']
+        ) == 's3a://b/data/orders'
+
+    def test_non_matching_prefix_leaves_path_as_is(self):
+        assert m.source_relative_dest_path(
+            '/data/other/t1', 's3a://b', ['/mapr/prod']
+        ) == 's3a://b/data/other/t1'
+
+    def test_prefix_matches_on_segment_boundary_only(self):
+        assert m.source_relative_dest_path(
+            '/mapr/production/x', 's3a://b', ['/mapr/prod']
+        ) == 's3a://b/mapr/production/x'
+
+    def test_longest_prefix_wins_regardless_of_order(self):
+        for prefixes in (['/mapr/prod', '/mapr/prod/data'],
+                         ['/mapr/prod/data', '/mapr/prod']):
+            assert m.source_relative_dest_path(
+                '/mapr/prod/data/x', 's3a://b', prefixes
+            ) == 's3a://b/x'
+
+    def test_only_one_prefix_is_stripped(self):
+        assert m.source_relative_dest_path(
+            '/mapr/prod/warehouse/x/t', 's3a://b', ['/mapr/prod', '/warehouse']
+        ) == 's3a://b/warehouse/x/t'
+
+    def test_managed_warehouse_path(self):
+        assert m.source_relative_dest_path(
+            'hdfs://nn/warehouse/tablespace/managed/hive/sales.db/orders',
+            's3a://b', ['/warehouse/tablespace/managed/hive'],
+        ) == 's3a://b/sales.db/orders'
+
+    @pytest.mark.parametrize('location, prefixes', [
+        ('', []),
+        (None, []),
+        ('hdfs://nn:8020', []),
+        ('/mapr/prod', ['/mapr/prod']),
+    ])
+    def test_unusable_or_fully_stripped_path_raises(self, location, prefixes):
+        with pytest.raises(ValueError):
+            m.source_relative_dest_path(location, 's3a://b', prefixes)
+
+
+class TestSourceRelativePathConfig:
+
+    def test_defaults_are_off_and_empty(self):
+        cfg = m.get_config()
+        assert cfg['use_source_relative_path'] is False
+        assert cfg['source_path_strip_prefixes'] == []
+
+    def test_variables_enable_the_mode_and_parse_prefixes(self):
+        values = {
+            'migration_use_source_relative_path': 'true',
+            'migration_source_path_strip_prefixes': '/mapr/prod, /warehouse/managed',
+        }
+
+        def _get(key, default_var=None, **kw):
+            return values.get(key, default_var)
+
+        with patch('airflow.models.Variable.get', side_effect=_get):
+            cfg = m.get_config()
+        assert cfg['use_source_relative_path'] is True
+        assert cfg['source_path_strip_prefixes'] == ['/mapr/prod', '/warehouse/managed']

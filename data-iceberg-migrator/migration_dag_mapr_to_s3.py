@@ -51,6 +51,7 @@ from migrator_utils.migrations.shared import (
     effective_source_metrics,
     estimate_distcp_cost,
     execute_with_iceberg_retry,
+    find_destination_conflicts,
     get_config,
     hive_type_to_spark_ddl,
     normalize_s3,
@@ -58,6 +59,7 @@ from migrator_utils.migrations.shared import (
     permanent_fail,
     resolve_batch_cap,
     size_distcp_job,
+    source_relative_dest_path,
     sql_quote,
     track_duration,
     validate_bucket_endpoint_pairs,
@@ -85,6 +87,8 @@ SKIPPABLE_DISCOVERY_ERRORS = (
     "DATABASE_NOT_FOUND",
     "SOURCE_PATH_NOT_FOUND",
     "TABLE_CORRUPTED",
+    "DESTINATION_PATH_CONFLICT",
+    "DESTINATION_PATH_INVALID",
 )
 
 # Spark's HiveExternalCatalog raises this when the spark.sql.sources.schema.* table
@@ -278,6 +282,31 @@ def _classify_discovery_error(error: str, source_path_exists: bool | None) -> st
 def _skippable_discovery_message(table: dict) -> str:
     """Reason a table was skipped; the fallback only covers an empty exception str()."""
     return table.get("error") or "Skipped during discovery"
+
+
+def _apply_source_relative_paths(
+    tables: list[dict], dest_bucket: str, strip_prefixes: list[str]
+) -> None:
+    """Point each healthy table's s3_location at its source path, in place.
+
+    Overrides include_db_in_path. A table whose source path cannot be turned
+    into a destination is skipped and reported, not failed, so one bad
+    location does not abort the whole database.
+    """
+    logger.info(
+        "[SourceRelativePath] enabled: destination is {bucket}/{source path}; "
+        f"include_db_in_path is ignored; strip prefixes={strip_prefixes or 'none'}"
+    )
+    for t in tables:
+        if "error" in t:
+            continue
+        try:
+            t["s3_location"] = source_relative_dest_path(
+                t.get("source_location", ""), dest_bucket, strip_prefixes
+            )
+        except ValueError as exc:
+            t["error_type"] = "DESTINATION_PATH_INVALID"
+            t["error"] = f"Cannot derive destination from source path: {exc}"
 
 
 def _resolve_dag_owner() -> str:
@@ -1759,6 +1788,11 @@ pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_i
         json_str = output[json_start + len("===JSON_START===") : json_end].strip()
         metadata = json.loads(json_str)
 
+    if config.get("use_source_relative_path"):
+        _apply_source_relative_paths(
+            metadata, dest_bucket, config.get("source_path_strip_prefixes") or []
+        )
+
     for t in metadata:
         if t.get("error_type") == "FAILED":
             t["error_type"] = _classify_discovery_error(
@@ -1796,6 +1830,14 @@ pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_i
                 f"  Source data path missing for {src_db}.{t['source_table']} — orphaned "
                 f"metastore entry, will be skipped in downstream phases | "
                 f"error={t.get('error', '')[:200]}"
+            )
+        elif t.get("error_type") in (
+            "DESTINATION_PATH_CONFLICT",
+            "DESTINATION_PATH_INVALID",
+        ):
+            logger.error(
+                f"  Destination path problem for {src_db}.{t['source_table']} — "
+                f"will be skipped in downstream phases | error={t.get('error', '')[:200]}"
             )
         elif t.get("error_type") == "TABLE_CORRUPTED":
             logger.error(
@@ -1835,8 +1877,31 @@ pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_i
     }
 
 
+@task(trigger_rule="all_done")
+def resolve_destination_conflicts(discoveries) -> dict:
+    """Find tables whose source-relative destinations overlap, across all databases.
+
+    Returns {"db\\ttable": message}. Only conflicts are returned: a task instance
+    that sees every table's metadata is fine here, but handing that to each
+    mapped record_discovered_tables instance would not be. Empty unless
+    use_source_relative_path is on.
+    """
+    if not get_config().get("use_source_relative_path"):
+        return {}
+    tables = []
+    for d in discoveries:
+        if isinstance(d, dict):
+            tables.extend(d.get("tables", []))
+    conflicts = find_destination_conflicts(tables)
+    for (db, tbl), message in conflicts.items():
+        logger.error(f"[SourceRelativePath] {db}.{tbl}: {message}")
+    return {f"{db}\t{tbl}": msg for (db, tbl), msg in conflicts.items()}
+
+
 @task.pyspark(conn_id="spark_default")
-def record_discovered_tables(discovery: dict, spark, **context) -> dict:
+def record_discovered_tables(
+    discovery: dict, spark, conflicts: dict | None = None, **context
+) -> dict:
     """Record discovered tables in Iceberg tracking table."""
 
     if not isinstance(discovery, dict) or "tables" not in discovery:
@@ -1844,6 +1909,12 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
             f"[record_discovered_tables] Skipping invalid/failed upstream input: {type(discovery)}"
         )
         return {}
+
+    for t in discovery["tables"]:
+        message = (conflicts or {}).get(f"{t.get('source_database', '')}\t{t['source_table']}")
+        if message and "error" not in t:
+            t["error_type"] = "DESTINATION_PATH_CONFLICT"
+            t["error"] = message
 
     config = get_config()
     tracking_db = config["tracking_database"]
@@ -4673,6 +4744,12 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         1 for t in table_status if t.overall_status == "SOURCE_PATH_NOT_FOUND"
     )
     corrupted_tables = sum(1 for t in table_status if t.overall_status == "TABLE_CORRUPTED")
+    conflict_tables = sum(
+        1 for t in table_status if t.overall_status == "DESTINATION_PATH_CONFLICT"
+    )
+    invalid_dest_tables = sum(
+        1 for t in table_status if t.overall_status == "DESTINATION_PATH_INVALID"
+    )
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (
         1024**3
     )
@@ -4808,6 +4885,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             background-color: #fce4ec;
             color: #ad1457;
         }}
+        .status-conflict {{
+            background-color: #fff0d6;
+            color: #9a5b00;
+        }}
         .status-warning {{
             background-color: #fff3cd;
             color: #856404;
@@ -4897,6 +4978,14 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             <div class="summary-card">
                 <h3>TABLE CORRUPTED</h3>
                 <p class="value">{corrupted_tables}</p>
+            </div>
+            <div class="summary-card">
+                <h3>DESTINATION CONFLICT</h3>
+                <p class="value">{conflict_tables}</p>
+            </div>
+            <div class="summary-card">
+                <h3>INVALID DESTINATION PATH</h3>
+                <p class="value">{invalid_dest_tables}</p>
             </div>
             <div class="summary-card info">
                 <h3>TOTAL DATA</h3>
@@ -5056,6 +5145,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif status == "TABLE_CORRUPTED":
             status_class = "status-corrupted"
             status_label = status
+        elif status in ("DESTINATION_PATH_CONFLICT", "DESTINATION_PATH_INVALID"):
+            status_class = "status-conflict"
+            status_label = status
         elif "VALIDATED_WITH_WARNINGS" in status:
             status_class = "status-warning"
             status_label = status
@@ -5195,6 +5287,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif t.overall_status == "TABLE_CORRUPTED":
             badge_class = "status-corrupted"
             badge_label = "TABLE_CORRUPTED"
+        elif t.overall_status in ("DESTINATION_PATH_CONFLICT", "DESTINATION_PATH_INVALID"):
+            badge_class = "status-conflict"
+            badge_label = t.overall_status
         else:
             badge_class = "status-not-found"
             badge_label = "TABLE_NOT_FOUND"
@@ -5208,9 +5303,13 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                     ' <span style="color:#6c757d;font-size:11px;">'
                     f"{html_escape(str(reason))}</span>"
                 )
-        elif t.overall_status == "TABLE_CORRUPTED" and t.error_message:
-            # Spark's message names the missing schema part, which the owner needs
-            # to repair the table.
+        elif (
+            t.overall_status
+            in ("TABLE_CORRUPTED", "DESTINATION_PATH_CONFLICT", "DESTINATION_PATH_INVALID")
+            and t.error_message
+        ):
+            # The message names the missing schema part (corrupted), the
+            # conflicting tables or the unusable path, which the owner needs to act.
             detail = (
                 ' <span style="color:#6c757d;font-size:11px;">'
                 f"{html_escape(str(t.error_message))}</span>"
@@ -5690,7 +5789,10 @@ with DAG(
     t_discover.operator.max_active_tis_per_dagrun = _env_int(
         "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3
     )
-    t_record = record_discovered_tables.expand(discovery=t_discover)
+    t_resolve = resolve_destination_conflicts(discoveries=t_discover)
+    t_record = record_discovered_tables.partial(conflicts=t_resolve).expand(
+        discovery=t_discover
+    )
     t_record.operator.trigger_rule = "all_done"
     t_batches = flatten_and_batch(discoveries=t_record)
     t_batches.operator.trigger_rule = "all_done"

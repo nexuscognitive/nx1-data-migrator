@@ -106,6 +106,8 @@ to end; see its `README.md` for setup and the DAG settings.
 | `migration_distcp_checkpoint_location` | `<migration_tracking_location>/_distcp_checkpoints` | S3 prefix for per-table, per-attempt DistCp checkpoint JSON. The edge node writes with Hadoop FS; the Spark status task lists and reads checkpoint objects. | `source_to_s3_migration` |
 | `migration_discovery_driver_memory` | _(empty)_ | Optional `--driver-memory` passed to the remote `pyspark` table-discovery process; empty leaves Spark's default unchanged. | `source_to_s3_migration` |
 | `migration_include_db_in_path`     | `true`           | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted)                                                                  | `source_to_s3_migration`                          |
+| `migration_use_source_relative_path` | `false`        | When `true`, destination S3 path is `{bucket}/{source relative path}` instead of `{bucket}/{database}/{table}`. Overrides `migration_include_db_in_path`. See [Source-relative destination paths](#source-relative-destination-paths) | `source_to_s3_migration` |
+| `migration_source_path_strip_prefixes` | _(empty)_    | Comma-separated source path prefixes to remove before building the destination (e.g. `/mapr/prod.cluster,/user/hive/warehouse`). Only used when `migration_use_source_relative_path` is `true` | `source_to_s3_migration` |
 | `s3_listing_tool`                  | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`                                                                                                                                                                         | Currently unused                                  |
 | `migration_smtp_conn_id`           | `smtp_default`   | Airflow SMTP connection ID for email reports                                                                                                                                                                     | All DAGs                                          |
 | `migration_email_recipients`       | _(empty)_        | Comma-separated email addresses for reports                                                                                                                                                                      | All DAGs                                          |
@@ -710,6 +712,58 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 | `endpoint`         | No       | S3 endpoint URL for a non-default tenant; credentials resolved via `<hostname>_access_key/secret_key` Variables (see Multi-Tenant section)                                                          | `https://s3.tenant-a.example.com`        |
 | `partition_filter` | No       | Migrate only specific partitions. Comma-separated expressions. Supports: exact match (`year=2023/month=01`), prefix wildcard (`year=2023/*`), comparison (`year>=2022`), and `last_n_partitions=N`. | `year=2023/month=01, year=2023/month=02` |
 
+The Excel file never sets the S3 folder layout. The `bucket` cell is only the bucket
+root, and `dest database` is only the Hive database name in the destination
+metastore. The layout comes from the settings below.
+
+Example (same format in both path modes):
+
+| database | table      | dest database | bucket          | endpoint                 |
+| -------- | ---------- | ------------- | --------------- | ------------------------ |
+| sales    | \*         | sales         | s3a://dl-prod   | https://s3.example.com   |
+| hr       | emp,dept   | hr            | s3a://dl-prod   | https://s3.example.com   |
+
+#### Source-relative destination paths
+
+By default a table lands at `{bucket}/{dest_database}/{table}` (or `{bucket}/{table}`
+when `migration_include_db_in_path=false`). To land it at a path that mirrors the
+source location, set:
+
+```
+migration_use_source_relative_path   = true
+migration_source_path_strip_prefixes = /mapr/prod.cluster,/user/hive/warehouse
+```
+
+Both keys resolve like other optional settings: run conf or tenant profile, then
+Airflow Variable, then env var (`MIGRATION_USE_SOURCE_RELATIVE_PATH`,
+`MIGRATION_SOURCE_PATH_STRIP_PREFIXES`), then the default. The setting applies to the
+whole run.
+
+Rules:
+
+- The source location's scheme and authority (`maprfs://`, `hdfs://nn:8020`) are dropped; the rest of the path is used.
+- Strip prefixes are matched on path-segment boundaries. The longest match wins and only one prefix is removed.
+- A path that matches no prefix is used as is (no failure).
+- The mode overrides `migration_include_db_in_path`; the database folder is never added.
+- Managed and external source tables are treated the same. The destination is always an external Hive table at the computed location, so for managed tables strip the warehouse prefix to get a clean layout.
+
+Examples (bucket `s3a://dl-prod`):
+
+| Source location                                      | Mode          | Strip prefixes             | Destination                               |
+| ---------------------------------------------------- | ------------- | -------------------------- | ----------------------------------------- |
+| `maprfs:///datalake/sales/orders`                    | off (default) | -                          | `s3a://dl-prod/sales/orders`              |
+| `maprfs:///datalake/sales/orders`                    | on            | none                       | `s3a://dl-prod/datalake/sales/orders`     |
+| `maprfs:///mapr/prod.cluster/datalake/sales/orders`  | on            | `/mapr/prod.cluster`       | `s3a://dl-prod/datalake/sales/orders`     |
+| `hdfs://nn:8020/user/hive/warehouse/sales.db/orders` | on            | `/user/hive/warehouse`     | `s3a://dl-prod/sales.db/orders`           |
+| `maprfs:/datalake/x/y`                               | on            | `/mapr/a,/datalake`        | `s3a://dl-prod/x/y`                       |
+| `maprfs:///datalake`                                 | on            | `/datalake`                | `DESTINATION_PATH_INVALID`                |
+
+Failures are per table and do not fail the run. Both statuses are skippable, appear in
+the HTML report and email, and the other tables continue:
+
+- `DESTINATION_PATH_INVALID` - the path is empty after stripping.
+- `DESTINATION_PATH_CONFLICT` - two different tables resolve to the same destination, or one destination is nested inside another. Both tables are marked and the message lists the source paths involved.
+
 ---
 
 ### Task Flow
@@ -852,7 +906,7 @@ finalize_run
   - **Partition columns** - Extracted from table metadata
   - **Partition filter** - If `partition_filter` is set in the Excel config, only matching partitions are included; full-table row and partition counts are also captured as a baseline
 - Generates JSON output with all discovered metadata
-- Determines S3 destination path: `{bucket}/{dest_database}/{table_name}` (default) or `{bucket}/{table_name}` when `migration_include_db_in_path=false`
+- Determines S3 destination path: `{bucket}/{dest_database}/{table_name}` (default) or `{bucket}/{table_name}` when `migration_include_db_in_path=false`, or `{bucket}/{source relative path}` when `migration_use_source_relative_path=true` (see [Source-relative destination paths](#source-relative-destination-paths))
 
 ---
 
@@ -1141,6 +1195,8 @@ VALIDATED (All validations passed)
 
 (Any stage can fail → FAILED)
 ```
+
+Tables skipped at discovery (for example `DESTINATION_PATH_INVALID` or `DESTINATION_PATH_CONFLICT`) are reported but not migrated, and do not fail the run.
 
 ---
 
