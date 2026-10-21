@@ -1121,6 +1121,11 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
             else str(raw_endpoint_val).strip()
         )
 
+        exclude_row = []
+        if raw_cell.lower().startswith("exclude:"):
+            exclude_row = [t.strip() for t in raw_cell[len("exclude:"):].split(",") if t.strip()]
+            raw_cell = ""
+
         if "*" in [t.strip() for t in raw_cell.split(",")] and partition_filter:
             logger.warning(
                 f"[ParseExcel] Wildcard '*' combined with partition_filter='{partition_filter}' "
@@ -1143,9 +1148,11 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
                 "bucket": bucket_val,
                 "endpoint": endpoint_val,
                 "tokens": [],
+                "exclude_tokens": [],
                 "partition_filter": partition_filter,
             }
 
+        grouped[key]["exclude_tokens"].extend(exclude_row)
         for tok in raw_cell.split(","):
             tok = tok.strip()
             if tok:
@@ -1162,6 +1169,9 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         partition_filter,
     ), group in grouped.items():
         unique_tokens = list(dict.fromkeys(group["tokens"]))
+        unique_excludes = list(dict.fromkeys(group["exclude_tokens"]))
+        if unique_excludes and not unique_tokens:
+            unique_tokens = ["*"]
         if "*" in unique_tokens:
             unique_tokens = ["*"]
 
@@ -1175,12 +1185,14 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
             + (f" | partition_filter={partition_filter}" if partition_filter else "")
             + f" | tokens={unique_tokens[:10]}"
             + (" ..." if len(unique_tokens) > 10 else "")
+            + (f" | exclude={unique_excludes[:10]}" if unique_excludes else "")
         )
 
         configs.append(
             {
                 "source_database": src_db,
                 "table_tokens": unique_tokens,
+                "exclude_tokens": unique_excludes,
                 "dest_database": dest_db,
                 "dest_bucket": bucket_val,
                 "dest_endpoint": endpoint_val,
@@ -1201,7 +1213,7 @@ def cluster_login_setup(run_id: str) -> dict:
 
 @task
 @track_duration
-def discover_tables_via_spark_ssh(db_config: dict) -> dict:
+def discover_tables_via_spark_ssh(db_config: dict, **context) -> dict:
     """Use Spark SQL via SSH on edge node to discover tables and metadata."""
     import json
     import re
@@ -1220,6 +1232,7 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     dest_bucket = db_config["dest_bucket"]
     dest_endpoint = db_config.get("dest_endpoint", "")
     tokens_json = json.dumps(raw_tokens)
+    exclude_tokens_json = json.dumps(db_config.get("exclude_tokens") or [])
     partition_filter = db_config.get("partition_filter") or ""
 
     dest_bucket_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", dest_bucket)
@@ -1263,6 +1276,7 @@ dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
 
 tokens = json.loads('{tokens_json_escaped}')
+exclude_tokens = json.loads('{exclude_tokens_json_escaped}')
 filter_expr = "{filter_expr_escaped}"
 
 def _s3_location_for(tbl):
@@ -1376,6 +1390,38 @@ if not database_exists(spark, src_db):
     missing_tables = []
 else:
     table_list, missing_tables = resolve_tokens(spark, src_db, tokens)
+
+if exclude_tokens:
+    exclude_lower = [e.lower() for e in exclude_tokens]
+    explicit_lower = set(t.lower() for t in tokens if '*' not in t)
+    excluded_names = []
+    kept = []
+    matched_excludes = set()
+    for tbl in table_list:
+        low = tbl.lower()
+        hit = [e for e in exclude_lower if low == e or fnmatch.fnmatch(low, e)]
+        if hit:
+            excluded_names.append(tbl)
+            matched_excludes.update(hit)
+            if low in explicit_lower:
+                print("WARNING: table '{{0}}' is both an explicit token and excluded; it will be excluded".format(tbl))
+        else:
+            kept.append(tbl)
+    table_list = kept
+    still_missing = []
+    for tbl in missing_tables:
+        low = tbl.lower()
+        hit = [e for e in exclude_lower if low == e or fnmatch.fnmatch(low, e)]
+        if hit:
+            matched_excludes.update(hit)
+            print("WARNING: table '{{0}}' is both an explicit token and excluded; it will be excluded".format(tbl))
+        else:
+            still_missing.append(tbl)
+    missing_tables = still_missing
+    print("INFO: excluded by config: {{0}}".format(", ".join(excluded_names)))
+    for e in exclude_lower:
+        if e not in matched_excludes:
+            print("WARNING: exclude token '{{0}}' matched no tables in {{1}}".format(e, src_db))
 
 for tbl in missing_tables:
     record = _default_metadata_record(tbl)
@@ -1689,6 +1735,7 @@ spark.stop()
             run_id=run_id,
             src_db=src_db,
             tokens_json_escaped=tokens_json.replace("'", "\\'"),
+            exclude_tokens_json_escaped=exclude_tokens_json.replace("'", "\\'"),
             dest_db=dest_db,
             dest_bucket=dest_bucket,
             dest_bucket_slug=dest_bucket_slug,
@@ -1821,9 +1868,21 @@ pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_i
         total_count = len(metadata)
         failed_names = ", ".join([t["source_table"] for t in real_failures[:3]])
 
-        raise Exception(
-            f"Discovery failed for {failed_count}/{total_count} table(s) in {src_db}: {failed_names}. "
+        ti = context.get("ti")
+        task_obj = context.get("task") or getattr(ti, "task", None)
+        max_tries = (getattr(task_obj, "retries", 0) or 0) + 1
+        is_final_attempt = ti is not None and (ti.try_number or 0) >= max_tries
+        if not is_final_attempt:
+            raise Exception(
+                f"Discovery failed for {failed_count}/{total_count} table(s) in {src_db}: {failed_names}. "
+            )
+        logger.error(
+            f"Final attempt: discovery failed for {failed_count}/{total_count} table(s) in {src_db}: "
+            f"{', '.join(t['source_table'] for t in real_failures)}. "
+            f"Continuing with remaining tables; failed tables will be recorded as FAILED."
         )
+        for t in real_failures:
+            t["error_type"] = "FAILED"
 
     return {
         "run_id": run_id,
@@ -1851,11 +1910,20 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
 
     discovery_duration = discovery.get("_task_duration", 0.0)
 
+    discovery_failed = []
     for t in discovery["tables"]:
         error_type = t.get("error_type")
         is_missing = error_type in SKIPPABLE_DISCOVERY_ERRORS
-        disc_status = error_type if is_missing else "COMPLETED"
-        if is_missing:
+        is_failed = error_type == "FAILED"
+        disc_status = (
+            error_type if is_missing else "FAILED" if is_failed else "COMPLETED"
+        )
+        if is_failed:
+            discovery_failed.append(t["source_table"])
+            err_msg_escaped = sql_quote(t.get("error") or "", 2000)
+            overall_status_insert = overall_status_update = "'FAILED'"
+            error_msg_insert = error_msg_update = f"'{err_msg_escaped}'"
+        elif is_missing:
             err_msg_escaped = sql_quote(_skippable_discovery_message(t), 2000)
             overall_status_insert = f"'{error_type}'"
             error_msg_insert = f"'{err_msg_escaped}'"
@@ -2011,7 +2079,12 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
     # Stamped here because the batch descriptors downstream must address their
     # group by map index: the reduce sequence they are built from omits map
     # indexes whose task instance died, so list position is not the index.
-    return {**discovery, "_map_index": context["ti"].map_index}
+    return {
+        **discovery,
+        "tables": [t for t in discovery["tables"] if t.get("error_type") != "FAILED"],
+        "_discovery_failed": discovery_failed,
+        "_map_index": context["ti"].map_index,
+    }
 
 
 @task
@@ -5548,6 +5621,21 @@ def finalize_run(run_id: str, spark, cluster_setup: dict = None) -> dict:
             f"[finalize_run] Failed to update migration_runs for run_id '{run_id}': {str(e)}"
         )
         raise
+
+    discovery_failed_rows = spark.sql(f"""
+        SELECT source_table
+        FROM {tracking_db}.migration_table_status
+        WHERE run_id = '{run_id}' AND discovery_status = 'FAILED'
+        ORDER BY source_table
+    """).collect()
+    if len(discovery_failed_rows) > 0:
+        from airflow.exceptions import AirflowFailException
+
+        names = ", ".join(r["source_table"] for r in discovery_failed_rows[:10])
+        raise AirflowFailException(
+            f"Discovery failed for {len(discovery_failed_rows)} table(s): {names}. "
+            f"All other tables were processed; see report."
+        )
 
     return {
         "run_id": run_id,
