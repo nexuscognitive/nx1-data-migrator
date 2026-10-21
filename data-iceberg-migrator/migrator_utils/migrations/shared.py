@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import random
+import re
 import shlex
 import time
 from functools import wraps
@@ -209,6 +210,101 @@ def compute_dest_path(source_location: str, dest_database: str, table_name: str,
         relative = source_location[len(source_s3_prefix):].lstrip('/')
         return f"{dest_s3_prefix.rstrip('/')}/{relative}"
     return f"{dest_bucket.rstrip('/')}/{dest_database}/{table_name}"
+
+
+def parse_strip_prefixes(raw) -> list[str]:
+    """Split a comma-separated prefix list into normalised path prefixes.
+
+    Blank entries are dropped and a bare '/' is ignored, since stripping it would
+    be a no-op that only hides a typo.
+    """
+    prefixes = []
+    for item in str(raw or "").split(","):
+        prefix = normalize_source_path(item)
+        if prefix and prefix not in prefixes:
+            prefixes.append(prefix)
+    return prefixes
+
+
+def normalize_source_path(location: str) -> str:
+    """Drop the scheme/authority and collapse duplicate or trailing slashes.
+
+    'hdfs://nn:8020/data//x/' and 'maprfs:///data/x' both become '/data/x'.
+    A bare '/' (or nothing) normalises to ''.
+    """
+    path = (location or "").strip()
+    path = re.sub(r"^[A-Za-z][A-Za-z0-9+.\-]*:(?://[^/]*)?(?=/|$)", "", path)
+    segments = [seg for seg in path.split("/") if seg]
+    return "/" + "/".join(segments) if segments else ""
+
+
+def source_relative_dest_path(source_location: str, dest_bucket: str,
+                              strip_prefixes: list[str]) -> str:
+    """Destination for a table that keeps its source path: {bucket}/{relative path}.
+
+    The longest strip prefix that matches on a path-segment boundary is removed;
+    a path matching none is used as is. Raises ValueError when there is no
+    source path, or nothing is left after stripping.
+    """
+    path = normalize_source_path(source_location)
+    if not path:
+        raise ValueError(f"Source location is empty or unusable: {source_location!r}")
+    matches = [
+        p for p in strip_prefixes if path == p or path.startswith(p + "/")
+    ]
+    if matches:
+        path = path[len(max(matches, key=len)):]
+    relative = path.strip("/")
+    if not relative:
+        raise ValueError(
+            f"Source location {source_location!r} is empty after stripping its prefix"
+        )
+    return f"{dest_bucket.rstrip('/')}/{relative}"
+
+
+def find_destination_conflicts(tables: list[dict]) -> dict[tuple[str, str], str]:
+    """Map (source_database, source_table) to a message for every table whose
+    destination equals, or sits inside or above, another table's destination.
+
+    Tables that already carry an error are ignored. Rows for the same source
+    table (for example one per partition filter) share a destination on purpose
+    and never conflict with each other. Comparison is case-sensitive, as S3 is.
+    """
+    owners: dict[str, set[tuple[str, str]]] = {}
+    sources: dict[tuple[str, str], str] = {}
+    for t in tables:
+        if t.get("error") or not t.get("s3_location"):
+            continue
+        key = (t.get("source_database", ""), t["source_table"])
+        dest = t["s3_location"].rstrip("/")
+        owners.setdefault(dest, set()).add(key)
+        sources[key] = t.get("source_location") or ""
+
+    dests = sorted(owners)
+    conflicts: dict[tuple[str, str], set[str]] = {}
+    for i, dest in enumerate(dests):
+        clashing = set(owners[dest]) if len(owners[dest]) > 1 else set()
+        for other in dests[i + 1:]:
+            if other.startswith(dest + "/"):
+                clashing |= owners[dest] | owners[other]
+        if not clashing:
+            continue
+        for key in clashing:
+            conflicts.setdefault(key, set()).add(dest)
+    result = {}
+    for key, involved in conflicts.items():
+        peers = sorted(
+            f"{db}.{tbl} ({sources[(db, tbl)]})"
+            for dest in involved
+            for db, tbl in owners[dest]
+            if (db, tbl) != key
+        )
+        peers = list(dict.fromkeys(peers))
+        result[key] = (
+            f"Destination {sorted(involved)[0]} overlaps with another table's destination; "
+            f"conflicts with: {', '.join(peers)}"
+        )
+    return result
 
 
 def cell_str(val, default=''):
@@ -598,6 +694,18 @@ def get_config() -> dict:
         'include_db_in_path': str(
             _var('migration_include_db_in_path', 'MIGRATION_INCLUDE_DB_IN_PATH', 'true')
         ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+
+        # When True, dest path is {bucket}/{source path} instead of
+        # {bucket}/{database}/{table}; include_db_in_path is then ignored.
+        'use_source_relative_path': str(
+            _var('migration_use_source_relative_path', 'MIGRATION_USE_SOURCE_RELATIVE_PATH',
+                 'false', conf_key='use_source_relative_path')
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+        # Comma-separated source path prefixes removed from the destination path.
+        'source_path_strip_prefixes': parse_strip_prefixes(
+            _var('migration_source_path_strip_prefixes', 'MIGRATION_SOURCE_PATH_STRIP_PREFIXES',
+                 '', conf_key='source_path_strip_prefixes')
+        ),
 
         'iceberg_drop_backup': str(
             _dag_run_conf.get(
