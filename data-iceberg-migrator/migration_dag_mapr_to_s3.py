@@ -1877,7 +1877,7 @@ pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_i
     }
 
 
-@task(trigger_rule="all_done")
+@task(trigger_rule="all_done", multiple_outputs=False)
 def resolve_destination_conflicts(discoveries) -> dict:
     """Find tables whose source-relative destinations overlap, across all databases.
 
