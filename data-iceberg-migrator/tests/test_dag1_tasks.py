@@ -26,6 +26,14 @@ def _make_distcp_stdout(incremental=False):
     ).encode())
 
 
+def _distcp_command(client):
+    for call in client.exec_command.call_args_list:
+        command = call.args[0]
+        if "hadoop distcp" in command:
+            return command
+    raise AssertionError("No DistCp command was executed")
+
+
 def _partitioned_discovery(sample_discovery, partitions=('d=2024', 'd=2025')):
     """One table on the per-partition path: filtered, preserve_delete default."""
     base = sample_discovery['tables'][0]
@@ -1064,6 +1072,25 @@ class TestRecordDiscoveredTables:
 
 class TestRunDistcpSsh:
 
+    @staticmethod
+    def _distcp_command(client):
+        for call in client.exec_command.call_args_list:
+            command = call.args[0]
+            if "hadoop distcp" in command:
+                return command
+        raise AssertionError("No DistCp command was executed")
+
+    def _make_distcp_stdout(self, incremental=False):
+        return mock_ssh_stdout(0, (
+            "===DISTCP_METRICS_START===\n"
+            f"INCREMENTAL={'true' if incremental else 'false'}\n"
+            "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\nDISTCP_EXIT_CODE=0\n"
+            "BYTES_COPIED=10485760\nFILES_COPIED=5\n"
+            "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
+            "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
+            "===DISTCP_METRICS_END===\n"
+        ).encode())
+
     def test_successful_copy_detects_incremental(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
         stderr = MagicMock()
@@ -1074,6 +1101,99 @@ class TestRunDistcpSsh:
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
         assert result['distcp_results'][0]['bytes_copied'] == 10485760
         assert result['distcp_results'][0]['is_incremental'] is True
+
+    def test_successful_copy_persists_attempt_record(
+        self, mock_ssh_hook, sample_discovery,
+    ):
+        _, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (MagicMock(), self._make_distcp_stdout(), stderr)
+        kwargs = distcp_call(sample_discovery)
+        with patch.object(m, '_write_edge_distcp_checkpoint') as write_checkpoint:
+            m.run_distcp_ssh.function.__wrapped__(**kwargs)
+        records = [call.args[1] for call in write_checkpoint.call_args_list]
+        record = write_checkpoint.call_args.args[1]
+        checkpoint_path = write_checkpoint.call_args.args[2]
+        assert [item['status'] for item in records] == ['RUNNING', 'COMPLETED']
+        assert record['status'] == 'COMPLETED'
+        assert record['distcp_attempt'] == 1
+        assert checkpoint_path.endswith('/attempt-1.json')
+
+    def test_retry_skips_table_completed_in_prior_attempt(
+        self, mock_ssh_hook, sample_discovery,
+    ):
+        _, client, _, _ = mock_ssh_hook
+        ti = MagicMock()
+        ti.try_number = 2
+        previous = {
+            'source_database': 'sales_data',
+            'source_table': 'transactions',
+            'dest_database': 'sales_data_s3',
+            'partition_filter': None,
+            'status': 'COMPLETED',
+            'distcp_attempt': 1,
+        }
+        kwargs = distcp_call(sample_discovery)
+        kwargs['ti'] = ti
+        ti.xcom_pull.return_value = sample_discovery
+        with patch.object(m, '_read_edge_distcp_checkpoints', return_value=[previous]):
+            result = m.run_distcp_ssh.function.__wrapped__(
+                **kwargs,
+            )
+        assert result['distcp_results'][0]['status'] == 'COMPLETED'
+        assert result['distcp_results'][0]['resumed_from_attempt'] == 1
+        client.exec_command.assert_not_called()
+
+    def test_retry_reexecutes_table_with_running_checkpoint(
+        self, mock_ssh_hook, sample_discovery,
+    ):
+        _, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (MagicMock(), self._make_distcp_stdout(), stderr)
+        ti = MagicMock()
+        ti.try_number = 2
+        previous = {
+            'source_database': 'sales_data',
+            'source_table': 'transactions',
+            'dest_database': 'sales_data_s3',
+            'partition_filter': None,
+            'status': 'RUNNING',
+            'distcp_attempt': 1,
+        }
+        kwargs = distcp_call(sample_discovery)
+        kwargs['ti'] = ti
+        ti.xcom_pull.return_value = sample_discovery
+        with (
+            patch.object(m, '_read_edge_distcp_checkpoints', return_value=[previous]),
+            patch.object(m, '_write_edge_distcp_checkpoint'),
+        ):
+            result = m.run_distcp_ssh.function.__wrapped__(
+                **kwargs,
+            )
+        assert result['distcp_results'][0]['status'] == 'COMPLETED'
+        assert len([call for call in client.exec_command.call_args_list
+                    if 'hadoop distcp' in call.args[0]]) == 1
+
+    def test_checkpoint_write_failure_fails_task(self, mock_ssh_hook, sample_discovery):
+        _, _, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        mock_ssh_hook[1].exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(), stderr
+        )
+        with (
+            patch.object(
+                m,
+                '_write_edge_distcp_checkpoint',
+                side_effect=RuntimeError('S3 write failed'),
+            ),
+            pytest.raises(RuntimeError, match='S3 write failed'),
+        ):
+            m.run_distcp_ssh.function.__wrapped__(
+                **distcp_call(sample_discovery),
+            )
 
     def test_skips_table_not_found_without_ssh(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
@@ -1161,7 +1281,7 @@ class TestRunDistcpSsh:
         )
 
         m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
-        ssh_cmd = client.exec_command.call_args[0][0]
+        ssh_cmd = self._distcp_command(client)
         assert '-m 50 -bandwidth 100' in ssh_cmd
         assert '-m 10 -bandwidth 50' not in ssh_cmd
 
@@ -1192,7 +1312,7 @@ class TestRunDistcpSsh:
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
         assert result['distcp_results'][0]['partition_filter_active'] is True
 
-        ssh_cmd = client.exec_command.call_args[0][0]
+        ssh_cmd = self._distcp_command(client)
 
         assert 'PATHLIST' not in ssh_cmd
 
@@ -1237,7 +1357,7 @@ class TestRunDistcpSsh:
 
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
 
-        ssh_cmd = client.exec_command.call_args[0][0]
+        ssh_cmd = self._distcp_command(client)
         assert 'PATHLIST=' in ssh_cmd
         assert '-f "$PATHLIST"' in ssh_cmd
         assert '-delete' not in ssh_cmd
@@ -1293,8 +1413,10 @@ class TestRunDistcpSsh:
         }
         cfg = {**m.get_config(), 'distcp_preserve_delete': preserve_delete}
         with patch.object(m, 'get_config', return_value=cfg):
-            m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
-        return client.exec_command.call_args[0][0]
+            m.run_distcp_ssh.function.__wrapped__(
+                **distcp_call(filtered_discovery),
+            )
+        return self._distcp_command(client)
 
     def _assert_metrics_scoped_to_partitions(self, ssh_cmd, s3_loc, partitions):
         """Regression check (WF-201): BEFORE/AFTER S3 metrics must be summed only over the
@@ -1352,8 +1474,10 @@ class TestRunDistcpSsh:
         cfg = {**m.get_config(), 'distcp_preserve_delete': True}
         cfg.update(config_overrides or {})
         with patch.object(m, 'get_config', return_value=cfg):
-            m.run_distcp_ssh.function.__wrapped__(**distcp_call(filtered_discovery))
-        return client.exec_command.call_args[0][0]
+            m.run_distcp_ssh.function.__wrapped__(
+                **distcp_call(filtered_discovery),
+            )
+        return self._distcp_command(client)
 
     def test_master_switch_default_off_uses_fixed_defaults_per_partition(
         self, mock_ssh_hook, sample_discovery,
@@ -1445,8 +1569,10 @@ class TestRunDistcpSsh:
         result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(empty_source_discovery))
         assert result['distcp_results'][0]['status'] == 'EMPTY_SOURCE'
         if client.exec_command.called:
-            cmd = client.exec_command.call_args[0][0]
-            assert 'distcp' not in cmd.lower(), "distcp should not be called for empty source"
+            commands = [call.args[0] for call in client.exec_command.call_args_list]
+            assert not any('hadoop distcp' in cmd for cmd in commands), (
+                "DistCp should not be called for empty source"
+            )
 
     def test_empty_source_prefixes_for_every_partition_in_one_mkdir(self, mock_ssh_hook, sample_discovery):
         """One failing partition must not skip the others: all prefixes go to a single
@@ -1464,7 +1590,11 @@ class TestRunDistcpSsh:
 
         m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
 
-        mkdir_cmds = [c[0][0] for c in client.exec_command.call_args_list if '-mkdir' in c[0][0]]
+        mkdir_cmds = [
+            c[0][0]
+            for c in client.exec_command.call_args_list
+            if '-mkdir' in c[0][0] and 'sales_data_s3/transactions' in c[0][0]
+        ]
         assert len(mkdir_cmds) == 1
         assert mkdir_cmds[0].count('hadoop fs') == 1
         assert '/dt=2024-01-01' in mkdir_cmds[0]
@@ -1477,7 +1607,7 @@ class TestRunDistcpSsh:
 
         def _exec(cmd, **kwargs):
             err = MagicMock()
-            if '-mkdir' in cmd:
+            if '-mkdir' in cmd and 'sales_data_s3/transactions' in cmd:
                 err.read.return_value = b'GSS initiate failed'
                 return (MagicMock(), mock_ssh_stdout(1, b''), err)
             err.read.return_value = b''
@@ -1497,7 +1627,11 @@ class TestRunDistcpSsh:
         with patch.object(m.logger, 'info') as info, patch.object(m.logger, 'warning') as warning:
             result = m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
 
-        mkdir_cmds = [c[0][0] for c in client.exec_command.call_args_list if '-mkdir' in c[0][0]]
+        mkdir_cmds = [
+            c[0][0]
+            for c in client.exec_command.call_args_list
+            if '-mkdir' in c[0][0] and 'sales_data_s3/transactions' in c[0][0]
+        ]
         assert len(mkdir_cmds) == 1
         assert mkdir_cmds[0].startswith("bash -l <<'__LOGIN_SHELL_EOF__'")  # conftest cluster_type is HDP
         assert '|| true' not in mkdir_cmds[0]
@@ -1510,6 +1644,14 @@ class TestRunDistcpSsh:
 
 class TestDistcpShellHardening:
 
+    @pytest.fixture(autouse=True)
+    def _disable_checkpoint_io(self):
+        with (
+            patch.object(m, '_read_edge_distcp_checkpoints', return_value=[]),
+            patch.object(m, '_write_edge_distcp_checkpoint'),
+        ):
+            yield
+
     def _script(self, mock_ssh_hook, discovery):
         hook, client, _, _ = mock_ssh_hook
         stderr = MagicMock()
@@ -1518,7 +1660,7 @@ class TestDistcpShellHardening:
             MagicMock(), _make_distcp_stdout(), stderr
         )
         m.run_distcp_ssh.function.__wrapped__(**distcp_call(discovery))
-        return client.exec_command.call_args[0][0]
+        return _distcp_command(client)
 
     def test_every_copy_is_wrapped_in_timeout(self, mock_ssh_hook, sample_discovery):
         script = self._script(mock_ssh_hook, sample_discovery)
@@ -1882,6 +2024,14 @@ class TestDistcpBatchResolution:
 
 class TestDistcpSoftDeadline:
 
+    @pytest.fixture(autouse=True)
+    def _disable_checkpoint_io(self):
+        with (
+            patch.object(m, '_read_edge_distcp_checkpoints', return_value=[]),
+            patch.object(m, '_write_edge_distcp_checkpoint'),
+        ):
+            yield
+
     def test_tables_not_started_before_the_budget_expires_are_failed(
         self, mock_ssh_hook, sample_discovery, monkeypatch
     ):
@@ -2107,6 +2257,58 @@ class TestUpdateDistcpStatus:
     def test_sets_copied_on_success(self, mock_spark, sample_distcp_result, mock_iceberg_retry):
         m.update_distcp_status.function(distcp_result=sample_distcp_result, spark=mock_spark)
         assert any('COPIED' in str(c) for c in mock_iceberg_retry.call_args_list)
+
+    def test_latest_checkpoint_overrides_xcom_result(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry,
+    ):
+        latest = {
+            **sample_distcp_result['distcp_results'][0],
+            'status': 'FAILED',
+            'error': 'second attempt failed',
+            'distcp_attempt': 2,
+        }
+        with patch.object(m, '_read_spark_distcp_checkpoints', return_value=[latest]) as read:
+            result = m.update_distcp_status.function(
+                distcp_result=sample_distcp_result,
+                spark=mock_spark,
+            )
+        read.assert_called_once()
+        assert result['distcp_results'][0]['status'] == 'FAILED'
+        assert any("SET distcp_status = 'FAILED'" in call.args[1]
+                   for call in mock_iceberg_retry.call_args_list)
+
+    def test_orphaned_running_checkpoint_reconciles_as_interrupted_failure(
+        self, mock_spark, sample_distcp_result, mock_iceberg_retry,
+    ):
+        running = {
+            **sample_distcp_result['distcp_results'][0],
+            'status': 'RUNNING',
+            'distcp_attempt': 2,
+            'distcp_started_at': '2025-01-01 12:00:00',
+        }
+        with patch.object(m, '_read_spark_distcp_checkpoints', return_value=[running]):
+            result = m.update_distcp_status.function(
+                distcp_result=sample_distcp_result,
+                spark=mock_spark,
+            )
+        recovered = result['distcp_results'][0]
+        assert recovered['status'] == 'FAILED'
+        assert 'interrupted' in recovered['error']
+        assert any("SET distcp_status = 'FAILED'" in call.args[1]
+                   for call in mock_iceberg_retry.call_args_list)
+
+    def test_spark_reads_checkpoint_prefix_as_one_json_batch(self, mock_spark):
+        row = MagicMock()
+        row.asDict.return_value = {'status': 'COMPLETED'}
+        mock_spark.read.json.return_value.collect.return_value = [row]
+        result = m._read_spark_distcp_checkpoints(
+            mock_spark,
+            's3a://test-bucket/checkpoints/run/db/mapping',
+        )
+        assert result == [{'status': 'COMPLETED'}]
+        mock_spark.read.json.assert_called_once_with(
+            's3a://test-bucket/checkpoints/run/db/mapping/*/attempt-*.json'
+        )
 
     def test_sets_failed_on_error(self, mock_spark, sample_distcp_result, mock_iceberg_retry):
         sample_distcp_result['distcp_results'][0]['status'] = 'FAILED'

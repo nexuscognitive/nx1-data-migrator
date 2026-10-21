@@ -551,6 +551,7 @@ def get_config() -> dict:
         'distcp_map_memory_mb': _var('migration_distcp_map_memory_mb', 'MIGRATION_DISTCP_MAP_MEMORY_MB', ''),
         'distcp_map_java_opts': _var('migration_distcp_map_java_opts', 'MIGRATION_DISTCP_MAP_JAVA_OPTS', ''),
         'distcp_client_java_opts': _var('migration_distcp_client_java_opts', 'MIGRATION_DISTCP_CLIENT_JAVA_OPTS', ''),
+        'discovery_driver_memory': _var('migration_discovery_driver_memory', 'MIGRATION_DISCOVERY_DRIVER_MEMORY', ''),
         'distcp_extra_hadoop_opts': _var('migration_distcp_extra_hadoop_opts', 'MIGRATION_DISTCP_EXTRA_HADOOP_OPTS', ''),
         'distcp_preserve_delete': str(
             _var(
@@ -627,6 +628,14 @@ def get_config() -> dict:
         # credentials outside _var and need to know which namespace to read.
         'portal_run': _portal_run,
     }
+    checkpoint_location = _var(
+        'migration_distcp_checkpoint_location',
+        'MIGRATION_DISTCP_CHECKPOINT_LOCATION',
+        '',
+    ).strip()
+    config['distcp_checkpoint_location'] = checkpoint_location or (
+        f"{config['tracking_location'].rstrip('/')}/_distcp_checkpoints"
+    )
 
     if dag_owner and dag_owner != 'data-migration':
         try:
