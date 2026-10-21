@@ -1264,6 +1264,45 @@ class TestClusterLoginShellWrapper:
         assert script.startswith('source ~/.profile')
 
 
+class TestLoginShellProfileExitTrap:
+    """A login profile can set an EXIT trap that fails over SSH (e.g. `trap clear EXIT`
+    with no TERM). Our scripts' `set -e` must not turn that into a failed command."""
+
+    @staticmethod
+    def _run(tmp_path, cmd, cluster_type):
+        # bash -l reads ~/.bash_profile; the MapR wrapper sources ~/.profile.
+        for name in ('.bash_profile', '.profile'):
+            (tmp_path / name).write_text("trap 'false' EXIT\n")
+        return subprocess.run(
+            ['bash', '-c', m._login_shell(cmd, cluster_type)],
+            capture_output=True, text=True,
+            env={'HOME': str(tmp_path), 'PATH': '/usr/bin:/bin'},
+        )
+
+    @pytest.mark.parametrize('cluster_type', ['CDP', 'MapR'])
+    def test_successful_errexit_script_exits_zero(self, tmp_path, cluster_type):
+        r = self._run(tmp_path, 'set -e\necho DONE', cluster_type)
+        assert r.returncode == 0
+        assert r.stdout.strip() == 'DONE'
+
+    @pytest.mark.parametrize('cluster_type', ['CDP', 'MapR'])
+    def test_explicit_exit_zero_stays_zero(self, tmp_path, cluster_type):
+        r = self._run(tmp_path, 'set -e\necho DONE\nexit 0', cluster_type)
+        assert r.returncode == 0
+
+    @pytest.mark.parametrize('cluster_type', ['CDP', 'MapR'])
+    def test_failing_command_still_fails(self, tmp_path, cluster_type):
+        r = self._run(tmp_path, 'set -e\nfalse\necho NEVER', cluster_type)
+        assert r.returncode == 1
+        assert 'NEVER' not in r.stdout
+
+    @pytest.mark.parametrize('cluster_type', ['CDP', 'MapR'])
+    def test_explicit_exit_code_is_kept(self, tmp_path, cluster_type):
+        r = self._run(tmp_path, 'echo PARTIAL\nexit 3', cluster_type)
+        assert r.returncode == 3
+        assert r.stdout.strip() == 'PARTIAL'
+
+
 class TestClusterAuthCheckCmd:
 
     def test_kinit_checks_for_a_valid_tgt(self):
