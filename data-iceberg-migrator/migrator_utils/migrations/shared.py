@@ -774,7 +774,12 @@ def _login_shell(cmd: str, cluster_type: str = 'MapR') -> str:
     - HDP (and any non-MapR cluster): uses ``bash -l`` (login shell) so
       /etc/profile.d/*.sh is sourced, ensuring JAVA_HOME, SPARK_HOME,
       HADOOP_HOME, HADOOP_CONF_DIR and PATH are set.
+
+    The command runs in a subshell so its `set -e` can't reach an EXIT trap the
+    profile sets (e.g. `trap clear EXIT`, which fails without a TERM and would
+    otherwise become the session's exit code).
     """
+    cmd = f"(\n{cmd}\n)"
     if cluster_type.upper() == 'MAPR':
         return f"source ~/.profile 2>/dev/null || true\n{cmd}"
     return f"bash -l <<'__LOGIN_SHELL_EOF__'\n{cmd}\n__LOGIN_SHELL_EOF__\n"
