@@ -282,15 +282,20 @@ def find_destination_conflicts(tables: list[dict]) -> dict[tuple[str, str], str]
 
     dests = sorted(owners)
     conflicts: dict[tuple[str, str], set[str]] = {}
+    own_dest: dict[tuple[str, str], str] = {
+        key: dest for dest, keys in owners.items() for key in keys
+    }
     for i, dest in enumerate(dests):
-        clashing = set(owners[dest]) if len(owners[dest]) > 1 else set()
+        cluster_keys = set(owners[dest]) if len(owners[dest]) > 1 else set()
+        cluster_dests = {dest} if cluster_keys else set()
         for other in dests[i + 1:]:
             if other.startswith(dest + "/"):
-                clashing |= owners[dest] | owners[other]
-        if not clashing:
+                cluster_keys |= owners[dest] | owners[other]
+                cluster_dests |= {dest, other}
+        if not cluster_keys:
             continue
-        for key in clashing:
-            conflicts.setdefault(key, set()).add(dest)
+        for key in cluster_keys:
+            conflicts.setdefault(key, set()).update(cluster_dests)
     result = {}
     for key, involved in conflicts.items():
         peers = sorted(
@@ -301,7 +306,7 @@ def find_destination_conflicts(tables: list[dict]) -> dict[tuple[str, str], str]
         )
         peers = list(dict.fromkeys(peers))
         result[key] = (
-            f"Destination {sorted(involved)[0]} overlaps with another table's destination; "
+            f"Destination {own_dest[key]} overlaps with another table's destination; "
             f"conflicts with: {', '.join(peers)}"
         )
     return result
@@ -648,6 +653,11 @@ def get_config() -> dict:
         'distcp_map_java_opts': _var('migration_distcp_map_java_opts', 'MIGRATION_DISTCP_MAP_JAVA_OPTS', ''),
         'distcp_client_java_opts': _var('migration_distcp_client_java_opts', 'MIGRATION_DISTCP_CLIENT_JAVA_OPTS', ''),
         'discovery_driver_memory': _var('migration_discovery_driver_memory', 'MIGRATION_DISCOVERY_DRIVER_MEMORY', ''),
+        'discovery_spark_master': _var('migration_discovery_spark_master', 'MIGRATION_DISCOVERY_SPARK_MASTER', 'local[*]'),
+        'metastore_retry_attempts': _var('migration_metastore_retry_attempts', 'MIGRATION_METASTORE_RETRY_ATTEMPTS', '4'),
+        'metastore_retry_backoff_seconds': _var('migration_metastore_retry_backoff_seconds', 'MIGRATION_METASTORE_RETRY_BACKOFF_SECONDS', '15'),
+        'metastore_socket_timeout': _var('migration_metastore_socket_timeout', 'MIGRATION_METASTORE_SOCKET_TIMEOUT', '600s'),
+        'metastore_failure_retries': _var('migration_metastore_failure_retries', 'MIGRATION_METASTORE_FAILURE_RETRIES', '5'),
         'distcp_extra_hadoop_opts': _var('migration_distcp_extra_hadoop_opts', 'MIGRATION_DISTCP_EXTRA_HADOOP_OPTS', ''),
         'distcp_preserve_delete': str(
             _var(

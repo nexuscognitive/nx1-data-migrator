@@ -87,7 +87,6 @@ SKIPPABLE_DISCOVERY_ERRORS = (
     "DATABASE_NOT_FOUND",
     "SOURCE_PATH_NOT_FOUND",
     "TABLE_CORRUPTED",
-    "DESTINATION_PATH_CONFLICT",
     "DESTINATION_PATH_INVALID",
 )
 
@@ -277,6 +276,27 @@ def _classify_discovery_error(error: str, source_path_exists: bool | None) -> st
     if any(marker in err for marker in _PERMISSION_DENIED_MARKERS):
         return "FAILED"
     return "SOURCE_PATH_NOT_FOUND"
+
+
+def _int_setting(config: dict, key: str, default: int, lo: int, hi: int) -> int:
+    """Integer config value, falling back to the default when blank or invalid."""
+    try:
+        v = int(str(config.get(key, "")).strip())
+    except ValueError:
+        return default
+    return min(max(v, lo), hi)
+
+
+def _duration_setting(config: dict, key: str, default: str) -> str:
+    """Hadoop time value like '600s'; anything else falls back, so it is safe in the script."""
+    v = str(config.get(key) or "").strip()
+    return v if re.fullmatch(r"\d+(ms|s|m|h)?", v) else default
+
+
+def _discovery_master(config: dict) -> str:
+    """Spark master for discovery; local[*] unless configured (e.g. yarn)."""
+    v = str(config.get("discovery_spark_master") or "").strip()
+    return v if re.fullmatch(r"[A-Za-z0-9_\[\]*:.,/-]+", v) else "local[*]"
 
 
 def _skippable_discovery_message(table: dict) -> str:
@@ -1274,6 +1294,7 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
 import json
 import sys
 import fnmatch
+import time
 from pyspark.sql import SparkSession
 from pyspark.sql.utils import AnalysisException
 sys.path.insert(0, "{temp_dir}")
@@ -1283,6 +1304,9 @@ spark = SparkSession.builder \\
     .appName("table_discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}") \\
     .config("spark.hadoop.hive.exec.scratchdir", "{hive_scratch_dir}") \\
     .config("spark.hadoop.hive.exec.local.scratchdir", "{hive_scratch_dir}") \\
+    .config("spark.hadoop.hive.metastore.client.socket.timeout", "{metastore_socket_timeout}") \\
+    .config("spark.hadoop.hive.metastore.client.connect.retry.delay", "5s") \\
+    .config("spark.hadoop.hive.metastore.failure.retries", "{metastore_failure_retries}") \\
     .enableHiveSupport() \\
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
@@ -1298,6 +1322,13 @@ def _s3_location_for(tbl):
     if {include_db_in_path}:
         return dest_bucket + "/" + dest_db + "/" + tbl
     return dest_bucket + "/" + tbl
+
+def _root_cause(e):
+    # The Py4J message leads with the Iceberg wrapper; the useful part is the last "Caused by".
+    msg = str(e)
+    idx = msg.rfind("Caused by:")
+    cause = msg[idx:idx + 300] if idx != -1 else ""
+    return (msg[:250] + " ... " + cause) if cause else msg[:500]
 
 def _default_metadata_record(tbl):
     return {{
@@ -1438,10 +1469,19 @@ for tbl in table_list:
     # Race window: a table dropped between SHOW TABLES and DESCRIBE here is
     # classified FAILED (not TABLE_NOT_FOUND). Tolerable; retry resolves it.
     try:
-        desc_df = spark.sql(
-            "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
-        )
-        desc_rows = desc_df.collect()
+        # Large tables can make the metastore fetch time out or drop; retry before failing.
+        for _attempt in range({metastore_retry_attempts}):
+            try:
+                desc_rows = spark.sql(
+                    "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
+                ).collect()
+                break
+            except Exception as _e:
+                if _attempt >= {metastore_retry_attempts} - 1 or "Failed to get table info from metastore" not in str(_e):
+                    raise
+                print("WARNING: metastore read for {{0}}.{{1}} failed (attempt {{2}}), retrying".format(
+                    src_db, tbl, _attempt + 1))
+                time.sleep({metastore_retry_backoff_seconds} * (_attempt + 1))
 
         for row in desc_rows:
             col_name = (row.col_name or "").strip().rstrip(":").lower()
@@ -1701,7 +1741,7 @@ for tbl in table_list:
             "filtered_file_count": filtered_file_count,
             "full_table_row_count": full_row_count,
             "full_table_partition_count": full_partition_count,
-            "error": str(e)[:500],
+            "error": _root_cause(e),
             "error_type": "FAILED",
         }})
         metadata.append(record)
@@ -1727,6 +1767,12 @@ spark.stop()
             temp_dir=temp_dir,
             include_db_in_path=include_db_in_path,
             hive_scratch_dir=_hive_scratch_dir(config),
+            metastore_retry_attempts=_int_setting(config, "metastore_retry_attempts", 4, 1, 10),
+            metastore_retry_backoff_seconds=_int_setting(
+                config, "metastore_retry_backoff_seconds", 15, 0, 300
+            ),
+            metastore_failure_retries=_int_setting(config, "metastore_failure_retries", 5, 0, 20),
+            metastore_socket_timeout=_duration_setting(config, "metastore_socket_timeout", "600s"),
         )
 
         script_path = f"{temp_dir}/discover_tables.py"
@@ -1746,10 +1792,12 @@ spark.stop()
         _drv_mem = str(config.get("discovery_driver_memory") or "").strip()
         _drv_flag = f" --driver-memory {shlex.quote(_drv_mem)}" if _drv_mem else ""
 
+        _master = shlex.quote(_discovery_master(config))
+
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
 cd {temp_dir}
-pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
+pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
 """
         _, stdout, stderr = client.exec_command(
             _login_shell(cmd, config.get("cluster_type", "MapR")),
@@ -1831,10 +1879,7 @@ pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_i
                 f"metastore entry, will be skipped in downstream phases | "
                 f"error={t.get('error', '')[:200]}"
             )
-        elif t.get("error_type") in (
-            "DESTINATION_PATH_CONFLICT",
-            "DESTINATION_PATH_INVALID",
-        ):
+        elif t.get("error_type") == "DESTINATION_PATH_INVALID":
             logger.error(
                 f"  Destination path problem for {src_db}.{t['source_table']} — "
                 f"will be skipped in downstream phases | error={t.get('error', '')[:200]}"
@@ -1851,7 +1896,7 @@ pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_i
             logger.error(
                 f"  Discovery FAILED: {src_db}.{t['source_table']} "
                 f"| source_path_exists={t.get('source_path_exists')} "
-                f"| error={t.get('error','')[:200]}"
+                f"| error={t.get('error','')[:800]}"
             )
 
     real_failures = [
@@ -1877,31 +1922,8 @@ pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_i
     }
 
 
-@task(trigger_rule="all_done", multiple_outputs=False)
-def resolve_destination_conflicts(discoveries) -> dict:
-    """Find tables whose source-relative destinations overlap, across all databases.
-
-    Returns {"db\\ttable": message}. Only conflicts are returned: a task instance
-    that sees every table's metadata is fine here, but handing that to each
-    mapped record_discovered_tables instance would not be. Empty unless
-    use_source_relative_path is on.
-    """
-    if not get_config().get("use_source_relative_path"):
-        return {}
-    tables = []
-    for d in discoveries:
-        if isinstance(d, dict):
-            tables.extend(d.get("tables", []))
-    conflicts = find_destination_conflicts(tables)
-    for (db, tbl), message in conflicts.items():
-        logger.error(f"[SourceRelativePath] {db}.{tbl}: {message}")
-    return {f"{db}\t{tbl}": msg for (db, tbl), msg in conflicts.items()}
-
-
 @task.pyspark(conn_id="spark_default")
-def record_discovered_tables(
-    discovery: dict, spark, conflicts: dict | None = None, **context
-) -> dict:
+def record_discovered_tables(discovery: dict, spark, **context) -> dict:
     """Record discovered tables in Iceberg tracking table."""
 
     if not isinstance(discovery, dict) or "tables" not in discovery:
@@ -1909,12 +1931,6 @@ def record_discovered_tables(
             f"[record_discovered_tables] Skipping invalid/failed upstream input: {type(discovery)}"
         )
         return {}
-
-    for t in discovery["tables"]:
-        message = (conflicts or {}).get(f"{t.get('source_database', '')}\t{t['source_table']}")
-        if message and "error" not in t:
-            t["error_type"] = "DESTINATION_PATH_CONFLICT"
-            t["error"] = message
 
     config = get_config()
     tracking_db = config["tracking_database"]
@@ -4744,12 +4760,28 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         1 for t in table_status if t.overall_status == "SOURCE_PATH_NOT_FOUND"
     )
     corrupted_tables = sum(1 for t in table_status if t.overall_status == "TABLE_CORRUPTED")
-    conflict_tables = sum(
-        1 for t in table_status if t.overall_status == "DESTINATION_PATH_CONFLICT"
-    )
     invalid_dest_tables = sum(
         1 for t in table_status if t.overall_status == "DESTINATION_PATH_INVALID"
     )
+
+    # Non-blocking advisory: tables whose destinations overlap (exact or nested).
+    # Reported here only; migration proceeds. Downstream maintenance (orphan
+    # cleanup, snapshot expiration) can affect multiple tables at once, so ops
+    # needs to know.
+    advisory_candidates = [
+        {
+            "source_database": t.source_database,
+            "source_table": t.source_table,
+            "source_location": getattr(t, "source_location", "") or "",
+            "s3_location": getattr(t, "dest_location", "") or "",
+        }
+        for t in table_status
+        if t.overall_status not in SKIPPABLE_DISCOVERY_ERRORS
+        and (getattr(t, "dest_location", "") or "")
+    ]
+    destination_overlaps = find_destination_conflicts(advisory_candidates)
+    for (db, tbl), message in destination_overlaps.items():
+        logger.warning(f"[Advisory] {db}.{tbl}: {message}")
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (
         1024**3
     )
@@ -4932,6 +4964,34 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             margin: 40px 0;
             border-top: 2px dashed #ecf0f1;
         }}
+        .advisory-box {{
+            border-left: 4px solid #ffb300;
+            background-color: #fff8e1;
+            padding: 15px 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }}
+        .advisory-box p {{
+            margin: 0 0 10px 0;
+            color: #6b4a00;
+        }}
+        .advisory-box table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+            background: white;
+        }}
+        .advisory-box th, .advisory-box td {{
+            padding: 8px 10px;
+            border: 1px solid #ffe0a3;
+            text-align: left;
+            font-size: 12px;
+            vertical-align: top;
+        }}
+        .advisory-box th {{
+            background-color: #ffecb3;
+            color: #5a3d00;
+        }}
     </style>
 </head>
 <body>
@@ -4980,10 +5040,6 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                 <p class="value">{corrupted_tables}</p>
             </div>
             <div class="summary-card">
-                <h3>DESTINATION CONFLICT</h3>
-                <p class="value">{conflict_tables}</p>
-            </div>
-            <div class="summary-card">
                 <h3>INVALID DESTINATION PATH</h3>
                 <p class="value">{invalid_dest_tables}</p>
             </div>
@@ -5007,6 +5063,52 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
 
         <div class="section-divider"></div>
 """
+
+    if destination_overlaps:
+        own_dest = {
+            (c["source_database"], c["source_table"]): c["s3_location"].rstrip("/")
+            for c in advisory_candidates
+        }
+        own_source = {
+            (c["source_database"], c["source_table"]): c["source_location"]
+            for c in advisory_candidates
+        }
+        advisory_rows = ""
+        for (db, tbl) in sorted(destination_overlaps):
+            peers_text = destination_overlaps[(db, tbl)].split("conflicts with: ", 1)[-1]
+            advisory_rows += f"""
+                <tr>
+                    <td>{html_escape(db)}</td>
+                    <td><strong>{html_escape(tbl)}</strong></td>
+                    <td>{html_escape(own_source.get((db, tbl), ""))}</td>
+                    <td>{html_escape(own_dest.get((db, tbl), ""))}</td>
+                    <td>{html_escape(peers_text)}</td>
+                </tr>"""
+        html += f"""
+        <h2>Advisories</h2>
+        <div class="advisory-box">
+            <p><strong>{len(destination_overlaps)} table(s) have destinations that overlap with another table's destination.</strong>
+            Migration proceeded as configured; the source layout already contains these overlaps.
+            Downstream maintenance (orphan-file cleanup, snapshot expiration, path listing) can affect
+            multiple tables at once — coordinate accordingly.</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Database</th>
+                        <th>Table</th>
+                        <th>Source Path</th>
+                        <th>Destination</th>
+                        <th>Overlaps With</th>
+                    </tr>
+                </thead>
+                <tbody>{advisory_rows}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section-divider"></div>
+"""
+
     validation_summary_data = spark.sql(f"""
         SELECT
             COUNT(*) as total_tables_validated,
@@ -5145,7 +5247,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif status == "TABLE_CORRUPTED":
             status_class = "status-corrupted"
             status_label = status
-        elif status in ("DESTINATION_PATH_CONFLICT", "DESTINATION_PATH_INVALID"):
+        elif status == "DESTINATION_PATH_INVALID":
             status_class = "status-conflict"
             status_label = status
         elif "VALIDATED_WITH_WARNINGS" in status:
@@ -5287,7 +5389,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif t.overall_status == "TABLE_CORRUPTED":
             badge_class = "status-corrupted"
             badge_label = "TABLE_CORRUPTED"
-        elif t.overall_status in ("DESTINATION_PATH_CONFLICT", "DESTINATION_PATH_INVALID"):
+        elif t.overall_status == "DESTINATION_PATH_INVALID":
             badge_class = "status-conflict"
             badge_label = t.overall_status
         else:
@@ -5304,12 +5406,11 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                     f"{html_escape(str(reason))}</span>"
                 )
         elif (
-            t.overall_status
-            in ("TABLE_CORRUPTED", "DESTINATION_PATH_CONFLICT", "DESTINATION_PATH_INVALID")
+            t.overall_status in ("TABLE_CORRUPTED", "DESTINATION_PATH_INVALID")
             and t.error_message
         ):
-            # The message names the missing schema part (corrupted), the
-            # conflicting tables or the unusable path, which the owner needs to act.
+            # The message names the missing schema part (corrupted) or the
+            # unusable path, which the owner needs to act on.
             detail = (
                 ' <span style="color:#6c757d;font-size:11px;">'
                 f"{html_escape(str(t.error_message))}</span>"
@@ -5560,7 +5661,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     output_stream.write(html.encode("utf-8"))
     output_stream.close()
 
-    return {"report_path": report_path}
+    return {
+        "report_path": report_path,
+        "destination_overlap_count": len(destination_overlaps),
+    }
 
 
 @task.pyspark(conn_id="spark_default")
@@ -5695,6 +5799,7 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
 
     recipients = [r.strip() for r in recipients_str.split(",") if r.strip()]
     report_path = report_result.get("report_path", "")
+    overlap_count = int(report_result.get("destination_overlap_count") or 0)
 
     try:
         import os
@@ -5725,10 +5830,23 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
         tmp.write(html_content)
         tmp.close()
 
+        subject = f"Migration Report - {run_id}"
+        advisory_html = ""
+        if overlap_count:
+            subject += f" (advisories: {overlap_count})"
+            advisory_html = (
+                f'<p style="padding:10px;border-left:4px solid #ffb300;background:#fff8e1;">'
+                f"<strong>Advisories:</strong> {overlap_count} table(s) have destinations that "
+                "overlap with another table's destination. See the <em>Advisories</em> section "
+                "of the attached report for details.</p>"
+            )
         send_email(
             to=recipients,
-            subject=f"Migration Report - {run_id}",
-            html_content=f"<p>Please find the migration report for run <strong>{run_id}</strong> attached.</p>",
+            subject=subject,
+            html_content=(
+                f"<p>Please find the migration report for run <strong>{run_id}</strong> attached.</p>"
+                f"{advisory_html}"
+            ),
             files=[tmp.name],
             conn_id=smtp_conn_id,
         )
@@ -5789,10 +5907,7 @@ with DAG(
     t_discover.operator.max_active_tis_per_dagrun = _env_int(
         "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3
     )
-    t_resolve = resolve_destination_conflicts(discoveries=t_discover)
-    t_record = record_discovered_tables.partial(conflicts=t_resolve).expand(
-        discovery=t_discover
-    )
+    t_record = record_discovered_tables.expand(discovery=t_discover)
     t_record.operator.trigger_rule = "all_done"
     t_batches = flatten_and_batch(discoveries=t_record)
     t_batches.operator.trigger_rule = "all_done"
