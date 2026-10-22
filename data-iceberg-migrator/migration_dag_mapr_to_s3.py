@@ -279,6 +279,27 @@ def _classify_discovery_error(error: str, source_path_exists: bool | None) -> st
     return "SOURCE_PATH_NOT_FOUND"
 
 
+def _int_setting(config: dict, key: str, default: int, lo: int, hi: int) -> int:
+    """Integer config value, falling back to the default when blank or invalid."""
+    try:
+        v = int(str(config.get(key, "")).strip())
+    except ValueError:
+        return default
+    return min(max(v, lo), hi)
+
+
+def _duration_setting(config: dict, key: str, default: str) -> str:
+    """Hadoop time value like '600s'; anything else falls back, so it is safe in the script."""
+    v = str(config.get(key) or "").strip()
+    return v if re.fullmatch(r"\d+(ms|s|m|h)?", v) else default
+
+
+def _discovery_master(config: dict) -> str:
+    """Spark master for discovery; local[*] unless configured (e.g. yarn)."""
+    v = str(config.get("discovery_spark_master") or "").strip()
+    return v if re.fullmatch(r"[A-Za-z0-9_\[\]*:.,/-]+", v) else "local[*]"
+
+
 def _skippable_discovery_message(table: dict) -> str:
     """Reason a table was skipped; the fallback only covers an empty exception str()."""
     return table.get("error") or "Skipped during discovery"
@@ -1274,6 +1295,7 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
 import json
 import sys
 import fnmatch
+import time
 from pyspark.sql import SparkSession
 from pyspark.sql.utils import AnalysisException
 sys.path.insert(0, "{temp_dir}")
@@ -1283,6 +1305,9 @@ spark = SparkSession.builder \\
     .appName("table_discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}") \\
     .config("spark.hadoop.hive.exec.scratchdir", "{hive_scratch_dir}") \\
     .config("spark.hadoop.hive.exec.local.scratchdir", "{hive_scratch_dir}") \\
+    .config("spark.hadoop.hive.metastore.client.socket.timeout", "{metastore_socket_timeout}") \\
+    .config("spark.hadoop.hive.metastore.client.connect.retry.delay", "5s") \\
+    .config("spark.hadoop.hive.metastore.failure.retries", "{metastore_failure_retries}") \\
     .enableHiveSupport() \\
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
@@ -1298,6 +1323,13 @@ def _s3_location_for(tbl):
     if {include_db_in_path}:
         return dest_bucket + "/" + dest_db + "/" + tbl
     return dest_bucket + "/" + tbl
+
+def _root_cause(e):
+    # The Py4J message leads with the Iceberg wrapper; the useful part is the last "Caused by".
+    msg = str(e)
+    idx = msg.rfind("Caused by:")
+    cause = msg[idx:idx + 300] if idx != -1 else ""
+    return (msg[:250] + " ... " + cause) if cause else msg[:500]
 
 def _default_metadata_record(tbl):
     return {{
@@ -1438,10 +1470,19 @@ for tbl in table_list:
     # Race window: a table dropped between SHOW TABLES and DESCRIBE here is
     # classified FAILED (not TABLE_NOT_FOUND). Tolerable; retry resolves it.
     try:
-        desc_df = spark.sql(
-            "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
-        )
-        desc_rows = desc_df.collect()
+        # Large tables can make the metastore fetch time out or drop; retry before failing.
+        for _attempt in range({metastore_retry_attempts}):
+            try:
+                desc_rows = spark.sql(
+                    "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
+                ).collect()
+                break
+            except Exception as _e:
+                if _attempt >= {metastore_retry_attempts} - 1 or "Failed to get table info from metastore" not in str(_e):
+                    raise
+                print("WARNING: metastore read for {{0}}.{{1}} failed (attempt {{2}}), retrying".format(
+                    src_db, tbl, _attempt + 1))
+                time.sleep({metastore_retry_backoff_seconds} * (_attempt + 1))
 
         for row in desc_rows:
             col_name = (row.col_name or "").strip().rstrip(":").lower()
@@ -1701,7 +1742,7 @@ for tbl in table_list:
             "filtered_file_count": filtered_file_count,
             "full_table_row_count": full_row_count,
             "full_table_partition_count": full_partition_count,
-            "error": str(e)[:500],
+            "error": _root_cause(e),
             "error_type": "FAILED",
         }})
         metadata.append(record)
@@ -1727,6 +1768,12 @@ spark.stop()
             temp_dir=temp_dir,
             include_db_in_path=include_db_in_path,
             hive_scratch_dir=_hive_scratch_dir(config),
+            metastore_retry_attempts=_int_setting(config, "metastore_retry_attempts", 4, 1, 10),
+            metastore_retry_backoff_seconds=_int_setting(
+                config, "metastore_retry_backoff_seconds", 15, 0, 300
+            ),
+            metastore_failure_retries=_int_setting(config, "metastore_failure_retries", 5, 0, 20),
+            metastore_socket_timeout=_duration_setting(config, "metastore_socket_timeout", "600s"),
         )
 
         script_path = f"{temp_dir}/discover_tables.py"
@@ -1746,10 +1793,12 @@ spark.stop()
         _drv_mem = str(config.get("discovery_driver_memory") or "").strip()
         _drv_flag = f" --driver-memory {shlex.quote(_drv_mem)}" if _drv_mem else ""
 
+        _master = shlex.quote(_discovery_master(config))
+
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
 cd {temp_dir}
-pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
+pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
 """
         _, stdout, stderr = client.exec_command(
             _login_shell(cmd, config.get("cluster_type", "MapR")),
@@ -1851,7 +1900,7 @@ pyspark --master local[*]{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_i
             logger.error(
                 f"  Discovery FAILED: {src_db}.{t['source_table']} "
                 f"| source_path_exists={t.get('source_path_exists')} "
-                f"| error={t.get('error','')[:200]}"
+                f"| error={t.get('error','')[:800]}"
             )
 
     real_failures = [

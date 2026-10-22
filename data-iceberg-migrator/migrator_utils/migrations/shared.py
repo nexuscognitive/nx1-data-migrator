@@ -648,6 +648,11 @@ def get_config() -> dict:
         'distcp_map_java_opts': _var('migration_distcp_map_java_opts', 'MIGRATION_DISTCP_MAP_JAVA_OPTS', ''),
         'distcp_client_java_opts': _var('migration_distcp_client_java_opts', 'MIGRATION_DISTCP_CLIENT_JAVA_OPTS', ''),
         'discovery_driver_memory': _var('migration_discovery_driver_memory', 'MIGRATION_DISCOVERY_DRIVER_MEMORY', ''),
+        'discovery_spark_master': _var('migration_discovery_spark_master', 'MIGRATION_DISCOVERY_SPARK_MASTER', 'local[*]'),
+        'metastore_retry_attempts': _var('migration_metastore_retry_attempts', 'MIGRATION_METASTORE_RETRY_ATTEMPTS', '4'),
+        'metastore_retry_backoff_seconds': _var('migration_metastore_retry_backoff_seconds', 'MIGRATION_METASTORE_RETRY_BACKOFF_SECONDS', '15'),
+        'metastore_socket_timeout': _var('migration_metastore_socket_timeout', 'MIGRATION_METASTORE_SOCKET_TIMEOUT', '600s'),
+        'metastore_failure_retries': _var('migration_metastore_failure_retries', 'MIGRATION_METASTORE_FAILURE_RETRIES', '5'),
         'distcp_extra_hadoop_opts': _var('migration_distcp_extra_hadoop_opts', 'MIGRATION_DISTCP_EXTRA_HADOOP_OPTS', ''),
         'distcp_preserve_delete': str(
             _var(
