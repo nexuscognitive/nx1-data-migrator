@@ -87,7 +87,6 @@ SKIPPABLE_DISCOVERY_ERRORS = (
     "DATABASE_NOT_FOUND",
     "SOURCE_PATH_NOT_FOUND",
     "TABLE_CORRUPTED",
-    "DESTINATION_PATH_CONFLICT",
     "DESTINATION_PATH_INVALID",
 )
 
@@ -1880,10 +1879,7 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
                 f"metastore entry, will be skipped in downstream phases | "
                 f"error={t.get('error', '')[:200]}"
             )
-        elif t.get("error_type") in (
-            "DESTINATION_PATH_CONFLICT",
-            "DESTINATION_PATH_INVALID",
-        ):
+        elif t.get("error_type") == "DESTINATION_PATH_INVALID":
             logger.error(
                 f"  Destination path problem for {src_db}.{t['source_table']} — "
                 f"will be skipped in downstream phases | error={t.get('error', '')[:200]}"
@@ -1926,31 +1922,8 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
     }
 
 
-@task(trigger_rule="all_done", multiple_outputs=False)
-def resolve_destination_conflicts(discoveries) -> dict:
-    """Find tables whose source-relative destinations overlap, across all databases.
-
-    Returns {"db\\ttable": message}. Only conflicts are returned: a task instance
-    that sees every table's metadata is fine here, but handing that to each
-    mapped record_discovered_tables instance would not be. Empty unless
-    use_source_relative_path is on.
-    """
-    if not get_config().get("use_source_relative_path"):
-        return {}
-    tables = []
-    for d in discoveries:
-        if isinstance(d, dict):
-            tables.extend(d.get("tables", []))
-    conflicts = find_destination_conflicts(tables)
-    for (db, tbl), message in conflicts.items():
-        logger.error(f"[SourceRelativePath] {db}.{tbl}: {message}")
-    return {f"{db}\t{tbl}": msg for (db, tbl), msg in conflicts.items()}
-
-
 @task.pyspark(conn_id="spark_default")
-def record_discovered_tables(
-    discovery: dict, spark, conflicts: dict | None = None, **context
-) -> dict:
+def record_discovered_tables(discovery: dict, spark, **context) -> dict:
     """Record discovered tables in Iceberg tracking table."""
 
     if not isinstance(discovery, dict) or "tables" not in discovery:
@@ -1958,12 +1931,6 @@ def record_discovered_tables(
             f"[record_discovered_tables] Skipping invalid/failed upstream input: {type(discovery)}"
         )
         return {}
-
-    for t in discovery["tables"]:
-        message = (conflicts or {}).get(f"{t.get('source_database', '')}\t{t['source_table']}")
-        if message and "error" not in t:
-            t["error_type"] = "DESTINATION_PATH_CONFLICT"
-            t["error"] = message
 
     config = get_config()
     tracking_db = config["tracking_database"]
@@ -4793,12 +4760,28 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         1 for t in table_status if t.overall_status == "SOURCE_PATH_NOT_FOUND"
     )
     corrupted_tables = sum(1 for t in table_status if t.overall_status == "TABLE_CORRUPTED")
-    conflict_tables = sum(
-        1 for t in table_status if t.overall_status == "DESTINATION_PATH_CONFLICT"
-    )
     invalid_dest_tables = sum(
         1 for t in table_status if t.overall_status == "DESTINATION_PATH_INVALID"
     )
+
+    # Non-blocking advisory: tables whose destinations overlap (exact or nested).
+    # Reported here only; migration proceeds. Downstream maintenance (orphan
+    # cleanup, snapshot expiration) can affect multiple tables at once, so ops
+    # needs to know.
+    advisory_candidates = [
+        {
+            "source_database": t.source_database,
+            "source_table": t.source_table,
+            "source_location": getattr(t, "source_location", "") or "",
+            "s3_location": getattr(t, "dest_location", "") or "",
+        }
+        for t in table_status
+        if t.overall_status not in SKIPPABLE_DISCOVERY_ERRORS
+        and (getattr(t, "dest_location", "") or "")
+    ]
+    destination_overlaps = find_destination_conflicts(advisory_candidates)
+    for (db, tbl), message in destination_overlaps.items():
+        logger.warning(f"[Advisory] {db}.{tbl}: {message}")
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (
         1024**3
     )
@@ -4981,6 +4964,34 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             margin: 40px 0;
             border-top: 2px dashed #ecf0f1;
         }}
+        .advisory-box {{
+            border-left: 4px solid #ffb300;
+            background-color: #fff8e1;
+            padding: 15px 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }}
+        .advisory-box p {{
+            margin: 0 0 10px 0;
+            color: #6b4a00;
+        }}
+        .advisory-box table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+            background: white;
+        }}
+        .advisory-box th, .advisory-box td {{
+            padding: 8px 10px;
+            border: 1px solid #ffe0a3;
+            text-align: left;
+            font-size: 12px;
+            vertical-align: top;
+        }}
+        .advisory-box th {{
+            background-color: #ffecb3;
+            color: #5a3d00;
+        }}
     </style>
 </head>
 <body>
@@ -5029,10 +5040,6 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                 <p class="value">{corrupted_tables}</p>
             </div>
             <div class="summary-card">
-                <h3>DESTINATION CONFLICT</h3>
-                <p class="value">{conflict_tables}</p>
-            </div>
-            <div class="summary-card">
                 <h3>INVALID DESTINATION PATH</h3>
                 <p class="value">{invalid_dest_tables}</p>
             </div>
@@ -5056,6 +5063,52 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
 
         <div class="section-divider"></div>
 """
+
+    if destination_overlaps:
+        own_dest = {
+            (c["source_database"], c["source_table"]): c["s3_location"].rstrip("/")
+            for c in advisory_candidates
+        }
+        own_source = {
+            (c["source_database"], c["source_table"]): c["source_location"]
+            for c in advisory_candidates
+        }
+        advisory_rows = ""
+        for (db, tbl) in sorted(destination_overlaps):
+            peers_text = destination_overlaps[(db, tbl)].split("conflicts with: ", 1)[-1]
+            advisory_rows += f"""
+                <tr>
+                    <td>{html_escape(db)}</td>
+                    <td><strong>{html_escape(tbl)}</strong></td>
+                    <td>{html_escape(own_source.get((db, tbl), ""))}</td>
+                    <td>{html_escape(own_dest.get((db, tbl), ""))}</td>
+                    <td>{html_escape(peers_text)}</td>
+                </tr>"""
+        html += f"""
+        <h2>Advisories</h2>
+        <div class="advisory-box">
+            <p><strong>{len(destination_overlaps)} table(s) have destinations that overlap with another table's destination.</strong>
+            Migration proceeded as configured; the source layout already contains these overlaps.
+            Downstream maintenance (orphan-file cleanup, snapshot expiration, path listing) can affect
+            multiple tables at once — coordinate accordingly.</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Database</th>
+                        <th>Table</th>
+                        <th>Source Path</th>
+                        <th>Destination</th>
+                        <th>Overlaps With</th>
+                    </tr>
+                </thead>
+                <tbody>{advisory_rows}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section-divider"></div>
+"""
+
     validation_summary_data = spark.sql(f"""
         SELECT
             COUNT(*) as total_tables_validated,
@@ -5194,7 +5247,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif status == "TABLE_CORRUPTED":
             status_class = "status-corrupted"
             status_label = status
-        elif status in ("DESTINATION_PATH_CONFLICT", "DESTINATION_PATH_INVALID"):
+        elif status == "DESTINATION_PATH_INVALID":
             status_class = "status-conflict"
             status_label = status
         elif "VALIDATED_WITH_WARNINGS" in status:
@@ -5336,7 +5389,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif t.overall_status == "TABLE_CORRUPTED":
             badge_class = "status-corrupted"
             badge_label = "TABLE_CORRUPTED"
-        elif t.overall_status in ("DESTINATION_PATH_CONFLICT", "DESTINATION_PATH_INVALID"):
+        elif t.overall_status == "DESTINATION_PATH_INVALID":
             badge_class = "status-conflict"
             badge_label = t.overall_status
         else:
@@ -5353,12 +5406,11 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                     f"{html_escape(str(reason))}</span>"
                 )
         elif (
-            t.overall_status
-            in ("TABLE_CORRUPTED", "DESTINATION_PATH_CONFLICT", "DESTINATION_PATH_INVALID")
+            t.overall_status in ("TABLE_CORRUPTED", "DESTINATION_PATH_INVALID")
             and t.error_message
         ):
-            # The message names the missing schema part (corrupted), the
-            # conflicting tables or the unusable path, which the owner needs to act.
+            # The message names the missing schema part (corrupted) or the
+            # unusable path, which the owner needs to act on.
             detail = (
                 ' <span style="color:#6c757d;font-size:11px;">'
                 f"{html_escape(str(t.error_message))}</span>"
@@ -5609,7 +5661,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     output_stream.write(html.encode("utf-8"))
     output_stream.close()
 
-    return {"report_path": report_path}
+    return {
+        "report_path": report_path,
+        "destination_overlap_count": len(destination_overlaps),
+    }
 
 
 @task.pyspark(conn_id="spark_default")
@@ -5744,6 +5799,7 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
 
     recipients = [r.strip() for r in recipients_str.split(",") if r.strip()]
     report_path = report_result.get("report_path", "")
+    overlap_count = int(report_result.get("destination_overlap_count") or 0)
 
     try:
         import os
@@ -5774,10 +5830,23 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
         tmp.write(html_content)
         tmp.close()
 
+        subject = f"Migration Report - {run_id}"
+        advisory_html = ""
+        if overlap_count:
+            subject += f" (advisories: {overlap_count})"
+            advisory_html = (
+                f'<p style="padding:10px;border-left:4px solid #ffb300;background:#fff8e1;">'
+                f"<strong>Advisories:</strong> {overlap_count} table(s) have destinations that "
+                "overlap with another table's destination. See the <em>Advisories</em> section "
+                "of the attached report for details.</p>"
+            )
         send_email(
             to=recipients,
-            subject=f"Migration Report - {run_id}",
-            html_content=f"<p>Please find the migration report for run <strong>{run_id}</strong> attached.</p>",
+            subject=subject,
+            html_content=(
+                f"<p>Please find the migration report for run <strong>{run_id}</strong> attached.</p>"
+                f"{advisory_html}"
+            ),
             files=[tmp.name],
             conn_id=smtp_conn_id,
         )
@@ -5838,10 +5907,7 @@ with DAG(
     t_discover.operator.max_active_tis_per_dagrun = _env_int(
         "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3
     )
-    t_resolve = resolve_destination_conflicts(discoveries=t_discover)
-    t_record = record_discovered_tables.partial(conflicts=t_resolve).expand(
-        discovery=t_discover
-    )
+    t_record = record_discovered_tables.expand(discovery=t_discover)
     t_record.operator.trigger_rule = "all_done"
     t_batches = flatten_and_batch(discoveries=t_record)
     t_batches.operator.trigger_rule = "all_done"

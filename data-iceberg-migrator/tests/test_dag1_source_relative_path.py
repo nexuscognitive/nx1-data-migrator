@@ -1,10 +1,10 @@
 """DAG 1: destination derived from the source path (use_source_relative_path)."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import migration_dag_mapr_to_s3 as m
 import migrator_utils.migrations.shared as shared
-import pytest
 
 from . import test_dag1_tasks as dag1_tests
 
@@ -60,7 +60,23 @@ class TestFindDestinationConflicts:
         tables = [_table('d', 'p', '/x/p', 's3a://b/x/p'),
                   _table('d', 'sib', '/x/p-sib', 's3a://b/x/p-sib'),
                   _table('d', 'c', '/x/p/c', 's3a://b/x/p/c')]
-        assert set(shared.find_destination_conflicts(tables)) == {('d', 'p'), ('d', 'c')}
+        result = shared.find_destination_conflicts(tables)
+        assert set(result) == {('d', 'p'), ('d', 'c')}
+        # Each row's message reports its own destination and names the other side.
+        assert 's3a://b/x/p overlaps' in result[('d', 'p')]
+        assert 'd.c (/x/p/c)' in result[('d', 'p')]
+        assert 's3a://b/x/p/c overlaps' in result[('d', 'c')]
+        assert 'd.p (/x/p)' in result[('d', 'c')]
+
+    def test_three_level_nesting_lists_all_peers(self):
+        tables = [_table('d', 'a', '/x', 's3a://b/x'),
+                  _table('d', 'b', '/x/y', 's3a://b/x/y'),
+                  _table('d', 'c', '/x/y/z', 's3a://b/x/y/z')]
+        result = shared.find_destination_conflicts(tables)
+        assert set(result) == {('d', 'a'), ('d', 'b'), ('d', 'c')}
+        # Intermediate node must see both the parent and the deeper descendant.
+        assert 'd.a (/x)' in result[('d', 'b')]
+        assert 'd.c (/x/y/z)' in result[('d', 'b')]
 
     def test_prefix_sibling_is_not_nested(self):
         tables = [_table('d', 'a', '/x/a', 's3a://b/x/a'),
@@ -87,61 +103,13 @@ class TestFindDestinationConflicts:
         assert shared.find_destination_conflicts(tables) == {}
 
 
-class TestResolveDestinationConflicts:
-
-    def _run(self, enabled, discoveries):
-        cfg = {'use_source_relative_path': enabled}
-        with patch.object(m, 'get_config', return_value=cfg):
-            return m.resolve_destination_conflicts.function(discoveries=discoveries)
-
-    def test_disabled_returns_nothing(self):
-        d = {'tables': [_table('d', 'a', '/x', 's3a://b/x'),
-                        _table('e', 'b', '/y', 's3a://b/x')]}
-        assert self._run(False, [d]) == {}
-
-    def test_finds_conflicts_across_databases(self):
-        d1 = {'tables': [_table('d', 'a', '/x', 's3a://b/x')]}
-        d2 = {'tables': [_table('e', 'b', '/y', 's3a://b/x')]}
-        result = self._run(True, [d1, None, d2])
-        assert set(result) == {'d\ta', 'e\tb'}
+def test_invalid_destination_status_is_skippable():
+    assert 'DESTINATION_PATH_INVALID' in m.SKIPPABLE_DISCOVERY_ERRORS
 
 
-class TestRecordAppliesConflicts:
-
-    def _record(self, discovery, conflicts, mock_spark):
-        df = MagicMock()
-        row = MagicMock()
-        row.__getitem__ = lambda self, k: 0
-        df.collect.return_value = [row]
-        mock_spark.sql.return_value = df
-        return m.record_discovered_tables.function(
-            discovery=discovery, spark=mock_spark, conflicts=conflicts,
-            ti=MagicMock(map_index=0),
-        )
-
-    def test_conflicting_table_is_marked_and_tracked(
-        self, mock_spark, sample_discovery, mock_iceberg_retry
-    ):
-        tbl = sample_discovery['tables'][0]
-        key = f"{tbl['source_database']}\t{tbl['source_table']}"
-        result = self._record(sample_discovery, {key: 'clashes with e.b'}, mock_spark)
-        marked = result['tables'][0]
-        assert marked['error_type'] == 'DESTINATION_PATH_CONFLICT'
-        assert marked['error'] == 'clashes with e.b'
-        sql = ' '.join(c.args[1] for c in mock_iceberg_retry.call_args_list)
-        assert "'DESTINATION_PATH_CONFLICT'" in sql
-        assert 'clashes with e.b' in sql
-
-    def test_no_conflicts_leaves_tables_untouched(
-        self, mock_spark, sample_discovery, mock_iceberg_retry
-    ):
-        result = self._record(sample_discovery, {}, mock_spark)
-        assert all(t.get('error_type') != 'DESTINATION_PATH_CONFLICT' for t in result['tables'])
-
-
-@pytest.mark.parametrize('status', ['DESTINATION_PATH_CONFLICT', 'DESTINATION_PATH_INVALID'])
-def test_destination_statuses_are_skippable(status):
-    assert status in m.SKIPPABLE_DISCOVERY_ERRORS
+def test_destination_overlap_is_not_blocking():
+    # Conflicts are surfaced as advisories in the report, never as skippable errors.
+    assert 'DESTINATION_PATH_CONFLICT' not in m.SKIPPABLE_DISCOVERY_ERRORS
 
 
 
@@ -175,3 +143,87 @@ class TestDiscoveryUsesSourcePath:
         assert [t['s3_location'] for t in result['tables']] == [
             's3a://bucket/datalake/sales/orders', 's3a://bucket/data/events',
         ]
+
+
+def _report_row(db, tbl, dest, src='', status='VALIDATED'):
+    """Minimal migration_table_status row for generate_html_report."""
+    return SimpleNamespace(
+        source_database=db, source_table=tbl,
+        overall_status=status, source_location=src, dest_location=dest,
+        discovery_duration_seconds=0.0, distcp_duration_seconds=0.0,
+        distcp_bytes_copied=0, distcp_files_copied=0,
+        distcp_is_incremental=False, table_create_duration_seconds=0.0,
+        validation_duration_seconds=0.0, validation_status='COMPLETED',
+        row_count_match=True, partition_count_match=True, schema_match=True,
+        source_row_count=0, dest_hive_row_count=0,
+        source_partition_count=0, dest_partition_count=0,
+        source_total_size_bytes=0, s3_total_size_bytes_before=0,
+        s3_total_size_bytes_after=0, s3_bytes_transferred=0,
+        file_size_match=True, source_file_count=0,
+        s3_file_count_before=0, s3_file_count_after=0,
+        s3_files_transferred=0, file_count_match=True,
+        distcp_status='COMPLETED', file_format='PARQUET',
+        partition_filter=None, filtered_partition_count=None,
+        error_message=None,
+    )
+
+
+def _run_report(mock_spark, sample_run_id, table_rows):
+    run_row = SimpleNamespace(dag_run_id='dag_run_test')
+
+    def sql_router(sql):
+        df = MagicMock()
+        sl = sql.lower()
+        if 'migration_runs' in sl and 'where' in sl:
+            df.collect.return_value = [run_row]
+        elif 'order by' in sl:
+            df.collect.return_value = table_rows
+        else:
+            df.collect.return_value = []
+        return df
+
+    mock_spark.sql.side_effect = sql_router
+    result = m.generate_html_report.function(run_id=sample_run_id, spark=mock_spark)
+    stream = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value.create.return_value
+    html = stream.write.call_args[0][0].decode('utf-8')
+    return result, html
+
+
+class TestAdvisoriesSection:
+
+    def test_overlap_renders_advisories_section_and_counts_in_result(
+        self, mock_spark, sample_run_id
+    ):
+        rows = [
+            _report_row('d', 'parent', 's3a://b/x', src='/x'),
+            _report_row('d', 'child', 's3a://b/x/leaf', src='/x/leaf'),
+        ]
+        result, html = _run_report(mock_spark, sample_run_id, rows)
+        assert result['destination_overlap_count'] == 2
+        assert '<h2>Advisories</h2>' in html
+        assert 'advisory-box' in html
+        # Each row names its own destination and the peer.
+        assert 'd.child (/x/leaf)' in html
+        assert 'd.parent (/x)' in html
+
+    def test_no_overlap_omits_advisories_section(self, mock_spark, sample_run_id):
+        rows = [
+            _report_row('d', 'a', 's3a://b/x/a', src='/x/a'),
+            _report_row('d', 'b', 's3a://b/x/b', src='/x/b'),
+        ]
+        result, html = _run_report(mock_spark, sample_run_id, rows)
+        assert result['destination_overlap_count'] == 0
+        assert '<h2>Advisories</h2>' not in html
+
+    def test_skippable_rows_do_not_participate_in_overlap_check(
+        self, mock_spark, sample_run_id
+    ):
+        # A table that never made it past discovery (dest unused) shouldn't be
+        # counted as the owner of a destination.
+        rows = [
+            _report_row('d', 'ghost', 's3a://b/x', src='', status='SOURCE_PATH_NOT_FOUND'),
+            _report_row('d', 'real', 's3a://b/x', src='/x'),
+        ]
+        result, html = _run_report(mock_spark, sample_run_id, rows)
+        assert result['destination_overlap_count'] == 0
+        assert '<h2>Advisories</h2>' not in html

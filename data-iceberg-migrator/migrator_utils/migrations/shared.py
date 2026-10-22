@@ -282,15 +282,20 @@ def find_destination_conflicts(tables: list[dict]) -> dict[tuple[str, str], str]
 
     dests = sorted(owners)
     conflicts: dict[tuple[str, str], set[str]] = {}
+    own_dest: dict[tuple[str, str], str] = {
+        key: dest for dest, keys in owners.items() for key in keys
+    }
     for i, dest in enumerate(dests):
-        clashing = set(owners[dest]) if len(owners[dest]) > 1 else set()
+        cluster_keys = set(owners[dest]) if len(owners[dest]) > 1 else set()
+        cluster_dests = {dest} if cluster_keys else set()
         for other in dests[i + 1:]:
             if other.startswith(dest + "/"):
-                clashing |= owners[dest] | owners[other]
-        if not clashing:
+                cluster_keys |= owners[dest] | owners[other]
+                cluster_dests |= {dest, other}
+        if not cluster_keys:
             continue
-        for key in clashing:
-            conflicts.setdefault(key, set()).add(dest)
+        for key in cluster_keys:
+            conflicts.setdefault(key, set()).update(cluster_dests)
     result = {}
     for key, involved in conflicts.items():
         peers = sorted(
@@ -301,7 +306,7 @@ def find_destination_conflicts(tables: list[dict]) -> dict[tuple[str, str], str]
         )
         peers = list(dict.fromkeys(peers))
         result[key] = (
-            f"Destination {sorted(involved)[0]} overlaps with another table's destination; "
+            f"Destination {own_dest[key]} overlaps with another table's destination; "
             f"conflicts with: {', '.join(peers)}"
         )
     return result

@@ -105,6 +105,11 @@ to end; see its `README.md` for setup and the DAG settings.
 | `MIGRATION_DISCOVERY_MAX_CONCURRENT` | `3`          | Concurrent table-discovery tasks per DAG run. Each runs a `pyspark` driver on the edge node, so size it to the edge's memory. **Env-only**, same reason as above | `source_to_s3_migration`                          |
 | `migration_distcp_checkpoint_location` | `<migration_tracking_location>/_distcp_checkpoints` | S3 prefix for per-table, per-attempt DistCp checkpoint JSON. The edge node writes with Hadoop FS; the Spark status task lists and reads checkpoint objects. | `source_to_s3_migration` |
 | `migration_discovery_driver_memory` | _(empty)_ | Optional `--driver-memory` passed to the remote `pyspark` table-discovery process; empty leaves Spark's default unchanged. | `source_to_s3_migration` |
+| `migration_discovery_spark_master` | `local[*]`       | Spark master for the remote table-discovery `pyspark` process. Use `yarn` to run discovery on the cluster when the edge node cannot hold the driver.                                                             | `source_to_s3_migration`                          |
+| `migration_metastore_socket_timeout` | `600s`         | `hive.metastore.client.socket.timeout` for the discovery Spark session; raise for metastores slow on `DESCRIBE FORMATTED`.                                                                                        | `source_to_s3_migration`                          |
+| `migration_metastore_failure_retries` | `5`           | `hive.metastore.failure.retries` for the discovery Spark session; Hive client reconnects to HMS this many times.                                                                                                  | `source_to_s3_migration`                          |
+| `migration_metastore_retry_attempts` | `4`            | Python-level `DESCRIBE FORMATTED` retries per table when the HMS client exhausts its own retries with `Failed to get table info from metastore`.                                                                 | `source_to_s3_migration`                          |
+| `migration_metastore_retry_backoff_seconds` | `15`    | Base seconds between the retries above; backoff is linear (`backoff × attempt`).                                                                                                                                  | `source_to_s3_migration`                          |
 | `migration_include_db_in_path`     | `true`           | When `true` (default), destination S3 path is `{bucket}/{database}/{table}`. When `false`, path is `{bucket}/{table}` (database folder omitted)                                                                  | `source_to_s3_migration`                          |
 | `migration_use_source_relative_path` | `false`        | When `true`, destination S3 path is `{bucket}/{source relative path}` instead of `{bucket}/{database}/{table}`. Overrides `migration_include_db_in_path`. See [Source-relative destination paths](#source-relative-destination-paths) | `source_to_s3_migration` |
 | `migration_source_path_strip_prefixes` | _(empty)_    | Comma-separated source path prefixes to remove before building the destination (e.g. `/mapr/prod.cluster,/user/hive/warehouse`). Only used when `migration_use_source_relative_path` is `true` | `source_to_s3_migration` |
@@ -758,11 +763,15 @@ Examples (bucket `s3a://dl-prod`):
 | `maprfs:/datalake/x/y`                               | on            | `/mapr/a,/datalake`        | `s3a://dl-prod/x/y`                       |
 | `maprfs:///datalake`                                 | on            | `/datalake`                | `DESTINATION_PATH_INVALID`                |
 
-Failures are per table and do not fail the run. Both statuses are skippable, appear in
-the HTML report and email, and the other tables continue:
+A table whose path cannot be derived is marked `DESTINATION_PATH_INVALID`,
+skipped, and reported alongside the other tables; the run continues.
 
-- `DESTINATION_PATH_INVALID` - the path is empty after stripping.
-- `DESTINATION_PATH_CONFLICT` - two different tables resolve to the same destination, or one destination is nested inside another. Both tables are marked and the message lists the source paths involved.
+Overlapping destinations (two tables that resolve to the same path, or one
+that nests inside another) are not blocked. The source layout can legitimately
+contain overlaps, so migration proceeds. The run report and email include an
+Advisories section listing each overlapping table with its destination and
+source path, so downstream maintenance (orphan-file cleanup, snapshot
+expiration across tables sharing a prefix) can be coordinated.
 
 ---
 
@@ -1196,7 +1205,7 @@ VALIDATED (All validations passed)
 (Any stage can fail → FAILED)
 ```
 
-Tables skipped at discovery (for example `DESTINATION_PATH_INVALID` or `DESTINATION_PATH_CONFLICT`) are reported but not migrated, and do not fail the run.
+Tables skipped at discovery (for example `DESTINATION_PATH_INVALID`) are reported but not migrated, and do not fail the run.
 
 ---
 
