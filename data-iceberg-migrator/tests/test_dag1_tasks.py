@@ -4153,3 +4153,212 @@ class TestReportTicketFileLine:
             {'auth_method': auth_method, 'mapr_ticketfile_location': '/tmp/maprticket_svc'}
         )
         assert line == ''
+
+
+class TestOutOfDirPartitions:
+
+    OOD = [{
+        'partition': 'dt=2024-01-02', 'location': 'maprfs:/other/dt=2024-01-02',
+        'size_bytes': 2048, 'file_count': 2, 'exists': True,
+    }]
+
+    def test_remote_script_has_out_of_dir_logic_and_compiles(self, mock_ssh_hook, sample_run_id):
+        _, client, _, _ = mock_ssh_hook
+        TestDiscoverTablesViaSshSpark()._run_discovery(
+            client, [TestDiscoverTablesViaSshSpark()._make_metadata_record('orders')],
+            sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        compile(script, 'discover_tables.py', 'exec')
+        assert 'is_path_inside_root' in script
+        assert '"out_of_dir_partition_count": out_of_dir_partition_count' in script
+        assert '"out_of_dir_check_error": None' in script
+        assert 'listPartitions' in script
+
+    def test_discovery_passes_out_of_dir_fields_through(self, mock_ssh_hook, sample_run_id, caplog):
+        _, client, _, _ = mock_ssh_hook
+        disc = TestDiscoverTablesViaSshSpark()
+        record = disc._make_metadata_record(
+            'orders', out_of_dir_partition_count=1, out_of_dir_partitions=self.OOD,
+            out_of_dir_size_bytes=2048, out_of_dir_file_count=2, out_of_dir_check_error=None,
+        )
+        with caplog.at_level(logging.WARNING):
+            result = disc._run_discovery(client, [record], sample_run_id, ['orders'])
+        t = result['tables'][0]
+        assert t['out_of_dir_partition_count'] == 1
+        assert t['out_of_dir_partitions'] == self.OOD
+        assert 'error' not in t and 'error_type' not in t
+        assert 'dt=2024-01-02 -> maprfs:/other/dt=2024-01-02' in caplog.text
+
+    def test_record_sql_includes_new_columns(self, mock_spark, sample_discovery, mock_iceberg_retry):
+        row = MagicMock()
+        row.__getitem__ = lambda self, k: 0
+        df = MagicMock()
+        df.collect.return_value = [row]
+        mock_spark.sql.return_value = df
+        sample_discovery['tables'][0].update(
+            out_of_dir_partition_count=1, out_of_dir_partitions=self.OOD
+        )
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
+        insert_sql = next(
+            c.args[1] for c in mock_iceberg_retry.call_args_list if 'INSERT INTO' in c.args[1]
+        )
+        assert 'out_of_dir_partition_count, out_of_dir_partitions' in insert_sql
+        assert 'dt=2024-01-02' in insert_sql
+        row.__getitem__ = lambda self, k: 1
+        mock_iceberg_retry.reset_mock()
+        m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
+        update_sql = next(
+            c.args[1] for c in mock_iceberg_retry.call_args_list if 'UPDATE' in c.args[1]
+        )
+        assert 'out_of_dir_partition_count = 1' in update_sql
+        assert 'out_of_dir_partitions = ' in update_sql
+
+    def _validate(self, mock_spark, sample_table_result, **overrides):
+        v = TestValidateDestinationTables()
+        sample_table_result['tables'][0].update(overrides)
+        mock_spark.sql.side_effect = v._make_router(500)
+        v._setup_dest_schema(mock_spark)
+        return m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )['validation_results'][0]
+
+    def test_validation_mismatch_names_out_of_dir_partitions(
+        self, mock_spark, sample_table_result, caplog
+    ):
+        with caplog.at_level(logging.WARNING):
+            res = self._validate(
+                mock_spark, sample_table_result,
+                out_of_dir_partition_count=1, out_of_dir_partitions=self.OOD,
+            )
+        assert '1 out-of-directory source partition(s) not copied' in res['error']
+        assert 'dt=2024-01-02 -> maprfs:/other/dt=2024-01-02' in res['error']
+        assert 'out-of-directory source partition(s) not copied' in caplog.text
+
+    def test_validation_mismatch_unchanged_without_out_of_dir(self, mock_spark, sample_table_result):
+        res = self._validate(mock_spark, sample_table_result)
+        assert 'out-of-directory' not in res['error']
+        assert res['error'].startswith('Row count mismatch')
+
+    def _report(self, mock_spark, sample_run_id, **extra):
+        run_row = SimpleNamespace(dag_run_id='dag_run_test')
+        fields = dict(
+            source_database='sales_data', source_table='transactions',
+            overall_status='VALIDATED', discovery_duration_seconds=12.0,
+            distcp_duration_seconds=300.0, distcp_bytes_copied=10 * 1024 * 1024,
+            distcp_files_copied=5, distcp_is_incremental=False,
+            table_create_duration_seconds=8.0, validation_duration_seconds=5.0,
+            validation_status='COMPLETED', row_count_match=True,
+            partition_count_match=False, schema_match=True,
+            source_row_count=1000, dest_hive_row_count=1000,
+            source_partition_count=2, dest_partition_count=1,
+            source_total_size_bytes=10 * 1024 * 1024, s3_total_size_bytes_before=0,
+            s3_total_size_bytes_after=10 * 1024 * 1024, s3_bytes_transferred=10 * 1024 * 1024,
+            file_size_match=True, source_file_count=5,
+            s3_file_count_before=0, s3_file_count_after=5,
+            s3_files_transferred=5, file_count_match=True,
+            distcp_status='COMPLETED', file_format='PARQUET',
+            partition_filter=None, filtered_partition_count=None,
+        )
+        fields.update(extra)
+        tbl_row = SimpleNamespace(**fields)
+        vs_row = MagicMock()
+        vs_row.__getitem__ = lambda self, k: 1
+        vs_row.total_tables_validated = 1
+        vs_row.tables_passed_validation = 1
+        vs_row.tables_failed_validation = 0
+        vs_row.total_row_count_mismatches = 0
+        vs_row.total_partition_count_mismatches = 1
+        vs_row.total_schema_mismatches = 0
+
+        def sql_router(sql):
+            df = MagicMock()
+            sl = sql.lower()
+            if 'migration_runs' in sl and 'where' in sl:
+                df.collect.return_value = [run_row]
+            elif 'order by' in sl:
+                df.collect.return_value = [tbl_row]
+            elif 'sum(case when row_count_match' in sl:
+                df.collect.return_value = [vs_row]
+            elif 'sum(case when file_size_match' in sl:
+                fm_row = MagicMock()
+                fm_row.tables_size_match = 1
+                fm_row.tables_size_mismatch = 0
+                fm_row.tables_file_count_match = 1
+                fm_row.tables_file_count_mismatch = 0
+                fm_row.total_source_bytes = 10 * 1024 * 1024
+                fm_row.total_dest_bytes = 10 * 1024 * 1024
+                df.collect.return_value = [fm_row]
+            else:
+                df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = sql_router
+        m.generate_html_report.function(run_id=sample_run_id, spark=mock_spark)
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        return fs_mock.create.return_value.write.call_args[0][0].decode('utf-8')
+
+    def test_report_renders_out_of_dir_card_and_badge(self, mock_spark, sample_run_id):
+        import json
+        ood = [{'partition': 'dt=<b>', 'location': 'maprfs:/other/x&y', 'size_bytes': 1,
+                'file_count': 1, 'exists': True}]
+        html = self._report(
+            mock_spark, sample_run_id,
+            out_of_dir_partition_count=1, out_of_dir_partitions=json.dumps(ood),
+        )
+        assert 'OUT-OF-DIR PARTITIONS' in html
+        assert '1 OUT-OF-DIR PARTITION(S)' in html
+        assert 'dt=&lt;b&gt;' in html and 'maprfs:/other/x&amp;y' in html
+        assert '<details>' in html
+        assert 'Run MSCK' not in html
+        assert '1 out-of-directory source partition(s) not copied' in html
+
+    def test_report_unchanged_without_out_of_dir(self, mock_spark, sample_run_id):
+        html = self._report(mock_spark, sample_run_id)
+        assert 'OUT-OF-DIR' not in html
+        assert '<details>' not in html
+        assert 'Stale partitions on source, Run MSCK' in html
+        zero = self._report(
+            mock_spark, sample_run_id, out_of_dir_partition_count=0, out_of_dir_partitions='[]'
+        )
+        assert zero == html
+
+    def test_remote_script_qualifies_each_path_with_its_own_filesystem(self, mock_ssh_hook, sample_run_id):
+        _, client, _, _ = mock_ssh_hook
+        disc = TestDiscoverTablesViaSshSpark()
+        disc._run_discovery(
+            client, [disc._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        compile(script, 'discover_tables.py', 'exec')
+        qualify = script[script.index('def _qualify'):script.index('part_locations = {}')]
+        assert 'getFileSystem(spark._jsc.hadoopConfiguration()).makeQualified(_p)' in qualify
+        assert 'return x.strip()' in qualify
+        assert 'len(metastore_partitions) > 2000' in script
+        assert '_pfs.getContentSummary(_pp)' in script
+
+    def test_discovery_warns_on_out_of_dir_check_error(self, mock_ssh_hook, sample_run_id, caplog):
+        _, client, _, _ = mock_ssh_hook
+        disc = TestDiscoverTablesViaSshSpark()
+        record = disc._make_metadata_record(
+            'orders', out_of_dir_check_error='partition location lookup skipped: x',
+        )
+        with caplog.at_level(logging.WARNING):
+            result = disc._run_discovery(client, [record], sample_run_id, ['orders'])
+        assert 'error' not in result['tables'][0]
+        assert 'sales.orders' in caplog.text
+        assert 'partition location lookup skipped: x' in caplog.text
+
+    def test_report_icons_when_both_counts_mismatch(self, mock_spark, sample_run_id):
+        html = self._report(
+            mock_spark, sample_run_id, row_count_match=False,
+            out_of_dir_partition_count=3, out_of_dir_partitions='[]',
+        )
+        msg = '⚠ WARN: 3 out-of-directory source partition(s) not copied'
+        assert html.count(msg) == 2

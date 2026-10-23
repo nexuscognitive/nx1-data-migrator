@@ -186,3 +186,39 @@ class TestPartitionsToWhereClause:
         result = pu.partitions_to_where_clause(['  dt = 2024-01-01 '])
         assert '`dt`' in result
         assert '2024-01-01' in result
+
+
+# ---------------------------------------------------------------------------
+# is_path_inside_root / normalize_path
+# ---------------------------------------------------------------------------
+class TestIsPathInsideRoot:
+
+    ROOT = 'maprfs://cluster/a/b'
+
+    def test_same_path(self):
+        assert pu.is_path_inside_root('maprfs://cluster/a/b', self.ROOT) is True
+
+    def test_child(self):
+        assert pu.is_path_inside_root('maprfs://cluster/a/b/dt=1', self.ROOT) is True
+
+    def test_sibling_with_shared_prefix(self):
+        assert pu.is_path_inside_root('maprfs://cluster/a/bc', self.ROOT) is False
+        assert pu.is_path_inside_root('maprfs://cluster/a/bc/dt=1', self.ROOT) is False
+
+    def test_trailing_slash_on_either_side(self):
+        assert pu.is_path_inside_root('maprfs://cluster/a/b/', self.ROOT) is True
+        assert pu.is_path_inside_root('maprfs://cluster/a/b/dt=1/', self.ROOT + '/') is True
+
+    def test_different_scheme(self):
+        assert pu.is_path_inside_root('hdfs://cluster/a/b/dt=1', self.ROOT) is False
+
+    def test_different_authority(self):
+        assert pu.is_path_inside_root('maprfs://other/a/b/dt=1', self.ROOT) is False
+
+    def test_empty_values_are_not_inside(self):
+        assert pu.is_path_inside_root('', self.ROOT) is False
+        assert pu.is_path_inside_root(self.ROOT, '') is False
+
+    def test_normalize_path_keeps_bare_slash(self):
+        assert pu.normalize_path('/') == '/'
+        assert pu.normalize_path(' /a/b// ') == '/a/b'

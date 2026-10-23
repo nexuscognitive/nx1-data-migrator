@@ -172,3 +172,18 @@ def partitions_to_where_clause(partitions):
             clauses.append("(" + " AND ".join(conditions) + ")")
 
     return " OR ".join(clauses) if clauses else "1=1"
+
+
+def normalize_path(path):
+    path = (path or "").strip()
+    while len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    return path
+
+
+def is_path_inside_root(path, root):
+    p = normalize_path(path)
+    r = normalize_path(root)
+    if not p or not r:
+        return False
+    return p == r or p.startswith(r + "/")
