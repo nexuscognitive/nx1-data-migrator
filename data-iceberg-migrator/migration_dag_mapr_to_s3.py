@@ -88,6 +88,7 @@ SKIPPABLE_DISCOVERY_ERRORS = (
     "SOURCE_PATH_NOT_FOUND",
     "TABLE_CORRUPTED",
     "DESTINATION_PATH_INVALID",
+    "SKIPPED_VIEW",
 )
 
 # Spark's HiveExternalCatalog raises this when the spark.sql.sources.schema.* table
@@ -1555,6 +1556,23 @@ for tbl in table_list:
                         if k in ("field.delim", "escape.delim", "null.format", "field delimiter"):
                             serde_properties[k] = v
 
+        # Views aren't backed by storage, so DistCp has nothing to copy.
+        # Mark here (upfront, before the FS probe and SELECT COUNT(*)) so the
+        # row flows through the SKIPPABLE_DISCOVERY_ERRORS plumbing: DistCp,
+        # create, and validation skip it, and finalize_run doesn't fail the run
+        # because of it. VIRTUAL_VIEW is standard Hive view; MATERIALIZED_VIEW
+        # could technically have storage, but we still don't migrate it through
+        # this DAG.
+        if table_type.upper() in ("VIRTUAL_VIEW", "MATERIALIZED_VIEW", "VIEW"):
+            record = _default_metadata_record(tbl)
+            record["table_type"] = table_type
+            record["error"] = "'{{0}}.{{1}}' is a {{2}} and will not be migrated".format(
+                src_db, tbl, table_type
+            )
+            record["error_type"] = "SKIPPED_VIEW"
+            metadata.append(record)
+            continue
+
         source_total_size = 0
         source_file_count = 0
         fs = None
@@ -1936,6 +1954,11 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
                 f"  Table metadata corrupted for {src_db}.{t['source_table']} — the "
                 f"table owner must repair it; will be skipped in downstream phases | "
                 f"error={t.get('error', '')[:200]}"
+            )
+        elif t.get("error_type") == "SKIPPED_VIEW":
+            logger.info(
+                f"  Skipping view {src_db}.{t['source_table']} "
+                f"(table_type={t.get('table_type', 'UNKNOWN')}) — views are not migrated"
             )
         else:
             # source_path_exists says why this was not skippable: True = data is

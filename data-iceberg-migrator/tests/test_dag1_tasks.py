@@ -855,6 +855,78 @@ class TestDiscoverTablesViaSshSpark:
         assert 'corrupted' in by_table['system_exception_detail']['error']
         assert by_table['good_one'].get('error_type') is None
 
+    def test_view_is_skipped_and_does_not_abort_sibling_tables(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """A view carries SKIPPED_VIEW through SKIPPABLE_DISCOVERY_ERRORS, so DistCp,
+        create, and validation skip it; the sibling table discovers normally."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record('good_one'),
+            self._make_metadata_record(
+                'orders_view',
+                table_type='VIRTUAL_VIEW',
+                file_format='UNKNOWN',
+                source_location='',
+                source_path_exists=None,
+                error="'sales.orders_view' is a VIRTUAL_VIEW and will not be migrated",
+                error_type='SKIPPED_VIEW',
+            ),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['good_one', 'orders_view'],
+        )
+
+        by_table = {t['source_table']: t for t in result['tables']}
+        assert by_table['orders_view']['error_type'] == 'SKIPPED_VIEW'
+        assert by_table['orders_view']['table_type'] == 'VIRTUAL_VIEW'
+        assert 'VIRTUAL_VIEW' in by_table['orders_view']['error']
+        assert by_table['good_one'].get('error_type') is None
+
+    def test_materialized_view_is_also_skipped(self, mock_ssh_hook, sample_run_id):
+        """MATERIALIZED_VIEW is backed by storage but we don't migrate it through
+        this DAG — same SKIPPED_VIEW treatment."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record(
+                'daily_rollup_mv',
+                table_type='MATERIALIZED_VIEW',
+                file_format='UNKNOWN',
+                source_location='',
+                source_path_exists=None,
+                error="'sales.daily_rollup_mv' is a MATERIALIZED_VIEW and will not be migrated",
+                error_type='SKIPPED_VIEW',
+            ),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['daily_rollup_mv'],
+        )
+
+        assert result['tables'][0]['error_type'] == 'SKIPPED_VIEW'
+        assert result['tables'][0]['table_type'] == 'MATERIALIZED_VIEW'
+
+    def test_generated_remote_script_skips_views(self, mock_ssh_hook, sample_run_id):
+        """The edge script must bail out of the per-table loop for views before
+        the FS probe and SELECT COUNT(*)."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        compile(script, 'discover_tables.py', 'exec')
+        # Both standard and materialized views are classified SKIPPED_VIEW
+        assert 'VIRTUAL_VIEW' in script
+        assert 'MATERIALIZED_VIEW' in script
+        assert '"SKIPPED_VIEW"' in script
+        # The check runs before the FS probe (ordering is load-bearing: once we
+        # hit fs.exists() on a view with an empty location, we'd abort the db).
+        view_skip = 'table_type.upper() in ("VIRTUAL_VIEW"'
+        assert view_skip in script
+        assert script.index(view_skip) < script.index('source_path_exists = bool(fs.exists(path))')
+
     def test_orphan_that_never_threw_is_still_classified(self, mock_ssh_hook, sample_run_id):
         """A TEXTFILE/Avro orphan never throws — its schema comes from the catalog —
         so it emits as a success record and would reach DistCp with 0 files and be
