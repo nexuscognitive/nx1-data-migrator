@@ -759,6 +759,17 @@ def get_config() -> dict:
     config['distcp_checkpoint_location'] = checkpoint_location or (
         f"{config['tracking_location'].rstrip('/')}/_distcp_checkpoints"
     )
+    # Discovery checkpoints let a retry skip tables already walked. Default
+    # sits next to the DistCp checkpoints under tracking_location so both share
+    # the same bucket and credentials.
+    discovery_checkpoint_location = _var(
+        'migration_discovery_checkpoint_location',
+        'MIGRATION_DISCOVERY_CHECKPOINT_LOCATION',
+        '',
+    ).strip()
+    config['discovery_checkpoint_location'] = discovery_checkpoint_location or (
+        f"{config['tracking_location'].rstrip('/')}/_discovery_checkpoints"
+    )
 
     if dag_owner and dag_owner != 'data-migration':
         try:

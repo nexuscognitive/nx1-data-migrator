@@ -237,6 +237,117 @@ def _read_spark_distcp_checkpoints(spark, prefix: str) -> list[dict]:
     ]
 
 
+def _discovery_checkpoint_prefix(root: str, run_id: str, src_db: str) -> str:
+    """Prefix for one discovery task's checkpoints.
+
+    Simpler than the DistCp equivalent: discovery is already scoped per
+    (run_id, src_db) by Airflow's mapped-task structure, so no mapping_hash is
+    needed to disambiguate within a run. The DistCp version has to disambiguate
+    because multiple DistCp mapped tasks may share the same (run_id, src_db).
+    """
+    return (
+        f"{root.rstrip('/')}/{quote(str(run_id), safe='')}/"
+        f"{quote(str(src_db), safe='')}"
+    )
+
+
+def _read_edge_discovery_checkpoints(
+    ssh, prefix: str, s3_opts: str, cluster_type: str
+) -> list[dict]:
+    """Batched read: one SSH session, one `hadoop fs -cat` for the whole batch.
+
+    DistCp's per-file cat (see _read_edge_distcp_checkpoints) is one hadoop
+    invocation per checkpoint — 500 cached discoveries would spawn 500 JVMs
+    (~15 minutes just to read). Here `hadoop fs -cat` is called ONCE with every
+    file as an argument, so the whole set reads in ~a second. Each checkpoint
+    ends in '\\n' so the concatenated stream is newline-delimited JSON.
+    """
+    command = f"""set -o pipefail
+hadoop fs{s3_opts} -mkdir -p {shlex.quote(prefix)} >/dev/null 2>&1 || true
+files=$(hadoop fs{s3_opts} -ls {shlex.quote(prefix)} 2>/dev/null | awk '$1 ~ /^-/ {{print $NF}}')
+if [ -z "$files" ]; then
+    exit 0
+fi
+hadoop fs{s3_opts} -cat $files
+"""
+    with ssh.get_conn() as client:
+        _, stdout, stderr = client.exec_command(
+            _login_shell(command, cluster_type), timeout=SSH_COMMAND_TIMEOUT
+        )
+        output = stdout.read().decode()
+        error_output = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0:
+        raise RuntimeError(
+            f"Could not read discovery checkpoints (exit={exit_code}): "
+            f"{error_output[-1000:]}"
+        )
+    records = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except Exception as e:
+            logger.warning(f"[Discovery] Ignoring unparseable checkpoint line: {e}")
+    return records
+
+
+def _write_edge_discovery_checkpoints(
+    ssh,
+    records_by_identity: dict,
+    checkpoint_prefix: str,
+    s3_opts: str,
+    temp_dir: str,
+    cluster_type: str,
+) -> None:
+    """Batched write: one SSH session, SFTP all records to a staging dir, then
+    a single `hadoop fs -put -f` for the whole batch.
+
+    DistCp's per-record _write_edge_distcp_checkpoint opens one SSH session
+    and spawns one `hadoop fs` JVM per call. For discovery's 500-record scale
+    that's ~25 min of pure overhead. Here the JVM starts twice (mkdir + put)
+    regardless of batch size.
+    """
+    if not records_by_identity:
+        return
+    import contextlib
+    staging_dir = f"{temp_dir.rstrip('/')}/.discovery-checkpoints-{uuid.uuid4().hex}"
+    with ssh.get_conn() as client:
+        sftp = client.open_sftp()
+        try:
+            with contextlib.suppress(IOError):
+                sftp.mkdir(staging_dir)  # mkdir races are benign here
+            for identity, record in records_by_identity.items():
+                payload = (
+                    json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+                )
+                remote = f"{staging_dir}/{identity}.json"
+                with sftp.file(remote, "wb") as f:
+                    f.write(payload.encode("utf-8"))
+        finally:
+            sftp.close()
+
+        command = (
+            f"hadoop fs{s3_opts} -mkdir -p {shlex.quote(checkpoint_prefix)} && "
+            f"hadoop fs{s3_opts} -put -f {shlex.quote(staging_dir)}/*.json "
+            f"{shlex.quote(checkpoint_prefix.rstrip('/') + '/')} ; "
+            f"rc=$? ; rm -rf {shlex.quote(staging_dir)} ; exit $rc"
+        )
+        _, stdout, stderr = client.exec_command(
+            _login_shell(command, cluster_type), timeout=SSH_COMMAND_TIMEOUT
+        )
+        output = stdout.read().decode()
+        error_output = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0:
+        raise RuntimeError(
+            f"Could not persist discovery checkpoints (exit={exit_code}): "
+            f"{(error_output or output)[-1000:]}"
+        )
+
+
 # Later phases roll up their own outcome but must not overwrite a skipped table's
 # status, which already says why it was never copied.
 _PRESERVE_SKIPPABLE_STATUS_SQL = (
@@ -1341,12 +1452,68 @@ def discover_tables_via_spark_ssh(db_config: dict, **context) -> dict:
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
 
+        # Per-run, per-source-db checkpoint prefix. run_id scopes to this DAG
+        # run (no cross-run contamination); src_db scopes to this mapped task
+        # (no cross-task contamination). Empty discovery_checkpoint_location in
+        # config disables checkpointing entirely (read is skipped, write is a no-op).
+        _ckpt_root = str(config.get("discovery_checkpoint_location") or "").strip()
+        if _ckpt_root:
+            _ckpt_root_normalized = normalize_s3(_ckpt_root).rstrip("/")
+            checkpoint_prefix = _discovery_checkpoint_prefix(
+                _ckpt_root_normalized, run_id, src_db
+            )
+            # Build S3 opts for the TRACKING bucket (where checkpoints live),
+            # not the per-mapping destination bucket. Matches DistCp's pattern.
+            checkpoint_s3_opts = build_s3_opts(_ckpt_root_normalized, config)
+        else:
+            checkpoint_prefix = ""
+            checkpoint_s3_opts = ""
+
+        # Load existing checkpoints BEFORE launching pyspark so we can inject
+        # them into the script. Each hit is one table that will be skipped at
+        # the top of discover_one_table rather than re-DESCRIBE'd.
+        cached_by_identity = {}
+        if checkpoint_prefix:
+            try:
+                cached_records = _read_edge_discovery_checkpoints(
+                    ssh,
+                    checkpoint_prefix,
+                    checkpoint_s3_opts,
+                    config.get("cluster_type", "MapR"),
+                )
+                for record in cached_records:
+                    identity = _distcp_checkpoint_identity(record)
+                    cached_by_identity[identity] = record
+                logger.info(
+                    f"[Discovery] Loaded {len(cached_by_identity)} checkpoint(s) "
+                    f"from {checkpoint_prefix}"
+                )
+            except Exception as e:
+                # A checkpoint read failure must never block discovery — fall
+                # back to a cold run; writes below will repopulate the cache.
+                logger.warning(
+                    f"[Discovery] Could not load checkpoints at "
+                    f"{checkpoint_prefix}: {e}"
+                )
+
+        cached_metadata_json = json.dumps(
+            cached_by_identity, ensure_ascii=True, separators=(",", ":")
+        )
+
         pyspark_script = """# -*- coding: utf-8 -*-
+import contextlib
+import hashlib
 import json
 import sys
 import fnmatch
 import time
-from concurrent.futures import ThreadPoolExecutor
+# multiprocessing.dummy is a thread-backed Pool (despite the name). Prefer it
+# over concurrent.futures.ThreadPoolExecutor because MapR and hadoop edges run
+# Python 2.7 (see dev-tools/*/Dockerfile) where concurrent.futures requires the
+# `futures` backport pip package — not installed on those images. Pool.map has
+# the same submission-order semantics for I/O-bound work; the only extra care
+# needed is close()/join() since Py2's Pool has no __enter__/__exit__.
+from multiprocessing.dummy import Pool as ThreadPool
 from pyspark.sql import SparkSession
 from pyspark.sql.utils import AnalysisException
 sys.path.insert(0, "{temp_dir}")
@@ -1374,6 +1541,24 @@ dest_bucket = "{dest_bucket}"
 tokens = json.loads('{tokens_json_escaped}')
 exclude_tokens = json.loads('{exclude_tokens_json_escaped}')
 filter_expr = "{filter_expr_escaped}"
+
+# Per-table discovery checkpoints: on retry, skip tables whose record has
+# already been loaded. The dict is pre-populated by the Airflow task (which
+# owns S3 credentials — see _read_edge_discovery_checkpoints in the driver)
+# and injected as JSON here. Keys are SHA256(src_db, src_table, dest_db,
+# partition_filter), matching DistCp's identity scheme so operators have one
+# mental model. Empty dict = cold run; everything will be rediscovered and
+# the driver writes checkpoints after this subprocess completes.
+CHECKPOINTED = json.loads('{cached_metadata_json_escaped}')
+if CHECKPOINTED:
+    print("INFO: resumed {{0}} table(s) from discovery checkpoints".format(len(CHECKPOINTED)))
+
+def _checkpoint_identity(_src_db, _src_table, _dest_db, _partition_filter):
+    payload = json.dumps(
+        [_src_db, _src_table, _dest_db, _partition_filter],
+        ensure_ascii=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 def _s3_location_for(tbl):
     if {include_db_in_path}:
@@ -1536,6 +1721,13 @@ def discover_one_table(tbl):
     # Runs under ThreadPoolExecutor below; SparkSession.sql() is thread-safe
     # (Spark 2.0+). All early-exit paths return a record — never append — so
     # the caller's main thread owns metadata.append and we need no lock.
+    # Checkpoint fast-path: if this (src_db, tbl, dest_db, filter) was already
+    # discovered in this run_id, return the cached record untouched — the whole
+    # point of checkpointing is that retries skip the metastore + FS work.
+    _identity = _checkpoint_identity(src_db, tbl, dest_db, filter_expr or None)
+    _cached = CHECKPOINTED.get(_identity)
+    if _cached is not None:
+        return _cached
     loc = None
     # None = could not determine; the driver reads that as unknown, not absent.
     source_path_exists = None
@@ -1859,7 +2051,8 @@ def discover_one_table(tbl):
 # main thread as pool.map yields, so no lock is needed. pool.map preserves
 # submission order and propagates exceptions — but discover_one_table catches
 # everything and returns a FAILED record, so pool.map never raises.
-with ThreadPoolExecutor(max_workers={per_table_parallelism}) as pool:
+# contextlib.closing adapts Py2's Pool (no __enter__/__exit__) to `with`.
+with contextlib.closing(ThreadPool({per_table_parallelism})) as pool:
     for record in pool.map(discover_one_table, table_list):
         metadata.append(record)
 
@@ -1894,6 +2087,10 @@ spark.stop()
             per_table_parallelism=_int_setting(
                 config, "discovery_per_table_parallelism", 8, 1, 64
             ),
+            # Single-quote-escape only: the placeholder sits inside a single-
+            # quoted string literal (CHECKPOINTED = json.loads('...')). JSON
+            # itself produces no single quotes, so this is a one-char escape.
+            cached_metadata_json_escaped=cached_metadata_json.replace("'", "\\'"),
         )
 
         script_path = f"{temp_dir}/discover_tables.py"
@@ -1975,6 +2172,43 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
             t["error"] = (
                 f"Source data path does not exist: {t.get('source_location', '')}"
             )
+
+    # Persist checkpoints for everything in a terminal non-FAILED state (success
+    # and every SKIPPABLE_DISCOVERY_ERRORS variant — including the FAILED → *
+    # reclassifications above, which are deterministic and worth caching).
+    # Writes happen BEFORE the raise-on-failures gate below so an intermediate
+    # retry can skip these on its next attempt. Already-cached identities are
+    # skipped to avoid rewriting unchanged records.
+    if checkpoint_prefix:
+        to_checkpoint = {}
+        for t in metadata:
+            if t.get("error_type") == "FAILED":
+                continue
+            identity = _distcp_checkpoint_identity(t)
+            if identity in cached_by_identity:
+                continue
+            to_checkpoint[identity] = t
+        if to_checkpoint:
+            try:
+                _write_edge_discovery_checkpoints(
+                    ssh,
+                    to_checkpoint,
+                    checkpoint_prefix,
+                    checkpoint_s3_opts,
+                    temp_dir,
+                    config.get("cluster_type", "MapR"),
+                )
+                logger.info(
+                    f"[Discovery] Persisted {len(to_checkpoint)} new checkpoint(s) "
+                    f"to {checkpoint_prefix}"
+                )
+            except Exception as e:
+                # A checkpoint write failure must never fail the task — the
+                # metadata is already in memory and will be returned normally.
+                logger.warning(
+                    f"[Discovery] Could not persist checkpoints to "
+                    f"{checkpoint_prefix}: {e}"
+                )
 
     logger.info(
         f"Discovery complete for database '{src_db}': {len(metadata)} table(s) found"
