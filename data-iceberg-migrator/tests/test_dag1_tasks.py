@@ -719,13 +719,15 @@ class TestDiscoverTablesViaSshSpark:
     def _run_discovery(self, client, metadata, sample_run_id, tokens, **context):
         import json
         # Four SSH exec_command calls happen per discovery, in order:
-        #   1. mkdir -p <temp_dir>
-        #   2. _read_edge_discovery_checkpoints (empty on first run)
+        #   1. _read_edge_discovery_checkpoints (own session, runs BEFORE the
+        #      main `with ssh.get_conn()` block to avoid paramiko's
+        #      SSHClient.__exit__ invalidating the main client's transport)
+        #   2. mkdir -p <temp_dir> (inside the main session)
         #   3. pyspark run (returns the metadata JSON)
-        #   4. _write_edge_discovery_checkpoints (one-shot batch upload)
+        #   4. _write_edge_discovery_checkpoints (own session, one-shot batch)
         # Each extra slot is harmless if the test produces no non-FAILED records
-        # (write SSH session is skipped), but omitting slot 2 would shift the
-        # pyspark response into the read parser and misclassify everything.
+        # (write SSH session is skipped), but omitting slot 1 would shift the
+        # mkdir response into the read parser.
         client.exec_command.side_effect = [
             (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
@@ -1122,7 +1124,10 @@ class TestDiscoverTablesViaSshSpark:
         assert 'import hashlib' in script
         assert 'def _checkpoint_identity(' in script
         # No S3-touching code in the script — the driver owns S3 creds.
-        assert "CHECKPOINTED = json.loads('" in script
+        # Payload is base64 (not raw JSON) so cached exception text with newlines
+        # or control chars survives Python's string-literal escape processing.
+        assert 'import base64' in script
+        assert 'CHECKPOINTED = json.loads(base64.b64decode(' in script
         assert '_load_checkpoints' not in script
         assert '_write_checkpoint' not in script
         assert 'spark._jvm.org.apache.hadoop.fs.FileSystem.get(\n            spark._jvm.java.net.URI(CHECKPOINT_PREFIX)' not in script
@@ -1144,7 +1149,8 @@ class TestDiscoverTablesViaSshSpark:
         )
         sftp_file = client.open_sftp.return_value.file.return_value
         script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
-        assert "CHECKPOINTED = json.loads('{}')" in script
+        # Empty dict JSON is '{}', base64('{}') is 'e30='.
+        assert "CHECKPOINTED = json.loads(base64.b64decode('e30=').decode('utf-8'))" in script
 
     def test_checkpoint_read_uses_batched_hadoop_fs_cat(
         self, mock_ssh_hook, sample_run_id
@@ -1155,8 +1161,9 @@ class TestDiscoverTablesViaSshSpark:
         self._run_discovery(
             client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
         )
-        # The 2nd exec_command call is the checkpoint read.
-        read_call = client.exec_command.call_args_list[1]
+        # The 1st exec_command call is the checkpoint read (runs BEFORE the
+        # main `with ssh.get_conn()` block to avoid nested-close invalidation).
+        read_call = client.exec_command.call_args_list[0]
         read_cmd = read_call.args[0]
         # One hadoop fs -ls to get the file list, then one hadoop fs -cat $files
         # (NOT a per-file cat loop like DistCp uses).
@@ -1183,6 +1190,162 @@ class TestDiscoverTablesViaSshSpark:
         assert '-put -f' in write_cmd
         assert '*.json' in write_cmd
         assert '_discovery_checkpoints' in write_cmd
+
+    def test_checkpoint_read_happens_before_main_ssh_session(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """Regression: paramiko SSHClient.__exit__ closes the underlying
+        transport, so a nested `with ssh.get_conn()` inside the main session
+        would invalidate the parent client reference and crash the next
+        client.open_sftp() with 'NoneType has no open_sftp_client'. The
+        checkpoint read must run with its own fully-scoped connection,
+        BEFORE the main `with ssh.get_conn()` block opens an SFTP channel."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        # exec_command call_args_list is ordered by call sequence.
+        exec_cmds = [c.args[0] for c in client.exec_command.call_args_list]
+        # Slot 1 = checkpoint read (hadoop fs -ls / -cat); slot 2 = mkdir;
+        # slot 3 = pyspark run; slot 4 = checkpoint write.
+        assert '_discovery_checkpoints' in exec_cmds[0], (
+            f"first SSH exec_command must be the checkpoint read (own session), "
+            f"got: {exec_cmds[0][:120]!r}"
+        )
+        assert 'mkdir -p' in exec_cmds[1], (
+            f"second SSH exec_command should be the mkdir inside the main "
+            f"session, got: {exec_cmds[1][:120]!r}"
+        )
+        # And open_sftp (used for the pyspark script upload) must be called
+        # AFTER the checkpoint read finished and the main session opened.
+        assert client.open_sftp.called, (
+            "pyspark script upload must have called client.open_sftp "
+            "(if the main session's client got invalidated, this never fires)"
+        )
+
+    def test_different_buckets_get_distinct_checkpoint_prefixes(self):
+        """Regression: parse_excel emits one discovery task per
+        (src_db, dest_db, bucket, endpoint, partition_filter). Two Excel rows
+        differing only by bucket would otherwise share the same run_id/src_db
+        tail and overwrite each other's cache, so the retry would pick up a
+        record pointing at the wrong bucket's s3_location. mapping_hash in the
+        prefix (sha256 of src/dest/bucket/endpoint/filter) breaks that tie."""
+        from migration_dag_mapr_to_s3 import (
+            _discovery_checkpoint_identity,
+            _discovery_checkpoint_prefix,
+        )
+        base = dict(
+            run_id='run_1', source_database='sales', dest_database='sales_s3',
+            dest_endpoint='', partition_filter=None,
+        )
+        a = {**base, 'dest_bucket': 's3a://bucket-A'}
+        b = {**base, 'dest_bucket': 's3a://bucket-B'}
+        prefix_a = _discovery_checkpoint_prefix('s3a://root', a)
+        prefix_b = _discovery_checkpoint_prefix('s3a://root', b)
+        assert prefix_a != prefix_b, (
+            f"different buckets must get different prefixes, got {prefix_a!r} == {prefix_b!r}"
+        )
+        # Identity for the same table in each must also differ, so a stray
+        # record landing in the wrong prefix wouldn't still cache-hit.
+        rec_a = {**a, 'source_table': 'orders'}
+        rec_b = {**b, 'source_table': 'orders'}
+        assert _discovery_checkpoint_identity(rec_a) != _discovery_checkpoint_identity(rec_b)
+
+    def test_cached_records_with_control_chars_survive_the_round_trip(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """Regression: a cached FAILED record whose `error` field contains a
+        newline, a quote, or a control character (TEXTFILE field delimiters
+        like \\u0001 trigger this routinely) must round-trip through the
+        pyspark script's deserialization. Base64 encoding at the driver side
+        makes the payload immune to Python's string-literal escape processing
+        that happens before json.loads runs."""
+        _, client, _, _ = mock_ssh_hook
+
+        # One cached checkpoint whose error text contains exactly the
+        # characters the reviewer's reproduction hit on: newline, quote,
+        # control char. Returned by _read_edge_discovery_checkpoints via
+        # the second mock SSH response (one record per line, newline-delim).
+        import base64 as _b64
+        import json as _json
+        import re as _re
+
+        from migration_dag_mapr_to_s3 import _discovery_checkpoint_identity
+        bad_record = {
+            'source_database': 'sales',
+            'source_table': 'orders',
+            'dest_database': 'sales_s3',
+            'dest_bucket': 's3a://bucket',
+            'dest_endpoint': '',
+            'partition_filter': None,
+            'error_type': 'FAILED',
+            'error': 'line1\nline2 "q" ',
+        }
+        identity = _discovery_checkpoint_identity(bad_record)
+        checkpoint_line = (_json.dumps(bad_record) + '\n').encode('utf-8')
+
+        metadata = [self._make_metadata_record('new_table')]
+        # Order mirrors discover_tables_via_spark_ssh: read, mkdir, pyspark, write.
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, checkpoint_line), MagicMock()),      # cp read
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),                  # mkdir
+            (MagicMock(), mock_ssh_stdout(0, self._make_discovery_output(_json.dumps(metadata))), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),                  # cp write
+        ]
+        m.discover_tables_via_spark_ssh.function.__wrapped__(db_config={
+            'run_id': sample_run_id, 'source_database': 'sales',
+            'table_tokens': ['new_table'], 'dest_database': 'sales_s3',
+            'dest_bucket': 's3a://bucket',
+        })
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        # The script must compile — a raw-JSON injection with embedded newlines
+        # or control chars would raise SyntaxError here or JSONDecodeError at
+        # script runtime.
+        compile(script, 'discover_tables.py', 'exec')
+        # Extract the base64 payload, decode, and assert the record round-trips.
+        match = _re.search(
+            r"CHECKPOINTED = json\.loads\(base64\.b64decode\('([^']+)'\)",
+            script,
+        )
+        assert match, "expected base64-wrapped CHECKPOINTED assignment"
+        decoded = _json.loads(_b64.b64decode(match.group(1)).decode('utf-8'))
+        assert identity in decoded
+        assert decoded[identity]['error'] == 'line1\nline2 "q" '
+
+    def test_discover_one_table_does_not_shadow_filter_expr(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """Regression: a stray `filter_expr = "..."` inside discover_one_table
+        would make Python treat filter_expr as local throughout the function,
+        and the checkpoint-identity read at the top would raise
+        UnboundLocalError on every cold-run table. The read must resolve to
+        the module-level binding set from the template."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        compile(script, 'discover_tables.py', 'exec')
+
+        # Static check: filter_expr must be set at module scope and never
+        # rebound inside the function.
+        import ast
+        tree = ast.parse(script)
+        fn = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == 'discover_one_table'
+        )
+        local_filter_assigns = [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == 'filter_expr' for t in n.targets)
+        ]
+        assert not local_filter_assigns, (
+            "discover_one_table must not assign filter_expr "
+            "(would shadow the module-level binding and break the cache fast-path)"
+        )
 
     def test_checkpoint_disabled_when_location_is_empty(
         self, mock_ssh_hook, sample_run_id, monkeypatch
@@ -1218,7 +1381,7 @@ class TestDiscoverTablesViaSshSpark:
         compile(script, 'discover_tables.py', 'exec')
         # Cache dict is still emitted but empty — the pyspark script's
         # discover_one_table .get(...) safely misses, no cold-path regression.
-        assert "CHECKPOINTED = json.loads('{}')" in script
+        assert "CHECKPOINTED = json.loads(base64.b64decode('e30=').decode('utf-8'))" in script
         # Only two SSH exec_commands should have fired (mkdir, pyspark).
         exec_cmds = [c.args[0] for c in client.exec_command.call_args_list]
         assert len(exec_cmds) == 2
@@ -4207,9 +4370,12 @@ class TestFinalizeRun:
     def _run_with_stats(self, mock_spark, run_id, **counts):
         """Returns the raw SQL strings. `c.args[0]`, not `str(c)`: a mock call's repr
         escapes newlines, so splitlines() yields one line and per-line assertions
-        silently degrade to matching the whole statement."""
+        silently degrade to matching the whole statement.
+
+        Missing counts default to 0 so adding a new rollup column (e.g.
+        views_skipped) doesn't force every existing test to pass it."""
         stats_row = MagicMock()
-        stats_row.__getitem__ = lambda self, k: counts[k]
+        stats_row.__getitem__ = lambda self, k: counts.get(k, 0)
         df = MagicMock()
         df.collect.return_value = [stats_row]
         mock_spark.sql.side_effect = _finalize_sql_router(df, [])
@@ -4238,7 +4404,11 @@ class TestFinalizeRun:
 
     def test_not_found_rollup_counts_every_skippable_status(self, mock_spark, sample_run_id):
         """Pin the `not_found` rollup specifically: asserting the names appear anywhere
-        is vacuous, since the `successful` rollup above satisfies that on its own."""
+        is vacuous, since the `successful` rollup above satisfies that on its own.
+
+        SKIPPED_VIEW is deliberately excluded from the not_found count (views
+        are an expected non-migration category, not a 'missing' one) — it has
+        its own rollup column, verified below."""
         sqls = self._run_with_stats(
             mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=1
         )
@@ -4246,8 +4416,30 @@ class TestFinalizeRun:
             line for sql in sqls for line in sql.splitlines() if 'as not_found' in line
         )
         assert '_SKIPPABLE_STATUS_SQL_IN' not in not_found_expr
+        # Every skippable status except SKIPPED_VIEW must still be rolled up.
         for status in m.SKIPPABLE_DISCOVERY_ERRORS:
+            if status == 'SKIPPED_VIEW':
+                continue
             assert status in not_found_expr
+        # SKIPPED_VIEW gets its own column so the summary doesn't downgrade a
+        # views-only run to COMPLETED_WITH_MISSING.
+        views_expr = next(
+            line for sql in sqls for line in sql.splitlines() if 'as views_skipped' in line
+        )
+        assert "overall_status = 'SKIPPED_VIEW'" in views_expr
+
+    def test_views_skipped_do_not_downgrade_a_clean_run(
+        self, mock_spark, sample_run_id
+    ):
+        """Regression: before SKIPPED_VIEW got its own rollup column, a run
+        whose only anomaly was a few views flipped to COMPLETED_WITH_MISSING,
+        which looks like missing data in the summary. It should stay COMPLETED."""
+        sqls = ' '.join(self._run_with_stats(
+            mock_spark, sample_run_id,
+            total=5, successful=5, failed=0, not_found=0, views_skipped=2,
+        ))
+        assert "status = 'COMPLETED'" in sqls
+        assert 'COMPLETED_WITH_MISSING' not in sqls
 
     def test_skipped_table_downgrades_run_to_completed_with_missing(
         self, mock_spark, sample_run_id
