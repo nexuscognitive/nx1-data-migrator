@@ -163,6 +163,33 @@ class TestParseExcel:
         assert result[0]['dest_database'] == 'sales_s3'
         assert result[0]['run_id'] == 'run_test'
 
+    def test_exclude_only_group_expands_to_wildcard(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'sales', 'table': ' Exclude: a, b ', 'dest database': 'sales_s3', 'bucket': 's3a://mybucket'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/file.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['table_tokens'] == ['*']
+        assert result[0]['exclude_tokens'] == ['a', 'b']
+
+    def test_exclude_rows_merge_with_includes_in_group(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'sales', 'table': 't1', 'dest database': 'sales_s3', 'bucket': 's3a://mybucket'},
+            {'database': 'sales', 'table': 'exclude: x', 'dest database': 'sales_s3', 'bucket': 's3a://mybucket'},
+            {'database': 'sales', 'table': 'EXCLUDE:x,y', 'dest database': 'sales_s3', 'bucket': 's3a://mybucket'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/file.xlsx', 'run_test', spark=mock_spark)
+        assert len(result) == 1
+        assert result[0]['table_tokens'] == ['t1']
+        assert result[0]['exclude_tokens'] == ['x', 'y']
+
+    def test_rows_without_exclude_have_empty_exclude_tokens(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'sales', 'table': 'a,b', 'dest database': 'sales_s3', 'bucket': 's3a://mybucket'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/file.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['table_tokens'] == ['a', 'b']
+        assert result[0]['exclude_tokens'] == []
+
     def test_unreadable_excel_fails_permanently(self, mock_spark):
         """A corrupt upload fails identically on every retry (P-06: BadZipFile retried
         twice over ~12 minutes before this)."""
@@ -562,6 +589,25 @@ class TestDiscoverTablesViaSshSpark:
         with pytest.raises(Exception, match="Discovery failed for"):
             m.discover_tables_via_spark_ssh.function.__wrapped__(db_config=db_config)
 
+        client.exec_command.side_effect = [
+            (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), pyspark_stdout, MagicMock()),
+        ]
+        with pytest.raises(Exception, match="Discovery failed for"):
+            m.discover_tables_via_spark_ssh.function.__wrapped__(
+                db_config=db_config, ti=SimpleNamespace(try_number=1, task=SimpleNamespace(retries=2))
+            )
+
+        client.exec_command.side_effect = [
+            (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), pyspark_stdout, MagicMock()),
+        ]
+        result = m.discover_tables_via_spark_ssh.function.__wrapped__(
+            db_config=db_config, ti=SimpleNamespace(try_number=3, task=SimpleNamespace(retries=2))
+        )
+        assert [(t['source_table'], t['error_type']) for t in result['tables']] == [('broken', 'FAILED')]
+        assert result['tables'][0]['error'] == 'Table not found'
+
     def test_table_not_found_does_not_raise(self, mock_ssh_hook, sample_run_id):
         hook, client, _, _ = mock_ssh_hook
         import json
@@ -652,7 +698,7 @@ class TestDiscoverTablesViaSshSpark:
         record.update(overrides)
         return record
 
-    def _run_discovery(self, client, metadata, sample_run_id, tokens):
+    def _run_discovery(self, client, metadata, sample_run_id, tokens, **context):
         import json
         client.exec_command.side_effect = [
             (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
@@ -662,7 +708,7 @@ class TestDiscoverTablesViaSshSpark:
             'run_id': sample_run_id, 'source_database': 'sales',
             'table_tokens': tokens, 'dest_database': 'sales_s3',
             'dest_bucket': 's3a://bucket',
-        })
+        }, **context)
 
     def test_generated_remote_script_is_valid_python(self, mock_ssh_hook, sample_run_id):
         """The script only ever runs on the edge node, where a syntax error surfaces
@@ -847,6 +893,32 @@ class TestDiscoverTablesViaSshSpark:
         with pytest.raises(Exception, match="Discovery failed for"):
             self._run_discovery(client, metadata, sample_run_id, ['good_one', 'flaky'])
 
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['good_one', 'flaky'],
+            ti=SimpleNamespace(try_number=1, task=SimpleNamespace(retries=0)),
+        )
+        by_table = {t['source_table']: t for t in result['tables']}
+        assert by_table['flaky']['error_type'] == 'FAILED'
+        assert 'OutOfMemoryError' in by_table['flaky']['error']
+        assert 'error' not in by_table['good_one']
+
+    def test_exclude_tokens_are_passed_into_script(self, mock_ssh_hook, sample_run_id):
+        _, client, _, _ = mock_ssh_hook
+        import json
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, self._make_discovery_output(json.dumps([]))), MagicMock()),
+        ]
+        m.discover_tables_via_spark_ssh.function.__wrapped__(db_config={
+            'run_id': sample_run_id, 'source_database': 'sales',
+            'table_tokens': ['*'], 'exclude_tokens': ['tmp_*', 'old'],
+            'dest_database': 'sales_s3', 'dest_bucket': 's3a://bucket',
+        })
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        assert """exclude_tokens = json.loads('["tmp_*", "old"]')""" in script
+        compile(script, 'discover_tables.py', 'exec')
+
 
 class TestRecordDiscoveredTables:
 
@@ -856,6 +928,27 @@ class TestRecordDiscoveredTables:
         df = MagicMock()
         df.collect.return_value = [row]
         mock_spark.sql.return_value = df
+
+    @pytest.mark.parametrize("existing", [0, 1])
+    def test_failed_discovery_recorded_and_stripped(
+        self, mock_spark, sample_discovery, mock_iceberg_retry, existing
+    ):
+        self._setup_count(mock_spark, existing)
+        failed = dict(sample_discovery['tables'][0])
+        failed.update(source_table='flaky', error="it's broken", error_type='FAILED')
+        sample_discovery['tables'].append(failed)
+        good = sample_discovery['tables'][0]['source_table']
+        result = m.record_discovered_tables.function(
+            discovery=sample_discovery, spark=mock_spark, ti=MagicMock(map_index=0)
+        )
+        sqls = [c.args[1] for c in mock_iceberg_retry.call_args_list]
+        flaky_sql = next(q for q in sqls if "'flaky'" in q)
+        assert "discovery_status = 'FAILED'" in flaky_sql or "'FAILED', current_timestamp()" in flaky_sql
+        assert "overall_status = 'FAILED'" in flaky_sql or "'FAILED', '" in flaky_sql
+        assert "broken" in flaky_sql
+        assert [t['source_table'] for t in result['tables']] == [good]
+        assert result['_discovery_failed'] == ['flaky']
+        assert result['_map_index'] == 0
 
     def test_inserts_new_record(self, mock_spark, sample_discovery, mock_iceberg_retry):
         self._setup_count(mock_spark, 0)
@@ -3783,6 +3876,16 @@ class TestSendMigrationReportEmail:
         assert 'user@example.com' in result['recipients']
 
 
+def _finalize_sql_router(stats_df, failed_rows):
+    failed_df = MagicMock()
+    failed_df.collect.return_value = failed_rows
+
+    def _route(sql, *args, **kwargs):
+        return failed_df if "discovery_status = 'FAILED'" in sql else stats_df
+
+    return _route
+
+
 class TestFinalizeRun:
 
     def test_updates_migration_runs_with_completed(self, mock_spark, sample_run_id):
@@ -3790,7 +3893,7 @@ class TestFinalizeRun:
         stats_row.__getitem__ = lambda self, k: 5
         df = MagicMock()
         df.collect.return_value = [stats_row]
-        mock_spark.sql.return_value = df
+        mock_spark.sql.side_effect = _finalize_sql_router(df, [])
 
         m.finalize_run.function(run_id=sample_run_id, spark=mock_spark)
         sql_calls = [str(c) for c in mock_spark.sql.call_args_list]
@@ -3804,9 +3907,29 @@ class TestFinalizeRun:
         stats_row.__getitem__ = lambda self, k: counts[k]
         df = MagicMock()
         df.collect.return_value = [stats_row]
-        mock_spark.sql.return_value = df
+        mock_spark.sql.side_effect = _finalize_sql_router(df, [])
         m.finalize_run.function(run_id=run_id, spark=mock_spark)
         return [c.args[0] for c in mock_spark.sql.call_args_list if c.args]
+
+    def test_discovery_failed_rows_fail_the_run(self, mock_spark, sample_run_id):
+        from airflow.exceptions import AirflowFailException
+        stats_row = MagicMock()
+        stats_row.__getitem__ = lambda self, k: 3
+        stats_df = MagicMock()
+        stats_df.collect.return_value = [stats_row]
+        mock_spark.sql.side_effect = _finalize_sql_router(
+            stats_df, [{'source_table': 'broken_a'}, {'source_table': 'broken_b'}]
+        )
+        with pytest.raises(AirflowFailException, match=r'Discovery failed for 2 table\(s\): broken_a, broken_b'):
+            m.finalize_run.function(run_id=sample_run_id, spark=mock_spark)
+        assert any(
+            "status = 'COMPLETED" in c.args[0] for c in mock_spark.sql.call_args_list if c.args
+        ) or mock_spark.sql.call_count >= 2
+
+    def test_no_discovery_failed_rows_does_not_raise(self, mock_spark, sample_run_id):
+        self._run_with_stats(
+            mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=0
+        )
 
     def test_not_found_rollup_counts_every_skippable_status(self, mock_spark, sample_run_id):
         """Pin the `not_found` rollup specifically: asserting the names appear anywhere
