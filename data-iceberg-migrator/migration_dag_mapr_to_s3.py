@@ -11,6 +11,7 @@ Orchestrates migration of Hive tables from MapR or HDFS to S3:
 Excel columns: database | table | dest database | bucket | endpoint
 """
 
+import base64
 import hashlib
 import json
 import logging
@@ -88,6 +89,7 @@ SKIPPABLE_DISCOVERY_ERRORS = (
     "SOURCE_PATH_NOT_FOUND",
     "TABLE_CORRUPTED",
     "DESTINATION_PATH_INVALID",
+    "SKIPPED_VIEW",
 )
 
 # Spark's HiveExternalCatalog raises this when the spark.sql.sources.schema.* table
@@ -236,6 +238,151 @@ def _read_spark_distcp_checkpoints(spark, prefix: str) -> list[dict]:
     ]
 
 
+def _discovery_checkpoint_identity(record: dict) -> str:
+    """SHA256 identity of one discovered table.
+
+    Includes dest_bucket and dest_endpoint on top of DistCp's 4-tuple: parse_excel
+    groups discovery tasks by (src_db, dest_db, bucket, endpoint, partition_filter),
+    so two Excel rows differing only by bucket produce separate tasks that MUST
+    produce separate checkpoint files. The DistCp identity leaves bucket out
+    (its prefix carries a mapping_hash that provides the same scoping); here we
+    put it in the identity so cache hits can't return a record pointing at the
+    wrong bucket's s3_location even if a prefix check is ever skipped.
+    """
+    identity = [
+        record.get("source_database"),
+        record.get("source_table"),
+        record.get("dest_database"),
+        record.get("dest_bucket"),
+        record.get("dest_endpoint"),
+        record.get("partition_filter"),
+    ]
+    payload = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _discovery_checkpoint_prefix(root: str, db_config: dict) -> str:
+    """Prefix for one discovery task's checkpoints.
+
+    Mirrors _distcp_checkpoint_prefix: a short mapping_hash tail disambiguates
+    sibling tasks that share (run_id, src_db) but target different
+    (dest_db, bucket, endpoint, partition_filter). Without it, two concurrent
+    discovery tasks for the same source database could overwrite each other's
+    cache; whichever retried would pick up the other's dest_bucket pointing at
+    the wrong S3 location.
+    """
+    mapping_identity = [
+        db_config.get("source_database"),
+        db_config.get("dest_database"),
+        db_config.get("dest_bucket"),
+        db_config.get("dest_endpoint"),
+        db_config.get("partition_filter"),
+    ]
+    payload = json.dumps(mapping_identity, ensure_ascii=True, separators=(",", ":"))
+    mapping_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return (
+        f"{root.rstrip('/')}/{quote(str(db_config['run_id']), safe='')}/"
+        f"{quote(str(db_config['source_database']), safe='')}/{mapping_hash}"
+    )
+
+
+def _read_edge_discovery_checkpoints(
+    ssh, prefix: str, s3_opts: str, cluster_type: str
+) -> list[dict]:
+    """Batched read: one SSH session, one `hadoop fs -cat` for the whole batch.
+
+    DistCp's per-file cat (see _read_edge_distcp_checkpoints) is one hadoop
+    invocation per checkpoint — 500 cached discoveries would spawn 500 JVMs
+    (~15 minutes just to read). Here `hadoop fs -cat` is called ONCE with every
+    file as an argument, so the whole set reads in ~a second. Each checkpoint
+    ends in '\\n' so the concatenated stream is newline-delimited JSON.
+    """
+    command = f"""set -o pipefail
+hadoop fs{s3_opts} -mkdir -p {shlex.quote(prefix)} >/dev/null 2>&1 || true
+files=$(hadoop fs{s3_opts} -ls {shlex.quote(prefix)} 2>/dev/null | awk '$1 ~ /^-/ {{print $NF}}')
+if [ -z "$files" ]; then
+    exit 0
+fi
+hadoop fs{s3_opts} -cat $files
+"""
+    with ssh.get_conn() as client:
+        _, stdout, stderr = client.exec_command(
+            _login_shell(command, cluster_type), timeout=SSH_COMMAND_TIMEOUT
+        )
+        output = stdout.read().decode()
+        error_output = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0:
+        raise RuntimeError(
+            f"Could not read discovery checkpoints (exit={exit_code}): "
+            f"{error_output[-1000:]}"
+        )
+    records = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except Exception as e:
+            logger.warning(f"[Discovery] Ignoring unparseable checkpoint line: {e}")
+    return records
+
+
+def _write_edge_discovery_checkpoints(
+    ssh,
+    records_by_identity: dict,
+    checkpoint_prefix: str,
+    s3_opts: str,
+    temp_dir: str,
+    cluster_type: str,
+) -> None:
+    """Batched write: one SSH session, SFTP all records to a staging dir, then
+    a single `hadoop fs -put -f` for the whole batch.
+
+    DistCp's per-record _write_edge_distcp_checkpoint opens one SSH session
+    and spawns one `hadoop fs` JVM per call. For discovery's 500-record scale
+    that's ~25 min of pure overhead. Here the JVM starts twice (mkdir + put)
+    regardless of batch size.
+    """
+    if not records_by_identity:
+        return
+    import contextlib
+    staging_dir = f"{temp_dir.rstrip('/')}/.discovery-checkpoints-{uuid.uuid4().hex}"
+    with ssh.get_conn() as client:
+        sftp = client.open_sftp()
+        try:
+            with contextlib.suppress(IOError):
+                sftp.mkdir(staging_dir)  # mkdir races are benign here
+            for identity, record in records_by_identity.items():
+                payload = (
+                    json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+                )
+                remote = f"{staging_dir}/{identity}.json"
+                with sftp.file(remote, "wb") as f:
+                    f.write(payload.encode("utf-8"))
+        finally:
+            sftp.close()
+
+        command = (
+            f"hadoop fs{s3_opts} -mkdir -p {shlex.quote(checkpoint_prefix)} && "
+            f"hadoop fs{s3_opts} -put -f {shlex.quote(staging_dir)}/*.json "
+            f"{shlex.quote(checkpoint_prefix.rstrip('/') + '/')} ; "
+            f"rc=$? ; rm -rf {shlex.quote(staging_dir)} ; exit $rc"
+        )
+        _, stdout, stderr = client.exec_command(
+            _login_shell(command, cluster_type), timeout=SSH_COMMAND_TIMEOUT
+        )
+        output = stdout.read().decode()
+        error_output = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0:
+        raise RuntimeError(
+            f"Could not persist discovery checkpoints (exit={exit_code}): "
+            f"{(error_output or output)[-1000:]}"
+        )
+
+
 # Later phases roll up their own outcome but must not overwrite a skipped table's
 # status, which already says why it was never copied.
 _PRESERVE_SKIPPABLE_STATUS_SQL = (
@@ -355,10 +502,14 @@ def _env_int(env_var: str, default: int) -> int:
     """Read a parse-time integer from the environment only.
 
     Deliberately not get_config(): these values are needed while the DAG file is
-    parsed, and test_dag_integrity asserts the parse path reads no Airflow
-    Variable except migration_dag_owner — each read is a metadata-DB round trip
-    on every parse loop. load_dotenv has already run at import (:64-65), so a
-    value in the deployed env.shared is visible here.
+    parsed, and test_dag_integrity's parse-time Variable allowlist costs a
+    metadata-DB round trip per scheduler parse loop for each read.
+    load_dotenv has already run at import (:64-65), so a value in the deployed
+    env.shared is visible here.
+
+    For a knob that must be tunable from the Airflow UI without a redeploy,
+    use _var_or_env_int instead and add the Variable name to the allowlist in
+    test_parse_path_variable_reads_are_in_the_allowlist.
 
     Never raises: a bad value must not drop the DAG from Airflow.
     """
@@ -374,6 +525,39 @@ def _env_int(env_var: str, default: int) -> int:
         logger.warning(f"{env_var}={value} is not positive — using {default}")
         return default
     return value
+
+
+def _var_or_env_int(var_name: str, env_var: str, default: int) -> int:
+    """Resolve a positive int with precedence Airflow Variable > env > default.
+
+    Use for parse-time operator attributes where UI tunability outweighs the
+    per-scheduler-parse metadata-DB round trip. Each call site must be
+    allowlisted in test_parse_path_variable_reads_are_in_the_allowlist, so
+    adding one is a deliberate decision rather than an accident.
+
+    Delegates env/default handling to _env_int for one source of truth. Any
+    Variable-side failure (DB unreachable at parse, non-integer value, zero or
+    negative) silently falls through to env; the DAG must never fail to parse
+    because of a bad or missing Variable.
+    """
+    try:
+        from airflow.models import Variable
+        raw = (Variable.get(var_name, default_var='') or '').strip()
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    return value
+                logger.warning(
+                    f"Variable {var_name}={value} is not positive — falling back to env"
+                )
+            except ValueError:
+                logger.warning(
+                    f"Variable {var_name}={raw!r} is not an integer — falling back to env"
+                )
+    except Exception:
+        pass
+    return _env_int(env_var, default)
 
 
 # A stuck copy should die in minutes; a healthy 5 TB copy needs hours. A flat
@@ -1293,28 +1477,101 @@ def discover_tables_via_spark_ssh(db_config: dict, **context) -> dict:
         pf_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", partition_filter)[:40]
         dest_bucket_slug = f"{dest_bucket_slug}_{pf_slug}"
 
-    with ssh.get_conn() as client:
-        discovery_root = str(config.get("edge_discovery_temp_path") or "/tmp").rstrip("/") or "/tmp"
-        if "$" in discovery_root or discovery_root.startswith("~"):
-            raise ValueError(
-                f"cluster_edge_discovery_temp_path must be a literal path, got: {discovery_root}"
+    # Compute paths and read checkpoints OUTSIDE the main SSH session.
+    # _read_edge_discovery_checkpoints opens its own `with ssh.get_conn()`,
+    # and paramiko's SSHClient.__exit__ closes the underlying transport —
+    # which would invalidate a parent `with ssh.get_conn()` block's cached
+    # client reference and crash the next client.open_sftp() with
+    # 'NoneType has no open_sftp_client'. Running the read first and the
+    # main session second keeps every connection's lifetime cleanly scoped.
+    discovery_root = str(config.get("edge_discovery_temp_path") or "/tmp").rstrip("/") or "/tmp"
+    if "$" in discovery_root or discovery_root.startswith("~"):
+        raise ValueError(
+            f"cluster_edge_discovery_temp_path must be a literal path, got: {discovery_root}"
+        )
+    temp_dir = f"{discovery_root}/discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}"
+
+    # Per-run, per-source-db, per-mapping checkpoint prefix. run_id scopes to
+    # this DAG run (no cross-run contamination); the mapping_hash tail (sha256
+    # of src_db + dest_db + bucket + endpoint + partition_filter) scopes to
+    # this exact mapped task so sibling discovery tasks for the same src_db
+    # targeting different buckets don't share a prefix. Empty
+    # discovery_checkpoint_location in config disables checkpointing entirely
+    # (read is skipped, write is a no-op).
+    _ckpt_root = str(config.get("discovery_checkpoint_location") or "").strip()
+    if _ckpt_root:
+        _ckpt_root_normalized = normalize_s3(_ckpt_root).rstrip("/")
+        checkpoint_prefix = _discovery_checkpoint_prefix(
+            _ckpt_root_normalized, db_config
+        )
+        # Build S3 opts for the TRACKING bucket (where checkpoints live), not
+        # the per-mapping destination bucket. Matches DistCp's pattern.
+        checkpoint_s3_opts = build_s3_opts(_ckpt_root_normalized, config)
+    else:
+        checkpoint_prefix = ""
+        checkpoint_s3_opts = ""
+
+    # Load existing checkpoints BEFORE launching pyspark so we can inject them
+    # into the script. Each hit is one table that will be skipped at the top of
+    # discover_one_table rather than re-DESCRIBE'd.
+    cached_by_identity = {}
+    if checkpoint_prefix:
+        try:
+            cached_records = _read_edge_discovery_checkpoints(
+                ssh,
+                checkpoint_prefix,
+                checkpoint_s3_opts,
+                config.get("cluster_type", "MapR"),
             )
-        temp_dir = f"{discovery_root}/discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}"
+            for record in cached_records:
+                identity = _discovery_checkpoint_identity(record)
+                cached_by_identity[identity] = record
+            logger.info(
+                f"[Discovery] Loaded {len(cached_by_identity)} checkpoint(s) "
+                f"from {checkpoint_prefix}"
+            )
+        except Exception as e:
+            # A checkpoint read failure must never block discovery — fall back
+            # to a cold run; writes below will repopulate the cache.
+            logger.warning(
+                f"[Discovery] Could not load checkpoints at "
+                f"{checkpoint_prefix}: {e}"
+            )
+
+    cached_metadata_json = json.dumps(
+        cached_by_identity, ensure_ascii=True, separators=(",", ":")
+    )
+
+    with ssh.get_conn() as client:
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
 
         pyspark_script = """# -*- coding: utf-8 -*-
+import base64
+import contextlib
+import hashlib
 import json
 import sys
 import fnmatch
 import time
+# multiprocessing.dummy is a thread-backed Pool (despite the name). Prefer it
+# over concurrent.futures.ThreadPoolExecutor because MapR and hadoop edges run
+# Python 2.7 (see dev-tools/*/Dockerfile) where concurrent.futures requires the
+# `futures` backport pip package — not installed on those images. Pool.map has
+# the same submission-order semantics for I/O-bound work; the only extra care
+# needed is close()/join() since Py2's Pool has no __enter__/__exit__.
+from multiprocessing.dummy import Pool as ThreadPool
 from pyspark.sql import SparkSession
 from pyspark.sql.utils import AnalysisException
 sys.path.insert(0, "{temp_dir}")
 from partition_utils import apply_partition_filter, partitions_to_where_clause
 
+# FAIR scheduler so the per-table threadpool below doesn't FIFO queries behind
+# each other — default FIFO would serialize concurrent spark.sql calls and
+# negate the threadpool. Supported since Spark 1.0, including MapR Spark 2.3.
 spark = SparkSession.builder \\
     .appName("table_discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}") \\
+    .config("spark.scheduler.mode", "FAIR") \\
     .config("spark.hadoop.hive.exec.scratchdir", "{hive_scratch_dir}") \\
     .config("spark.hadoop.hive.exec.local.scratchdir", "{hive_scratch_dir}") \\
     .config("spark.hadoop.hive.metastore.client.socket.timeout", "{metastore_socket_timeout}") \\
@@ -1327,10 +1584,34 @@ spark.sparkContext.setLogLevel("ERROR")
 src_db = "{src_db}"
 dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
+dest_endpoint = "{dest_endpoint_escaped}"
 
 tokens = json.loads('{tokens_json_escaped}')
 exclude_tokens = json.loads('{exclude_tokens_json_escaped}')
 filter_expr = "{filter_expr_escaped}"
+
+# Per-table discovery checkpoints: on retry, skip tables whose record has
+# already been loaded. The dict is pre-populated by the Airflow task (which
+# owns S3 credentials — see _read_edge_discovery_checkpoints in the driver)
+# and injected as base64-encoded JSON here. Keys are SHA256(src_db, src_table,
+# dest_db, dest_bucket, dest_endpoint, partition_filter) — bucket and endpoint
+# are in the identity (unlike DistCp's) because sibling discovery tasks for
+# the same src_db targeting different buckets must not share cached records.
+# Empty dict = cold run; everything will be rediscovered and the driver writes
+# checkpoints after this subprocess completes.
+# Base64 (not raw JSON string-escaping) so cached exception text with newlines,
+# quotes, or control chars like \\u0001 (TEXTFILE field delimiters!) survives
+# the Python-literal processing that happens before json.loads runs.
+CHECKPOINTED = json.loads(base64.b64decode('{cached_metadata_b64}').decode('utf-8'))
+if CHECKPOINTED:
+    print("INFO: resumed {{0}} table(s) from discovery checkpoints".format(len(CHECKPOINTED)))
+
+def _checkpoint_identity(_src_db, _src_table, _dest_db, _dest_bucket, _dest_endpoint, _partition_filter):
+    payload = json.dumps(
+        [_src_db, _src_table, _dest_db, _dest_bucket, _dest_endpoint, _partition_filter],
+        ensure_ascii=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 def _s3_location_for(tbl):
     if {include_db_in_path}:
@@ -1350,6 +1631,9 @@ def _default_metadata_record(tbl):
         "source_table": tbl,
         "dest_database": dest_db,
         "dest_bucket": dest_bucket,
+        # Carried on every record so the driver's _discovery_checkpoint_identity
+        # (which includes dest_endpoint in the hash) matches what pyspark hashed.
+        "dest_endpoint": dest_endpoint,
         "source_location": "",
         "s3_location": _s3_location_for(tbl),
         "file_format": "UNKNOWN",
@@ -1489,7 +1773,26 @@ for tbl in missing_tables:
     record["error_type"] = "TABLE_NOT_FOUND"
     metadata.append(record)
 
-for tbl in table_list:
+def discover_one_table(tbl):
+    # Runs under ThreadPoolExecutor below; SparkSession.sql() is thread-safe
+    # (Spark 2.0+). All early-exit paths return a record — never append — so
+    # the caller's main thread owns metadata.append and we need no lock.
+    # Checkpoint fast-path: if this (src_db, tbl, dest_db, filter) was already
+    # discovered in this run_id, return the cached record untouched — the whole
+    # point of checkpointing is that retries skip the metastore + FS work.
+    # Deliberately do NOT rebind filter_expr inside this function: any local
+    # assignment would make Python treat it as local throughout, and this read
+    # (before any such assignment) would raise UnboundLocalError on every
+    # cold-run table. filter_expr is set at module scope and never changes.
+    # dest_endpoint and filter_expr normalisation mirrors _default_metadata_record
+    # (where dest_endpoint is stored as-is, partition_filter as `filter_expr or None`),
+    # so the pyspark hash matches _discovery_checkpoint_identity in the driver.
+    _identity = _checkpoint_identity(
+        src_db, tbl, dest_db, dest_bucket, dest_endpoint, filter_expr or None
+    )
+    _cached = CHECKPOINTED.get(_identity)
+    if _cached is not None:
+        return _cached
     loc = None
     # None = could not determine; the driver reads that as unknown, not absent.
     source_path_exists = None
@@ -1497,19 +1800,11 @@ for tbl in table_list:
     input_format = None
     serde_properties = {{}}
     in_serde_section = False
-    filter_expr = "{filter_expr_escaped}"
     row_count = 0
     filtered_partitions = []
     partition_filter_active = False
     filtered_source_size = 0
     filtered_file_count = 0
-    full_row_count = 0
-    full_partition_count = 0
-    partition_filter_active = False
-    filtered_partitions = []
-    filtered_source_size = 0
-    filtered_file_count = 0
-    row_count = 0
     full_row_count = 0
     full_partition_count = 0
     # Race window: a table dropped between SHOW TABLES and DESCRIBE here is
@@ -1554,6 +1849,22 @@ for tbl in table_list:
                         v = v.strip()
                         if k in ("field.delim", "escape.delim", "null.format", "field delimiter"):
                             serde_properties[k] = v
+
+        # Views aren't backed by storage, so DistCp has nothing to copy.
+        # Mark here (upfront, before the FS probe and SELECT COUNT(*)) so the
+        # row flows through the SKIPPABLE_DISCOVERY_ERRORS plumbing: DistCp,
+        # create, and validation skip it, and finalize_run doesn't fail the run
+        # because of it. VIRTUAL_VIEW is standard Hive view; MATERIALIZED_VIEW
+        # could technically have storage, but we still don't migrate it through
+        # this DAG.
+        if table_type.upper() in ("VIRTUAL_VIEW", "MATERIALIZED_VIEW", "VIEW"):
+            record = _default_metadata_record(tbl)
+            record["table_type"] = table_type
+            record["error"] = "'{{0}}.{{1}}' is a {{2}} and will not be migrated".format(
+                src_db, tbl, table_type
+            )
+            record["error_type"] = "SKIPPED_VIEW"
+            return record
 
         source_total_size = 0
         source_file_count = 0
@@ -1770,7 +2081,7 @@ for tbl in table_list:
             "partition_file_counts": partition_file_counts,
             "source_path_exists": source_path_exists,
         }})
-        metadata.append(record)
+        return record
 
     except Exception as e:
         record = _default_metadata_record(tbl)
@@ -1790,6 +2101,16 @@ for tbl in table_list:
             "error": _root_cause(e),
             "error_type": "FAILED",
         }})
+        return record
+
+# Thread-safety: SparkSession.sql / spark.table / py4j FileSystem reads are
+# documented thread-safe (Spark 2.0+). metadata.append is only called in the
+# main thread as pool.map yields, so no lock is needed. pool.map preserves
+# submission order and propagates exceptions — but discover_one_table catches
+# everything and returns a FAILED record, so pool.map never raises.
+# contextlib.closing adapts Py2's Pool (no __enter__/__exit__) to `with`.
+with contextlib.closing(ThreadPool({per_table_parallelism})) as pool:
+    for record in pool.map(discover_one_table, table_list):
         metadata.append(record)
 
 print ("===JSON_START===")
@@ -1807,6 +2128,9 @@ spark.stop()
             exclude_tokens_json_escaped=exclude_tokens_json.replace("'", "\\'"),
             dest_db=dest_db,
             dest_bucket=dest_bucket,
+            # Lands inside a double-quoted literal (`dest_endpoint = "..."`), so
+            # escape backslashes first then double quotes. Empty string is fine.
+            dest_endpoint_escaped=dest_endpoint.replace("\\", "\\\\").replace('"', '\\"'),
             dest_bucket_slug=dest_bucket_slug,
             filter_expr_escaped=partition_filter.replace("'", "\\'").replace(
                 '"', '\\"'
@@ -1820,6 +2144,18 @@ spark.stop()
             ),
             metastore_failure_retries=_int_setting(config, "metastore_failure_retries", 5, 0, 20),
             metastore_socket_timeout=_duration_setting(config, "metastore_socket_timeout", "600s"),
+            per_table_parallelism=_int_setting(
+                config, "discovery_per_table_parallelism", 8, 1, 64
+            ),
+            # Base64 so cached JSON (which may contain newlines, quotes, and
+            # control chars like \\u0001 inside Spark exception strings or
+            # TEXTFILE field delimiters) survives Python's string-literal
+            # escape processing before it reaches json.loads. The base64
+            # alphabet is pure ASCII with no characters special to Python
+            # string literals, safe to drop into any quote style.
+            cached_metadata_b64=base64.b64encode(
+                cached_metadata_json.encode("utf-8")
+            ).decode("ascii"),
         )
 
         script_path = f"{temp_dir}/discover_tables.py"
@@ -1902,6 +2238,43 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
                 f"Source data path does not exist: {t.get('source_location', '')}"
             )
 
+    # Persist checkpoints for everything in a terminal non-FAILED state (success
+    # and every SKIPPABLE_DISCOVERY_ERRORS variant — including the FAILED → *
+    # reclassifications above, which are deterministic and worth caching).
+    # Writes happen BEFORE the raise-on-failures gate below so an intermediate
+    # retry can skip these on its next attempt. Already-cached identities are
+    # skipped to avoid rewriting unchanged records.
+    if checkpoint_prefix:
+        to_checkpoint = {}
+        for t in metadata:
+            if t.get("error_type") == "FAILED":
+                continue
+            identity = _discovery_checkpoint_identity(t)
+            if identity in cached_by_identity:
+                continue
+            to_checkpoint[identity] = t
+        if to_checkpoint:
+            try:
+                _write_edge_discovery_checkpoints(
+                    ssh,
+                    to_checkpoint,
+                    checkpoint_prefix,
+                    checkpoint_s3_opts,
+                    temp_dir,
+                    config.get("cluster_type", "MapR"),
+                )
+                logger.info(
+                    f"[Discovery] Persisted {len(to_checkpoint)} new checkpoint(s) "
+                    f"to {checkpoint_prefix}"
+                )
+            except Exception as e:
+                # A checkpoint write failure must never fail the task — the
+                # metadata is already in memory and will be returned normally.
+                logger.warning(
+                    f"[Discovery] Could not persist checkpoints to "
+                    f"{checkpoint_prefix}: {e}"
+                )
+
     logger.info(
         f"Discovery complete for database '{src_db}': {len(metadata)} table(s) found"
     )
@@ -1936,6 +2309,11 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
                 f"  Table metadata corrupted for {src_db}.{t['source_table']} — the "
                 f"table owner must repair it; will be skipped in downstream phases | "
                 f"error={t.get('error', '')[:200]}"
+            )
+        elif t.get("error_type") == "SKIPPED_VIEW":
+            logger.info(
+                f"  Skipping view {src_db}.{t['source_table']} "
+                f"(table_type={t.get('table_type', 'UNKNOWN')}) — views are not migrated"
             )
         else:
             # source_path_exists says why this was not skippable: True = data is
@@ -2214,7 +2592,12 @@ def flatten_and_batch(discoveries) -> list[dict]:
         estimate_distcp_cost(t, config) for g in groups for t in g["tables"]
     )
     backstop = _DISTCP_EXECUTION_TIMEOUT.total_seconds()
-    lanes = _env_int("MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3)
+    # Same precedence as the parse-time cap: Variable > env > default. Keeps
+    # batch sizing in sync with the operator concurrency when a user tunes
+    # migration_distcp_copy_max_concurrent from the Airflow UI.
+    lanes = _var_or_env_int(
+        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    )
     cap = resolve_batch_cap(total_cost, lanes, backstop)
     logger.info(f"[Batching] {distcp_batching_mode(cap, lanes, backstop, config)}")
     logger.info(
@@ -4836,6 +5219,12 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     invalid_dest_tables = sum(
         1 for t in table_status if t.overall_status == "DESTINATION_PATH_INVALID"
     )
+    # Views are an expected non-migration category, not a "missing" one. Count
+    # them separately so the summary card and `_not_found_row` branch below
+    # don't lump them under TABLE_NOT_FOUND.
+    views_skipped_tables = sum(
+        1 for t in table_status if t.overall_status == "SKIPPED_VIEW"
+    )
 
     # Non-blocking advisory: tables whose destinations overlap (exact or nested).
     # Reported here only; migration proceeds. Downstream maintenance (orphan
@@ -4994,6 +5383,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             background-color: #fff0d6;
             color: #9a5b00;
         }}
+        .status-view-skipped {{
+            background-color: #e0e7ff;
+            color: #3730a3;
+        }}
         .status-warning {{
             background-color: #fff3cd;
             color: #856404;
@@ -5115,6 +5508,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
             <div class="summary-card">
                 <h3>INVALID DESTINATION PATH</h3>
                 <p class="value">{invalid_dest_tables}</p>
+            </div>
+            <div class="summary-card">
+                <h3>VIEWS SKIPPED</h3>
+                <p class="value">{views_skipped_tables}</p>
             </div>
             <div class="summary-card info">
                 <h3>TOTAL DATA</h3>
@@ -5323,6 +5720,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif status == "DESTINATION_PATH_INVALID":
             status_class = "status-conflict"
             status_label = status
+        elif status == "SKIPPED_VIEW":
+            status_class = "status-view-skipped"
+            status_label = status
         elif "VALIDATED_WITH_WARNINGS" in status:
             status_class = "status-warning"
             status_label = status
@@ -5465,6 +5865,9 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         elif t.overall_status == "DESTINATION_PATH_INVALID":
             badge_class = "status-conflict"
             badge_label = t.overall_status
+        elif t.overall_status == "SKIPPED_VIEW":
+            badge_class = "status-view-skipped"
+            badge_label = "SKIPPED_VIEW"
         else:
             badge_class = "status-not-found"
             badge_label = "TABLE_NOT_FOUND"
@@ -5488,6 +5891,15 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                 ' <span style="color:#6c757d;font-size:11px;">'
                 f"{html_escape(str(t.error_message))}</span>"
             )
+        elif t.overall_status == "SKIPPED_VIEW":
+            # Views aren't an error — show their type so the reader knows this
+            # is intentional (VIRTUAL_VIEW vs MATERIALIZED_VIEW).
+            tt = getattr(t, "table_type", "") or ""
+            if tt:
+                detail = (
+                    ' <span style="color:#6c757d;font-size:11px;">'
+                    f"{html_escape(str(tt))}</span>"
+                )
         return f"""
                     <tr>
                         <td>{t.source_database}</td>
@@ -5746,16 +6158,20 @@ def finalize_run(run_id: str, spark, cluster_setup: dict = None) -> dict:
     config = get_config()
     tracking_db = config["tracking_database"]
 
-    stats = {"total": 0, "successful": 0, "failed": 0, "not_found": 0}
+    stats = {"total": 0, "successful": 0, "failed": 0, "not_found": 0, "views_skipped": 0}
     final_status = "FAILED"
 
     try:
+        # not_found covers every SKIPPABLE_DISCOVERY_ERRORS variant EXCEPT
+        # SKIPPED_VIEW: views are an expected non-migration category, so having
+        # them alone shouldn't flip the run to COMPLETED_WITH_MISSING.
         stats_result = spark.sql(f"""
             SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED', 'EMPTY_SOURCE', {_SKIPPABLE_STATUS_SQL_IN}) THEN 1 ELSE 0 END) as successful,
                 SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN overall_status IN ({_SKIPPABLE_STATUS_SQL_IN}) THEN 1 ELSE 0 END) as not_found
+                SUM(CASE WHEN overall_status IN ({_SKIPPABLE_STATUS_SQL_IN}) AND overall_status != 'SKIPPED_VIEW' THEN 1 ELSE 0 END) as not_found,
+                SUM(CASE WHEN overall_status = 'SKIPPED_VIEW' THEN 1 ELSE 0 END) as views_skipped
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'
         """).collect()
@@ -5772,6 +6188,7 @@ def finalize_run(run_id: str, spark, cluster_setup: dict = None) -> dict:
                 "successful": stats_result[0]["successful"] or 0,
                 "failed": stats_result[0]["failed"] or 0,
                 "not_found": stats_result[0]["not_found"] or 0,
+                "views_skipped": stats_result[0]["views_skipped"] or 0,
             }
             if stats["failed"] > 0:
                 final_status = "COMPLETED_WITH_FAILURES"
@@ -5992,8 +6409,10 @@ with DAG(
     t_discover = discover_tables_via_spark_ssh.expand(db_config=t_excel)
     # Each discovery is a local[*] pyspark driver on the edge node; uncapped, one per
     # Excel database row, they OOM-killed a small edge node mid-run.
-    t_discover.operator.max_active_tis_per_dagrun = _env_int(
-        "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3
+    # Tunable from Airflow UI via Variable migration_discovery_max_concurrent;
+    # the env var is the deployed-env fallback.
+    t_discover.operator.max_active_tis_per_dagrun = _var_or_env_int(
+        "migration_discovery_max_concurrent", "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3
     )
     t_record = record_discovered_tables.expand(discovery=t_discover)
     t_record.operator.trigger_rule = "all_done"
@@ -6006,8 +6425,10 @@ with DAG(
     # The edge node and YARN queue are shared, and no Pool is available without
     # an infra change, so this caps per run only: total concurrent copies is
     # this times max_active_runs (5).
-    t_distcp.operator.max_active_tis_per_dagrun = _env_int(
-        "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    # Tunable from Airflow UI via Variable migration_distcp_copy_max_concurrent;
+    # the env var is the deployed-env fallback.
+    t_distcp.operator.max_active_tis_per_dagrun = _var_or_env_int(
+        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
     )
     t_distcp.operator.execution_timeout = _DISTCP_EXECUTION_TIMEOUT
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
@@ -6015,8 +6436,8 @@ with DAG(
     # One Iceberg writer per batch, and the batch count is no longer bounded by
     # a config ceiling. Reuses the copy lane count: a status write is far
     # cheaper than a copy and never needs more lanes than the stage feeding it.
-    t_distcp_status.operator.max_active_tis_per_dagrun = _env_int(
-        "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    t_distcp_status.operator.max_active_tis_per_dagrun = _var_or_env_int(
+        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
     )
     t_tables = create_hive_tables.expand(distcp_result=t_distcp_status)
     t_tables.operator.trigger_rule = "all_done"

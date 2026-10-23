@@ -149,6 +149,33 @@ Add one connection manually:
 | `\r: command not found` in script     | Windows line endings — run: `sed -i 's/\r//' scripts/setup-test-data.sh`                                                                                           |
 | bore port changed                     | Update `cluster_edge_ssh` connection port in Airflow UI after each bore restart                                                                                    |
 
+## Tuning DAG 1 performance
+
+Three Airflow Variables control discovery and DistCp parallelism. Each is read with the precedence **Airflow Variable → env var → default**, so set the Variable from **Airflow UI → Admin → Variables** for day-of changes without a redeploy. A non-integer, zero/negative, or unreadable Variable silently falls through to env/default — a bad value can never drop the DAG from Airflow.
+
+| Variable                                     | Default | Scope          | What it caps                                                                                                                                                                                       | When to raise                                                                                                                                                                        | When to lower                                                                                                                      |
+| -------------------------------------------- | ------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `migration_discovery_max_concurrent`         | `3`     | across databases | How many Excel-database rows discover **in parallel**. Each is a `local[*]` pyspark driver on the edge node, so this is edge-RAM-bounded, not Airflow policy.                                      | Many Excel databases (>3) and the edge node has headroom (`free -g` on the edge shows comfortable RAM after a run).                                                                   | Edge pod OOMs or discovery jobs get killed by the kernel. 3 is the safe baseline on a small edge.                                   |
+| `migration_discovery_per_table_parallelism`  | `8`     | within one DB  | How many tables inside **one** discovery task walk through metastore + FS probe + row count at the same time (threadpool on one SparkSession, FAIR scheduler so concurrent spark.sql don't FIFO). | A single giant database (hundreds of tables in one Excel row — this is the biggest lever for that case). Healthy HMS (HDP/CDP Hive 2.3+): try 16; a Hive 3 metastore handles 32 easily. | Metastore throws `TTransportException` under load (MapR Hive 1.2 on an old deployment is the usual culprit): drop to 4.             |
+| `migration_distcp_copy_max_concurrent`       | `3`     | across batches | How many DistCp copies run **in parallel** on the shared YARN queue. Also used by `flatten_and_batch` for lane-aware batch sizing, so the two stay in sync when you tune this.                     | YARN queue has unused capacity and the edge SSH session can absorb more concurrent `hadoop distcp` processes. Watch RM UI for queued apps before raising.                               | DistCp jobs queue in YARN or hit cluster quotas. Also lower if the edge node is CPU-bound shelling out to Hadoop clients.           |
+
+**Reading order of operations when discovery is slow:**
+
+1. Open the run's Gantt in Airflow; find whether one `discover_tables_via_spark_ssh` map index is holding up the DAG (one giant DB) or whether many of them run back-to-back (many DBs serialized behind the cap).
+2. One giant DB → bump `migration_discovery_per_table_parallelism`. The threadpool is the single biggest lever here (~8× on the default).
+3. Many DBs → bump `migration_discovery_max_concurrent`. Each extra concurrent discovery is one extra `local[*]` pyspark driver on the edge, so verify edge RAM headroom first.
+
+**How to apply a change mid-run**: set the Variable in the UI; the scheduler picks it up on its next parse loop (~30s). Already-running mapped task instances keep their current cap; the change takes effect for the next DAG run (or for any task instances still queued inside the current run, since the operator attribute is re-read at parse). No deploy needed.
+
+### Discovery resumes on retry
+
+Each successful per-table discovery is checkpointed to S3 (default: `{tracking_location}/_discovery_checkpoints/<run_id>/<source_db>/<identity>.json`). On an Airflow retry of the same `discover_tables_via_spark_ssh` task, the script loads the checkpoints at startup and skips tables already walked — only the ones that failed get re-attempted. On the common "2 flaky tables out of 500" case, a retry drops from re-walking all 500 to re-walking only the 2.
+
+- **Scoping**: the prefix includes `run_id` and `source_database`, so a new DAG run never reuses an old run's cache, and parallel mapped discovery tasks for different databases don't collide.
+- **What gets cached**: everything terminal — successful discoveries and `SKIPPED_VIEW` records. `FAILED` records are deliberately NOT cached so retries re-attempt them.
+- **Location**: configurable via Airflow Variable `migration_discovery_checkpoint_location` (precedence Variable > env > default). Shares bucket and credentials with the DistCp checkpoints.
+- **Cleanup**: checkpoints accumulate (same pattern as DistCp's). Stale entries from old runs are harmless because the `run_id` scoping guarantees a fresh prefix on each new run — delete the parent prefix periodically if S3 object counts become a concern.
+
 ## Running Tests
 
 Each project has its own test suite. Run from the project directory:

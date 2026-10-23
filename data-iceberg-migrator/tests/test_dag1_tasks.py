@@ -502,12 +502,14 @@ class TestDiscoverTablesViaSshSpark:
             'filtered_source_size_bytes': 1024, 'filtered_file_count': 1,
             'full_table_row_count': 500, 'full_table_partition_count': 0,
         }]
-        # First exec_command: mkdir, second: pyspark
+        # SSH call order: mkdir, checkpoint read (empty), pyspark, checkpoint write.
         mkdir_stdout = mock_ssh_stdout(0, b'')
         pyspark_stdout = mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata)))
         client.exec_command.side_effect = [
             (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
             (MagicMock(), pyspark_stdout, MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
         ]
 
         db_config = {
@@ -526,8 +528,11 @@ class TestDiscoverTablesViaSshSpark:
         pyspark_stdout = mock_ssh_stdout(1, b'Error: some spark failure')
         pyspark_stderr = MagicMock()
         pyspark_stderr.read.return_value = b'spark error details'
+        # Slot order: mkdir, checkpoint read (empty), pyspark fail. The pyspark
+        # failure raises before any checkpoint write would happen.
         client.exec_command.side_effect = [
             (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
             (MagicMock(), pyspark_stdout, pyspark_stderr),
         ]
 
@@ -543,8 +548,11 @@ class TestDiscoverTablesViaSshSpark:
         hook, client, _, _ = mock_ssh_hook
         mkdir_stdout = mock_ssh_stdout(0, b'')
         pyspark_stdout = mock_ssh_stdout(0, b'output without json markers')
+        # Slot order: mkdir, checkpoint read (empty), pyspark. The "no JSON
+        # markers" raise happens before any checkpoint write.
         client.exec_command.side_effect = [
             (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
             (MagicMock(), pyspark_stdout, MagicMock()),
         ]
 
@@ -576,8 +584,12 @@ class TestDiscoverTablesViaSshSpark:
         }]
         mkdir_stdout = mock_ssh_stdout(0, b'')
         pyspark_stdout = mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata)))
+        # Slot order: mkdir, checkpoint read (empty), pyspark. The single table
+        # in this test ends up FAILED so no checkpoint write slot is consumed.
+        empty_read = (MagicMock(), mock_ssh_stdout(0, b''), MagicMock())
         client.exec_command.side_effect = [
             (MagicMock(), mkdir_stdout, MagicMock()),
+            empty_read,
             (MagicMock(), pyspark_stdout, MagicMock()),
         ]
 
@@ -591,6 +603,7 @@ class TestDiscoverTablesViaSshSpark:
 
         client.exec_command.side_effect = [
             (MagicMock(), mkdir_stdout, MagicMock()),
+            empty_read,
             (MagicMock(), pyspark_stdout, MagicMock()),
         ]
         with pytest.raises(Exception, match="Discovery failed for"):
@@ -600,6 +613,7 @@ class TestDiscoverTablesViaSshSpark:
 
         client.exec_command.side_effect = [
             (MagicMock(), mkdir_stdout, MagicMock()),
+            empty_read,
             (MagicMock(), pyspark_stdout, MagicMock()),
         ]
         result = m.discover_tables_via_spark_ssh.function.__wrapped__(
@@ -631,7 +645,9 @@ class TestDiscoverTablesViaSshSpark:
         pyspark_stdout = mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata)))
         client.exec_command.side_effect = [
             (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),  # checkpoint read
             (MagicMock(), pyspark_stdout, MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),  # checkpoint write
         ]
 
         db_config = {
@@ -666,7 +682,9 @@ class TestDiscoverTablesViaSshSpark:
         pyspark_stdout = mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata)))
         client.exec_command.side_effect = [
             (MagicMock(), mkdir_stdout, MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),  # checkpoint read
             (MagicMock(), pyspark_stdout, MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),  # checkpoint write
         ]
 
         db_config = {
@@ -700,9 +718,21 @@ class TestDiscoverTablesViaSshSpark:
 
     def _run_discovery(self, client, metadata, sample_run_id, tokens, **context):
         import json
+        # Four SSH exec_command calls happen per discovery, in order:
+        #   1. _read_edge_discovery_checkpoints (own session, runs BEFORE the
+        #      main `with ssh.get_conn()` block to avoid paramiko's
+        #      SSHClient.__exit__ invalidating the main client's transport)
+        #   2. mkdir -p <temp_dir> (inside the main session)
+        #   3. pyspark run (returns the metadata JSON)
+        #   4. _write_edge_discovery_checkpoints (own session, one-shot batch)
+        # Each extra slot is harmless if the test produces no non-FAILED records
+        # (write SSH session is skipped), but omitting slot 1 would shift the
+        # mkdir response into the read parser.
         client.exec_command.side_effect = [
             (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata))), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
         ]
         return m.discover_tables_via_spark_ssh.function.__wrapped__(db_config={
             'run_id': sample_run_id, 'source_database': 'sales',
@@ -718,7 +748,7 @@ class TestDiscoverTablesViaSshSpark:
             client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
         )
         sftp_file = client.open_sftp.return_value.file.return_value
-        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
         compile(script, 'discover_tables.py', 'exec')
         # Guard the two fields the driver-side classifier depends on.
         probe = 'source_path_exists = bool(fs.exists(path))'
@@ -735,7 +765,7 @@ class TestDiscoverTablesViaSshSpark:
             client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
         )
         sftp_file = client.open_sftp.return_value.file.return_value
-        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
         body = script[script.index('def resolve_tokens'):script.index('\nmetadata = []')]
 
         class AnalysisException(Exception):
@@ -791,7 +821,10 @@ class TestDiscoverTablesViaSshSpark:
             '===DISCOVERY_ABORT=== SHOW TABLES IN sales failed: SafeModeException\n'
             + self._make_discovery_output(json.dumps([])).decode()
         )
+        # Slot order: mkdir, checkpoint read (empty), pyspark (abort marker).
+        # Abort raises before any checkpoint write slot is consumed.
         client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, output.encode()), MagicMock()),
         ]
@@ -855,6 +888,78 @@ class TestDiscoverTablesViaSshSpark:
         assert 'corrupted' in by_table['system_exception_detail']['error']
         assert by_table['good_one'].get('error_type') is None
 
+    def test_view_is_skipped_and_does_not_abort_sibling_tables(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """A view carries SKIPPED_VIEW through SKIPPABLE_DISCOVERY_ERRORS, so DistCp,
+        create, and validation skip it; the sibling table discovers normally."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record('good_one'),
+            self._make_metadata_record(
+                'orders_view',
+                table_type='VIRTUAL_VIEW',
+                file_format='UNKNOWN',
+                source_location='',
+                source_path_exists=None,
+                error="'sales.orders_view' is a VIRTUAL_VIEW and will not be migrated",
+                error_type='SKIPPED_VIEW',
+            ),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['good_one', 'orders_view'],
+        )
+
+        by_table = {t['source_table']: t for t in result['tables']}
+        assert by_table['orders_view']['error_type'] == 'SKIPPED_VIEW'
+        assert by_table['orders_view']['table_type'] == 'VIRTUAL_VIEW'
+        assert 'VIRTUAL_VIEW' in by_table['orders_view']['error']
+        assert by_table['good_one'].get('error_type') is None
+
+    def test_materialized_view_is_also_skipped(self, mock_ssh_hook, sample_run_id):
+        """MATERIALIZED_VIEW is backed by storage but we don't migrate it through
+        this DAG — same SKIPPED_VIEW treatment."""
+        _, client, _, _ = mock_ssh_hook
+        metadata = [
+            self._make_metadata_record(
+                'daily_rollup_mv',
+                table_type='MATERIALIZED_VIEW',
+                file_format='UNKNOWN',
+                source_location='',
+                source_path_exists=None,
+                error="'sales.daily_rollup_mv' is a MATERIALIZED_VIEW and will not be migrated",
+                error_type='SKIPPED_VIEW',
+            ),
+        ]
+
+        result = self._run_discovery(
+            client, metadata, sample_run_id, ['daily_rollup_mv'],
+        )
+
+        assert result['tables'][0]['error_type'] == 'SKIPPED_VIEW'
+        assert result['tables'][0]['table_type'] == 'MATERIALIZED_VIEW'
+
+    def test_generated_remote_script_skips_views(self, mock_ssh_hook, sample_run_id):
+        """The edge script must bail out of the per-table loop for views before
+        the FS probe and SELECT COUNT(*)."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        compile(script, 'discover_tables.py', 'exec')
+        # Both standard and materialized views are classified SKIPPED_VIEW
+        assert 'VIRTUAL_VIEW' in script
+        assert 'MATERIALIZED_VIEW' in script
+        assert '"SKIPPED_VIEW"' in script
+        # The check runs before the FS probe (ordering is load-bearing: once we
+        # hit fs.exists() on a view with an empty location, we'd abort the db).
+        view_skip = 'table_type.upper() in ("VIRTUAL_VIEW"'
+        assert view_skip in script
+        assert script.index(view_skip) < script.index('source_path_exists = bool(fs.exists(path))')
+
     def test_orphan_that_never_threw_is_still_classified(self, mock_ssh_hook, sample_run_id):
         """A TEXTFILE/Avro orphan never throws — its schema comes from the catalog —
         so it emits as a success record and would reach DistCp with 0 files and be
@@ -905,7 +1010,10 @@ class TestDiscoverTablesViaSshSpark:
     def test_exclude_tokens_are_passed_into_script(self, mock_ssh_hook, sample_run_id):
         _, client, _, _ = mock_ssh_hook
         import json
+        # Slot order: mkdir, checkpoint read (empty), pyspark (empty metadata).
+        # Empty metadata → no checkpoint write slot consumed.
         client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
             (MagicMock(), mock_ssh_stdout(0, self._make_discovery_output(json.dumps([]))), MagicMock()),
         ]
@@ -915,9 +1023,369 @@ class TestDiscoverTablesViaSshSpark:
             'dest_database': 'sales_s3', 'dest_bucket': 's3a://bucket',
         })
         sftp_file = client.open_sftp.return_value.file.return_value
-        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
         assert """exclude_tokens = json.loads('["tmp_*", "old"]')""" in script
         compile(script, 'discover_tables.py', 'exec')
+
+    def test_generated_remote_script_uses_threadpool_for_per_table_work(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """500-table dbs were taking 2+ hours because the per-table loop was
+        serial. The pyspark script now walks tables through a thread pool with
+        the FAIR scheduler so concurrent spark.sql calls actually interleave.
+        multiprocessing.dummy.Pool (not concurrent.futures) because MapR /
+        hadoop edges run Python 2.7 without the `futures` backport."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        compile(script, 'discover_tables.py', 'exec')
+
+        # FIFO (Spark default) would serialize the threadpool's spark.sql calls.
+        assert '.config("spark.scheduler.mode", "FAIR")' in script
+        # Py2.7-friendly: multiprocessing.dummy is stdlib on every supported edge.
+        assert 'from multiprocessing.dummy import Pool as ThreadPool' in script
+        # Guard against regressing to the concurrent.futures import that would
+        # break MapR/hadoop edges on Py 2.7 (template comment may still mention
+        # the trade-off, so check for the actual `from ... import` statement).
+        assert 'from concurrent.futures import' not in script
+        # Per-table body is a function the pool maps over.
+        assert 'def discover_one_table(tbl):' in script
+        # contextlib.closing adapts Py2's Pool (no __enter__/__exit__) to `with`.
+        assert 'with contextlib.closing(ThreadPool(' in script
+        assert 'pool.map(discover_one_table, table_list)' in script
+        # Function must own every exit path so pool.map never raises.
+        for_def_at = script.index('def discover_one_table(tbl):')
+        pool_at = script.index('with contextlib.closing(ThreadPool(')
+        assert for_def_at < pool_at
+        # Guard the body ordering: DESCRIBE must be inside the function (so each
+        # thread has its own retry loop) and NOT at module scope after it.
+        assert script.index('DESCRIBE FORMATTED') < pool_at
+        # No stray sequential 'for tbl in table_list:' discovery loop remains.
+        # (The earlier `for tbl in table_list:` block in the exclude-filter
+        # logic is before the discovery function; we only forbid one AFTER it.)
+        assert 'for tbl in table_list:' not in script[for_def_at:]
+
+    def test_per_table_parallelism_setting_is_injected(
+        self, mock_ssh_hook, sample_run_id, monkeypatch
+    ):
+        """The env var reaches the generated script's max_workers argument."""
+        _, client, _, _ = mock_ssh_hook
+        monkeypatch.setenv('MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM', '16')
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        assert 'with contextlib.closing(ThreadPool(16))' in script
+
+    def test_per_table_parallelism_clamped_to_bounds(
+        self, mock_ssh_hook, sample_run_id, monkeypatch
+    ):
+        """Nonsense values fall back to a safe range instead of exploding the
+        edge node's HMS. 128 -> clamped to 64; 0 -> clamped to 1."""
+        _, client, _, _ = mock_ssh_hook
+        writes = client.open_sftp.return_value.file.return_value.__enter__.return_value.write.call_args_list
+
+        monkeypatch.setenv('MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM', '128')
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        # Each discovery writes [pyspark_script_str, checkpoint_json_bytes...].
+        # The most recent script is the last STRING write.
+        scripts = [w.args[0] for w in writes if isinstance(w.args[0], str)]
+        assert 'with contextlib.closing(ThreadPool(64))' in scripts[-1]
+
+        monkeypatch.setenv('MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM', '0')
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        scripts = [w.args[0] for w in writes if isinstance(w.args[0], str)]
+        assert 'with contextlib.closing(ThreadPool(1))' in scripts[-1]
+
+    def test_generated_remote_script_ships_a_prebuilt_cache_dict(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """The pyspark subprocess shouldn't touch S3 directly (it doesn't own
+        creds). The Airflow task owns credentials and ships a pre-loaded
+        {identity: record} dict as JSON. In discover_one_table, the cache
+        check must run before any DESCRIBE work."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        compile(script, 'discover_tables.py', 'exec')
+
+        # Identity function stays in the pyspark script (needed for cache lookup).
+        assert 'import hashlib' in script
+        assert 'def _checkpoint_identity(' in script
+        # No S3-touching code in the script — the driver owns S3 creds.
+        # Payload is base64 (not raw JSON) so cached exception text with newlines
+        # or control chars survives Python's string-literal escape processing.
+        assert 'import base64' in script
+        assert 'CHECKPOINTED = json.loads(base64.b64decode(' in script
+        assert '_load_checkpoints' not in script
+        assert '_write_checkpoint' not in script
+        assert 'spark._jvm.org.apache.hadoop.fs.FileSystem.get(\n            spark._jvm.java.net.URI(CHECKPOINT_PREFIX)' not in script
+        assert 'wholeTextFiles' not in script
+        # discover_one_table must consult the cache BEFORE any DESCRIBE work.
+        fn_start = script.index('def discover_one_table(tbl):')
+        describe_at = script.index('DESCRIBE FORMATTED', fn_start)
+        cache_check = script.index('CHECKPOINTED.get(_identity)', fn_start)
+        assert cache_check < describe_at
+
+    def test_cache_dict_is_empty_on_cold_run(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """When the checkpoint read returns no records (fresh run), the dict
+        injected into the script is empty — not missing, not malformed."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        # Empty dict JSON is '{}', base64('{}') is 'e30='.
+        assert "CHECKPOINTED = json.loads(base64.b64decode('e30=').decode('utf-8'))" in script
+
+    def test_checkpoint_read_uses_batched_hadoop_fs_cat(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """The read must concatenate all files in ONE hadoop fs invocation —
+        per-file -cat would spawn 500 JVMs for a 500-record cache."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        # The 1st exec_command call is the checkpoint read (runs BEFORE the
+        # main `with ssh.get_conn()` block to avoid nested-close invalidation).
+        read_call = client.exec_command.call_args_list[0]
+        read_cmd = read_call.args[0]
+        # One hadoop fs -ls to get the file list, then one hadoop fs -cat $files
+        # (NOT a per-file cat loop like DistCp uses).
+        assert 'hadoop fs' in read_cmd
+        assert '-cat $files' in read_cmd
+        assert '-ls' in read_cmd
+        # Guard against regressing to the per-file read pattern.
+        assert 'while IFS= read -r' not in read_cmd
+
+    def test_checkpoint_write_batches_all_records_in_one_hadoop_fs_put(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """500 records = one SFTP batch + one hadoop fs -put, not 500 of each."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        # Call order: mkdir, read, pyspark, write. The write is the last one.
+        write_call = client.exec_command.call_args_list[-1]
+        write_cmd = write_call.args[0]
+        # One hadoop fs -put for the whole batch, source is a glob (*.json),
+        # destination is the checkpoint prefix directory.
+        assert 'hadoop fs' in write_cmd
+        assert '-put -f' in write_cmd
+        assert '*.json' in write_cmd
+        assert '_discovery_checkpoints' in write_cmd
+
+    def test_checkpoint_read_happens_before_main_ssh_session(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """Regression: paramiko SSHClient.__exit__ closes the underlying
+        transport, so a nested `with ssh.get_conn()` inside the main session
+        would invalidate the parent client reference and crash the next
+        client.open_sftp() with 'NoneType has no open_sftp_client'. The
+        checkpoint read must run with its own fully-scoped connection,
+        BEFORE the main `with ssh.get_conn()` block opens an SFTP channel."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        # exec_command call_args_list is ordered by call sequence.
+        exec_cmds = [c.args[0] for c in client.exec_command.call_args_list]
+        # Slot 1 = checkpoint read (hadoop fs -ls / -cat); slot 2 = mkdir;
+        # slot 3 = pyspark run; slot 4 = checkpoint write.
+        assert '_discovery_checkpoints' in exec_cmds[0], (
+            f"first SSH exec_command must be the checkpoint read (own session), "
+            f"got: {exec_cmds[0][:120]!r}"
+        )
+        assert 'mkdir -p' in exec_cmds[1], (
+            f"second SSH exec_command should be the mkdir inside the main "
+            f"session, got: {exec_cmds[1][:120]!r}"
+        )
+        # And open_sftp (used for the pyspark script upload) must be called
+        # AFTER the checkpoint read finished and the main session opened.
+        assert client.open_sftp.called, (
+            "pyspark script upload must have called client.open_sftp "
+            "(if the main session's client got invalidated, this never fires)"
+        )
+
+    def test_different_buckets_get_distinct_checkpoint_prefixes(self):
+        """Regression: parse_excel emits one discovery task per
+        (src_db, dest_db, bucket, endpoint, partition_filter). Two Excel rows
+        differing only by bucket would otherwise share the same run_id/src_db
+        tail and overwrite each other's cache, so the retry would pick up a
+        record pointing at the wrong bucket's s3_location. mapping_hash in the
+        prefix (sha256 of src/dest/bucket/endpoint/filter) breaks that tie."""
+        from migration_dag_mapr_to_s3 import (
+            _discovery_checkpoint_identity,
+            _discovery_checkpoint_prefix,
+        )
+        base = dict(
+            run_id='run_1', source_database='sales', dest_database='sales_s3',
+            dest_endpoint='', partition_filter=None,
+        )
+        a = {**base, 'dest_bucket': 's3a://bucket-A'}
+        b = {**base, 'dest_bucket': 's3a://bucket-B'}
+        prefix_a = _discovery_checkpoint_prefix('s3a://root', a)
+        prefix_b = _discovery_checkpoint_prefix('s3a://root', b)
+        assert prefix_a != prefix_b, (
+            f"different buckets must get different prefixes, got {prefix_a!r} == {prefix_b!r}"
+        )
+        # Identity for the same table in each must also differ, so a stray
+        # record landing in the wrong prefix wouldn't still cache-hit.
+        rec_a = {**a, 'source_table': 'orders'}
+        rec_b = {**b, 'source_table': 'orders'}
+        assert _discovery_checkpoint_identity(rec_a) != _discovery_checkpoint_identity(rec_b)
+
+    def test_cached_records_with_control_chars_survive_the_round_trip(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """Regression: a cached FAILED record whose `error` field contains a
+        newline, a quote, or a control character (TEXTFILE field delimiters
+        like \\u0001 trigger this routinely) must round-trip through the
+        pyspark script's deserialization. Base64 encoding at the driver side
+        makes the payload immune to Python's string-literal escape processing
+        that happens before json.loads runs."""
+        _, client, _, _ = mock_ssh_hook
+
+        # One cached checkpoint whose error text contains exactly the
+        # characters the reviewer's reproduction hit on: newline, quote,
+        # control char. Returned by _read_edge_discovery_checkpoints via
+        # the second mock SSH response (one record per line, newline-delim).
+        import base64 as _b64
+        import json as _json
+        import re as _re
+
+        from migration_dag_mapr_to_s3 import _discovery_checkpoint_identity
+        bad_record = {
+            'source_database': 'sales',
+            'source_table': 'orders',
+            'dest_database': 'sales_s3',
+            'dest_bucket': 's3a://bucket',
+            'dest_endpoint': '',
+            'partition_filter': None,
+            'error_type': 'FAILED',
+            'error': 'line1\nline2 "q" ',
+        }
+        identity = _discovery_checkpoint_identity(bad_record)
+        checkpoint_line = (_json.dumps(bad_record) + '\n').encode('utf-8')
+
+        metadata = [self._make_metadata_record('new_table')]
+        # Order mirrors discover_tables_via_spark_ssh: read, mkdir, pyspark, write.
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, checkpoint_line), MagicMock()),      # cp read
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),                  # mkdir
+            (MagicMock(), mock_ssh_stdout(0, self._make_discovery_output(_json.dumps(metadata))), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),                  # cp write
+        ]
+        m.discover_tables_via_spark_ssh.function.__wrapped__(db_config={
+            'run_id': sample_run_id, 'source_database': 'sales',
+            'table_tokens': ['new_table'], 'dest_database': 'sales_s3',
+            'dest_bucket': 's3a://bucket',
+        })
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        # The script must compile — a raw-JSON injection with embedded newlines
+        # or control chars would raise SyntaxError here or JSONDecodeError at
+        # script runtime.
+        compile(script, 'discover_tables.py', 'exec')
+        # Extract the base64 payload, decode, and assert the record round-trips.
+        match = _re.search(
+            r"CHECKPOINTED = json\.loads\(base64\.b64decode\('([^']+)'\)",
+            script,
+        )
+        assert match, "expected base64-wrapped CHECKPOINTED assignment"
+        decoded = _json.loads(_b64.b64decode(match.group(1)).decode('utf-8'))
+        assert identity in decoded
+        assert decoded[identity]['error'] == 'line1\nline2 "q" '
+
+    def test_discover_one_table_does_not_shadow_filter_expr(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """Regression: a stray `filter_expr = "..."` inside discover_one_table
+        would make Python treat filter_expr as local throughout the function,
+        and the checkpoint-identity read at the top would raise
+        UnboundLocalError on every cold-run table. The read must resolve to
+        the module-level binding set from the template."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        compile(script, 'discover_tables.py', 'exec')
+
+        # Static check: filter_expr must be set at module scope and never
+        # rebound inside the function.
+        import ast
+        tree = ast.parse(script)
+        fn = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == 'discover_one_table'
+        )
+        local_filter_assigns = [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == 'filter_expr' for t in n.targets)
+        ]
+        assert not local_filter_assigns, (
+            "discover_one_table must not assign filter_expr "
+            "(would shadow the module-level binding and break the cache fast-path)"
+        )
+
+    def test_checkpoint_disabled_when_location_is_empty(
+        self, mock_ssh_hook, sample_run_id, monkeypatch
+    ):
+        """Setting the checkpoint location to an empty string must disable
+        the whole subsystem — no SSH read, no SSH write, empty cache dict
+        injected into the script so the per-table loop runs cold."""
+        _, client, _, _ = mock_ssh_hook
+        # The DAG imports get_config via `from ... import get_config`, so the
+        # name resolves against the DAG module, not the shared module — patch
+        # the local binding or the monkeypatch is invisible to the task.
+        original = m.get_config
+        monkeypatch.setattr(
+            m,
+            'get_config',
+            lambda: {**original(), 'discovery_checkpoint_location': ''},
+        )
+        # With checkpointing disabled only mkdir + pyspark SSH calls happen,
+        # so the 4-slot default from _run_discovery would misalign the responses.
+        import json
+        metadata = [self._make_metadata_record('orders')]
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata))), MagicMock()),
+        ]
+        m.discover_tables_via_spark_ssh.function.__wrapped__(db_config={
+            'run_id': sample_run_id, 'source_database': 'sales',
+            'table_tokens': ['orders'], 'dest_database': 'sales_s3',
+            'dest_bucket': 's3a://bucket',
+        })
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        compile(script, 'discover_tables.py', 'exec')
+        # Cache dict is still emitted but empty — the pyspark script's
+        # discover_one_table .get(...) safely misses, no cold-path regression.
+        assert "CHECKPOINTED = json.loads(base64.b64decode('e30=').decode('utf-8'))" in script
+        # Only two SSH exec_commands should have fired (mkdir, pyspark).
+        exec_cmds = [c.args[0] for c in client.exec_command.call_args_list]
+        assert len(exec_cmds) == 2
+        assert not any('_discovery_checkpoints' in c for c in exec_cmds)
 
 
 class TestRecordDiscoveredTables:
@@ -3902,9 +4370,12 @@ class TestFinalizeRun:
     def _run_with_stats(self, mock_spark, run_id, **counts):
         """Returns the raw SQL strings. `c.args[0]`, not `str(c)`: a mock call's repr
         escapes newlines, so splitlines() yields one line and per-line assertions
-        silently degrade to matching the whole statement."""
+        silently degrade to matching the whole statement.
+
+        Missing counts default to 0 so adding a new rollup column (e.g.
+        views_skipped) doesn't force every existing test to pass it."""
         stats_row = MagicMock()
-        stats_row.__getitem__ = lambda self, k: counts[k]
+        stats_row.__getitem__ = lambda self, k: counts.get(k, 0)
         df = MagicMock()
         df.collect.return_value = [stats_row]
         mock_spark.sql.side_effect = _finalize_sql_router(df, [])
@@ -3933,7 +4404,11 @@ class TestFinalizeRun:
 
     def test_not_found_rollup_counts_every_skippable_status(self, mock_spark, sample_run_id):
         """Pin the `not_found` rollup specifically: asserting the names appear anywhere
-        is vacuous, since the `successful` rollup above satisfies that on its own."""
+        is vacuous, since the `successful` rollup above satisfies that on its own.
+
+        SKIPPED_VIEW is deliberately excluded from the not_found count (views
+        are an expected non-migration category, not a 'missing' one) — it has
+        its own rollup column, verified below."""
         sqls = self._run_with_stats(
             mock_spark, sample_run_id, total=3, successful=3, failed=0, not_found=1
         )
@@ -3941,8 +4416,30 @@ class TestFinalizeRun:
             line for sql in sqls for line in sql.splitlines() if 'as not_found' in line
         )
         assert '_SKIPPABLE_STATUS_SQL_IN' not in not_found_expr
+        # Every skippable status except SKIPPED_VIEW must still be rolled up.
         for status in m.SKIPPABLE_DISCOVERY_ERRORS:
+            if status == 'SKIPPED_VIEW':
+                continue
             assert status in not_found_expr
+        # SKIPPED_VIEW gets its own column so the summary doesn't downgrade a
+        # views-only run to COMPLETED_WITH_MISSING.
+        views_expr = next(
+            line for sql in sqls for line in sql.splitlines() if 'as views_skipped' in line
+        )
+        assert "overall_status = 'SKIPPED_VIEW'" in views_expr
+
+    def test_views_skipped_do_not_downgrade_a_clean_run(
+        self, mock_spark, sample_run_id
+    ):
+        """Regression: before SKIPPED_VIEW got its own rollup column, a run
+        whose only anomaly was a few views flipped to COMPLETED_WITH_MISSING,
+        which looks like missing data in the summary. It should stay COMPLETED."""
+        sqls = ' '.join(self._run_with_stats(
+            mock_spark, sample_run_id,
+            total=5, successful=5, failed=0, not_found=0, views_skipped=2,
+        ))
+        assert "status = 'COMPLETED'" in sqls
+        assert 'COMPLETED_WITH_MISSING' not in sqls
 
     def test_skipped_table_downgrades_run_to_completed_with_missing(
         self, mock_spark, sample_run_id
