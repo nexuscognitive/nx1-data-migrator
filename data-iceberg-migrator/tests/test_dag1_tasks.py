@@ -991,6 +991,73 @@ class TestDiscoverTablesViaSshSpark:
         assert """exclude_tokens = json.loads('["tmp_*", "old"]')""" in script
         compile(script, 'discover_tables.py', 'exec')
 
+    def test_generated_remote_script_uses_threadpool_for_per_table_work(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        """500-table dbs were taking 2+ hours because the per-table loop was
+        serial. The pyspark script now walks tables through a ThreadPoolExecutor
+        with the FAIR scheduler so concurrent spark.sql calls actually interleave."""
+        _, client, _, _ = mock_ssh_hook
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        compile(script, 'discover_tables.py', 'exec')
+
+        # FIFO (Spark default) would serialize the threadpool's spark.sql calls.
+        assert '.config("spark.scheduler.mode", "FAIR")' in script
+        # Per-table body is now a function the pool maps over.
+        assert 'from concurrent.futures import ThreadPoolExecutor' in script
+        assert 'def discover_one_table(tbl):' in script
+        assert 'with ThreadPoolExecutor(max_workers=' in script
+        assert 'pool.map(discover_one_table, table_list)' in script
+        # Function must own every exit path so pool.map never raises.
+        for_def_at = script.index('def discover_one_table(tbl):')
+        pool_at = script.index('with ThreadPoolExecutor(max_workers=')
+        assert for_def_at < pool_at
+        # Guard the body ordering: DESCRIBE must be inside the function (so each
+        # thread has its own retry loop) and NOT at module scope after it.
+        assert script.index('DESCRIBE FORMATTED') < pool_at
+        # No stray sequential 'for tbl in table_list:' discovery loop remains.
+        # (The earlier `for tbl in table_list:` block in the exclude-filter
+        # logic is before the discovery function; we only forbid one AFTER it.)
+        assert 'for tbl in table_list:' not in script[for_def_at:]
+
+    def test_per_table_parallelism_setting_is_injected(
+        self, mock_ssh_hook, sample_run_id, monkeypatch
+    ):
+        """The env var reaches the generated script's max_workers argument."""
+        _, client, _, _ = mock_ssh_hook
+        monkeypatch.setenv('MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM', '16')
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        sftp_file = client.open_sftp.return_value.file.return_value
+        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        assert 'with ThreadPoolExecutor(max_workers=16)' in script
+
+    def test_per_table_parallelism_clamped_to_bounds(
+        self, mock_ssh_hook, sample_run_id, monkeypatch
+    ):
+        """Nonsense values fall back to a safe range instead of exploding the
+        edge node's HMS. 128 -> clamped to 64; 0 -> clamped to 1."""
+        _, client, _, _ = mock_ssh_hook
+
+        monkeypatch.setenv('MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM', '128')
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        script = client.open_sftp.return_value.file.return_value.__enter__.return_value.write.call_args[0][0]
+        assert 'with ThreadPoolExecutor(max_workers=64)' in script
+
+        monkeypatch.setenv('MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM', '0')
+        self._run_discovery(
+            client, [self._make_metadata_record('orders')], sample_run_id, ['orders'],
+        )
+        script = client.open_sftp.return_value.file.return_value.__enter__.return_value.write.call_args[0][0]
+        assert 'with ThreadPoolExecutor(max_workers=1)' in script
+
 
 class TestRecordDiscoveredTables:
 

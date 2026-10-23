@@ -654,6 +654,11 @@ def get_config() -> dict:
         'distcp_client_java_opts': _var('migration_distcp_client_java_opts', 'MIGRATION_DISTCP_CLIENT_JAVA_OPTS', ''),
         'discovery_driver_memory': _var('migration_discovery_driver_memory', 'MIGRATION_DISCOVERY_DRIVER_MEMORY', ''),
         'discovery_spark_master': _var('migration_discovery_spark_master', 'MIGRATION_DISCOVERY_SPARK_MASTER', 'local[*]'),
+        'discovery_per_table_parallelism': _var(
+            'migration_discovery_per_table_parallelism',
+            'MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM',
+            '8',
+        ),
         'metastore_retry_attempts': _var('migration_metastore_retry_attempts', 'MIGRATION_METASTORE_RETRY_ATTEMPTS', '4'),
         'metastore_retry_backoff_seconds': _var('migration_metastore_retry_backoff_seconds', 'MIGRATION_METASTORE_RETRY_BACKOFF_SECONDS', '15'),
         'metastore_socket_timeout': _var('migration_metastore_socket_timeout', 'MIGRATION_METASTORE_SOCKET_TIMEOUT', '600s'),

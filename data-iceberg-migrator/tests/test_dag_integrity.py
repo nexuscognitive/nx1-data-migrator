@@ -73,18 +73,47 @@ class TestMaprToS3DagIntegrity:
         window = dag_body[dag_body.index(anchor):][:200]
         assert 'MIGRATION_DISCOVERY_MAX_CONCURRENT' in window
 
-    def test_parse_path_reads_no_variable_except_the_owner(self):
-        """Operator attributes are set at parse; a Variable read there costs a
-        metadata-DB round trip on every scheduler parse loop."""
+    def test_parse_path_variable_reads_are_in_the_allowlist(self):
+        """Operator attributes are set at parse; every Variable.get() there costs
+        a metadata-DB round trip per scheduler parse loop. Keep the set of
+        parse-time Variable readers small and explicit — adding a new one is a
+        deliberate decision, not an accident. If this test fails after a new
+        helper is added, extend ALLOWLIST below once the trade-off is understood.
+        """
+        import ast
         from pathlib import Path
         source = (
             Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
         ).read_text()
-        before, _, after = source.partition('def _resolve_dag_owner')
-        owner_body, _, rest = after.partition('\ndef ')
-        assert 'Variable.get(' not in before
-        assert 'Variable.get(' not in rest
-        assert 'Variable.get(' in owner_body
+
+        ALLOWLIST = {'_resolve_dag_owner', '_var_or_env_int'}
+
+        tree = ast.parse(source)
+        # Build parent links so we can walk back from a Variable.get call to
+        # its enclosing FunctionDef.
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                child._parent = parent  # type: ignore[attr-defined]
+
+        offenders = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Attribute)
+                and node.attr == 'get'
+                and isinstance(node.value, ast.Name)
+                and node.value.id == 'Variable'
+            ):
+                continue
+            enclosing = node
+            while enclosing is not None and not isinstance(enclosing, ast.FunctionDef):
+                enclosing = getattr(enclosing, '_parent', None)
+            name = enclosing.name if enclosing else '<module>'
+            if name not in ALLOWLIST:
+                offenders.append(f'Variable.get at line {node.lineno} inside {name}')
+
+        assert not offenders, (
+            f'Variable.get calls outside allowlist {ALLOWLIST}: ' + '; '.join(offenders)
+        )
 
 
 class TestIcebergDagIntegrity:
@@ -204,3 +233,63 @@ class TestEnvInt:
         assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
         monkeypatch.setenv('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', '-2')
         assert m1._env_int('MIGRATION_DISTCP_COPY_MAX_CONCURRENT', 3) == 3
+
+
+class TestVarOrEnvInt:
+    """Precedence: Airflow Variable > env var > default. A failure to read the
+    Variable (DB blip at parse) must fall through to env, never crash the DAG."""
+
+    _ENV = 'MIGRATION_DISTCP_COPY_MAX_CONCURRENT'
+    _VAR = 'migration_distcp_copy_max_concurrent'
+
+    def test_variable_wins_over_env_and_default(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv(self._ENV, '5')
+        with patch('airflow.models.Variable.get', return_value='9') as mock_get:
+            assert m1._var_or_env_int(self._VAR, self._ENV, 3) == 9
+        assert mock_get.call_args.args[0] == self._VAR
+
+    def test_env_used_when_variable_is_empty(self, monkeypatch):
+        """An Airflow Variable cleared in the UI reads back as present-but-empty.
+        The default_var kwarg returns '' and the helper must treat that as unset."""
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv(self._ENV, '7')
+        with patch('airflow.models.Variable.get', return_value=''):
+            assert m1._var_or_env_int(self._VAR, self._ENV, 3) == 7
+
+    def test_default_used_when_both_unset(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.delenv(self._ENV, raising=False)
+        with patch('airflow.models.Variable.get', return_value=''):
+            assert m1._var_or_env_int(self._VAR, self._ENV, 4) == 4
+
+    def test_non_integer_variable_falls_back_to_env(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv(self._ENV, '6')
+        with patch('airflow.models.Variable.get', return_value='lots'):
+            assert m1._var_or_env_int(self._VAR, self._ENV, 3) == 6
+
+    def test_non_positive_variable_falls_back_to_env(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv(self._ENV, '6')
+        with patch('airflow.models.Variable.get', return_value='0'):
+            assert m1._var_or_env_int(self._VAR, self._ENV, 3) == 6
+        with patch('airflow.models.Variable.get', return_value='-5'):
+            assert m1._var_or_env_int(self._VAR, self._ENV, 3) == 6
+
+    def test_variable_db_error_falls_back_to_env_not_a_dag_crash(self, monkeypatch):
+        """Scheduler parses every ~30s; a transient metadata-DB hiccup must not
+        drop the DAG from Airflow — the fallback is what keeps it alive."""
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv(self._ENV, '5')
+        with patch(
+            'airflow.models.Variable.get',
+            side_effect=RuntimeError('metadata db unreachable'),
+        ):
+            assert m1._var_or_env_int(self._VAR, self._ENV, 3) == 5
+
+    def test_whitespace_only_variable_is_treated_as_empty(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.setenv(self._ENV, '7')
+        with patch('airflow.models.Variable.get', return_value='   '):
+            assert m1._var_or_env_int(self._VAR, self._ENV, 3) == 7

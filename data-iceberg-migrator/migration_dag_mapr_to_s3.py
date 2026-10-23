@@ -356,10 +356,14 @@ def _env_int(env_var: str, default: int) -> int:
     """Read a parse-time integer from the environment only.
 
     Deliberately not get_config(): these values are needed while the DAG file is
-    parsed, and test_dag_integrity asserts the parse path reads no Airflow
-    Variable except migration_dag_owner — each read is a metadata-DB round trip
-    on every parse loop. load_dotenv has already run at import (:64-65), so a
-    value in the deployed env.shared is visible here.
+    parsed, and test_dag_integrity's parse-time Variable allowlist costs a
+    metadata-DB round trip per scheduler parse loop for each read.
+    load_dotenv has already run at import (:64-65), so a value in the deployed
+    env.shared is visible here.
+
+    For a knob that must be tunable from the Airflow UI without a redeploy,
+    use _var_or_env_int instead and add the Variable name to the allowlist in
+    test_parse_path_variable_reads_are_in_the_allowlist.
 
     Never raises: a bad value must not drop the DAG from Airflow.
     """
@@ -375,6 +379,39 @@ def _env_int(env_var: str, default: int) -> int:
         logger.warning(f"{env_var}={value} is not positive — using {default}")
         return default
     return value
+
+
+def _var_or_env_int(var_name: str, env_var: str, default: int) -> int:
+    """Resolve a positive int with precedence Airflow Variable > env > default.
+
+    Use for parse-time operator attributes where UI tunability outweighs the
+    per-scheduler-parse metadata-DB round trip. Each call site must be
+    allowlisted in test_parse_path_variable_reads_are_in_the_allowlist, so
+    adding one is a deliberate decision rather than an accident.
+
+    Delegates env/default handling to _env_int for one source of truth. Any
+    Variable-side failure (DB unreachable at parse, non-integer value, zero or
+    negative) silently falls through to env; the DAG must never fail to parse
+    because of a bad or missing Variable.
+    """
+    try:
+        from airflow.models import Variable
+        raw = (Variable.get(var_name, default_var='') or '').strip()
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    return value
+                logger.warning(
+                    f"Variable {var_name}={value} is not positive — falling back to env"
+                )
+            except ValueError:
+                logger.warning(
+                    f"Variable {var_name}={raw!r} is not an integer — falling back to env"
+                )
+    except Exception:
+        pass
+    return _env_int(env_var, default)
 
 
 # A stuck copy should die in minutes; a healthy 5 TB copy needs hours. A flat
@@ -1309,13 +1346,18 @@ import json
 import sys
 import fnmatch
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pyspark.sql import SparkSession
 from pyspark.sql.utils import AnalysisException
 sys.path.insert(0, "{temp_dir}")
 from partition_utils import apply_partition_filter, partitions_to_where_clause
 
+# FAIR scheduler so the per-table threadpool below doesn't FIFO queries behind
+# each other — default FIFO would serialize concurrent spark.sql calls and
+# negate the threadpool. Supported since Spark 1.0, including MapR Spark 2.3.
 spark = SparkSession.builder \\
     .appName("table_discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}") \\
+    .config("spark.scheduler.mode", "FAIR") \\
     .config("spark.hadoop.hive.exec.scratchdir", "{hive_scratch_dir}") \\
     .config("spark.hadoop.hive.exec.local.scratchdir", "{hive_scratch_dir}") \\
     .config("spark.hadoop.hive.metastore.client.socket.timeout", "{metastore_socket_timeout}") \\
@@ -1490,7 +1532,10 @@ for tbl in missing_tables:
     record["error_type"] = "TABLE_NOT_FOUND"
     metadata.append(record)
 
-for tbl in table_list:
+def discover_one_table(tbl):
+    # Runs under ThreadPoolExecutor below; SparkSession.sql() is thread-safe
+    # (Spark 2.0+). All early-exit paths return a record — never append — so
+    # the caller's main thread owns metadata.append and we need no lock.
     loc = None
     # None = could not determine; the driver reads that as unknown, not absent.
     source_path_exists = None
@@ -1570,8 +1615,7 @@ for tbl in table_list:
                 src_db, tbl, table_type
             )
             record["error_type"] = "SKIPPED_VIEW"
-            metadata.append(record)
-            continue
+            return record
 
         source_total_size = 0
         source_file_count = 0
@@ -1788,7 +1832,7 @@ for tbl in table_list:
             "partition_file_counts": partition_file_counts,
             "source_path_exists": source_path_exists,
         }})
-        metadata.append(record)
+        return record
 
     except Exception as e:
         record = _default_metadata_record(tbl)
@@ -1808,6 +1852,15 @@ for tbl in table_list:
             "error": _root_cause(e),
             "error_type": "FAILED",
         }})
+        return record
+
+# Thread-safety: SparkSession.sql / spark.table / py4j FileSystem reads are
+# documented thread-safe (Spark 2.0+). metadata.append is only called in the
+# main thread as pool.map yields, so no lock is needed. pool.map preserves
+# submission order and propagates exceptions — but discover_one_table catches
+# everything and returns a FAILED record, so pool.map never raises.
+with ThreadPoolExecutor(max_workers={per_table_parallelism}) as pool:
+    for record in pool.map(discover_one_table, table_list):
         metadata.append(record)
 
 print ("===JSON_START===")
@@ -1838,6 +1891,9 @@ spark.stop()
             ),
             metastore_failure_retries=_int_setting(config, "metastore_failure_retries", 5, 0, 20),
             metastore_socket_timeout=_duration_setting(config, "metastore_socket_timeout", "600s"),
+            per_table_parallelism=_int_setting(
+                config, "discovery_per_table_parallelism", 8, 1, 64
+            ),
         )
 
         script_path = f"{temp_dir}/discover_tables.py"
@@ -2237,7 +2293,12 @@ def flatten_and_batch(discoveries) -> list[dict]:
         estimate_distcp_cost(t, config) for g in groups for t in g["tables"]
     )
     backstop = _DISTCP_EXECUTION_TIMEOUT.total_seconds()
-    lanes = _env_int("MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3)
+    # Same precedence as the parse-time cap: Variable > env > default. Keeps
+    # batch sizing in sync with the operator concurrency when a user tunes
+    # migration_distcp_copy_max_concurrent from the Airflow UI.
+    lanes = _var_or_env_int(
+        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    )
     cap = resolve_batch_cap(total_cost, lanes, backstop)
     logger.info(f"[Batching] {distcp_batching_mode(cap, lanes, backstop, config)}")
     logger.info(
@@ -6015,8 +6076,10 @@ with DAG(
     t_discover = discover_tables_via_spark_ssh.expand(db_config=t_excel)
     # Each discovery is a local[*] pyspark driver on the edge node; uncapped, one per
     # Excel database row, they OOM-killed a small edge node mid-run.
-    t_discover.operator.max_active_tis_per_dagrun = _env_int(
-        "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3
+    # Tunable from Airflow UI via Variable migration_discovery_max_concurrent;
+    # the env var is the deployed-env fallback.
+    t_discover.operator.max_active_tis_per_dagrun = _var_or_env_int(
+        "migration_discovery_max_concurrent", "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3
     )
     t_record = record_discovered_tables.expand(discovery=t_discover)
     t_record.operator.trigger_rule = "all_done"
@@ -6029,8 +6092,10 @@ with DAG(
     # The edge node and YARN queue are shared, and no Pool is available without
     # an infra change, so this caps per run only: total concurrent copies is
     # this times max_active_runs (5).
-    t_distcp.operator.max_active_tis_per_dagrun = _env_int(
-        "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    # Tunable from Airflow UI via Variable migration_distcp_copy_max_concurrent;
+    # the env var is the deployed-env fallback.
+    t_distcp.operator.max_active_tis_per_dagrun = _var_or_env_int(
+        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
     )
     t_distcp.operator.execution_timeout = _DISTCP_EXECUTION_TIMEOUT
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
@@ -6038,8 +6103,8 @@ with DAG(
     # One Iceberg writer per batch, and the batch count is no longer bounded by
     # a config ceiling. Reuses the copy lane count: a status write is far
     # cheaper than a copy and never needs more lanes than the stage feeding it.
-    t_distcp_status.operator.max_active_tis_per_dagrun = _env_int(
-        "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+    t_distcp_status.operator.max_active_tis_per_dagrun = _var_or_env_int(
+        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
     )
     t_tables = create_hive_tables.expand(distcp_result=t_distcp_status)
     t_tables.operator.trigger_rule = "all_done"
