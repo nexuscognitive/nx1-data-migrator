@@ -167,6 +167,17 @@ Three Airflow Variables control discovery and DistCp parallelism. Each is read w
 
 **How to apply a change mid-run**: set the Variable in the UI; the scheduler picks it up on its next parse loop (~30s). Already-running mapped task instances keep their current cap; the change takes effect for the next DAG run (or for any task instances still queued inside the current run, since the operator attribute is re-read at parse). No deploy needed.
 
+### DistCp copy tuning
+
+How many mappers and how much bandwidth each table's copy gets is covered in
+**[DistCp Performance Tuning](data-iceberg-migrator/docs/DistCp_Performance_Tuning.md)**:
+the three sizing modes, how auto-sizing works, worked examples, cluster-load guidance, and
+how copies are batched and time-budgeted.
+
+Per-table auto-sizing is **off by default**: every table is copied with 50 mappers × 100 MB/s
+until `migration_distcp_enable_auto_sizing` is set to `true`. Check the `[DistCp] Sizing mode:`
+line in a `run_distcp_ssh` log to see which mode a run used.
+
 ### Discovery resumes on retry
 
 Each successful per-table discovery is checkpointed to S3 (default: `{tracking_location}/_discovery_checkpoints/<run_id>/<source_db>/<identity>.json`). On an Airflow retry of the same `discover_tables_via_spark_ssh` task, the script loads the checkpoints at startup and skips tables already walked — only the ones that failed get re-attempted. On the common "2 flaky tables out of 500" case, a retry drops from re-walking all 500 to re-walking only the 2.
