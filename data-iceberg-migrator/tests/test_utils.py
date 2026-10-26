@@ -25,11 +25,16 @@ class TestGetConfig:
         assert cfg['distcp_preserve_delete'] is True
         for key in ['s3_endpoint', 's3_access_key', 's3_secret_key',
                      'spark_conn_id', 'tracking_location', 'report_output_location',
-                     'distcp_checkpoint_location', 'auth_method', 'smtp_conn_id',
-                     'email_recipients']:
+                     'distcp_checkpoint_location', 'discovery_checkpoint_location',
+                     'auth_method', 'smtp_conn_id', 'email_recipients']:
             assert key in cfg, f"Missing key: {key}"
         assert cfg['distcp_checkpoint_location'] == (
             f"{cfg['tracking_location']}/_distcp_checkpoints"
+        )
+        # Discovery checkpoints default to a sibling path under tracking_location
+        # so they share the same bucket / credentials as the DistCp checkpoints.
+        assert cfg['discovery_checkpoint_location'] == (
+            f"{cfg['tracking_location']}/_discovery_checkpoints"
         )
 
     def test_falls_back_to_default_when_variable_missing(self):
