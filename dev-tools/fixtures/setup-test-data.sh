@@ -57,6 +57,9 @@
 #   Transient retry cases         : T-01..T-05
 #   Permanent error cases         : P-01..P-07
 #   TZ / TIMESTAMP test tables    : R-20 (tz_db.*_la)
+#
+# PART C (ood_db, seeded in [9c/11])
+#   Out-of-directory partitions   : TC-OOD-1 (ood_db.orders_ood), TC-OOD-2 (ood_db.orders_ok)
 # =============================================================================
 
 set -euo pipefail
@@ -2375,6 +2378,122 @@ echo "  Partitions registered for 8 tz tables."
 
 
 # =============================================================================
+# [9c/11]  Out-of-directory partitions (ood_db)
+# =============================================================================
+# TC-OOD-1  ood_db.orders_ood  5 partitions, 7 rows. 3 partitions point OUTSIDE
+#           the table root, so DistCp (copies the root) and MSCK on the dest
+#           never see them:
+#             dt=2024-01-01  2 rows  <root>/dt=2024-01-01                inside
+#             dt=2024-01-02  1 row   <root>/dt=2024-01-02                inside
+#             dt=2024-01-03  2 rows  /user/hive/external/ood_db/...      OUTSIDE (other directory)
+#             dt=2024-01-04  1 row   <root>_archive/dt=2024-01-04        OUTSIDE (sibling sharing the root's prefix)
+#             dt=2024-01-05  1 row   file:///tmp/ood_local/...           OUTSIDE (other filesystem scheme)
+#           Expected after DAG1: 3 rows / 2 partitions at dest, out_of_dir_partition_count=3,
+#           VALIDATED_WITH_WARNINGS.
+# TC-OOD-2  ood_db.orders_ok   control: 2 partitions, 3 rows, all inside the root.
+#           Expected after DAG1: out_of_dir_partition_count=0, VALIDATED.
+#
+# All partitions are written under the root first, then three are moved and
+# registered with an explicit ADD PARTITION ... LOCATION, which is how this
+# happens on real clusters. dt=2024-01-05 lives on the pod's local disk: re-run
+# this script after a pod restart.
+echo ""
+echo "============================================================"
+echo " [9c/11] Out-of-directory partitions (ood_db)"
+echo "============================================================"
+
+OOD_ROOT="${WH}/ood_db.db/orders_ood"
+OOD_ARCHIVE="${WH}/ood_db.db/orders_ood_archive"
+OOD_OK_ROOT="${WH}/ood_db.db/orders_ok"
+OOD_EXT="${EDGE_NAMENODE}/user/hive/external/ood_db"
+OOD_LOCAL="/tmp/ood_local"
+export OOD_ROOT OOD_ARCHIVE OOD_OK_ROOT OOD_EXT OOD_LOCAL
+
+hdfs dfs -rm -r -f -skipTrash "${OOD_ROOT}" "${OOD_ARCHIVE}" "${OOD_OK_ROOT}" "${OOD_EXT}" > /dev/null 2>&1 || true
+rm -rf "${OOD_LOCAL}"
+
+pyspark --master local[*] << 'PYEOF'
+import os
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+
+spark = SparkSession.builder.appName("seed_ood_data").enableHiveSupport().getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+
+schema = StructType([
+    StructField("order_id", IntegerType(), False),
+    StructField("amount", DoubleType(), False),
+    StructField("dt", StringType(), False),
+])
+ood_rows = [
+    (1, 10.0, "2024-01-01"), (2, 20.0, "2024-01-01"),
+    (3, 30.0, "2024-01-02"),
+    (4, 40.0, "2024-01-03"), (5, 50.0, "2024-01-03"),
+    (6, 60.0, "2024-01-04"),
+    (7, 70.0, "2024-01-05"),
+]
+ok_rows = [(1, 10.0, "2024-01-01"), (2, 20.0, "2024-01-01"), (3, 30.0, "2024-01-02")]
+
+for rows, path in ((ood_rows, os.environ["OOD_ROOT"]), (ok_rows, os.environ["OOD_OK_ROOT"])):
+    spark.createDataFrame(rows, schema).coalesce(1).write.mode("overwrite").partitionBy("dt").parquet(path)
+    print("  wrote {0} rows to {1}".format(len(rows), path))
+
+spark.stop()
+PYEOF
+
+hdfs dfs -mkdir -p "${OOD_EXT}" "${OOD_ARCHIVE}"
+hdfs dfs -mv "${OOD_ROOT}/dt=2024-01-03" "${OOD_EXT}/orders_2024_01_03"
+hdfs dfs -mv "${OOD_ROOT}/dt=2024-01-04" "${OOD_ARCHIVE}/dt=2024-01-04"
+mkdir -p "${OOD_LOCAL}"
+hdfs dfs -get "${OOD_ROOT}/dt=2024-01-05" "${OOD_LOCAL}/orders_2024_01_05"
+hdfs dfs -rm -r -skipTrash "${OOD_ROOT}/dt=2024-01-05" > /dev/null
+chmod -R a+rX "${OOD_LOCAL}"
+echo "  Moved dt=2024-01-03, dt=2024-01-04 and dt=2024-01-05 out of ${OOD_ROOT}"
+
+pyspark --master local[*] << 'PYEOF'
+import os
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("register_ood_tables").enableHiveSupport().getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+
+root = os.environ["OOD_ROOT"]
+ok_root = os.environ["OOD_OK_ROOT"]
+partition_locations = [
+    ("2024-01-01", root + "/dt=2024-01-01"),
+    ("2024-01-02", root + "/dt=2024-01-02"),
+    ("2024-01-03", os.environ["OOD_EXT"] + "/orders_2024_01_03"),
+    ("2024-01-04", os.environ["OOD_ARCHIVE"] + "/dt=2024-01-04"),
+    ("2024-01-05", "file://" + os.environ["OOD_LOCAL"] + "/orders_2024_01_05"),
+]
+
+spark.sql("CREATE DATABASE IF NOT EXISTS ood_db")
+spark.sql("DROP TABLE IF EXISTS ood_db.orders_ood")
+spark.sql("DROP TABLE IF EXISTS ood_db.orders_ok")
+
+spark.sql(
+    "CREATE EXTERNAL TABLE ood_db.orders_ood (order_id INT, amount DOUBLE) "
+    "PARTITIONED BY (dt STRING) STORED AS PARQUET LOCATION '{0}'".format(root)
+)
+for dt, loc in partition_locations:
+    spark.sql("ALTER TABLE ood_db.orders_ood ADD PARTITION (dt='{0}') LOCATION '{1}'".format(dt, loc))
+
+spark.sql(
+    "CREATE EXTERNAL TABLE ood_db.orders_ok (order_id INT, amount DOUBLE) "
+    "PARTITIONED BY (dt STRING) STORED AS PARQUET LOCATION '{0}'".format(ok_root)
+)
+spark.sql("MSCK REPAIR TABLE ood_db.orders_ok")
+
+for t in ("orders_ood", "orders_ok"):
+    n = spark.sql("SELECT COUNT(*) AS c FROM ood_db.{0}".format(t)).collect()[0]["c"]
+    p = spark.sql("SHOW PARTITIONS ood_db.{0}".format(t)).count()
+    print("  ood_db.{0}: {1} rows, {2} partitions".format(t, n, p))
+
+spark.stop()
+PYEOF
+
+
+# =============================================================================
 # [10/11]  Verification
 # =============================================================================
 echo ""
@@ -2437,6 +2556,8 @@ checks = [
     ("corrupt_test_db.table_a",        "P-04a", _rows("PERMANENT-FAIL", "P-04-source-a"), None),
     ("corrupt_test_db.corrupt_table",  "P-04b", _rows("PERMANENT-FAIL", "P-04-source-b"), None),
     ("corrupt_test_db.table_c",        "P-04c", _rows("PERMANENT-FAIL", "P-04-source-c"), None),
+    ("ood_db.orders_ood",              "TC-OOD-1", _rows("OUT-OF-DIR", "TC-OOD-1"), ("dt", _parts("OUT-OF-DIR", "TC-OOD-1"))),
+    ("ood_db.orders_ok",               "TC-OOD-2", _rows("OUT-OF-DIR", "TC-OOD-2"), ("dt", _parts("OUT-OF-DIR", "TC-OOD-2"))),
 ]
 
 all_pass = True
@@ -2496,6 +2617,42 @@ except Exception as e:
     print("  R-11 partition filter range: FAIL --", e)
     all_pass = False
 
+import re
+
+
+def _location(sql):
+    for d in spark.sql(sql).collect():
+        if (d.col_name or "").strip().rstrip(":").lower() == "location":
+            return (d.data_type or "").strip()
+    return ""
+
+
+def _inside(loc, root):
+    if loc.split(":", 1)[0] != root.split(":", 1)[0]:
+        return False
+    path = re.sub(r"^[a-z]+:(//[^/]*)?", "", loc).rstrip("/")
+    root_path = re.sub(r"^[a-z]+:(//[^/]*)?", "", root).rstrip("/")
+    return path == root_path or path.startswith(root_path + "/")
+
+
+for table, sid in (("ood_db.orders_ood", "TC-OOD-1"), ("ood_db.orders_ok", "TC-OOD-2")):
+    try:
+        root = _location("DESCRIBE FORMATTED {0}".format(table))
+        outside = []
+        for r in spark.sql("SHOW PARTITIONS {0}".format(table)).collect():
+            k, v = r.partition.split("=", 1)
+            loc = _location("DESCRIBE FORMATTED {0} PARTITION ({1}='{2}')".format(table, k, v))
+            if not _inside(loc, root):
+                outside.append("{0} -> {1}".format(r.partition, loc))
+        expected = FIXTURES["OUT-OF-DIR"][sid]["out_of_dir_parts"]
+        assert len(outside) == expected, "{0} outside root, expected {1}: {2}".format(len(outside), expected, outside)
+        print("  {0} out-of-dir partitions: PASS ({1} outside {2})".format(sid, len(outside), root))
+        for o in outside:
+            print("      " + o)
+    except Exception as e:
+        print("  {0} out-of-dir partitions: FAIL --".format(sid), e)
+        all_pass = False
+
 print("")
 if all_pass:
     print("  ALL CHECKS PASSED -- data ready.")
@@ -2526,6 +2683,26 @@ REGRESSION BASELINE (run DAG 1 first, then DAG 2):
     DATABASE_NOT_FOUND: does_not_exist_db.*
     SKIPPED           : formats_db_s3.text_table (INPLACE=TRUE in DAG2 Excel)
     SKIPPED           : migration_db_s3.customers (INPLACE on already-Iceberg)
+
+OUT-OF-DIRECTORY PARTITIONS (DAG 1 only, ood_db):
+  Excel: dev-tools/mapr-edge-node/excel_configs/dag1_out_of_dir_partitions.xlsx
+         (one row: ood_db / * / ood_db_s3)
+  TC-OOD-1 ood_db.orders_ood:
+    Discovery log : "Out-of-directory partitions for ood_db.orders_ood: 3 partition(s)"
+    Tracking      : out_of_dir_partition_count = 3 (dt=2024-01-03, dt=2024-01-04, dt=2024-01-05)
+                    source_row_count 7 / dest_hive_row_count 3
+                    source_partition_count 5 / dest_partition_count 2
+                    overall_status = VALIDATED_WITH_WARNINGS
+                    error_message contains "3 out-of-directory source partition(s) not copied"
+    Report        : OUT-OF-DIR PARTITIONS card = 1, badge on orders_ood, no "Run MSCK" hint
+  TC-OOD-2 ood_db.orders_ok:
+    Tracking      : out_of_dir_partition_count = 0, overall_status = VALIDATED
+  Check:
+    SELECT source_table, overall_status, source_row_count, dest_hive_row_count,
+           source_partition_count, dest_partition_count,
+           out_of_dir_partition_count, out_of_dir_partitions, error_message
+    FROM <tracking_db>.migration_table_status
+    WHERE run_id = '<run_id>' AND source_database = 'ood_db';
 
 TRANSIENT RETRY TESTS:
   T-01 YARN OOM during DistCp (retry_test_db.yarn_oom_table):
