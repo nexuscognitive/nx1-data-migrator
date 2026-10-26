@@ -4666,7 +4666,7 @@ class TestOutOfDirPartitions:
             sample_run_id, ['orders'],
         )
         sftp_file = client.open_sftp.return_value.file.return_value
-        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
         compile(script, 'discover_tables.py', 'exec')
         assert 'is_path_inside_root' in script
         assert '"out_of_dir_partition_count": out_of_dir_partition_count' in script
@@ -4832,7 +4832,7 @@ class TestOutOfDirPartitions:
             client, [disc._make_metadata_record('orders')], sample_run_id, ['orders'],
         )
         sftp_file = client.open_sftp.return_value.file.return_value
-        script = sftp_file.__enter__.return_value.write.call_args[0][0]
+        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
         compile(script, 'discover_tables.py', 'exec')
         qualify = script[script.index('def _qualify'):script.index('part_locations = {}')]
         assert 'getFileSystem(spark._jsc.hadoopConfiguration()).makeQualified(_p)' in qualify
