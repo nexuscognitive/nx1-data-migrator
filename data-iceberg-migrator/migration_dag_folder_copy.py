@@ -4,15 +4,24 @@ DAG 3: Folder-Only Data Copy
 Copies folders from MapR/HDFS to S3 via DistCp — no Hive metadata.
 For migrating raw data directories that don't have associated Hive tables.
 
-Excel columns: source_path | target_bucket | dest_folder | endpoint
+Excel columns: source_path | target_bucket | dest_folder | endpoint | split_subfolders (optional)
+
+Performance / diagnostics knobs (DAG Param > Airflow Variable folder_copy_<name> > env FOLDER_COPY_<NAME>):
+  - listing_strategy : 'ls_r' (default, `hadoop fs -ls -R` + `-du -s`) or 'count' (`hadoop fs -count`)
+  - split_subfolders : copy immediate subfolders as separate DistCp tasks instead of one big folder
+  - split_depth      : how many directory levels to split when split_subfolders is on (default 1)
+  - max_split_entries: safety cap on generated tasks; above it the folder is copied unsplit (default 1000)
+  - max_loose_files  : safety cap on loose files that sit directly in a split folder (default 200)
 """
 
 import contextlib
+import json
 import logging
 import os
 import re
 import shlex
 import sys
+import time
 from datetime import datetime, timedelta
 from html import escape as _html_escape
 from pathlib import Path
@@ -123,6 +132,324 @@ def _folder_copy_dag_failure_callback(context) -> None:
     except Exception:
         with contextlib.suppress(Exception):
             logger.error("[FolderCopy] DAG failure callback raised and was suppressed")
+
+
+# =============================================================================
+# FOLDER-COPY DIAGNOSTICS, LISTING AND SUBFOLDER HELPERS
+# =============================================================================
+
+_LISTING_STRATEGIES = ('ls_r', 'count')
+
+# Markers printed by the generated edge-node script (see run_folder_distcp_ssh).
+_PHASE_START_RE = re.compile(r'^PHASE_START (\w+)', re.MULTILINE)
+_PHASE_END_RE = re.compile(r'^PHASE_END (\w+) seconds=(\d+)', re.MULTILINE)
+_MEMORY_KILL_RE = re.compile(
+    r'beyond physical memory limits|Container killed by|OutOfMemoryError|GC overhead limit exceeded',
+    re.IGNORECASE,
+)
+# One `hadoop fs -ls` entry (MapR-FS and HDFS): perms, replication, owner, group, size, date, time, path.
+_LS_LINE_RE = re.compile(
+    r'^(?P<kind>[-dl])[rwxsStT-]{9}[+.]?\s+\S+\s+\S+\s+\S+\s+(?P<size>\d+)\s+'
+    r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+(?P<path>.+?)\s*$'
+)
+
+
+def _truthy(value) -> bool:
+    return str(value).strip().lower() in ('true', '1', 'yes', 'y', 'on')
+
+
+def _sql_num(value) -> str:
+    """SQL literal for an optional DOUBLE value."""
+    if value is None or value == '':
+        return 'NULL'
+    try:
+        return repr(float(value))
+    except (TypeError, ValueError):
+        return 'NULL'
+
+
+def _sql_int(value) -> str:
+    """SQL literal for an optional INT value."""
+    if value is None or value == '':
+        return 'NULL'
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return 'NULL'
+
+
+def _resolve_setting(name: str, context: dict = None, default=None):
+    """DAG Param > Airflow Variable folder_copy_<name> > env FOLDER_COPY_<NAME> > default.
+
+    Params make A/B runs on the same data possible without redeploying (e.g. the
+    same folder with listing_strategy=ls_r and then =count).
+    """
+    value = None
+    try:
+        params = (context or {}).get('params') or {}
+        value = params.get(name)
+    except Exception:
+        value = None
+    if value is not None and str(value).strip() != '':
+        return value
+    try:
+        from airflow.models import Variable
+        value = Variable.get(f'folder_copy_{name}', default_var=None)
+    except Exception:
+        value = None
+    if value is not None and str(value).strip() != '':
+        return value
+    value = os.environ.get(f'FOLDER_COPY_{name.upper()}')
+    if value is not None and value.strip() != '':
+        return value
+    return default
+
+
+def _resolve_listing_strategy(context: dict = None) -> str:
+    value = str(_resolve_setting('listing_strategy', context, default='ls_r')).strip().lower()
+    if value not in _LISTING_STRATEGIES:
+        logger.warning(
+            f"[FolderCopy] Unknown listing_strategy {value!r} — using 'ls_r'. "
+            f"Valid values: {', '.join(_LISTING_STRATEGIES)}"
+        )
+        return 'ls_r'
+    return value
+
+
+def _listing_snippet(
+    hadoop_cmd: str,
+    path_expr: str,
+    file_var: str,
+    size_var: str,
+    strategy: str = 'ls_r',
+    shallow: bool = False,
+) -> str:
+    """Shell lines that set `file_var` / `size_var` for `path_expr`.
+
+    ls_r    : the original behaviour — a recursive `-ls -R` plus a `-du -s`.
+    count   : one `-count` call (file count and content size together).
+    shallow : direct children only (used for the loose files of a split folder).
+
+    `path_expr` is inserted verbatim, so the caller supplies its own quoting.
+    Plain placeholders (not an f-string) keep the awk braces readable.
+    """
+    if shallow:
+        template = (
+            "_SHALLOW_LS=$(@HC@ -ls @PATH@ 2>/dev/null | grep '^-')\n"
+            "@FV@=$(printf '%s\\n' \"$_SHALLOW_LS\" | grep -c '^-')\n"
+            "@SV@=$(printf '%s\\n' \"$_SHALLOW_LS\" | awk '/^-/ {s+=$5} END {print s+0}')\n"
+        )
+    elif strategy == 'count':
+        template = (
+            "_COUNT_LINE=$(@HC@ -count @PATH@ 2>/dev/null | tail -1)\n"
+            "@FV@=$(echo \"$_COUNT_LINE\" | awk '{print $2}')\n"
+            "@SV@=$(echo \"$_COUNT_LINE\" | awk '{print $3}')\n"
+        )
+    else:
+        template = (
+            "@FV@=$(@HC@ -ls -R @PATH@ 2>/dev/null | grep '^-' | wc -l)\n"
+            "@SV@=$(@HC@ -du -s @PATH@ 2>/dev/null | awk '{print $1}')\n"
+        )
+    return (
+        template.replace('@HC@', hadoop_cmd)
+        .replace('@PATH@', path_expr)
+        .replace('@FV@', file_var)
+        .replace('@SV@', size_var)
+    )
+
+
+def _last_open_phase(output: str):
+    """Name of the most recent PHASE_START with no matching PHASE_END, or None."""
+    ended = {name for name, _ in _PHASE_END_RE.findall(output or '')}
+    open_phases = [p for p in _PHASE_START_RE.findall(output or '') if p not in ended]
+    return open_phases[-1] if open_phases else None
+
+
+def _read_remote_command(
+    channel,
+    partial_sink: list,
+    deadline_seconds: float,
+    label: str = '',
+    heartbeat_seconds: float = 300.0,
+) -> tuple:
+    """Drain an SSH exec channel incrementally; return (stdout, stderr, exit_code).
+
+    `stdout.read()` returns nothing until the command ends, so a command that
+    stalls (e.g. the recursive S3 listing) loses every line it already printed.
+    Chunks are appended to `partial_sink` as they arrive, so the caller can still
+    see which PHASE_START marker was the last one reached after a timeout or an
+    SSH drop, and a heartbeat shows the same thing in the task log while it runs.
+    """
+    err_chunks = []
+    started = time.monotonic()
+    last_beat = started
+
+    def _drain() -> bool:
+        got = False
+        while channel.recv_ready():
+            partial_sink.append(channel.recv(65536).decode('utf-8', errors='replace'))
+            got = True
+        while channel.recv_stderr_ready():
+            err_chunks.append(channel.recv_stderr(65536).decode('utf-8', errors='replace'))
+            got = True
+        return got
+
+    while True:
+        got = _drain()
+        if channel.exit_status_ready():
+            _drain()
+            break
+        now = time.monotonic()
+        if now - started > deadline_seconds:
+            raise TimeoutError(
+                f"{label} still running after {deadline_seconds:.0f}s; last phase reached: "
+                f"{_last_open_phase(''.join(partial_sink)) or 'none (no phase marker seen)'}"
+            )
+        if now - last_beat >= heartbeat_seconds:
+            logger.info(
+                f"[FolderDistCp] {label} running for {now - started:.0f}s — current phase: "
+                f"{_last_open_phase(''.join(partial_sink)) or 'n/a'}"
+            )
+            last_beat = now
+        if not got:
+            time.sleep(1)
+    return ''.join(partial_sink), ''.join(err_chunks), channel.recv_exit_status()
+
+
+def _build_run_diagnostics(
+    output: str,
+    exit_code,
+    yarn_ids: list,
+    listing_strategy: str,
+    shallow: bool = False,
+    extra: dict = None,
+) -> dict:
+    """Turn the edge-script output into the fields that separate the failure modes.
+
+    - failure_phase        : the phase that was running when it stopped (an unmatched
+                             PHASE_START), 'distcp' for a DistCp error, else None.
+    - yarn_app_created     : False + a pre-DistCp failure_phase = the run died before
+                             DistCp was submitted (the listing/discovery problem).
+    - memory_kill_suspected: container-kill / OOM text or exit 137 (the separate
+                             1 GB-container issue).
+    - edge_*               : edge node identity, SSSD state and groups, so the
+                             bad-edge-node permission failure can be ruled in or out.
+    """
+    output = output or ''
+    ended = {name: int(sec) for name, sec in _PHASE_END_RE.findall(output)}
+
+    def _kv(key: str) -> str:
+        match = re.search(rf'^{key}=(.*?)\r?$', output, re.MULTILINE)
+        return match.group(1).strip() if match else ''
+
+    distcp_exit_raw = _kv('DISTCP_EXIT_CODE')
+    distcp_exit = int(distcp_exit_raw) if distcp_exit_raw.lstrip('-').isdigit() else None
+    open_phase = _last_open_phase(output)
+
+    if open_phase:
+        failure_phase = open_phase
+    elif distcp_exit not in (None, 0):
+        failure_phase = 'distcp'
+    elif exit_code not in (0, None):
+        failure_phase = 'script'
+    elif exit_code is None:
+        # No exit status: the SSH session died or Python raised. If phases had already
+        # completed the script itself got further than startup.
+        failure_phase = 'after_script' if ended else 'ssh_or_startup'
+    else:
+        failure_phase = None
+
+    diag = {
+        'failure_phase': failure_phase,
+        'yarn_app_created': bool(yarn_ids),
+        'script_exit_code': exit_code,
+        'distcp_exit_code': distcp_exit,
+        'memory_kill_suspected': bool(_MEMORY_KILL_RE.search(output)) or exit_code == 137 or distcp_exit == 137,
+        'phase_seconds': ended,
+        'listing_strategy': listing_strategy,
+        'shallow': shallow,
+        'edge_host': _kv('EDGE_HOST'),
+        'edge_groups': _kv('EDGE_GROUPS'),
+        'edge_sssd_running': _kv('EDGE_SSSD_RUNNING'),
+        'edge_mem_available_mb': _kv('EDGE_MEM_AVAILABLE_MB'),
+    }
+    if extra:
+        diag.update(extra)
+    return diag
+
+
+def _list_immediate_children(ssh, config: dict, path: str) -> tuple:
+    """Return (sorted subdirectory paths, sorted [(file path, size)]) directly under `path`."""
+    cmd = f'hadoop fs -ls "{path}"'
+    with ssh.get_conn() as client:
+        _, stdout, stderr = client.exec_command(
+            _login_shell(cmd, config.get('cluster_type', 'MapR')),
+            timeout=SSH_COMMAND_TIMEOUT,
+        )
+        out = stdout.read().decode(errors='replace')
+        err = stderr.read().decode(errors='replace')
+        rc = stdout.channel.recv_exit_status()
+    if rc != 0:
+        raise RuntimeError(f"`hadoop fs -ls {path}` exited {rc}: {err.strip()[:300]}")
+
+    dirs, files = [], []
+    for line in out.splitlines():
+        match = _LS_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        entry_path = match.group('path')
+        if match.group('kind') == 'd':
+            if os.path.basename(entry_path.rstrip('/')) != '.snapshot':
+                dirs.append(entry_path)
+        elif match.group('kind') == '-':
+            files.append((entry_path, int(match.group('size'))))
+    return sorted(dirs), sorted(files)
+
+
+def _split_folder_config(ssh, config: dict, cfg: dict, depth: int, max_loose: int) -> list:
+    """Replace one folder config by one config per subfolder (plus one for loose files).
+
+    A folder with no subfolders is returned unchanged: there is nothing to split.
+    Files that sit directly in the folder become a single 'shallow' entry that
+    copies just those files, so splitting never drops data. Raises ValueError when
+    the loose files exceed `max_loose` (the caller then copies the folder unsplit).
+    """
+    dirs, files = _list_immediate_children(ssh, config, cfg['source_path'])
+    if not dirs:
+        return [cfg]
+    if len(files) > max_loose:
+        raise ValueError(
+            f"{cfg['source_path']} has {len(files)} files directly inside it "
+            f"(limit {max_loose}); they cannot be copied as a separate batch"
+        )
+
+    top_parent = cfg.get('parent_source_path') or cfg['source_path']
+    base_dest = str(cfg['dest_folder']).rstrip('/')
+    entries = []
+    for child_path in dirs:
+        child = {
+            **cfg,
+            'source_path': child_path,
+            'dest_folder': f"{base_dest}/{os.path.basename(child_path.rstrip('/'))}",
+            'parent_source_path': top_parent,
+            'split_role': 'subfolder',
+            'split_subfolders': False,
+        }
+        if depth > 1:
+            entries.extend(_split_folder_config(ssh, config, child, depth - 1, max_loose))
+        else:
+            entries.append(child)
+    if files:
+        entries.append({
+            **cfg,
+            'shallow': True,
+            'source_files': [p for p, _ in files],
+            'source_files_bytes': sum(size for _, size in files),
+            'parent_source_path': top_parent,
+            'split_role': 'loose_files',
+            'split_subfolders': False,
+        })
+    return entries
 
 
 @task
@@ -312,6 +639,16 @@ def init_folder_copy_tracking_tables(spark) -> dict:
         ("distcp_bytes_copied", "BIGINT"),
         ("distcp_files_copied", "BIGINT"),
         ("throughput_mbps", "DOUBLE"),
+        # Phase timing / failure-mode diagnostics
+        ("parent_source_path", "STRING"),
+        ("failure_phase", "STRING"),
+        ("yarn_app_created", "BOOLEAN"),
+        ("script_exit_code", "INT"),
+        ("s3_list_before_seconds", "DOUBLE"),
+        ("source_scan_seconds", "DOUBLE"),
+        ("s3_list_after_seconds", "DOUBLE"),
+        ("validation_listing_seconds", "DOUBLE"),
+        ("diagnostics_json", "STRING"),
     ):
         try:
             spark.sql(
@@ -352,6 +689,15 @@ def init_folder_copy_tracking_tables(spark) -> dict:
             'distcp_bytes_copied',
             'distcp_files_copied',
             'throughput_mbps',
+            'parent_source_path',
+            'failure_phase',
+            'yarn_app_created',
+            'script_exit_code',
+            's3_list_before_seconds',
+            'source_scan_seconds',
+            's3_list_after_seconds',
+            'validation_listing_seconds',
+            'diagnostics_json',
         )),
         ('data_copy_runs', (
             'dag_run_id',
@@ -486,12 +832,21 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
         raw_endpoint = row.get('endpoint', '')
         dest_endpoint = '' if (raw_endpoint is None or str(raw_endpoint).strip().lower() in ('', 'nan', 'none')) else str(raw_endpoint).strip()
 
+        # Optional per-row override of the global split_subfolders setting.
+        # Blank/missing = follow the global setting (None).
+        raw_split = row.get('split_subfolders', '')
+        if raw_split is None or str(raw_split).strip().lower() in ('', 'nan', 'none'):
+            split_subfolders = None
+        else:
+            split_subfolders = str(raw_split).strip().lower() in ('true', '1', 'yes', 'y', 'on')
+
         config_entry = {
             'run_id': run_id,
             'source_path': source_path,
             'dest_bucket': dest_bucket,
             'dest_folder': dest_folder,
             'dest_endpoint': dest_endpoint,
+            'split_subfolders': split_subfolders,
         }
         logger.info(
             f"[FolderCopy] Parsed: {source_path} -> {dest_bucket}/{dest_folder}"
@@ -554,6 +909,76 @@ def _probe_source_size(ssh, source_path: str, config: dict) -> tuple[int, int]:
 
 
 @task
+def expand_folder_subfolders(folder_configs: list, cluster_setup: dict = None, **context) -> list:
+    """Optionally split each folder into one DistCp task per subfolder.
+
+    Subfolder-wise copy is the mitigation for very large, deeply nested folders:
+    each task lists and copies only its own subtree, so no single listing has to
+    walk the whole folder. It is off unless split_subfolders is set (DAG Param,
+    Variable folder_copy_split_subfolders, or the per-row Excel column), and any
+    folder that cannot be split safely is copied whole, exactly as before.
+
+    Each subfolder keeps its own tracking row, validation and report line;
+    parent_source_path ties them back to the Excel row.
+    """
+    global_split = _truthy(_resolve_setting('split_subfolders', context, default=False))
+    wanted = [
+        global_split if cfg.get('split_subfolders') is None else bool(cfg.get('split_subfolders'))
+        for cfg in folder_configs
+    ]
+    if not any(wanted):
+        logger.info("[FolderSplit] Subfolder splitting not requested — copying folders whole")
+        return folder_configs
+
+    depth = max(1, int(_resolve_setting('split_depth', context, default=1)))
+    max_entries = int(_resolve_setting('max_split_entries', context, default=1000))
+    max_loose = int(_resolve_setting('max_loose_files', context, default=200))
+
+    config = get_config()
+    ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
+
+    expanded = []
+    for cfg, split_this in zip(folder_configs, wanted):
+        if not split_this:
+            expanded.append(cfg)
+            continue
+        source_path = cfg['source_path']
+        try:
+            entries = _split_folder_config(ssh, config, cfg, depth, max_loose)
+        except Exception as exc:
+            logger.error(
+                f"[FolderSplit] Could not split {source_path} ({exc}) — copying it whole"
+            )
+            expanded.append(cfg)
+            continue
+        if len(entries) > max_entries:
+            logger.error(
+                f"[FolderSplit] {source_path} would become {len(entries)} tasks, over the "
+                f"max_split_entries limit of {max_entries} — copying it whole. "
+                f"Lower split_depth or raise the limit (and Airflow core.max_map_length)."
+            )
+            expanded.append(cfg)
+            continue
+        if len(entries) == 1 and entries[0] is cfg:
+            logger.info(f"[FolderSplit] {source_path} has no subfolders — nothing to split")
+        else:
+            loose = sum(1 for e in entries if e.get('split_role') == 'loose_files')
+            logger.info(
+                f"[FolderSplit] {source_path} -> {len(entries) - loose} subfolder task(s)"
+                + (f" + 1 loose-files task" if loose else "")
+                + f" (depth={depth})"
+            )
+        expanded.extend(entries)
+
+    if len(expanded) > 1024:
+        logger.warning(
+            f"[FolderSplit] {len(expanded)} copy tasks generated; Airflow's default "
+            f"core.max_map_length is 1024 and mapping may fail above it"
+        )
+    return expanded
+
+
+@task
 def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **context) -> dict:
     """Copy a single source folder to S3 via SSH DistCp with -update for incremental runs."""
     from datetime import datetime as _dt
@@ -568,8 +993,27 @@ def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **con
     dest_endpoint = folder_config.get('dest_endpoint', '')
     s3_dest = f"{dest_bucket}/{dest_folder}"
 
-    logger.info(f"[FolderCopy] Sizing mode: {distcp_sizing_mode(config)}")
-    probe_size, probe_files = _probe_source_size(ssh, source_path, config)
+    # 'shallow' = copy only the explicit files that sat directly in a split folder.
+    shallow = bool(folder_config.get('shallow'))
+    source_files = list(folder_config.get('source_files') or []) if shallow else []
+    source_files_bytes = int(folder_config.get('source_files_bytes') or 0) if shallow else 0
+    listing_strategy = _resolve_listing_strategy(context)
+    diag_extra = {
+        'parent_source_path': folder_config.get('parent_source_path'),
+        'split_role': folder_config.get('split_role'),
+    }
+    partial_output: list = []
+    diag: dict = {}
+
+    logger.info(
+        f"[FolderCopy] Sizing mode: {distcp_sizing_mode(config)} | "
+        f"listing_strategy={listing_strategy} | shallow={shallow}"
+    )
+    if shallow:
+        # The parent folder holds the rest of the data; only these files are in scope.
+        probe_size, probe_files = source_files_bytes, max(len(source_files), 1)
+    else:
+        probe_size, probe_files = _probe_source_size(ssh, source_path, config)
     mappers, bandwidth = size_distcp_job(probe_size, probe_files, config)
     logger.info(
         f"[FolderCopy] Sized {source_path}: {mappers} mappers x {bandwidth} MB/s "
@@ -607,14 +1051,51 @@ def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **con
         allow_delete_raw = os.environ.get('FOLDER_COPY_ALLOW_DELETE')
     allow_delete = str(allow_delete_raw).strip().lower() in ('true', '1', 'yes', 'on')
 
+    # Never delete for a loose-files copy: its destination also holds the subfolder
+    # copies, which DistCp -delete would remove as "not in the source".
     delete_flag = ''
-    if config.get('distcp_preserve_delete') is True and allow_delete:
+    if config.get('distcp_preserve_delete') is True and allow_delete and not shallow:
         delete_flag = ' -delete'
 
     s3_opts = build_s3_opts(dest_bucket, config, dest_endpoint)
 
+    dest_count_snippet = _listing_snippet(
+        f'hadoop fs{s3_opts}', '"$location"', 'FILE_COUNT', 'TOTAL_SIZE', listing_strategy, shallow
+    )
+    if shallow:
+        # Counts come from the split step's directory listing, so no source scan is needed.
+        src_metrics_block = (
+            f'SRC_FILE_COUNT={len(source_files)}\n'
+            f'SRC_TOTAL_SIZE={source_files_bytes}\n'
+        )
+        distcp_sources = ' '.join(shlex.quote(p) for p in source_files)
+        # DistCp -update treats a single source file's target as a file path, not a directory.
+        distcp_target = (
+            f"{s3_dest}/{os.path.basename(source_files[0])}" if len(source_files) == 1 else s3_dest
+        )
+    else:
+        src_metrics_block = _listing_snippet(
+            'hadoop fs', f'"{source_path}"', 'SRC_FILE_COUNT', 'SRC_TOTAL_SIZE', listing_strategy, False
+        )
+        distcp_sources = f'"{source_path}"'
+        distcp_target = s3_dest
+
     cmd = f'''set +e
 {client_opts_export}
+phase_start() {{ PHASE_T0=$(date +%s); echo "PHASE_START $1 $(date -u +%Y-%m-%dT%H:%M:%SZ)"; }}
+phase_end() {{ echo "PHASE_END $1 seconds=$(( $(date +%s) - PHASE_T0 ))"; }}
+
+echo "EDGE_HOST=$(hostname)"
+echo "EDGE_USER=$(id -un 2>/dev/null)"
+echo "EDGE_GROUPS=$(id -Gn 2>/dev/null | tr ' ' ',')"
+if command -v pgrep >/dev/null 2>&1; then
+    if pgrep -x sssd >/dev/null 2>&1; then echo "EDGE_SSSD_RUNNING=true"; else echo "EDGE_SSSD_RUNNING=false"; fi
+else
+    echo "EDGE_SSSD_RUNNING=unknown"
+fi
+echo "EDGE_MEM_AVAILABLE_MB=$(free -m 2>/dev/null | awk '/^Mem:/ {{print $7}}')"
+echo "LISTING_STRATEGY={listing_strategy}"
+
 calculate_s3_metrics() {{
     local location=$1
     if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
@@ -622,9 +1103,7 @@ calculate_s3_metrics() {{
         echo "S3_TOTAL_SIZE=0"
         return
     fi
-    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
-    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
-    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
+{dest_count_snippet}    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
     [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
     echo "S3_FILE_COUNT=$FILE_COUNT"
     echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
@@ -645,8 +1124,10 @@ emit_metrics() {{
 }}
 
 echo "=== Source existence check ==="
+phase_start source_check
 SRC_TEST_ERR=$(hadoop fs -test -d "{source_path}" 2>&1)
 SRC_TEST_RC=$?
+phase_end source_check
 echo "SOURCE_TEST_RC=$SRC_TEST_RC"
 if [ "$SRC_TEST_RC" -eq 1 ]; then
     echo "SOURCE_NOT_FOUND=true"
@@ -662,7 +1143,9 @@ hadoop fs{s3_opts} -test -d "{s3_dest}" 2>/dev/null && INCR=true
 echo "INCREMENTAL=$INCR"
 
 echo "=== S3 metrics BEFORE distcp ==="
+phase_start s3_list_before
 S3_BEFORE=$(calculate_s3_metrics "{s3_dest}")
+phase_end s3_list_before
 S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
 S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
 [ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
@@ -671,8 +1154,8 @@ echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
 echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
 
 echo "=== Source metrics ==="
-SRC_FILE_COUNT=$(hadoop fs -ls -R "{source_path}" 2>/dev/null | grep '^-' | wc -l)
-SRC_TOTAL_SIZE=$(hadoop fs -du -s "{source_path}" 2>/dev/null | awk '{{print $1}}')
+phase_start source_scan
+{src_metrics_block}phase_end source_scan
 [ -z "$SRC_FILE_COUNT" ] && SRC_FILE_COUNT=0
 [ -z "$SRC_TOTAL_SIZE" ] && SRC_TOTAL_SIZE=0
 echo "SRC_FILE_COUNT=$SRC_FILE_COUNT"
@@ -686,9 +1169,11 @@ if [ "$SRC_FILE_COUNT" -eq 0 ]; then
 fi
 
 echo "=== Running distcp ==="
+phase_start distcp
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts}{jvm_opts} -update{delete_flag} -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
-    -log {distcp_log_dir}/distcp_{log_name}.log "{source_path}" "{s3_dest}" 2>&1)
+    -log {distcp_log_dir}/distcp_{log_name}.log {distcp_sources} "{distcp_target}" 2>&1)
 DISTCP_EXIT=$?
+phase_end distcp
 echo "$DISTCP_OUTPUT"
 echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
 
@@ -698,7 +1183,9 @@ FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -iE "Files Copied|Number of files co
 [ -z "$FILES_COPIED" ] && FILES_COPIED=0
 
 echo "=== S3 metrics AFTER distcp ==="
+phase_start s3_list_after
 S3_AFTER=$(calculate_s3_metrics "{s3_dest}")
+phase_end s3_list_after
 S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
 S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
 [ -z "$S3_FILE_COUNT_AFTER" ] && S3_FILE_COUNT_AFTER=0
@@ -723,9 +1210,14 @@ exit 0
                 timeout=SSH_COMMAND_TIMEOUT,
                 get_pty=True,
             )
-            output = stdout.read().decode()
-            error_output = stderr.read().decode()
-            exit_code = stdout.channel.recv_exit_status()
+            # Incremental read: if the script stalls or the connection drops, the
+            # phase markers printed so far are kept in partial_output.
+            output, error_output, exit_code = _read_remote_command(
+                stdout.channel,
+                partial_output,
+                deadline_seconds=SSH_COMMAND_TIMEOUT,
+                label=f"{source_path} -> {s3_dest}",
+            )
 
             logger.info(f"=== [FolderDistCp] {source_path} -> {s3_dest} (FULL stdout) ===")
             logger.info(output)
@@ -747,6 +1239,28 @@ exit 0
             else:
                 logger.warning(
                     f"[FolderDistCp] No YARN Application ID found for {source_path}"
+                )
+
+            diag = _build_run_diagnostics(
+                output, exit_code, yarn_application_ids, listing_strategy, shallow, diag_extra
+            )
+            logger.info(
+                f"[FolderDistCp] Diagnostics for {source_path}: phase_seconds={diag['phase_seconds']} | "
+                f"yarn_app_created={diag['yarn_app_created']} | failure_phase={diag['failure_phase']} | "
+                f"exit_code={exit_code} | memory_kill_suspected={diag['memory_kill_suspected']} | "
+                f"edge_host={diag['edge_host']} sssd={diag['edge_sssd_running']} "
+                f"groups={diag['edge_groups']} mem_available_mb={diag['edge_mem_available_mb']}"
+            )
+            if diag['edge_sssd_running'] == 'false':
+                logger.warning(
+                    f"[FolderDistCp] SSSD is not running on edge node {diag['edge_host']} — "
+                    f"group lookups can be wrong there (permission failures), and timings from "
+                    f"this node should not be compared with a validated node."
+                )
+            if diag['memory_kill_suspected']:
+                logger.warning(
+                    f"[FolderDistCp] Memory kill / OOM signature in the output for {source_path} — "
+                    f"a resource problem, separate from the listing phase."
                 )
 
             metrics = {
@@ -808,6 +1322,7 @@ exit 0
             if source_test_rc == 1:
                 logger.error(f"[FolderDistCp] SOURCE_NOT_FOUND: {source_path}")
                 return {
+                    **diag,
                     'run_id': run_id,
                     'source_path': source_path,
                     'dest_bucket': dest_bucket,
@@ -851,6 +1366,7 @@ exit 0
                     f"S3 prefix created at {s3_dest}"
                 )
                 return {
+                    **diag,
                     'run_id': run_id,
                     'source_path': source_path,
                     'dest_bucket': dest_bucket,
@@ -890,6 +1406,7 @@ exit 0
                     )[:2000]
                 logger.error(f"[FolderDistCp] FAILED: {error_msg}")
                 result = {
+                    **diag,
                     'run_id': run_id,
                     'source_path': source_path,
                     'dest_bucket': dest_bucket,
@@ -929,6 +1446,7 @@ exit 0
                 f"throughput={throughput:.2f} MB/s"
             )
             return {
+                **diag,
                 'run_id': run_id,
                 'source_path': source_path,
                 'dest_bucket': dest_bucket,
@@ -961,7 +1479,25 @@ exit 0
         completed_at = _dt.utcnow()
         error_msg = str(e)[:2000]
         logger.error(f"[FolderDistCp] ERROR: {source_path} -> {s3_dest}: {error_msg}")
+        partial_text = ''.join(partial_output)
+        if partial_text:
+            logger.error(
+                f"[FolderDistCp] Output captured before the failure (last 3000 chars):\n"
+                f"{partial_text[-3000:]}"
+            )
+        # A failure before DistCp was ever submitted (no YARN app id) names the phase
+        # it died in: the PHASE_START that never got its PHASE_END.
+        partial_yarn_ids = list(dict.fromkeys(re.findall(r"application_\d+_\d+", partial_text)))
+        diag = _build_run_diagnostics(
+            partial_text, None, partial_yarn_ids, listing_strategy, shallow, diag_extra
+        )
+        logger.error(
+            f"[FolderDistCp] Failed in phase {diag['failure_phase']!r} "
+            f"(yarn_app_created={diag['yarn_app_created']}, phase_seconds={diag['phase_seconds']}, "
+            f"edge_host={diag['edge_host'] or 'unknown'})"
+        )
         result = {
+            **diag,
             'run_id': run_id,
             'source_path': source_path,
             'dest_bucket': dest_bucket,
@@ -1033,6 +1569,27 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
     distcp_files = int(distcp_result.get('distcp_files_copied', 0) or 0)
     throughput_mbps = float(distcp_result.get('throughput_mbps', 0.0) or 0.0)
 
+    phase_seconds = distcp_result.get('phase_seconds') or {}
+    parent_source_path = sql_quote(str(distcp_result.get('parent_source_path') or ''))
+    failure_phase = sql_quote(str(distcp_result.get('failure_phase') or ''))
+    yarn_app_created = str(bool(distcp_result.get('yarn_app_created'))).lower()
+    script_exit_code = _sql_int(distcp_result.get('script_exit_code'))
+    s3_list_before_s = _sql_num(phase_seconds.get('s3_list_before'))
+    source_scan_s = _sql_num(phase_seconds.get('source_scan'))
+    s3_list_after_s = _sql_num(phase_seconds.get('s3_list_after'))
+    diagnostics_json = sql_quote(json.dumps({
+        'phase_seconds': phase_seconds,
+        'listing_strategy': distcp_result.get('listing_strategy'),
+        'shallow': distcp_result.get('shallow'),
+        'split_role': distcp_result.get('split_role'),
+        'distcp_exit_code': distcp_result.get('distcp_exit_code'),
+        'memory_kill_suspected': distcp_result.get('memory_kill_suspected'),
+        'edge_host': distcp_result.get('edge_host'),
+        'edge_groups': distcp_result.get('edge_groups'),
+        'edge_sssd_running': distcp_result.get('edge_sssd_running'),
+        'edge_mem_available_mb': distcp_result.get('edge_mem_available_mb'),
+    }), 4000)
+
     execute_with_iceberg_retry(spark, f"""
         INSERT INTO {tracking_db}.data_copy_status (
             run_id, source_path, dest_bucket, dest_path,
@@ -1044,7 +1601,10 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
             error_message, updated_at,
             yarn_application_id, distcp_started_at, distcp_completed_at,
             distcp_duration_seconds, distcp_bytes_copied, distcp_files_copied,
-            throughput_mbps
+            throughput_mbps,
+            parent_source_path, failure_phase, yarn_app_created, script_exit_code,
+            s3_list_before_seconds, source_scan_seconds, s3_list_after_seconds,
+            validation_listing_seconds, diagnostics_json
         ) VALUES (
             '{run_id}',
             '{source_path}',
@@ -1070,7 +1630,16 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
             {distcp_duration},
             {distcp_bytes},
             {distcp_files},
-            {throughput_mbps}
+            {throughput_mbps},
+            '{parent_source_path}',
+            '{failure_phase}',
+            {yarn_app_created},
+            {script_exit_code},
+            {s3_list_before_s},
+            {source_scan_s},
+            {s3_list_after_s},
+            NULL,
+            '{diagnostics_json}'
         )
     """, task_label=f"record_data_copy_status:{source_path}")
 
@@ -1127,6 +1696,13 @@ def validate_data_copy(copy_status: dict, **context) -> dict:
             ti.xcom_push(key='return_value', value=result)
         return result
 
+    # Same listing the copy used, so validation timings are comparable with the copy's.
+    listing_strategy = copy_status.get('listing_strategy') or _resolve_listing_strategy(context)
+    shallow = bool(copy_status.get('shallow'))
+    dest_count_snippet = _listing_snippet(
+        f'hadoop fs{s3_opts}', f'"{s3_dest}"', 'DEST_FILE_COUNT', 'DEST_TOTAL_SIZE', listing_strategy, shallow
+    )
+
     cmd = f"""
 if ! hadoop fs{s3_opts} -test -d "{s3_dest}" 2>/dev/null; then
     echo "DEST_EXISTS=false"
@@ -1134,9 +1710,7 @@ if ! hadoop fs{s3_opts} -test -d "{s3_dest}" 2>/dev/null; then
     echo "DEST_TOTAL_SIZE=0"
 else
     echo "DEST_EXISTS=true"
-    DEST_FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "{s3_dest}" 2>/dev/null | grep '^-' | wc -l)
-    DEST_TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "{s3_dest}" 2>/dev/null | awk '{{print $1}}')
-    [ -z "$DEST_FILE_COUNT" ] && DEST_FILE_COUNT=0
+{dest_count_snippet}    [ -z "$DEST_FILE_COUNT" ] && DEST_FILE_COUNT=0
     [ -z "$DEST_TOTAL_SIZE" ] && DEST_TOTAL_SIZE=0
     echo "DEST_FILE_COUNT=$DEST_FILE_COUNT"
     echo "DEST_TOTAL_SIZE=$DEST_TOTAL_SIZE"
@@ -1147,13 +1721,20 @@ fi
     dest_file_count = 0
     dest_size_bytes = 0
     validation_error = None
+    validation_listing_seconds = None
 
     try:
         with ssh.get_conn() as client:
+            _listing_t0 = time.monotonic()
             _, stdout, stderr = client.exec_command(_login_shell(cmd, config.get('cluster_type', 'MapR')), timeout=SSH_COMMAND_TIMEOUT)
             output = stdout.read().decode()
             stderr.read()
             stdout.channel.recv_exit_status()
+            validation_listing_seconds = round(time.monotonic() - _listing_t0, 1)
+            logger.info(
+                f"[FolderValidate] Destination listing for {s3_dest} took "
+                f"{validation_listing_seconds}s (strategy={listing_strategy}, shallow={shallow})"
+            )
 
             for line in output.split('\n'):
                 line = line.strip()
@@ -1194,8 +1775,10 @@ fi
         'size_match': size_match,
         'validation_status': validation_status,
         'validation_error': validation_error,
+        'validation_listing_seconds': validation_listing_seconds,
     }
     if validation_status != 'VALIDATED':
+        result['failure_phase'] = copy_status.get('failure_phase') or 'validation'
         result['validation_error'] = (
             validation_error or 'file count or size mismatch'
         )
@@ -1242,6 +1825,8 @@ def update_data_copy_validation(validation_result: dict, spark) -> dict:
     distcp_bytes = int(validation_result.get('distcp_bytes_copied', 0) or 0)
     distcp_files = int(validation_result.get('distcp_files_copied', 0) or 0)
     throughput_mbps = float(validation_result.get('throughput_mbps', 0.0) or 0.0)
+    val_list_secs = _sql_num(validation_result.get('validation_listing_seconds'))
+    failure_phase = sql_quote(str(validation_result.get('failure_phase') or ''))
 
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.data_copy_status
@@ -1258,6 +1843,11 @@ def update_data_copy_validation(validation_result: dict, spark) -> dict:
             distcp_bytes_copied     = {distcp_bytes},
             distcp_files_copied     = {distcp_files},
             throughput_mbps         = {throughput_mbps},
+            validation_listing_seconds = {val_list_secs},
+            failure_phase    = CASE
+                                 WHEN '{failure_phase}' != '' THEN '{failure_phase}'
+                                 ELSE failure_phase
+                               END,
             error_message    = CASE
                                  WHEN '{val_error}' != '' THEN '{val_error}'
                                  ELSE error_message
@@ -1881,6 +2471,75 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark,
         </tbody>
     </table>
 
+    <div class="section-divider"></div>
+
+    <h2>Phase Timings &amp; Diagnostics</h2>
+    <p class="timestamp">
+        Seconds spent per phase before/after DistCp. A row with <em>YARN app created = no</em> and a
+        pre-DistCp failure phase (source_check, s3_list_before, source_scan) stopped before DistCp was
+        submitted. DistCp duration here is the DistCp command only; the DistCp Duration column above
+        covers the whole edge script, listings included.
+    </p>
+    <table>
+        <thead>
+            <tr>
+                <th>Source Path</th>
+                <th>Parent Folder</th>
+                <th>S3 List Before (s)</th>
+                <th>Source Scan (s)</th>
+                <th>DistCp Only (s)</th>
+                <th>S3 List After (s)</th>
+                <th>Validation List (s)</th>
+                <th>Listing</th>
+                <th>YARN App Created</th>
+                <th>Failure Phase</th>
+                <th>Exit Code</th>
+                <th>Memory Kill?</th>
+                <th>Edge Node (SSSD)</th>
+            </tr>
+        </thead>
+        <tbody>
+"""
+
+    def _secs(value):
+        try:
+            return f"{float(value):,.0f}" if value is not None else 'N/A'
+        except (TypeError, ValueError):
+            return 'N/A'
+
+    for f in folders:
+        try:
+            _diag = json.loads(getattr(f, 'diagnostics_json', None) or '{}')
+        except Exception:
+            _diag = {}
+        _phases = _diag.get('phase_seconds') or {}
+        _fphase = getattr(f, 'failure_phase', None) or ''
+        _yarn_created = getattr(f, 'yarn_app_created', None)
+        _exit = getattr(f, 'script_exit_code', None)
+        _edge = _diag.get('edge_host') or ''
+        _sssd = _diag.get('edge_sssd_running') or ''
+        html += f"""
+                <tr>
+                    <td>{_html_escape(str(f.source_path or ''))}</td>
+                    <td>{_html_escape(str(getattr(f, 'parent_source_path', '') or ''))}</td>
+                    <td class="metric">{_secs(getattr(f, 's3_list_before_seconds', None))}</td>
+                    <td class="metric">{_secs(getattr(f, 'source_scan_seconds', None))}</td>
+                    <td class="metric">{_secs(_phases.get('distcp'))}</td>
+                    <td class="metric">{_secs(getattr(f, 's3_list_after_seconds', None))}</td>
+                    <td class="metric">{_secs(getattr(f, 'validation_listing_seconds', None))}</td>
+                    <td>{_html_escape(str(_diag.get('listing_strategy') or ''))}{' (files only)' if _diag.get('shallow') else ''}</td>
+                    <td>{'yes' if _yarn_created else ('no' if _yarn_created is not None else 'N/A')}</td>
+                    <td>{_html_escape(_fphase) or '&mdash;'}</td>
+                    <td>{_html_escape(str(_exit)) if _exit is not None else 'N/A'}</td>
+                    <td>{'<span class="validation-warn">suspected</span>' if _diag.get('memory_kill_suspected') else 'no'}</td>
+                    <td>{_html_escape(_edge) or 'N/A'}{(' (SSSD ' + _html_escape(str(_sssd)) + ')') if _sssd else ''}</td>
+                </tr>
+"""
+
+    html += """
+        </tbody>
+    </table>
+
     <div style="margin-top:50px; padding-top:20px; border-top:1px solid #ecf0f1; color:#95a5a6; font-size:12px;">
         <p>This report was automatically generated by the Folder Data Copy DAG.</p>
     </div>
@@ -2007,6 +2666,30 @@ with DAG(
                 '(e.g. tenant_1, tenant_2). Blank = use the global cluster_* Variables.'
             )
         ),
+        'split_subfolders': Param(
+            default=None,
+            type=['null', 'boolean'],
+            description=(
+                'Copy each subfolder as its own DistCp task (for very large, deeply nested folders). '
+                'Blank = use the Variable folder_copy_split_subfolders / the per-row Excel column '
+                '(default: off).'
+            )
+        ),
+        'split_depth': Param(
+            default=None,
+            type=['null', 'integer'],
+            description='Directory levels to split when split_subfolders is on. Blank = 1.'
+        ),
+        'listing_strategy': Param(
+            default='',
+            type='string',
+            enum=['', 'ls_r', 'count'],
+            description=(
+                "How file counts/sizes are measured on source and S3: 'ls_r' = recursive ls + du "
+                "(original), 'count' = hadoop fs -count. Blank = Variable "
+                "folder_copy_listing_strategy, else 'ls_r'."
+            )
+        ),
     },
     render_template_as_native_obj=True,
     on_failure_callback=_folder_copy_dag_failure_callback,
@@ -2031,11 +2714,18 @@ with DAG(
         run_id=t_fc_run_id
     )
 
+    # Optional: split each folder into per-subfolder copies. Passes the rows through
+    # untouched (no SSH) unless split_subfolders is enabled.
+    t_fc_expand = expand_folder_subfolders(
+        folder_configs=t_fc_excel,
+        cluster_setup=t_fc_cluster
+    )
+
     # Per-folder: copy → record → validate → update validation (dynamically mapped)
     # max_active_tis_per_dagrun=3 caps concurrent DistCp YARN jobs
     t_fc_distcp = run_folder_distcp_ssh.override(
         trigger_rule='all_done', max_active_tis_per_dagrun=3
-    ).partial(cluster_setup=t_fc_cluster).expand(folder_config=t_fc_excel)
+    ).partial(cluster_setup=t_fc_cluster).expand(folder_config=t_fc_expand)
 
     t_fc_record = record_data_copy_status.override(
         trigger_rule='all_done'
@@ -2071,5 +2761,5 @@ with DAG(
     # Dependency chain — prereqs → init → run_id → excel → cluster → work
     # Per-folder chain is linear: distcp → record_status → validate → update_validation
     t_fc_prereq >> t_fc_init >> t_fc_run_id >> t_fc_cluster >> t_fc_excel
-    t_fc_excel >> t_fc_distcp >> t_fc_record >> t_fc_copy_validate >> t_fc_val_status
+    t_fc_excel >> t_fc_expand >> t_fc_distcp >> t_fc_record >> t_fc_copy_validate >> t_fc_val_status
     t_fc_val_status >> t_fc_final >> t_fc_report >> t_fc_email
