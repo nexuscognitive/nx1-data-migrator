@@ -1664,9 +1664,8 @@ def _default_metadata_record(tbl):
         "partition_file_counts": {{}},
         "out_of_dir_partition_count": 0,
         "out_of_dir_partitions": [],
-        "out_of_dir_size_bytes": 0,
-        "out_of_dir_file_count": 0,
         "out_of_dir_check_error": None,
+        "out_of_dir_check_seconds": 0,
     }}
 
 def database_exists(spark, db):
@@ -1954,86 +1953,66 @@ def discover_one_table(tbl):
 
         out_of_dir_partition_count = 0
         out_of_dir_partitions = []
-        out_of_dir_size_bytes = 0
-        out_of_dir_file_count = 0
         out_of_dir_check_error = None
-        if partition_definition and loc and metastore_partitions:
-            try:
-                def _qualify(x):
-                    try:
-                        _p = spark._jvm.org.apache.hadoop.fs.Path(x)
-                        return _p.getFileSystem(spark._jsc.hadoopConfiguration()).makeQualified(_p).toString()
-                    except Exception:
-                        return x.strip()
-
-                part_locations = {{}}
+        out_of_dir_check_seconds = 0
+        if {out_of_dir_check_enabled} and partition_definition and loc and metastore_partitions:
+            if len(metastore_partitions) > {out_of_dir_max_partitions}:
+                out_of_dir_check_error = (
+                    "out-of-dir check skipped: table has {{0}} partitions, "
+                    "above migration_out_of_dir_max_partitions={out_of_dir_max_partitions}"
+                ).format(len(metastore_partitions))
+            else:
+                _ood_started = time.time()
                 try:
+                    def _qualify(x):
+                        try:
+                            _p = spark._jvm.org.apache.hadoop.fs.Path(x)
+                            return _p.getFileSystem(spark._jsc.hadoopConfiguration()).makeQualified(_p).toString()
+                        except Exception:
+                            return x
+
+                    _root_cache = {{}}
+
+                    def _is_outside(raw):
+                        if is_path_inside_root(raw, loc):
+                            return False
+                        if "root" not in _root_cache:
+                            _root_cache["root"] = _qualify(loc)
+                        return not is_path_inside_root(_qualify(raw), _root_cache["root"])
+
                     _cat = spark._jsparkSession.sessionState().catalog().externalCatalog()
                     _seq = _cat.listPartitions(src_db, tbl, spark._jvm.scala.Option.empty())
                     _conv = spark._jvm.scala.collection.JavaConverters
+                    _flagged = {{}}
                     for _cp in _conv.seqAsJavaListConverter(_seq).asJava():
-                        _spec = _conv.mapAsJavaMapConverter(_cp.spec()).asJava()
                         _uri = _cp.storage().locationUri()
                         if not _uri.isDefined():
                             continue
+                        _raw = _uri.get().toString()
+                        if not _is_outside(_raw):
+                            continue
+                        _spec = _conv.mapAsJavaMapConverter(_cp.spec()).asJava()
                         _key = "/".join(
                             "{{0}}={{1}}".format(c, _spec.get(c)) for c in partition_cols_from_describe
                         )
-                        part_locations[_key] = _uri.get().toString()
-                except Exception:
-                    part_locations = {{}}
-                    if len(metastore_partitions) > 2000:
-                        out_of_dir_check_error = (
-                            "partition location lookup skipped: bulk listPartitions failed "
-                            "and table has {{0}} partitions".format(len(metastore_partitions))
-                        )
-                    for _ps in (metastore_partitions if out_of_dir_check_error is None else []):
-                        _kv = [seg.split("=", 1) for seg in _ps.split("/") if "=" in seg]
-                        _spec_sql = ", ".join(
-                            "{{0}}='{{1}}'".format(k, v.replace("'", "\\\\'")) for k, v in _kv
-                        )
-                        for _r in spark.sql(
-                            "DESCRIBE FORMATTED {{0}}.{{1}} PARTITION ({{2}})".format(src_db, tbl, _spec_sql)
-                        ).collect():
-                            if (_r.col_name or "").strip().rstrip(":").lower() == "location":
-                                part_locations[_ps] = (_r.data_type or "").strip()
-                                break
-
-                in_scope = sorted(part_locations.keys())
-                if filter_expr:
-                    in_scope = apply_partition_filter(in_scope, filter_expr)
-
-                root_q = _qualify(loc)
-                for _ps in in_scope:
-                    _loc_q = _qualify(part_locations[_ps])
-                    if is_path_inside_root(_loc_q, root_q):
-                        continue
-                    out_of_dir_partition_count += 1
-                    _size, _files, _exists = 0, 0, False
-                    try:
-                        _pp = spark._jvm.org.apache.hadoop.fs.Path(_loc_q)
-                        _pfs = _pp.getFileSystem(spark._jsc.hadoopConfiguration())
-                        _exists = bool(_pfs.exists(_pp))
-                        if _exists:
-                            _cs = _pfs.getContentSummary(_pp)
-                            _size = int(_cs.getLength())
-                            _files = int(_cs.getFileCount())
-                    except Exception:
-                        pass
-                    out_of_dir_size_bytes += _size
-                    out_of_dir_file_count += _files
-                    if len(out_of_dir_partitions) < 100:
-                        out_of_dir_partitions.append({{
-                            "partition": _ps,
-                            "location": _loc_q,
-                            "size_bytes": _size,
-                            "file_count": _files,
-                            "exists": _exists,
-                        }})
-            except Exception as _e:
-                out_of_dir_check_error = str(_e)[:300]
-                print("WARNING: out-of-dir partition check for {{0}}.{{1}} failed ({{2}})".format(
-                    src_db, tbl, out_of_dir_check_error))
+                        _flagged[_key] = _raw
+                    _flagged_keys = sorted(_flagged.keys())
+                    if filter_expr:
+                        _flagged_keys = apply_partition_filter(_flagged_keys, filter_expr)
+                    for _ps in _flagged_keys:
+                        out_of_dir_partition_count += 1
+                        if len(out_of_dir_partitions) < 100:
+                            out_of_dir_partitions.append({{
+                                "partition": _ps,
+                                "location": _flagged[_ps],
+                            }})
+                except Exception as _e:
+                    out_of_dir_partition_count = 0
+                    out_of_dir_partitions = []
+                    out_of_dir_check_error = "out-of-dir check failed: " + str(_e)[:300]
+                    print("WARNING: out-of-dir partition check for {{0}}.{{1}} failed ({{2}})".format(
+                        src_db, tbl, out_of_dir_check_error))
+                out_of_dir_check_seconds = round(time.time() - _ood_started, 2)
 
         # Apply partition filter
         full_partition_count = len(metastore_partitions)
@@ -2174,9 +2153,8 @@ def discover_one_table(tbl):
             "source_path_exists": source_path_exists,
             "out_of_dir_partition_count": out_of_dir_partition_count,
             "out_of_dir_partitions": out_of_dir_partitions,
-            "out_of_dir_size_bytes": out_of_dir_size_bytes,
-            "out_of_dir_file_count": out_of_dir_file_count,
             "out_of_dir_check_error": out_of_dir_check_error,
+            "out_of_dir_check_seconds": out_of_dir_check_seconds,
         }})
         return record
 
@@ -2240,6 +2218,10 @@ spark.stop()
                 config, "metastore_retry_backoff_seconds", 15, 0, 300
             ),
             metastore_failure_retries=_int_setting(config, "metastore_failure_retries", 5, 0, 20),
+            out_of_dir_check_enabled=bool(config.get("out_of_dir_check_enabled", True)),
+            out_of_dir_max_partitions=_int_setting(
+                config, "out_of_dir_max_partitions", 20000, 1, 10000000
+            ),
             metastore_socket_timeout=_duration_setting(config, "metastore_socket_timeout", "600s"),
             per_table_parallelism=_int_setting(
                 config, "discovery_per_table_parallelism", 8, 1, 64
@@ -2380,6 +2362,11 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
             logger.info(
                 f"  Discovered: {src_db}.{t['source_table']} | format={t['file_format']} | partitions={t['partition_count']} | rows={t['row_count']} | size={t.get('source_total_size_bytes',0)/(1024**2):.1f} MB"
             )
+            if t.get("out_of_dir_check_seconds"):
+                logger.info(
+                    f"  Out-of-dir check for {src_db}.{t['source_table']}: "
+                    f"{t['out_of_dir_check_seconds']}s ({t.get('partition_count', 0)} partitions)"
+                )
             if t.get("out_of_dir_check_error"):
                 logger.warning(
                     f"  Out-of-directory partition check incomplete for {src_db}.{t['source_table']}: "
@@ -2389,8 +2376,7 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
                 _ood = t.get("out_of_dir_partitions") or []
                 logger.warning(
                     f"  Out-of-directory partitions for {src_db}.{t['source_table']}: "
-                    f"{t['out_of_dir_partition_count']} partition(s), "
-                    f"{t.get('out_of_dir_size_bytes', 0)/(1024**2):.1f} MB not under "
+                    f"{t['out_of_dir_partition_count']} partition(s) not under "
                     f"{t.get('source_location', '')} (will not be copied by DistCp) | "
                     + "; ".join(f"{o['partition']} -> {o['location']}" for o in _ood[:5])
                 )

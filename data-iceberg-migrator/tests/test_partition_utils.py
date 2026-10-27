@@ -222,3 +222,9 @@ class TestIsPathInsideRoot:
     def test_normalize_path_keeps_bare_slash(self):
         assert pu.normalize_path('/') == '/'
         assert pu.normalize_path(' /a/b// ') == '/a/b'
+
+    def test_missing_scheme_or_authority_compares_paths_only(self):
+        assert pu.is_path_inside_root('/a/b/dt=1', self.ROOT) is True
+        assert pu.is_path_inside_root('maprfs:///a/b/dt=1', self.ROOT) is True
+        assert pu.is_path_inside_root('maprfs:/a/b/dt=1', self.ROOT) is True
+        assert pu.is_path_inside_root('/a/bc/dt=1', self.ROOT) is False

@@ -659,6 +659,12 @@ def get_config() -> dict:
             'MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM',
             '8',
         ),
+        'out_of_dir_check_enabled': str(
+            _var('migration_out_of_dir_check_enabled', 'MIGRATION_OUT_OF_DIR_CHECK_ENABLED', 'true')
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+        'out_of_dir_max_partitions': _var(
+            'migration_out_of_dir_max_partitions', 'MIGRATION_OUT_OF_DIR_MAX_PARTITIONS', '20000'
+        ),
         'metastore_retry_attempts': _var('migration_metastore_retry_attempts', 'MIGRATION_METASTORE_RETRY_ATTEMPTS', '4'),
         'metastore_retry_backoff_seconds': _var('migration_metastore_retry_backoff_seconds', 'MIGRATION_METASTORE_RETRY_BACKOFF_SECONDS', '15'),
         'metastore_socket_timeout': _var('migration_metastore_socket_timeout', 'MIGRATION_METASTORE_SOCKET_TIMEOUT', '600s'),

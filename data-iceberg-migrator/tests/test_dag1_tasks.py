@@ -4656,7 +4656,6 @@ class TestOutOfDirPartitions:
 
     OOD = [{
         'partition': 'dt=2024-01-02', 'location': 'maprfs:/other/dt=2024-01-02',
-        'size_bytes': 2048, 'file_count': 2, 'exists': True,
     }]
 
     def test_remote_script_has_out_of_dir_logic_and_compiles(self, mock_ssh_hook, sample_run_id):
@@ -4668,7 +4667,6 @@ class TestOutOfDirPartitions:
         sftp_file = client.open_sftp.return_value.file.return_value
         script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
         compile(script, 'discover_tables.py', 'exec')
-        assert 'is_path_inside_root' in script
         assert '"out_of_dir_partition_count": out_of_dir_partition_count' in script
         assert '"out_of_dir_check_error": None' in script
         assert 'listPartitions' in script
@@ -4678,7 +4676,7 @@ class TestOutOfDirPartitions:
         disc = TestDiscoverTablesViaSshSpark()
         record = disc._make_metadata_record(
             'orders', out_of_dir_partition_count=1, out_of_dir_partitions=self.OOD,
-            out_of_dir_size_bytes=2048, out_of_dir_file_count=2, out_of_dir_check_error=None,
+            out_of_dir_check_error=None,
         )
         with caplog.at_level(logging.WARNING):
             result = disc._run_discovery(client, [record], sample_run_id, ['orders'])
@@ -4802,8 +4800,7 @@ class TestOutOfDirPartitions:
 
     def test_report_renders_out_of_dir_card_and_badge(self, mock_spark, sample_run_id):
         import json
-        ood = [{'partition': 'dt=<b>', 'location': 'maprfs:/other/x&y', 'size_bytes': 1,
-                'file_count': 1, 'exists': True}]
+        ood = [{'partition': 'dt=<b>', 'location': 'maprfs:/other/x&y'}]
         html = self._report(
             mock_spark, sample_run_id,
             out_of_dir_partition_count=1, out_of_dir_partitions=json.dumps(ood),
@@ -4825,20 +4822,81 @@ class TestOutOfDirPartitions:
         )
         assert zero == html
 
-    def test_remote_script_qualifies_each_path_with_its_own_filesystem(self, mock_ssh_hook, sample_run_id):
+    def _script(self, mock_ssh_hook, sample_run_id):
         _, client, _, _ = mock_ssh_hook
         disc = TestDiscoverTablesViaSshSpark()
         disc._run_discovery(
             client, [disc._make_metadata_record('orders')], sample_run_id, ['orders'],
         )
         sftp_file = client.open_sftp.return_value.file.return_value
-        script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+        return sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
+
+    def _block(self, script):
+        return script[script.index('out_of_dir_partition_count = 0'):script.index('# Apply partition filter')]
+
+    def test_remote_script_uses_raw_fast_path_then_qualify_recheck(self, mock_ssh_hook, sample_run_id):
+        script = self._script(mock_ssh_hook, sample_run_id)
         compile(script, 'discover_tables.py', 'exec')
-        qualify = script[script.index('def _qualify'):script.index('part_locations = {}')]
-        assert 'getFileSystem(spark._jsc.hadoopConfiguration()).makeQualified(_p)' in qualify
-        assert 'return x.strip()' in qualify
-        assert 'len(metastore_partitions) > 2000' in script
-        assert '_pfs.getContentSummary(_pp)' in script
+        block = self._block(script)
+        fast = block.index('if is_path_inside_root(raw, loc):')
+        qualify = block.index('getFileSystem(spark._jsc.hadoopConfiguration()).makeQualified(_p)')
+        recheck = block.index('is_path_inside_root(_qualify(raw), _root_cache["root"])')
+        assert fast < recheck
+        assert 'return x\n' in block
+        assert 'listPartitions' in block and 'DESCRIBE' not in block and 'spark.sql' not in block
+        assert '"location": _flagged[_ps]' in block
+        assert qualify > 0
+
+    def test_remote_script_builds_key_after_location_check_and_filters_flagged_only(
+        self, mock_ssh_hook, sample_run_id
+    ):
+        block = self._block(self._script(mock_ssh_hook, sample_run_id))
+        assert block.index('if not _is_outside(_raw):') < block.index('_cp.spec()')
+        assert block.index('_cp.spec()') < block.index('_key = "/".join(')
+        assert block.index('_flagged_keys = sorted(') < block.index('apply_partition_filter(_flagged_keys, filter_expr)')
+        assert 'filter_expr =' not in block
+
+    def test_remote_script_guard_message_and_timing(self, mock_ssh_hook, sample_run_id):
+        script = self._script(mock_ssh_hook, sample_run_id)
+        block = self._block(script)
+        assert 'len(metastore_partitions) > 20000' in block
+        assert 'out-of-dir check skipped: table has {0} partitions, ' in block
+        assert 'above migration_out_of_dir_max_partitions=20000' in block
+        assert 'round(time.time() - _ood_started, 2)' in block
+        assert '"out_of_dir_check_seconds": out_of_dir_check_seconds' in script
+        assert '"out_of_dir_check_seconds": 0' in script
+
+    def test_discovery_passes_through_and_logs_check_seconds(self, mock_ssh_hook, sample_run_id, caplog):
+        _, client, _, _ = mock_ssh_hook
+        disc = TestDiscoverTablesViaSshSpark()
+        record = disc._make_metadata_record(
+            'orders', out_of_dir_check_seconds=1.25, partition_count=42,
+        )
+        with caplog.at_level(logging.INFO):
+            result = disc._run_discovery(client, [record], sample_run_id, ['orders'])
+        assert result['tables'][0]['out_of_dir_check_seconds'] == 1.25
+        assert 'Out-of-dir check for sales.orders: 1.25s (42 partitions)' in caplog.text
+
+    def test_no_timing_log_when_check_did_not_run(self, mock_ssh_hook, sample_run_id, caplog):
+        _, client, _, _ = mock_ssh_hook
+        disc = TestDiscoverTablesViaSshSpark()
+        record = disc._make_metadata_record('orders', out_of_dir_check_seconds=0)
+        with caplog.at_level(logging.INFO):
+            disc._run_discovery(client, [record], sample_run_id, ['orders'])
+        assert 'Out-of-dir check for' not in caplog.text
+
+    def test_remote_script_check_disabled_and_limit_from_config(self, mock_ssh_hook, sample_run_id):
+        base = m.get_config()
+        with patch.object(m, 'get_config', return_value={
+            **base, 'out_of_dir_check_enabled': False, 'out_of_dir_max_partitions': '50',
+        }):
+            script = self._script(mock_ssh_hook, sample_run_id)
+        compile(script, 'discover_tables.py', 'exec')
+        assert 'if False and partition_definition' in script
+        assert 'len(metastore_partitions) > 50' in script
+        assert 'above migration_out_of_dir_max_partitions=50' in script
+        block = self._block(script)
+        assert block.index('if False and partition_definition') < block.index('listPartitions')
 
     def test_discovery_warns_on_out_of_dir_check_error(self, mock_ssh_hook, sample_run_id, caplog):
         _, client, _, _ = mock_ssh_hook
