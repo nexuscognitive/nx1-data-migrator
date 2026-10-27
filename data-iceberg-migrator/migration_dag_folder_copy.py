@@ -148,14 +148,18 @@ _MEMORY_KILL_RE = re.compile(
     re.IGNORECASE,
 )
 # One `hadoop fs -ls` entry (MapR-FS and HDFS): perms, replication, owner, group, size, date, time, path.
+# Owner and group may contain spaces on AD/SSSD-joined clusters (e.g. "domain users"), so they are
+# matched loosely; the size/date anchor after them is what identifies the fields.
 _LS_LINE_RE = re.compile(
-    r'^(?P<kind>[-dl])[rwxsStT-]{9}[+.]?\s+\S+\s+\S+\s+\S+\s+(?P<size>\d+)\s+'
+    r'^(?P<kind>[-dlbcps])[rwxsStT-]{9}[+.@]?\s+\S+\s+.+?\s+(?P<size>\d+)\s+'
     r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+(?P<path>.+?)\s*$'
 )
+_LS_HEADER_RE = re.compile(r'^Found (\d+) items?$')
 
 
 def _truthy(value) -> bool:
-    return str(value).strip().lower() in ('true', '1', 'yes', 'y', 'on')
+    # '1.0' is included because pandas reads an all-numeric/boolean Excel column as float.
+    return str(value).strip().lower() in ('true', '1', '1.0', 'yes', 'y', 'on')
 
 
 def _sql_num(value) -> str:
@@ -216,6 +220,63 @@ def _resolve_listing_strategy(context: dict = None) -> str:
     return value
 
 
+def _allow_delete(config: dict) -> bool:
+    """folder_copy_allow_delete: config key > Airflow Variable > env FOLDER_COPY_ALLOW_DELETE."""
+    raw = config.get('folder_copy_allow_delete')
+    if raw is None:
+        try:
+            from airflow.models import Variable
+            raw = Variable.get('folder_copy_allow_delete', default_var=None)
+        except Exception:
+            raw = None
+    if raw is None:
+        raw = os.environ.get('FOLDER_COPY_ALLOW_DELETE')
+    return _truthy(raw)
+
+
+def _int_setting(name: str, context: dict, default: int, minimum: int) -> int:
+    """Integer setting that falls back to `default` with a warning instead of failing the task."""
+    raw = _resolve_setting(name, context, default=default)
+    try:
+        value = float(str(raw).strip())
+        if not value.is_integer() or value < minimum:
+            raise ValueError('not an integer >= %d' % minimum)
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(f"[FolderSplit] Invalid {name}={raw!r} — using default {default}")
+        return default
+
+
+def _airflow_map_limit() -> int:
+    """Airflow's core.max_map_length: the most dynamic-task mappings one DAG run may create."""
+    try:
+        from airflow.configuration import conf
+        return conf.getint('core', 'max_map_length', fallback=1024)
+    except Exception:
+        return 1024
+
+
+def _diagnostics_json(diag: dict, limit: int = 4000) -> str:
+    """JSON for the diagnostics column that always parses, even when it is long.
+
+    edge_groups (one entry per AD group) is the field that can grow large, so it is
+    shortened first and dropped only if the rest still does not fit.
+    """
+    text = json.dumps(diag)
+    if len(text) <= limit:
+        return text
+    groups = str(diag.get('edge_groups') or '')
+    keep = max(0, len(groups) - (len(text) - limit) - 3)
+    diag = {**diag, 'edge_groups': (groups[:keep] + '...') if keep else None}
+    text = json.dumps(diag)
+    if len(text) > limit:
+        diag = {**diag, 'edge_groups': None}
+        text = json.dumps(diag)
+    if len(text) > limit:
+        text = json.dumps({'truncated': True})
+    return text
+
+
 def _listing_snippet(
     hadoop_cmd: str,
     path_expr: str,
@@ -237,7 +298,9 @@ def _listing_snippet(
         template = (
             "_SHALLOW_LS=$(@HC@ -ls @PATH@ 2>/dev/null | grep '^-')\n"
             "@FV@=$(printf '%s\\n' \"$_SHALLOW_LS\" | grep -c '^-')\n"
-            "@SV@=$(printf '%s\\n' \"$_SHALLOW_LS\" | awk '/^-/ {s+=$5} END {print s+0}')\n"
+            # Size is the field just before the YYYY-MM-DD date: a fixed column breaks when
+            # owner/group are omitted (Hadoop 2.7 S3A) or contain spaces.
+            "@SV@=$(printf '%s\\n' \"$_SHALLOW_LS\" | awk '/^-/ {for (i = 2; i < NF; i++) if ($i ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) {s += $(i-1); break}} END {print s+0}')\n"
         )
     elif strategy == 'count':
         template = (
@@ -380,7 +443,12 @@ def _build_run_diagnostics(
 
 def _list_immediate_children(ssh, config: dict, path: str) -> tuple:
     """Return (sorted subdirectory paths, sorted [(file path, size)]) directly under `path`."""
-    cmd = f'hadoop fs -ls "{path}"'
+    # Force a UTF-8 locale: the edge's login shell may be C/POSIX, which prints non-ASCII
+    # names as '?', and the split would then copy them to a different S3 key.
+    cmd = (
+        'LC_ALL=C.UTF-8 HADOOP_CLIENT_OPTS="-Dsun.jnu.encoding=UTF-8 -Dfile.encoding=UTF-8 '
+        f'$HADOOP_CLIENT_OPTS" hadoop fs -ls "{path}"'
+    )
     with ssh.get_conn() as client:
         _, stdout, stderr = client.exec_command(
             _login_shell(cmd, config.get('cluster_type', 'MapR')),
@@ -392,17 +460,38 @@ def _list_immediate_children(ssh, config: dict, path: str) -> tuple:
     if rc != 0:
         raise RuntimeError(f"`hadoop fs -ls {path}` exited {rc}: {err.strip()[:300]}")
 
+    # Fail safe: any line we cannot classify raises, so the caller copies the folder whole
+    # instead of silently leaving entries out of the split.
     dirs, files = [], []
-    for line in out.splitlines():
-        match = _LS_LINE_RE.match(line.strip())
-        if not match:
+    expected = None
+    parsed = 0
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
+        header = _LS_HEADER_RE.match(line)
+        if header:
+            expected = int(header.group(1))
+            continue
+        match = _LS_LINE_RE.match(line)
+        if not match:
+            raise ValueError(f"unrecognised `hadoop fs -ls` line under {path}: {line[:200]!r}")
+        parsed += 1
         entry_path = match.group('path')
-        if match.group('kind') == 'd':
+        kind = match.group('kind')
+        # '?' is what the shell prints for undecodable bytes, and U+FFFD is what decoding
+        # yields. Either way the name is not the real one, so the split cannot be trusted.
+        if any(ch in entry_path for ch in ('?', '�')):
+            raise ValueError(f"{path} has an entry with an unverifiable name ({entry_path!r}); cannot split safely")
+        if kind == 'd':
             if os.path.basename(entry_path.rstrip('/')) != '.snapshot':
                 dirs.append(entry_path)
-        elif match.group('kind') == '-':
+        elif kind == '-':
             files.append((entry_path, int(match.group('size'))))
+        else:
+            raise ValueError(f"{path} contains a non-regular entry ({entry_path}); cannot split safely")
+    if expected is not None and expected != parsed:
+        raise ValueError(f"`hadoop fs -ls {path}` reported {expected} items but {parsed} were parsed")
     return sorted(dirs), sorted(files)
 
 
@@ -838,7 +927,7 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
         if raw_split is None or str(raw_split).strip().lower() in ('', 'nan', 'none'):
             split_subfolders = None
         else:
-            split_subfolders = str(raw_split).strip().lower() in ('true', '1', 'yes', 'y', 'on')
+            split_subfolders = _truthy(raw_split)
 
         config_entry = {
             'run_id': run_id,
@@ -930,19 +1019,30 @@ def expand_folder_subfolders(folder_configs: list, cluster_setup: dict = None, *
         logger.info("[FolderSplit] Subfolder splitting not requested — copying folders whole")
         return folder_configs
 
-    depth = max(1, int(_resolve_setting('split_depth', context, default=1)))
-    max_entries = int(_resolve_setting('max_split_entries', context, default=1000))
-    max_loose = int(_resolve_setting('max_loose_files', context, default=200))
+    depth = _int_setting('split_depth', context, default=1, minimum=1)
+    max_entries = _int_setting('max_split_entries', context, default=1000, minimum=1)
+    max_loose = _int_setting('max_loose_files', context, default=200, minimum=0)
+    map_limit = _airflow_map_limit()
 
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
+    # DistCp -delete only runs inside each task, so it cannot remove a subfolder or file
+    # that vanished from the source: no task would cover it any more. Copy whole instead.
+    delete_on = config.get('distcp_preserve_delete') is True and _allow_delete(config)
 
     expanded = []
-    for cfg, split_this in zip(folder_configs, wanted):
+    for index, (cfg, split_this) in enumerate(zip(folder_configs, wanted, strict=False)):
         if not split_this:
             expanded.append(cfg)
             continue
         source_path = cfg['source_path']
+        if delete_on:
+            logger.warning(
+                f"[FolderSplit] {source_path} copied whole — folder_copy_allow_delete is on and "
+                f"splitting would stop DistCp -delete from removing deleted source content"
+            )
+            expanded.append(cfg)
+            continue
         try:
             entries = _split_folder_config(ssh, config, cfg, depth, max_loose)
         except Exception as exc:
@@ -959,21 +1059,31 @@ def expand_folder_subfolders(folder_configs: list, cluster_setup: dict = None, *
             )
             expanded.append(cfg)
             continue
+        # Airflow fails the whole task when the mapped list exceeds core.max_map_length,
+        # so keep a running total. Every row not yet processed still needs one slot.
+        remaining = len(folder_configs) - index - 1
+        if len(expanded) + len(entries) + remaining > map_limit:
+            logger.error(
+                f"[FolderSplit] Splitting {source_path} would exceed core.max_map_length "
+                f"({map_limit}) across this run — copying it whole"
+            )
+            expanded.append(cfg)
+            continue
         if len(entries) == 1 and entries[0] is cfg:
             logger.info(f"[FolderSplit] {source_path} has no subfolders — nothing to split")
         else:
             loose = sum(1 for e in entries if e.get('split_role') == 'loose_files')
             logger.info(
                 f"[FolderSplit] {source_path} -> {len(entries) - loose} subfolder task(s)"
-                + (f" + 1 loose-files task" if loose else "")
+                + (" + 1 loose-files task" if loose else "")
                 + f" (depth={depth})"
             )
         expanded.extend(entries)
 
-    if len(expanded) > 1024:
+    if len(expanded) > map_limit:
         logger.warning(
-            f"[FolderSplit] {len(expanded)} copy tasks generated; Airflow's default "
-            f"core.max_map_length is 1024 and mapping may fail above it"
+            f"[FolderSplit] {len(expanded)} copy tasks generated, over core.max_map_length "
+            f"({map_limit}); the mapped task will fail even without splitting"
         )
     return expanded
 
@@ -1040,21 +1150,10 @@ def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **con
     )
     log_name = re.sub(r'[^A-Za-z0-9_.-]', '_', str(dest_folder or 'folder')).strip('_') or 'folder'
 
-    allow_delete_raw = config.get('folder_copy_allow_delete')
-    if allow_delete_raw is None:
-        try:
-            from airflow.models import Variable
-            allow_delete_raw = Variable.get('folder_copy_allow_delete', default_var=None)
-        except Exception:
-            allow_delete_raw = None
-    if allow_delete_raw is None:
-        allow_delete_raw = os.environ.get('FOLDER_COPY_ALLOW_DELETE')
-    allow_delete = str(allow_delete_raw).strip().lower() in ('true', '1', 'yes', 'on')
-
     # Never delete for a loose-files copy: its destination also holds the subfolder
     # copies, which DistCp -delete would remove as "not in the source".
     delete_flag = ''
-    if config.get('distcp_preserve_delete') is True and allow_delete and not shallow:
+    if config.get('distcp_preserve_delete') is True and _allow_delete(config) and not shallow:
         delete_flag = ' -delete'
 
     s3_opts = build_s3_opts(dest_bucket, config, dest_endpoint)
@@ -1577,7 +1676,7 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
     s3_list_before_s = _sql_num(phase_seconds.get('s3_list_before'))
     source_scan_s = _sql_num(phase_seconds.get('source_scan'))
     s3_list_after_s = _sql_num(phase_seconds.get('s3_list_after'))
-    diagnostics_json = sql_quote(json.dumps({
+    diagnostics_json = sql_quote(_diagnostics_json({
         'phase_seconds': phase_seconds,
         'listing_strategy': distcp_result.get('listing_strategy'),
         'shallow': distcp_result.get('shallow'),
@@ -1588,7 +1687,7 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
         'edge_groups': distcp_result.get('edge_groups'),
         'edge_sssd_running': distcp_result.get('edge_sssd_running'),
         'edge_mem_available_mb': distcp_result.get('edge_mem_available_mb'),
-    }), 4000)
+    }))
 
     execute_with_iceberg_retry(spark, f"""
         INSERT INTO {tracking_db}.data_copy_status (
