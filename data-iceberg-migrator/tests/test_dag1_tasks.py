@@ -2871,6 +2871,13 @@ class TestUpdateDistcpStatus:
             's3a://test-bucket/checkpoints/run/db/mapping/*/attempt-*.json'
         )
 
+    def test_spark_reader_returns_empty_when_prefix_has_no_attempts(self, mock_spark):
+        fs = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+        fs.globStatus.return_value = []
+        result = m._read_spark_distcp_checkpoints(mock_spark, 's3a://test-bucket/checkpoints/run/db/mapping')
+        assert result == []
+        mock_spark.read.json.assert_not_called()
+
     def test_sets_failed_on_error(self, mock_spark, sample_distcp_result, mock_iceberg_retry):
         sample_distcp_result['distcp_results'][0]['status'] = 'FAILED'
         sample_distcp_result['distcp_results'][0]['error'] = 'Network error'
@@ -4458,6 +4465,99 @@ class TestFinalizeRun:
         ))
         assert "status = 'COMPLETED'" in sqls
         assert 'COMPLETED_WITH_MISSING' not in sqls
+
+
+class TestCleanupCheckpoints:
+    def test_prefixes_cover_both_roots(self, sample_run_id):
+        config = {**m.get_config(),
+                  'distcp_checkpoint_location': 's3://trk/_distcp_checkpoints/',
+                  'discovery_checkpoint_location': 's3a://trk/_discovery_checkpoints'}
+        assert m._checkpoint_run_prefixes(config, sample_run_id) == [
+            f's3a://trk/_distcp_checkpoints/{sample_run_id}',
+            f's3a://trk/_discovery_checkpoints/{sample_run_id}',
+        ]
+
+    def test_prefix_is_parent_of_what_the_writers_use(self, sample_discovery):
+        config = {**m.get_config(), 'distcp_checkpoint_location': 's3a://trk/d',
+                  'discovery_checkpoint_location': 's3a://trk/v'}
+        distcp_run, discovery_run = m._checkpoint_run_prefixes(config, sample_discovery['run_id'])
+        assert m._distcp_checkpoint_prefix('s3a://trk/d', sample_discovery).startswith(distcp_run + '/')
+        assert m._discovery_checkpoint_prefix('s3a://trk/v', sample_discovery).startswith(discovery_run + '/')
+
+    def test_skips_disabled_discovery_root(self, sample_run_id):
+        config = {**m.get_config(), 'distcp_checkpoint_location': 's3a://trk/d',
+                  'discovery_checkpoint_location': '  '}
+        assert m._checkpoint_run_prefixes(config, sample_run_id) == [f's3a://trk/d/{sample_run_id}']
+
+    def test_dedupes_identical_roots(self, sample_run_id):
+        config = {**m.get_config(), 'distcp_checkpoint_location': 's3a://trk/c',
+                  'discovery_checkpoint_location': 's3a://trk/c/'}
+        assert m._checkpoint_run_prefixes(config, sample_run_id) == [f's3a://trk/c/{sample_run_id}']
+
+    @pytest.mark.parametrize('bad', [None, '', 'run_x', '../run_20250101_120000_abcd1234',
+                                     'run_20250101_120000_abcd1234/..', 'run_20250101_120000_ABCD1234',
+                                     'run_20250101_120000_abcd1234\n'])
+    def test_rejects_unsafe_run_id(self, bad):
+        with pytest.raises(ValueError):
+            m._checkpoint_run_prefixes(m.get_config(), bad)
+
+    def test_delete_runs_one_session_with_skiptrash(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(0, b''), MagicMock())
+        m._delete_edge_checkpoint_prefixes(hook, ['s3a://trk/a/run_1', 's3a://trk/b/run_1'], m.get_config())
+        assert client.exec_command.call_count == 1
+        cmd = client.exec_command.call_args.args[0]
+        assert cmd.count('-rm -r -f -skipTrash') == 2
+        assert 's3a://trk/a/run_1' in cmd and 's3a://trk/b/run_1' in cmd
+
+    def test_each_prefix_uses_its_own_s3_opts(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(0, b''), MagicMock())
+        with patch.object(m, 'build_s3_opts', side_effect=lambda url, cfg, *a: f' -D{url.split("/")[2]}=1'):
+            m._delete_edge_checkpoint_prefixes(hook, ['s3a://bkt-a/x/run_1', 's3a://bkt-b/y/run_1'], m.get_config())
+        cmd = client.exec_command.call_args.args[0]
+        assert 'hadoop fs -Dbkt-a=1 -rm' in cmd and 'hadoop fs -Dbkt-b=1 -rm' in cmd
+
+    def test_one_failed_rm_does_not_stop_the_next(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(0, b''), MagicMock())
+        m._delete_edge_checkpoint_prefixes(hook, ['s3a://trk/a/run_1', 's3a://trk/b/run_1'], m.get_config())
+        cmd = client.exec_command.call_args.args[0]
+        assert cmd.count('|| rc=1') == 2 and 'exit "$rc"' in cmd
+
+    def test_delete_raises_on_nonzero_exit(self, mock_ssh_hook):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b'Permission denied'
+        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(1, b''), stderr)
+        with pytest.raises(RuntimeError, match='Permission denied'):
+            m._delete_edge_checkpoint_prefixes(hook, ['s3a://trk/a/run_1'], m.get_config())
+
+    def test_task_deletes_both_prefixes(self, mock_ssh_hook, sample_run_id):
+        _, client, _, _ = mock_ssh_hook
+        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(0, b''), MagicMock())
+        result = m.cleanup_checkpoints.function(run_id=sample_run_id)
+        assert len(result['deleted']) == 2 and 'error' not in result
+        cmd = client.exec_command.call_args.args[0]
+        assert f'_distcp_checkpoints/{sample_run_id}' in cmd
+        assert f'_discovery_checkpoints/{sample_run_id}' in cmd
+
+    def test_task_invalid_run_id_skips_ssh(self, mock_ssh_hook):
+        _, client, _, _ = mock_ssh_hook
+        result = m.cleanup_checkpoints.function(run_id=None)
+        assert result['deleted'] == [] and 'run_id' in result['error']
+        client.exec_command.assert_not_called()
+
+    def test_task_swallows_ssh_failure(self, mock_ssh_hook, sample_run_id, caplog):
+        _, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b'AccessDeniedException'
+        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(1, b''), stderr)
+        with caplog.at_level(logging.WARNING):
+            result = m.cleanup_checkpoints.function(run_id=sample_run_id)
+        assert result['deleted'] == [] and 'AccessDeniedException' in result['error']
+        assert any(r.levelno == logging.WARNING and '[cleanup_checkpoints]' in r.getMessage()
+                   for r in caplog.records)
 
 
 class TestFlattenAndBatch:

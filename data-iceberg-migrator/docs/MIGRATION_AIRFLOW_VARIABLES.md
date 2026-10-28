@@ -86,7 +86,7 @@ discovery that doesn't share these knobs; DAG 3 is folder-copy with no discovery
 | `migration_discovery_per_table_parallelism`   | `MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM`      | `8`        | int, clamped `[1,64]` | 1      | Within-one-task threadpool. How many tables walk through DESCRIBE / SHOW PARTITIONS / COUNT concurrently on the same SparkSession. Biggest lever for a single-giant-DB case. |
 | `migration_discovery_spark_master`            | `MIGRATION_DISCOVERY_SPARK_MASTER`               | `local[*]` | Spark master URL  | 1          | Where the discovery pyspark driver runs. Switch to `yarn` to offload scans to the cluster and remove the edge-RAM constraint. |
 | `migration_discovery_driver_memory`           | `MIGRATION_DISCOVERY_DRIVER_MEMORY`              | *(empty)*  | e.g. `4g`         | 1          | `--driver-memory` for the discovery pyspark call. Empty = Spark default. |
-| `migration_discovery_checkpoint_location`     | `MIGRATION_DISCOVERY_CHECKPOINT_LOCATION`        | *(empty → `{tracking_location}/_discovery_checkpoints`)* | `s3a://` URL or empty | 1 | Where per-table discovery checkpoints are written so retries skip tables already walked. Empty = default under tracking_location. |
+| `migration_discovery_checkpoint_location`     | `MIGRATION_DISCOVERY_CHECKPOINT_LOCATION`        | *(empty → `{tracking_location}/_discovery_checkpoints`)* | `s3a://` URL or empty | 1 | Where per-table discovery checkpoints are written so retries skip tables already walked. Empty = default under tracking_location. Deleted at the end of each run. |
 | `migration_metastore_retry_attempts`          | `MIGRATION_METASTORE_RETRY_ATTEMPTS`             | `4`        | int               | 1          | DESCRIBE/SHOW PARTITIONS retries per table on transient HMS failures. |
 | `migration_metastore_retry_backoff_seconds`   | `MIGRATION_METASTORE_RETRY_BACKOFF_SECONDS`      | `15`       | int (seconds)     | 1          | Backoff between HMS retries. Multiplied by attempt number. |
 | `migration_metastore_socket_timeout`          | `MIGRATION_METASTORE_SOCKET_TIMEOUT`             | `600s`     | Hadoop duration   | 1          | `hive.metastore.client.socket.timeout`. Format: `<n>[ms\|s\|m\|h]`. |
@@ -129,7 +129,7 @@ discovery that doesn't share these knobs; DAG 3 is folder-copy with no discovery
 | `migration_distcp_client_java_opts`              | `MIGRATION_DISTCP_CLIENT_JAVA_OPTS`             | *(empty)*  | JVM opts string            | 1, 3       | Extra JVM opts for the DistCp client (the submitter). |
 | `migration_distcp_extra_hadoop_opts`             | `MIGRATION_DISTCP_EXTRA_HADOOP_OPTS`            | *(empty)*  | `-D key=val` string        | 1          | Pass-through extra `-D` flags. |
 | `migration_distcp_preserve_delete`               | `MIGRATION_DISTCP_PRESERVE_DELETE`              | `true`     | bool                       | 1, 3       | Pass DistCp `-delete` on `-update` runs. Set `false` for append-only semantics. |
-| `migration_distcp_checkpoint_location`           | `MIGRATION_DISTCP_CHECKPOINT_LOCATION`          | *(empty → `{tracking_location}/_distcp_checkpoints`)* | `s3a://` URL or empty | 1 | Where per-DistCp-item checkpoints land. |
+| `migration_distcp_checkpoint_location`           | `MIGRATION_DISTCP_CHECKPOINT_LOCATION`          | *(empty → `{tracking_location}/_distcp_checkpoints`)* | `s3a://` URL or empty | 1 | Where per-DistCp-item checkpoints land. Deleted at the end of each run. |
 
 ---
 

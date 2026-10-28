@@ -229,13 +229,54 @@ def _read_spark_distcp_checkpoints(spark, prefix: str) -> list[dict]:
     fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
         spark._jvm.java.net.URI(prefix), hadoop_conf
     )
-    if not fs.exists(spark._jvm.org.apache.hadoop.fs.Path(prefix)):
-        return []
     checkpoint_glob = f"{prefix}/*/attempt-*.json"
+    # An S3A mkdir -p (the edge retry read) leaves an empty prefix that spark.read.json rejects.
+    if not fs.globStatus(spark._jvm.org.apache.hadoop.fs.Path(checkpoint_glob)):
+        return []
     return [
         row.asDict(recursive=True)
         for row in spark.read.json(checkpoint_glob).collect()
     ]
+
+
+_RUN_ID_PATTERN = re.compile(r"^run_\d{8}_\d{6}_[0-9a-f]{8}$")
+
+
+def _checkpoint_run_prefixes(config: dict, run_id) -> list[str]:
+    # An empty run_id would make the prefix the checkpoint root itself.
+    if not isinstance(run_id, str) or not _RUN_ID_PATTERN.fullmatch(run_id):
+        raise ValueError(f"Refusing to derive checkpoint prefixes for run_id {run_id!r}")
+    roots = [config["distcp_checkpoint_location"]]
+    discovery_root = (config.get("discovery_checkpoint_location") or "").strip()
+    if discovery_root:
+        roots.append(discovery_root)
+    prefixes = []
+    for root in roots:
+        prefix = f"{normalize_s3(root).rstrip('/')}/{quote(run_id, safe='')}"
+        if prefix not in prefixes:
+            prefixes.append(prefix)
+    return prefixes
+
+
+def _delete_edge_checkpoint_prefixes(ssh, prefixes: list[str], config: dict) -> None:
+    lines = ["rc=0"]
+    for prefix in prefixes:
+        s3_opts = build_s3_opts(prefix, config)
+        lines.append(f"hadoop fs{s3_opts} -rm -r -f -skipTrash {shlex.quote(prefix)} || rc=1")
+    lines.append('exit "$rc"')
+    command = "\n".join(lines) + "\n"
+    with ssh.get_conn() as client:
+        _, stdout, stderr = client.exec_command(
+            _login_shell(command, config.get("cluster_type", "MapR")), timeout=600
+        )
+        output = stdout.read().decode()
+        error_output = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0:
+        raise RuntimeError(
+            f"Could not delete checkpoints (exit={exit_code}): "
+            f"{(error_output or output)[-1000:]}"
+        )
 
 
 def _discovery_checkpoint_identity(record: dict) -> str:
@@ -6152,6 +6193,24 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     }
 
 
+@task
+def cleanup_checkpoints(run_id: str) -> dict:
+    """Delete this run's DistCp and discovery checkpoints; best-effort, never raises.
+
+    Only task retries and update_distcp_status read them, so they stop being useful when the run ends.
+    """
+    try:
+        config = get_config()
+        prefixes = _checkpoint_run_prefixes(config, run_id)
+        ssh = SSHHook(ssh_conn_id=config["ssh_conn_id"])
+        _delete_edge_checkpoint_prefixes(ssh, prefixes, config)
+        logger.info(f"[cleanup_checkpoints] Deleted {prefixes}")
+        return {"run_id": run_id, "deleted": prefixes}
+    except Exception as e:
+        logger.warning(f"[cleanup_checkpoints] Could not delete checkpoints for {run_id}: {e}")
+        return {"run_id": run_id, "deleted": [], "error": str(e)}
+
+
 @task.pyspark(conn_id="spark_default")
 def finalize_run(run_id: str, spark, cluster_setup: dict = None) -> dict:
     """Finalize migration run - update stats in Iceberg tracking."""
@@ -6468,6 +6527,10 @@ with DAG(
     t_email = send_migration_report_email(run_id=t_run_id, report_result=t_report)
     t_email.operator.trigger_rule = "all_done"
 
+    # Placed before finalize_run so that task stays the only leaf and still decides the DAG run state.
+    t_checkpoint_cleanup = cleanup_checkpoints(run_id=t_run_id)
+    t_checkpoint_cleanup.operator.trigger_rule = "all_done"
+
     # Finalize
     t_final = finalize_run(run_id=t_run_id, cluster_setup=t_cluster)
     t_final.operator.trigger_rule = "all_done"
@@ -6478,4 +6541,4 @@ with DAG(
     t_validate >> t_init >> t_run_id >> t_excel >> t_cluster >> t_discover >> t_record
     t_record >> t_batches >> t_distcp >> t_distcp_status >> t_tables >> t_tbl_status
     t_tbl_status >> t_dest_validation >> t_val_status >> t_reconcile
-    t_reconcile >> t_report >> t_email >> t_final  # >> t_cleanup
+    t_reconcile >> t_report >> t_email >> t_checkpoint_cleanup >> t_final  # >> t_cleanup

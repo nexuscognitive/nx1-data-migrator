@@ -103,7 +103,7 @@ to end; see its `README.md` for setup and the DAG settings.
 | `MIGRATION_DISTCP_COPY_MAX_CONCURRENT` | `3`         | Concurrent DistCp copies per DAG run. **Env-only** — read at DAG parse time, so it must be set in `env.shared` and redeployed with `deploy.py`; there is no equivalent Airflow Variable                          | `source_to_s3_migration`                          |
 | `MIGRATION_VALIDATION_MAX_CONCURRENT` | `3`          | Concurrent destination-validation tasks per DAG run. **Env-only**, same reason as above                                                                                                                          | `source_to_s3_migration`                          |
 | `MIGRATION_DISCOVERY_MAX_CONCURRENT` | `3`          | Concurrent table-discovery tasks per DAG run. Each runs a `pyspark` driver on the edge node, so size it to the edge's memory. **Env-only**, same reason as above | `source_to_s3_migration`                          |
-| `migration_distcp_checkpoint_location` | `<migration_tracking_location>/_distcp_checkpoints` | S3 prefix for per-table, per-attempt DistCp checkpoint JSON. The edge node writes with Hadoop FS; the Spark status task lists and reads checkpoint objects. | `source_to_s3_migration` |
+| `migration_distcp_checkpoint_location` | `<migration_tracking_location>/_distcp_checkpoints` | S3 prefix for per-table, per-attempt DistCp checkpoint JSON. The edge node writes with Hadoop FS; the Spark status task lists and reads checkpoint objects. Deleted at the end of each run. | `source_to_s3_migration` |
 | `migration_discovery_driver_memory` | _(empty)_ | Optional `--driver-memory` passed to the remote `pyspark` table-discovery process; empty leaves Spark's default unchanged. | `source_to_s3_migration` |
 | `migration_discovery_spark_master` | `local[*]`       | Spark master for the remote table-discovery `pyspark` process. Use `yarn` to run discovery on the cluster when the edge node cannot hold the driver.                                                             | `source_to_s3_migration`                          |
 | `migration_metastore_socket_timeout` | `600s`         | `hive.metastore.client.socket.timeout` for the discovery Spark session; raise for metastores slow on `DESCRIBE FORMATTED`.                                                                                        | `source_to_s3_migration`                          |
@@ -1187,10 +1187,36 @@ task batch-reads checkpoint JSON through Spark's Hadoop filesystem and reconcile
 the latest attempt for each table into `migration_table_status`; checkpoint
 records take precedence over XCom results.
 
-Checkpoint objects are not deleted by the DAG. Configure an S3 lifecycle rule for
-the checkpoint prefix according to your retention needs. The edge node needs
-write access to the configured prefix; the Spark runtime needs list and read
-access.
+The `cleanup_checkpoints` task deletes `<checkpoint-location>/<run-id>` and
+`<discovery-checkpoint-location>/<run-id>` from the edge node near the end of every
+run, whatever the outcome. Failures are logged, not raised, so they never change
+the DAG run state. The edge node needs write and delete access to both prefixes;
+the Spark runtime needs list and read access.
+
+Clearing a failed `run_distcp_ssh` task after the run has finished re-copies its
+whole batch with `-update`: completed tables are not skipped, and their tracking
+row gets the re-run's metrics. A cleared discovery task re-walks every table.
+Clearing with downstream cleans up again; clearing without downstream leaves the
+new attempt's checkpoints behind.
+
+#### Removing leftover checkpoints
+
+Prefixes from runs before this change, or from runs stopped before cleanup, are
+removed by hand per run id, while no run with that id is active:
+
+```bash
+hadoop fs -rm -r -skipTrash s3a://<tracking-location>/_distcp_checkpoints/<run-id> \
+                            s3a://<tracking-location>/_discovery_checkpoints/<run-id>
+```
+
+If the edge node has no default S3 credentials or endpoint configured (the command then
+fails with `Unable to load AWS credentials from any provider in the chain`), pass them
+the way the DAG does, directly after `hadoop fs`:
+
+```bash
+hadoop fs -Dfs.s3a.endpoint=<s3-endpoint> -Dfs.s3a.access.key=<access-key> \
+          -Dfs.s3a.secret.key=<secret-key> -rm -r -skipTrash <prefix> ...
+```
 
 ### Status Progression
 

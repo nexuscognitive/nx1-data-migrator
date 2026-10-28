@@ -174,7 +174,7 @@ Each successful per-table discovery is checkpointed to S3 (default: `{tracking_l
 - **Scoping**: the prefix includes `run_id` and `source_database`, so a new DAG run never reuses an old run's cache, and parallel mapped discovery tasks for different databases don't collide.
 - **What gets cached**: everything terminal — successful discoveries and `SKIPPED_VIEW` records. `FAILED` records are deliberately NOT cached so retries re-attempt them.
 - **Location**: configurable via Airflow Variable `migration_discovery_checkpoint_location` (precedence Variable > env > default). Shares bucket and credentials with the DistCp checkpoints.
-- **Cleanup**: checkpoints accumulate (same pattern as DistCp's). Stale entries from old runs are harmless because the `run_id` scoping guarantees a fresh prefix on each new run — delete the parent prefix periodically if S3 object counts become a concern.
+- **Cleanup**: the `cleanup_checkpoints` task deletes this run's `<root>/<run_id>` prefixes at the end of every run, whatever the outcome. Leftovers (runs stopped before cleanup, or runs from before this change) are removed by hand per run id; see "Removing leftover checkpoints" in `data-iceberg-migrator/docs/README.md`.
 
 ## Running Tests
 
