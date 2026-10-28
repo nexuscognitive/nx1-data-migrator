@@ -172,33 +172,3 @@ def partitions_to_where_clause(partitions):
             clauses.append("(" + " AND ".join(conditions) + ")")
 
     return " OR ".join(clauses) if clauses else "1=1"
-
-
-def normalize_path(path):
-    path = (path or "").strip()
-    while len(path) > 1 and path.endswith("/"):
-        path = path[:-1]
-    return path
-
-
-_LOCATION_RE = re.compile(r'^(?:([A-Za-z][A-Za-z0-9+.-]*):)?(?://([^/]*))?(.*)$')
-
-
-def _split_location(path):
-    m = _LOCATION_RE.match(normalize_path(path))
-    scheme, authority, rest = m.group(1), m.group(2), m.group(3)
-    return scheme or "", authority or "", re.sub(r'/{2,}', '/', rest)
-
-
-def is_path_inside_root(path, root):
-    p_scheme, p_auth, p_path = _split_location(path)
-    r_scheme, r_auth, r_path = _split_location(root)
-    if not p_path or not r_path:
-        return False
-    if p_scheme and r_scheme and p_scheme != r_scheme:
-        return False
-    if p_auth and r_auth and p_auth != r_auth:
-        return False
-    p_path = normalize_path(p_path)
-    r_path = normalize_path(r_path)
-    return p_path == r_path or p_path.startswith(r_path.rstrip("/") + "/")

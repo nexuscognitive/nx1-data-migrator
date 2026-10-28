@@ -755,6 +755,8 @@ SHOW PARTITIONS <db>.<table>;          -- the two lists should now agree
 
 ## Finding out-of-directory partitions
 
+**When to use:** DAG 1 does not detect out-of-directory partitions. When validation reports a row or partition count mismatch on a partitioned table (including the "Stale partitions on source, Run MSCK" warning), run this script on the edge node to check whether partitions sit outside the table directory.
+
 **Symptom:** row or partition counts differ between source and destination, and the source has partitions registered with a LOCATION outside the table LOCATION. Source `COUNT(*)` and `SHOW PARTITIONS` include them; DistCp (which copies the table LOCATION) and `MSCK` on the destination do not.
 
 **Run**   **▶ Edge node**
@@ -767,7 +769,7 @@ spark-submit --master 'local[*]' \
   [--row-counts] [--output /tmp/out_of_dir.csv]
 ```
 
-Without `--tables` every table in the database is checked. `--row-counts` adds one `COUNT(*)` per flagged partition.
+Without `--tables` every table in the database is checked. Spark log lines can be hidden by piping the output through `grep -v -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} '`. If no table matches `--tables` (or the database has none), the script prints `No tables in <db> matched: <tokens>` (or `No tables found in <db>`) and exits 0. `--row-counts` adds one `COUNT(*)` per flagged partition.
 
 **Read the output**
 

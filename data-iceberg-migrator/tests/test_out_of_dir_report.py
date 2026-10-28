@@ -75,3 +75,61 @@ def test_format_report_lists_skipped_error_and_partitions():
     assert "dt=1 -> /x/1 | exists=True files=2 bytes=10 rows=7" in text
     assert "db.u: SKIPPED (not partitioned)" in text
     assert "db.v: ERROR (boom)" in text
+
+
+def test_no_tables_message():
+    assert r.no_tables_message("db", ["a"], ["x*"], ["a"]) is None
+    assert r.no_tables_message("db", ["a", "b"], ["x*", "y"], []) == "No tables in db matched: x*,y"
+    assert r.no_tables_message("db", [], [], []) == "No tables found in db"
+    assert r.no_tables_message("db", [], ["x"], []) == "No tables found in db"
+
+
+def test_format_report_shows_zero_rows_without_out_of_dir_partitions():
+    res = [{"table": "t", "status": "ok", "total_partitions": 3, "partitions": []}]
+    text = r.format_report("db", res, True)
+    assert "db.t: partitions=3, out_of_dir=0, files=0, bytes=0, rows=0" in text
+    assert "None" not in text
+    assert "rows=" not in r.format_report("db", res, False)
+
+
+class TestIsPathInsideRoot:
+
+    ROOT = 'maprfs://cluster/a/b'
+
+    def test_same_path(self):
+        assert r._is_path_inside_root('maprfs://cluster/a/b', self.ROOT) is True
+
+    def test_child(self):
+        assert r._is_path_inside_root('maprfs://cluster/a/b/dt=1', self.ROOT) is True
+
+    def test_sibling_with_shared_prefix(self):
+        assert r._is_path_inside_root('maprfs://cluster/a/bc', self.ROOT) is False
+        assert r._is_path_inside_root('maprfs://cluster/a/bc/dt=1', self.ROOT) is False
+
+    def test_trailing_slash_on_either_side(self):
+        assert r._is_path_inside_root('maprfs://cluster/a/b/', self.ROOT) is True
+        assert r._is_path_inside_root('maprfs://cluster/a/b/dt=1/', self.ROOT + '/') is True
+
+    def test_different_scheme(self):
+        assert r._is_path_inside_root('hdfs://cluster/a/b/dt=1', self.ROOT) is False
+
+    def test_different_authority(self):
+        assert r._is_path_inside_root('maprfs://other/a/b/dt=1', self.ROOT) is False
+
+    def test_empty_values_are_not_inside(self):
+        assert r._is_path_inside_root('', self.ROOT) is False
+        assert r._is_path_inside_root(self.ROOT, '') is False
+
+    def test_normalize_path_keeps_bare_slash(self):
+        assert r._normalize_path('/') == '/'
+        assert r._normalize_path(' /a/b// ') == '/a/b'
+
+    def test_missing_scheme_or_authority_compares_paths_only(self):
+        assert r._is_path_inside_root('/a/b/dt=1', self.ROOT) is True
+        assert r._is_path_inside_root('maprfs:///a/b/dt=1', self.ROOT) is True
+        assert r._is_path_inside_root('maprfs:/a/b/dt=1', self.ROOT) is True
+        assert r._is_path_inside_root('/a/bc/dt=1', self.ROOT) is False
+
+    def test_scheme_is_compared_case_insensitively(self):
+        assert r._is_path_inside_root('MAPRFS://cluster/a/b/dt=1', self.ROOT) is True
+        assert r._is_path_inside_root('HDFS://cluster/a/b/dt=1', self.ROOT) is False

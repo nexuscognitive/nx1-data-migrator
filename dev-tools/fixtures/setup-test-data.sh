@@ -2388,10 +2388,10 @@ echo "  Partitions registered for 8 tz tables."
 #             dt=2024-01-03  2 rows  /user/hive/external/ood_db/...      OUTSIDE (other directory)
 #             dt=2024-01-04  1 row   <root>_archive/dt=2024-01-04        OUTSIDE (sibling sharing the root's prefix)
 #             dt=2024-01-05  1 row   file:///tmp/ood_local/...           OUTSIDE (other filesystem scheme)
-#           Expected after DAG1: 3 rows / 2 partitions at dest, out_of_dir_partition_count=3,
-#           VALIDATED_WITH_WARNINGS.
+#           Diagnostic script flags dt=2024-01-03, dt=2024-01-04, dt=2024-01-05
+#           (4 rows out of dir); a DAG1 run copies 3 of 7 rows / 2 of 5 partitions.
 # TC-OOD-2  ood_db.orders_ok   control: 2 partitions, 3 rows, all inside the root.
-#           Expected after DAG1: out_of_dir_partition_count=0, VALIDATED.
+#           Diagnostic script flags nothing.
 #
 # All partitions are written under the root first, then three are moved and
 # registered with an explicit ADD PARTITION ... LOCATION, which is how this
@@ -2684,25 +2684,16 @@ REGRESSION BASELINE (run DAG 1 first, then DAG 2):
     SKIPPED           : formats_db_s3.text_table (INPLACE=TRUE in DAG2 Excel)
     SKIPPED           : migration_db_s3.customers (INPLACE on already-Iceberg)
 
-OUT-OF-DIRECTORY PARTITIONS (DAG 1 only, ood_db):
-  Excel: dev-tools/mapr-edge-node/excel_configs/dag1_out_of_dir_partitions.xlsx
-         (one row: ood_db / * / ood_db_s3)
-  TC-OOD-1 ood_db.orders_ood:
-    Discovery log : "Out-of-directory partitions for ood_db.orders_ood: 3 partition(s)"
-    Tracking      : out_of_dir_partition_count = 3 (dt=2024-01-03, dt=2024-01-04, dt=2024-01-05)
-                    source_row_count 7 / dest_hive_row_count 3
-                    source_partition_count 5 / dest_partition_count 2
-                    overall_status = VALIDATED_WITH_WARNINGS
-                    error_message contains "3 out-of-directory source partition(s) not copied"
-    Report        : OUT-OF-DIR PARTITIONS card = 1, badge on orders_ood, no "Run MSCK" hint
-  TC-OOD-2 ood_db.orders_ok:
-    Tracking      : out_of_dir_partition_count = 0, overall_status = VALIDATED
-  Check:
-    SELECT source_table, overall_status, source_row_count, dest_hive_row_count,
-           source_partition_count, dest_partition_count,
-           out_of_dir_partition_count, out_of_dir_partitions, error_message
-    FROM <tracking_db>.migration_table_status
-    WHERE run_id = '<run_id>' AND source_database = 'ood_db';
+OUT-OF-DIRECTORY PARTITIONS (diagnostic script, ood_db):
+  Run on the edge node from data-iceberg-migrator/:
+    spark-submit --master 'local[*]' --py-files migrator_utils/migrations/partition_utils.py \
+      tools/out_of_dir_partitions_report.py --database ood_db --row-counts
+  Expected:
+    ood_db.orders_ood: partitions=5, out_of_dir=3, rows=4
+      dt=2024-01-03, dt=2024-01-04, dt=2024-01-05 listed with their locations
+    ood_db.orders_ok: partitions=2, out_of_dir=0
+  A DAG1 run on ood_db copies 3 of 7 rows for orders_ood and reports a count
+  mismatch; the script above explains it.
 
 TRANSIENT RETRY TESTS:
   T-01 YARN OOM during DistCp (retry_test_db.yarn_oom_table):

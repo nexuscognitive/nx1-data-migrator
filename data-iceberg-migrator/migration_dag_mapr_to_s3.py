@@ -1164,8 +1164,6 @@ def init_tracking_tables(spark) -> dict:
                 partition_schema_json STRING,
                 partition_schema_match BOOLEAN,
                 partition_schema_differences STRING,
-                out_of_dir_partition_count INT,
-                out_of_dir_partitions STRING,
                 overall_status STRING,
                 error_message STRING,
                 updated_at TIMESTAMP
@@ -1186,8 +1184,6 @@ def init_tracking_tables(spark) -> dict:
         ("empty_partition_names", "STRING"),
         ("distcp_mappers", "INT"),
         ("distcp_bandwidth_mbps", "INT"),
-        ("out_of_dir_partition_count", "INT"),
-        ("out_of_dir_partitions", "STRING"),
     ):
         try:
             spark.sql(
@@ -1568,7 +1564,7 @@ from multiprocessing.dummy import Pool as ThreadPool
 from pyspark.sql import SparkSession
 from pyspark.sql.utils import AnalysisException
 sys.path.insert(0, "{temp_dir}")
-from partition_utils import apply_partition_filter, partitions_to_where_clause, is_path_inside_root
+from partition_utils import apply_partition_filter, partitions_to_where_clause
 
 # FAIR scheduler so the per-table threadpool below doesn't FIFO queries behind
 # each other — default FIFO would serialize concurrent spark.sql calls and
@@ -1662,10 +1658,6 @@ def _default_metadata_record(tbl):
         "full_table_row_count": 0,
         "full_table_partition_count": 0,
         "partition_file_counts": {{}},
-        "out_of_dir_partition_count": 0,
-        "out_of_dir_partitions": [],
-        "out_of_dir_check_error": None,
-        "out_of_dir_check_seconds": 0,
     }}
 
 def database_exists(spark, db):
@@ -1951,69 +1943,6 @@ def discover_one_table(tbl):
         except Exception:
             pass
 
-        out_of_dir_partition_count = 0
-        out_of_dir_partitions = []
-        out_of_dir_check_error = None
-        out_of_dir_check_seconds = 0
-        if {out_of_dir_check_enabled} and partition_definition and loc and metastore_partitions:
-            if len(metastore_partitions) > {out_of_dir_max_partitions}:
-                out_of_dir_check_error = (
-                    "out-of-dir check skipped: table has {{0}} partitions, "
-                    "above migration_out_of_dir_max_partitions={out_of_dir_max_partitions}"
-                ).format(len(metastore_partitions))
-            else:
-                _ood_started = time.time()
-                try:
-                    def _qualify(x):
-                        try:
-                            _p = spark._jvm.org.apache.hadoop.fs.Path(x)
-                            return _p.getFileSystem(spark._jsc.hadoopConfiguration()).makeQualified(_p).toString()
-                        except Exception:
-                            return x
-
-                    _root_cache = {{}}
-
-                    def _is_outside(raw):
-                        if is_path_inside_root(raw, loc):
-                            return False
-                        if "root" not in _root_cache:
-                            _root_cache["root"] = _qualify(loc)
-                        return not is_path_inside_root(_qualify(raw), _root_cache["root"])
-
-                    _cat = spark._jsparkSession.sessionState().catalog().externalCatalog()
-                    _seq = _cat.listPartitions(src_db, tbl, spark._jvm.scala.Option.empty())
-                    _conv = spark._jvm.scala.collection.JavaConverters
-                    _flagged = {{}}
-                    for _cp in _conv.seqAsJavaListConverter(_seq).asJava():
-                        _uri = _cp.storage().locationUri()
-                        if not _uri.isDefined():
-                            continue
-                        _raw = _uri.get().toString()
-                        if not _is_outside(_raw):
-                            continue
-                        _spec = _conv.mapAsJavaMapConverter(_cp.spec()).asJava()
-                        _key = "/".join(
-                            "{{0}}={{1}}".format(c, _spec.get(c)) for c in partition_cols_from_describe
-                        )
-                        _flagged[_key] = _raw
-                    _flagged_keys = sorted(_flagged.keys())
-                    if filter_expr:
-                        _flagged_keys = apply_partition_filter(_flagged_keys, filter_expr)
-                    for _ps in _flagged_keys:
-                        out_of_dir_partition_count += 1
-                        if len(out_of_dir_partitions) < 100:
-                            out_of_dir_partitions.append({{
-                                "partition": _ps,
-                                "location": _flagged[_ps],
-                            }})
-                except Exception as _e:
-                    out_of_dir_partition_count = 0
-                    out_of_dir_partitions = []
-                    out_of_dir_check_error = "out-of-dir check failed: " + str(_e)[:300]
-                    print("WARNING: out-of-dir partition check for {{0}}.{{1}} failed ({{2}})".format(
-                        src_db, tbl, out_of_dir_check_error))
-                out_of_dir_check_seconds = round(time.time() - _ood_started, 2)
-
         # Apply partition filter
         full_partition_count = len(metastore_partitions)
         full_row_count = row_count
@@ -2151,10 +2080,6 @@ def discover_one_table(tbl):
             "full_table_partition_count": full_partition_count,
             "partition_file_counts": partition_file_counts,
             "source_path_exists": source_path_exists,
-            "out_of_dir_partition_count": out_of_dir_partition_count,
-            "out_of_dir_partitions": out_of_dir_partitions,
-            "out_of_dir_check_error": out_of_dir_check_error,
-            "out_of_dir_check_seconds": out_of_dir_check_seconds,
         }})
         return record
 
@@ -2218,10 +2143,6 @@ spark.stop()
                 config, "metastore_retry_backoff_seconds", 15, 0, 300
             ),
             metastore_failure_retries=_int_setting(config, "metastore_failure_retries", 5, 0, 20),
-            out_of_dir_check_enabled=bool(config.get("out_of_dir_check_enabled", True)),
-            out_of_dir_max_partitions=_int_setting(
-                config, "out_of_dir_max_partitions", 20000, 1, 10000000
-            ),
             metastore_socket_timeout=_duration_setting(config, "metastore_socket_timeout", "600s"),
             per_table_parallelism=_int_setting(
                 config, "discovery_per_table_parallelism", 8, 1, 64
@@ -2362,24 +2283,6 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
             logger.info(
                 f"  Discovered: {src_db}.{t['source_table']} | format={t['file_format']} | partitions={t['partition_count']} | rows={t['row_count']} | size={t.get('source_total_size_bytes',0)/(1024**2):.1f} MB"
             )
-            if t.get("out_of_dir_check_seconds"):
-                logger.info(
-                    f"  Out-of-dir check for {src_db}.{t['source_table']}: "
-                    f"{t['out_of_dir_check_seconds']}s ({t.get('partition_count', 0)} partitions)"
-                )
-            if t.get("out_of_dir_check_error"):
-                logger.warning(
-                    f"  Out-of-directory partition check incomplete for {src_db}.{t['source_table']}: "
-                    f"{t['out_of_dir_check_error']}"
-                )
-            if t.get("out_of_dir_partition_count"):
-                _ood = t.get("out_of_dir_partitions") or []
-                logger.warning(
-                    f"  Out-of-directory partitions for {src_db}.{t['source_table']}: "
-                    f"{t['out_of_dir_partition_count']} partition(s) not under "
-                    f"{t.get('source_location', '')} (will not be copied by DistCp) | "
-                    + "; ".join(f"{o['partition']} -> {o['location']}" for o in _ood[:5])
-                )
         elif t.get("error_type") == "TABLE_NOT_FOUND":
             logger.warning(
                 f"  Table not found on source: {src_db}.{t['source_table']} — will be skipped in downstream phases"
@@ -2506,8 +2409,6 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
         schema_json = sql_quote(json.dumps(t.get("schema", [])))
         partition_schema_json = sql_quote(json.dumps(t.get("partition_schema", [])))
         parts_json = sql_quote(json.dumps(parts))
-        out_of_dir_count = int(t.get("out_of_dir_partition_count") or 0)
-        out_of_dir_json = sql_quote(json.dumps(t.get("out_of_dir_partitions") or []))
         table_type = t.get("table_type", "UNKNOWN")
         partition_filter_active = t.get("partition_filter_active", False)
         if partition_filter_active:
@@ -2568,8 +2469,6 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     full_table_row_count = {full_table_row_count},
                     full_table_partition_count = {full_table_partition_count},
                     partition_schema_json = '{partition_schema_json}',
-                    out_of_dir_partition_count = {out_of_dir_count},
-                    out_of_dir_partitions = '{out_of_dir_json}',
                     overall_status = {overall_status_update},
                     error_message = {error_msg_update},
                     updated_at = current_timestamp()
@@ -2610,8 +2509,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     updated_at, partition_filter, filtered_partition_count, full_table_row_count, full_table_partition_count,
                     yarn_application_id,
                     partition_schema_json, partition_schema_match, partition_schema_differences,
-                    empty_partition_names,
-                    out_of_dir_partition_count, out_of_dir_partitions
+                    empty_partition_names
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
                     '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
@@ -2637,8 +2535,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count},
                     NULL,
                     '{partition_schema_json}', NULL, NULL,
-                    NULL,
-                    {out_of_dir_count}, '{out_of_dir_json}'
+                    NULL
                 )
             """,
                 task_label=f"record_discovered_tables:{t['source_table']}",
@@ -4600,16 +4497,6 @@ def update_table_create_status(table_result: dict, spark) -> dict:
     return table_result
 
 
-def _out_of_dir_reason(t: dict) -> str:
-    parts = t.get("out_of_dir_partitions") or []
-    shown = ", ".join(f"{o['partition']} -> {o['location']}" for o in parts[:3])
-    more = "" if len(parts) <= 3 else ", ..."
-    return (
-        f"{t.get('out_of_dir_partition_count')} out-of-directory source partition(s) "
-        f"not copied: {shown}{more}"
-    )
-
-
 @task.pyspark(conn_id="spark_default")
 @track_duration
 def validate_destination_tables(source_validation: dict, spark, **context) -> dict:
@@ -4946,12 +4833,6 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     f"Partition schema differences: {'; '.join(partition_schema_diffs[:3])}"
                 )
 
-            out_of_dir_count = int(t.get("out_of_dir_partition_count") or 0)
-            out_of_dir_detail = ""
-            if out_of_dir_count > 0 and (not row_count_match or not partition_count_match):
-                out_of_dir_detail = _out_of_dir_reason(t)
-                mismatch_parts.append(out_of_dir_detail)
-
             mismatch_error = "; ".join(mismatch_parts) if mismatch_parts else None
 
             validation_results.append(
@@ -4966,8 +4847,6 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     "dest_partition_count": dest_partition_count,
                     "row_count_match": row_count_match,
                     "partition_count_match": partition_count_match,
-                    "out_of_dir_partition_count": out_of_dir_count,
-                    "out_of_dir_detail": out_of_dir_detail,
                     "schema_match": schema_match,
                     "schema_differences": (
                         "; ".join(schema_diffs) if schema_diffs else ""
@@ -5012,16 +4891,9 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     f"row count mismatch (source={v.get('source_row_count')}, dest={v.get('dest_hive_row_count')})"
                 )
             if not v.get("partition_count_match", True):
-                if v.get("out_of_dir_partition_count"):
-                    warn_parts.append(
-                        f"partition count mismatch (source={v.get('source_partition_count')}, dest={v.get('dest_partition_count')})"
-                    )
-                else:
-                    warn_parts.append(
-                        f"partition count mismatch (source={v.get('source_partition_count')}, dest={v.get('dest_partition_count')}) — Stale partitions on source, Run MSCK"
-                    )
-            if v.get("out_of_dir_detail"):
-                warn_parts.append(v["out_of_dir_detail"])
+                warn_parts.append(
+                    f"partition count mismatch (source={v.get('source_partition_count')}, dest={v.get('dest_partition_count')}) — Stale partitions on source, Run MSCK"
+                )
             logger.warning(
                 f"[Validation] WARNING for {v['source_table']}: {'; '.join(warn_parts)}"
             )
@@ -5378,18 +5250,6 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     total_files = sum(t.s3_file_count_after or 0 for t in table_status)
     total_rows = sum(t.source_row_count or 0 for t in table_status)
     incremental_runs = sum(1 for t in table_status if t.distcp_is_incremental)
-    out_of_dir_tables = sum(
-        1 for t in table_status if (getattr(t, "out_of_dir_partition_count", None) or 0) > 0
-    )
-
-    out_of_dir_card = ""
-    if out_of_dir_tables:
-        out_of_dir_card = (
-            '            <div class="summary-card warning">\n'
-            "                <h3>OUT-OF-DIR PARTITIONS</h3>\n"
-            f'                <p class="value">{out_of_dir_tables}</p>\n'
-            "            </div>\n"
-        )
 
     cluster_type = config.get("cluster_type", "MapR")
 
@@ -5669,7 +5529,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                 <h3>INCREMENTAL RUNS</h3>
                 <p class="value">{incremental_runs}</p>
             </div>
-{out_of_dir_card}        </div>
+        </div>
 
         <div class="section-divider"></div>
 """
@@ -6081,42 +5941,12 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         part_match_class = (
             "validation-pass" if t.partition_count_match else "validation-warn"
         )
-        out_of_dir_count = getattr(t, "out_of_dir_partition_count", None) or 0
-        out_of_dir_html = ""
-        if out_of_dir_count > 0:
-            try:
-                out_of_dir_list = json.loads(getattr(t, "out_of_dir_partitions", None) or "[]")
-            except ValueError:
-                out_of_dir_list = []
-            out_of_dir_items = "".join(
-                f"<li>{html_escape(str(o.get('partition')))} &rarr; "
-                f"{html_escape(str(o.get('location')))}</li>"
-                for o in out_of_dir_list[:20]
-            )
-            out_of_dir_html = (
-                f'<br><span class="status-badge status-conflict">'
-                f"{out_of_dir_count} OUT-OF-DIR PARTITION(S)</span>"
-                f'<details><summary style="font-size:11px;">partitions</summary>'
-                f'<ul style="font-size:11px;margin:4px 0;">{out_of_dir_items}</ul></details>'
-            )
         if t.partition_count_match:
             part_match_icon = "✓ PASS"
-        elif t.row_count_match and out_of_dir_count > 0:
-            part_match_icon = (
-                f"⚠ WARN: {out_of_dir_count} out-of-directory source partition(s) not copied"
-            )
         elif t.row_count_match:
             part_match_icon = "⚠ WARN: Stale partitions on source, Run MSCK"
         else:
             part_match_icon = "⚠ WARN: Data mismatch. Check source data accuracy."
-        if out_of_dir_count > 0:
-            out_of_dir_icon = (
-                f"⚠ WARN: {out_of_dir_count} out-of-directory source partition(s) not copied"
-            )
-            if not t.row_count_match:
-                row_match_icon = out_of_dir_icon
-            if not t.partition_count_match:
-                part_match_icon = out_of_dir_icon
 
         # Schema Match covers BOTH the non-partition columns (schema_match) and the
         # partition columns (partition_schema_match). partition_schema_match is NULL
@@ -6138,7 +5968,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
-                    <td><strong>{t.source_table}</strong>{out_of_dir_html}</td>
+                    <td><strong>{t.source_table}</strong></td>
                     <td>{t.partition_filter or '<span style="color:#bdc3c7;font-size:11px;">—</span>'}</td>
                     <td class="metric">{(t.source_row_count or 0):,}</td>
                     <td class="metric">{(t.dest_hive_row_count or 0):,}</td>

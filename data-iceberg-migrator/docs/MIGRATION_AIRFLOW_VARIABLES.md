@@ -91,8 +91,6 @@ discovery that doesn't share these knobs; DAG 3 is folder-copy with no discovery
 | `migration_metastore_retry_backoff_seconds`   | `MIGRATION_METASTORE_RETRY_BACKOFF_SECONDS`      | `15`       | int (seconds)     | 1          | Backoff between HMS retries. Multiplied by attempt number. |
 | `migration_metastore_socket_timeout`          | `MIGRATION_METASTORE_SOCKET_TIMEOUT`             | `600s`     | Hadoop duration   | 1          | `hive.metastore.client.socket.timeout`. Format: `<n>[ms\|s\|m\|h]`. |
 | `migration_metastore_failure_retries`         | `MIGRATION_METASTORE_FAILURE_RETRIES`            | `5`        | int               | 1          | `hive.metastore.failure.retries` passed to Spark. |
-| `migration_out_of_dir_check_enabled`          | `MIGRATION_OUT_OF_DIR_CHECK_ENABLED`             | `true`     | bool              | 1          | Detect partitions whose LOCATION is outside the table LOCATION (one bulk metastore call per table). Set `false` to switch off. |
-| `migration_out_of_dir_max_partitions`         | `MIGRATION_OUT_OF_DIR_MAX_PARTITIONS`            | `20000`    | int, clamped `[1,10000000]` | 1 | Tables with more metastore partitions skip the out-of-dir check; the reason is logged. |
 
 ---
 

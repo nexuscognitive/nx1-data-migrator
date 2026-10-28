@@ -1,18 +1,48 @@
 import argparse
 import csv
 import fnmatch
+import re
 import sys
 
 try:
-    from partition_utils import apply_partition_filter, is_path_inside_root, partitions_to_where_clause
+    from partition_utils import apply_partition_filter, partitions_to_where_clause
 except ImportError:
     from migrator_utils.migrations.partition_utils import (
         apply_partition_filter,
-        is_path_inside_root,
         partitions_to_where_clause,
     )
 
 CSV_COLUMNS = ["database", "table", "partition", "location", "exists", "file_count", "size_bytes", "row_count"]
+
+
+_LOCATION_RE = re.compile(r"^(?:([A-Za-z][A-Za-z0-9+.-]*):)?(?://([^/]*))?(.*)$")
+
+
+def _normalize_path(path):
+    path = (path or "").strip()
+    while len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    return path
+
+
+def _split_location(path):
+    m = _LOCATION_RE.match(_normalize_path(path))
+    scheme, authority, rest = m.group(1), m.group(2), m.group(3)
+    return (scheme or "").lower(), authority or "", re.sub(r"/{2,}", "/", rest)
+
+
+def _is_path_inside_root(path, root):
+    p_scheme, p_auth, p_path = _split_location(path)
+    r_scheme, r_auth, r_path = _split_location(root)
+    if not p_path or not r_path:
+        return False
+    if p_scheme and r_scheme and p_scheme != r_scheme:
+        return False
+    if p_auth and r_auth and p_auth != r_auth:
+        return False
+    p_path = _normalize_path(p_path)
+    r_path = _normalize_path(r_path)
+    return p_path == r_path or p_path.startswith(r_path.rstrip("/") + "/")
 
 
 def parse_args(argv=None):
@@ -33,12 +63,20 @@ def match_tables(all_tables, tokens):
     return [t for t in all_tables if any(fnmatch.fnmatch(t.lower(), k.lower()) for k in tokens)]
 
 
+def no_tables_message(database, all_tables, tokens, matched):
+    if matched:
+        return None
+    if not all_tables:
+        return "No tables found in %s" % database
+    return "No tables in %s matched: %s" % (database, ",".join(tokens))
+
+
 def find_out_of_dir(part_locations, root, qualify, partition_filter=None):
     names = sorted(part_locations)
     if partition_filter:
         names = apply_partition_filter(names, partition_filter)
     root_q = qualify(root)
-    return [(n, part_locations[n]) for n in names if not is_path_inside_root(qualify(part_locations[n]), root_q)]
+    return [(n, part_locations[n]) for n in names if not _is_path_inside_root(qualify(part_locations[n]), root_q)]
 
 
 def summarize(result):
@@ -80,7 +118,7 @@ def format_report(database, results, row_counts=False):
             lines.append("%s: ERROR (%s)" % (head, r["reason"]))
             continue
         s = summarize(r)
-        rows = "" if not row_counts else ", rows=%s" % s["total_rows"]
+        rows = "" if not row_counts else ", rows=%s" % (s["total_rows"] or 0)
         lines.append(
             "%s: partitions=%d, out_of_dir=%d, files=%d, bytes=%d%s"
             % (head, s["total_partitions"], s["out_of_dir_count"], s["total_files"], s["total_bytes"], rows)
@@ -207,9 +245,15 @@ def main(argv=None):
     spark = SparkSession.builder.appName("out_of_dir_partitions_report").enableHiveSupport().getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
     all_tables = [r.tableName for r in spark.sql("SHOW TABLES IN %s" % args.database).collect()]
+    matched = match_tables(all_tables, args.tables)
+    message = no_tables_message(args.database, all_tables, args.tables, matched)
+    if message:
+        print(message)
+        spark.stop()
+        return
     qualify = _make_qualify(spark)
     results = []
-    for tbl in match_tables(all_tables, args.tables):
+    for tbl in matched:
         results.append(inspect_table(spark, args.database, tbl, qualify, args.partition_filter, args.row_counts))
     print(format_report(args.database, results, args.row_counts))
     if args.output:
