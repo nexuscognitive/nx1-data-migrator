@@ -8,7 +8,59 @@ import migration_dag_folder_copy as m
 import pandas as pd
 import pytest
 
-from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
+from .helpers import make_excel_bytes, setup_spark_excel
+from .helpers import mock_ssh_stdout as _raw_mock_ssh_stdout
+
+
+def wire_channel(stdout, stderr=None):
+    """Feed a mock's `read()` payload through the channel API that the DAG drains.
+
+    `_read_remote_command` loops on channel.recv_ready()/recv(). A bare MagicMock
+    channel reports ready forever, so every stream must be wired explicitly.
+    """
+    def _payload(mock):
+        value = mock.read.return_value if mock is not None else None
+        return value if isinstance(value, (bytes, bytearray)) else b''
+
+    state = {'out': False, 'err': False}
+
+    def out_ready():
+        return not state['out'] and bool(_payload(stdout))
+
+    def out_recv(_size=65536):
+        state['out'] = True
+        return _payload(stdout)
+
+    def err_ready():
+        return not state['err'] and bool(_payload(stderr))
+
+    def err_recv(_size=65536):
+        state['err'] = True
+        return _payload(stderr)
+
+    stdout.channel.recv_ready.side_effect = out_ready
+    stdout.channel.recv.side_effect = out_recv
+    stdout.channel.recv_stderr_ready.side_effect = err_ready
+    stdout.channel.recv_stderr.side_effect = err_recv
+    return stdout
+
+
+def mock_ssh_stdout(exit_code=0, output=b''):
+    """Build a wired SSH stdout mock (see wire_channel)."""
+    return wire_channel(_raw_mock_ssh_stdout(exit_code, output))
+
+
+@pytest.fixture
+def mock_ssh_hook(mock_ssh_hook):
+    """Override conftest's fixture so every stdout/stderr mock drains via the channel API.
+
+    Payloads are read at call time, so tests can still set `.read.return_value`
+    after the fixture is built.
+    """
+    hook, client, stdout_mock, stderr_mock = mock_ssh_hook
+    wire_channel(stdout_mock, stderr_mock)
+    return hook, client, stdout_mock, stderr_mock
+
 
 EXPECTED_SCHEMA_ADDITIONS = (
     ('data_copy_status', (
@@ -19,6 +71,15 @@ EXPECTED_SCHEMA_ADDITIONS = (
         ('distcp_bytes_copied', 'BIGINT'),
         ('distcp_files_copied', 'BIGINT'),
         ('throughput_mbps', 'DOUBLE'),
+        ('parent_source_path', 'STRING'),
+        ('failure_phase', 'STRING'),
+        ('yarn_app_created', 'BOOLEAN'),
+        ('script_exit_code', 'INT'),
+        ('s3_list_before_seconds', 'DOUBLE'),
+        ('source_scan_seconds', 'DOUBLE'),
+        ('s3_list_after_seconds', 'DOUBLE'),
+        ('validation_listing_seconds', 'DOUBLE'),
+        ('diagnostics_json', 'STRING'),
     )),
     ('data_copy_runs', (
         ('dag_run_id', 'STRING'),
@@ -350,12 +411,14 @@ class TestRunFolderDistcpSsh:
         probe_stdout.read.return_value = b'1        800  42949672960 /data/sales/raw\n'
         probe_stderr = MagicMock()
         probe_stderr.read.return_value = b''
+        wire_channel(probe_stdout, probe_stderr)
 
         distcp_stdout = MagicMock()
         distcp_stdout.channel.recv_exit_status.return_value = 0
         distcp_stdout.read.return_value = self._success_output()
         distcp_stderr = MagicMock()
         distcp_stderr.read.return_value = b''
+        wire_channel(distcp_stdout, distcp_stderr)
 
         client.exec_command.side_effect = [
             (MagicMock(), probe_stdout, probe_stderr),
@@ -1271,3 +1334,214 @@ class TestSendDataCopyReportEmail:
                 run_id=sample_folder_run_id, spark=mock_spark,
             )
         assert result == {'sent': False, 'reason': 'no_recipients'}
+
+
+# ===========================================================================
+# Subfolder splitting (expand_folder_subfolders and its listing helpers)
+# ===========================================================================
+def _ls_ssh(output: str, rc: int = 0):
+    """SSH hook whose `hadoop fs -ls` returns `output`."""
+    client = MagicMock()
+    stdout, stderr = MagicMock(), MagicMock()
+    stdout.read.return_value = output.encode()
+    stderr.read.return_value = b''
+    stdout.channel.recv_exit_status.return_value = rc
+    wire_channel(stdout, stderr)
+    client.exec_command.return_value = (None, stdout, stderr)
+    ssh = MagicMock()
+    ssh.get_conn.return_value.__enter__.return_value = client
+    return ssh
+
+
+class TestLsLineParsing:
+
+    def test_owner_and_group_with_spaces_match(self):
+        line = 'drwxr-xr-x   - jdoe domain users  3 2024-01-15 10:22 /data/b'
+        match = m._LS_LINE_RE.match(line)
+        assert match is not None
+        assert match.group('kind') == 'd'
+        assert match.group('path') == '/data/b'
+
+    def test_file_with_space_in_name(self):
+        match = m._LS_LINE_RE.match('-rw-r--r--+  3 jdoe hdfs 1024 2024-01-15 10:22:33 /data/my file.csv')
+        assert match.group('kind') == '-'
+        assert match.group('size') == '1024'
+        assert match.group('path') == '/data/my file.csv'
+
+    def test_symlink_is_classified_not_dropped(self):
+        match = m._LS_LINE_RE.match('lrwxrwxrwx   - jdoe hdfs 5 2024-01-15 10:22 /data/link')
+        assert match.group('kind') == 'l'
+
+
+class TestListImmediateChildren:
+
+    def test_parses_dirs_and_files_with_space_owner(self):
+        out = '\n'.join([
+            'Found 2 items',
+            'drwxr-xr-x   - jdoe domain users  0 2024-01-15 10:22 /data/a',
+            '-rw-r--r--   3 jdoe domain users 99 2024-01-15 10:22 /data/top.csv',
+        ])
+        dirs, files = m._list_immediate_children(_ls_ssh(out), {'cluster_type': 'MapR'}, '/data')
+        assert dirs == ['/data/a']
+        assert files == [('/data/top.csv', 99)]
+
+    def test_header_count_mismatch_raises(self):
+        out = '\n'.join([
+            'Found 3 items',
+            'drwxr-xr-x   - jdoe hdfs 0 2024-01-15 10:22 /data/a',
+        ])
+        with pytest.raises(ValueError, match='reported 3 items but 1 were parsed'):
+            m._list_immediate_children(_ls_ssh(out), {}, '/data')
+
+    def test_unrecognised_line_raises(self):
+        out = 'Found 1 items\nthis is not an ls entry'
+        with pytest.raises(ValueError, match='unrecognised'):
+            m._list_immediate_children(_ls_ssh(out), {}, '/data')
+
+    def test_symlink_raises_so_folder_is_copied_whole(self):
+        out = 'Found 1 items\nlrwxrwxrwx   - jdoe hdfs 5 2024-01-15 10:22 /data/link'
+        with pytest.raises(ValueError, match='non-regular entry'):
+            m._list_immediate_children(_ls_ssh(out), {}, '/data')
+
+    def test_snapshot_dir_skipped_but_counted(self):
+        out = '\n'.join([
+            'Found 2 items',
+            'drwxr-xr-x   - jdoe hdfs 0 2024-01-15 10:22 /data/.snapshot',
+            'drwxr-xr-x   - jdoe hdfs 0 2024-01-15 10:22 /data/a',
+        ])
+        dirs, _ = m._list_immediate_children(_ls_ssh(out), {}, '/data')
+        assert dirs == ['/data/a']
+
+
+class TestSettingHelpers:
+
+    @pytest.mark.parametrize('value', [True, 1.0, '1.0', 'TRUE', ' yes ', 1])
+    def test_truthy_accepts_excel_and_string_forms(self, value):
+        assert m._truthy(value) is True
+
+    @pytest.mark.parametrize('value', [False, 0.0, 'nan', 'no', None, ''])
+    def test_truthy_rejects_false_like_values(self, value):
+        assert m._truthy(value) is False
+
+    @pytest.mark.parametrize('raw, expected', [('2', 2), ('2.0', 2), (' 3 ', 3)])
+    def test_int_setting_parses_valid_values(self, raw, expected):
+        with patch.object(m, '_resolve_setting', return_value=raw):
+            assert m._int_setting('split_depth', {}, default=1, minimum=1) == expected
+
+    @pytest.mark.parametrize('raw', ['2.5', 'abc', '0', 'nan', ''])
+    def test_int_setting_falls_back_to_default_with_warning(self, raw):
+        with patch.object(m, '_resolve_setting', return_value=raw), \
+             patch.object(m.logger, 'warning') as warn:
+            assert m._int_setting('split_depth', {}, default=1, minimum=1) == 1
+        warn.assert_called_once()
+
+    def test_allow_delete_reads_config_key_first(self):
+        assert m._allow_delete({'folder_copy_allow_delete': 'true'}) is True
+        assert m._allow_delete({'folder_copy_allow_delete': 'false'}) is False
+
+    def test_diagnostics_json_stays_valid_when_long(self):
+        import json
+        diag = {'edge_groups': 'grp ' * 2000, 'failure_phase': 'distcp', 'edge_host': 'edge1'}
+        text = m._diagnostics_json(diag)
+        assert len(text) <= 4000
+        parsed = json.loads(text)
+        assert parsed['edge_host'] == 'edge1'
+
+    def test_diagnostics_json_unchanged_when_short(self):
+        import json
+        diag = {'edge_groups': 'a,b', 'failure_phase': None}
+        assert json.loads(m._diagnostics_json(diag)) == diag
+
+
+class TestExpandFolderSubfolders:
+
+    @pytest.fixture
+    def settings(self):
+        """Stub the DAG Param/Variable/env lookups; tests set values by name."""
+        values = {}
+        def _resolve(name, context=None, default=None):
+            return values.get(name, default)
+        with patch.object(m, '_resolve_setting', side_effect=_resolve), \
+             patch.object(m, '_airflow_map_limit', return_value=1024):
+            yield values
+
+    @pytest.fixture
+    def cfg(self):
+        config = {'ssh_conn_id': 'ssh_conn', 'distcp_preserve_delete': False}
+        with patch.object(m, 'get_config', return_value=config):
+            yield config
+
+    @staticmethod
+    def _folder(path, split=True):
+        return {
+            'run_id': 'r', 'source_path': path, 'dest_bucket': 's3a://b',
+            'dest_folder': path.strip('/').split('/')[-1], 'dest_endpoint': '',
+            'split_subfolders': split,
+        }
+
+    @staticmethod
+    def _entries(folder, n):
+        return [{**folder, 'source_path': f"{folder['source_path']}/s{i}"} for i in range(n)]
+
+    def test_not_requested_returns_input_unchanged(self, settings, cfg):
+        folders = [self._folder('/data/a', split=False)]
+        with patch.object(m, '_split_folder_config') as split:
+            assert m.expand_folder_subfolders.function(folders) == folders
+        split.assert_not_called()
+
+    def test_delete_on_copies_folder_whole_without_listing(self, settings, cfg):
+        cfg['distcp_preserve_delete'] = True
+        cfg['folder_copy_allow_delete'] = True
+        folders = [self._folder('/data/a')]
+        with patch.object(m, '_split_folder_config') as split:
+            result = m.expand_folder_subfolders.function(folders)
+        assert result == folders
+        split.assert_not_called()
+
+    def test_delete_flag_off_still_splits(self, settings, cfg):
+        cfg['distcp_preserve_delete'] = True
+        cfg['folder_copy_allow_delete'] = False
+        folder = self._folder('/data/a')
+        with patch.object(m, '_split_folder_config', return_value=self._entries(folder, 2)):
+            result = m.expand_folder_subfolders.function([folder])
+        assert len(result) == 2
+
+    def test_map_limit_copies_later_folder_whole_when_total_would_exceed(self, settings, cfg):
+        first, second = self._folder('/data/a'), self._folder('/data/b')
+        with patch.object(m, '_airflow_map_limit', return_value=3), \
+             patch.object(m, '_split_folder_config', side_effect=[
+                 self._entries(first, 2), self._entries(second, 2)]):
+            result = m.expand_folder_subfolders.function([first, second])
+        # first: 2 entries, 0 remaining -> 2 <= 3, split.
+        # second: 2 + 2 already used, 0 remaining -> 4 > 3, copied whole.
+        assert len(result) == 3
+        assert result[-1] is second
+
+    def test_map_limit_reserves_slot_for_unprocessed_rows(self, settings, cfg):
+        first, second = self._folder('/data/a'), self._folder('/data/b', split=False)
+        with patch.object(m, '_airflow_map_limit', return_value=2), \
+             patch.object(m, '_split_folder_config', return_value=self._entries(first, 2)) as split:
+            result = m.expand_folder_subfolders.function([first, second])
+        # first: 2 entries + 1 reserved for the unsplit second row = 3 > 2, so it is copied whole.
+        assert split.called
+        assert result == [first, second]
+        with patch.object(m, '_airflow_map_limit', return_value=3), \
+             patch.object(m, '_split_folder_config', return_value=self._entries(first, 2)):
+            result = m.expand_folder_subfolders.function([first, second])
+        # With room for the reserved slot, the first row splits and the second is kept.
+        assert len(result) == 3
+        assert result[-1] is second
+
+    def test_split_error_copies_folder_whole(self, settings, cfg):
+        folder = self._folder('/data/a')
+        with patch.object(m, '_split_folder_config', side_effect=ValueError('bad listing')):
+            result = m.expand_folder_subfolders.function([folder])
+        assert result == [folder]
+
+    def test_invalid_split_depth_falls_back_to_one(self, settings, cfg):
+        settings['split_depth'] = 'two'
+        folder = self._folder('/data/a', split=None)
+        settings['split_subfolders'] = True
+        with patch.object(m, '_split_folder_config', return_value=self._entries(folder, 1)) as split:
+            m.expand_folder_subfolders.function([folder])
+        assert split.call_args.args[3] == 1
