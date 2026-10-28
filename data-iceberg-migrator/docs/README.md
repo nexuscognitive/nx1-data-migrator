@@ -100,9 +100,9 @@ to end; see its `README.md` for setup and the DAG settings.
 | `migration_distcp_preserve_delete` | `true`           | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes))                                                                                  | `source_to_s3_migration`                          |
 | `migration_distcp_max_tables_per_batch` | `25`        | Hard cap on tables per batch                                                                                                                                                                                      | `source_to_s3_migration`                          |
 | `migration_distcp_call_timeout_max_seconds` | `21600` | Ceiling on one DistCp call's timeout, in seconds                                                                                                                                                                 | `source_to_s3_migration`                          |
-| `MIGRATION_DISTCP_COPY_MAX_CONCURRENT` | `3`         | Concurrent DistCp copies per DAG run. **Env-only** — read at DAG parse time, so it must be set in `env.shared` and redeployed with `deploy.py`; there is no equivalent Airflow Variable                          | `source_to_s3_migration`                          |
-| `MIGRATION_VALIDATION_MAX_CONCURRENT` | `3`          | Concurrent destination-validation tasks per DAG run. **Env-only**, same reason as above                                                                                                                          | `source_to_s3_migration`                          |
-| `MIGRATION_DISCOVERY_MAX_CONCURRENT` | `3`          | Concurrent table-discovery tasks per DAG run. Each runs a `pyspark` driver on the edge node, so size it to the edge's memory. **Env-only**, same reason as above | `source_to_s3_migration`                          |
+| `migration_distcp_copy_max_concurrent` | `3`         | Concurrent DistCp copies per DAG run; also sets the batch-count floor in `flatten_and_batch`. Read at DAG parse time as Airflow Variable → env var `MIGRATION_DISTCP_COPY_MAX_CONCURRENT` → default, so it can be changed from the Airflow UI without a redeploy | `source_to_s3_migration`                          |
+| `MIGRATION_VALIDATION_MAX_CONCURRENT` | `3`          | Concurrent destination-validation tasks per DAG run. **Env-only** — read at DAG parse time, so it must be set in `env.shared` and redeployed with `deploy.py`; there is no equivalent Airflow Variable | `source_to_s3_migration`                          |
+| `migration_discovery_max_concurrent` | `3`          | Concurrent table-discovery tasks per DAG run. Each runs a `pyspark` driver on the edge node, so size it to the edge's memory. Read at DAG parse time as Airflow Variable → env var `MIGRATION_DISCOVERY_MAX_CONCURRENT` → default | `source_to_s3_migration`                          |
 | `migration_distcp_checkpoint_location` | `<migration_tracking_location>/_distcp_checkpoints` | S3 prefix for per-table, per-attempt DistCp checkpoint JSON. The edge node writes with Hadoop FS; the Spark status task lists and reads checkpoint objects. | `source_to_s3_migration` |
 | `migration_discovery_driver_memory` | _(empty)_ | Optional `--driver-memory` passed to the remote `pyspark` table-discovery process; empty leaves Spark's default unchanged. | `source_to_s3_migration` |
 | `migration_discovery_spark_master` | `local[*]`       | Spark master for the remote table-discovery `pyspark` process. Use `yarn` to run discovery on the cluster when the edge node cannot hold the driver.                                                             | `source_to_s3_migration`                          |
@@ -119,6 +119,7 @@ to end; see its `README.md` for setup and the DAG settings.
 | `hdfs_nameservice`                 | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR                                                                                                                                                     | `source_to_s3_migration`, `folder_only_data_copy` |
 
 > **Upgrading an existing deployment:** auto-sizing only engages when
+> `migration_distcp_enable_auto_sizing` is `true` **and**
 > `migration_distcp_mappers` **and** `migration_distcp_bandwidth` are unset at *every*
 > tier — Airflow Variable, then env var, then the built-in default. Deployments created
 > from an earlier `env.shared.example` carry `MIGRATION_DISTCP_MAPPERS=50` and
@@ -128,7 +129,8 @@ to end; see its `README.md` for setup and the DAG settings.
 > `env.shared`. Either delete both lines from `env.shared` and redeploy, or set both
 > Airflow Variables to an **empty string** — Airflow reports an empty Variable as
 > present, so it masks the env file where deleting the Variable would expose it.
-> `[DistCp] Sizing mode:` in the task log says which mode is active.
+> `[DistCp] Sizing mode:` in the task log says which mode is active. See
+> [DistCp Performance Tuning](DistCp_Performance_Tuning.md) for how each mode sizes a copy.
 
 
 #### Service account configuration
@@ -607,12 +609,16 @@ goes into the first batch with room left — under the size limit, and under
 exceeds the limit gets a batch to itself, because one table cannot be split. A
 batch never spans two source databases.
 
-**4. Budget each batch:** `max(its own estimate, the size limit) x 1.25`,
-capped at 7.2 hours. The `max` stops a small batch being starved by its own low
-estimate, the 1.25 is slack for a wrong estimate, and the 7.2-hour cap — nine
-tenths of the task timeout — keeps the budget firing *before* the task is
-killed. That last part matters: a batch killed by the task timeout writes no
-status rows at all, which is why no batch is ever budgeted past it.
+**4. Budget each batch: a flat 7.2 hours,** nine tenths of the 8-hour task
+timeout, whatever the batch's own estimate. Earlier versions scaled each
+budget from the batch's estimate; because the estimate ignores YARN queueing
+and SSH overhead, those budgets ran out mid-batch and skipped healthy tables.
+The 7.2-hour figure keeps the budget firing *before* the task is killed. That
+matters: a batch killed by the task timeout writes no status rows at all,
+which is why no batch is ever budgeted past it. A copy that is genuinely stuck
+is caught by its own per-call timeout (three times its estimate, between 30
+minutes and `migration_distcp_call_timeout_max_seconds`), not by the batch
+budget.
 
 **5. Order batches most expensive first,** so the long ones start first and the
 whole run finishes sooner.
@@ -640,6 +646,9 @@ runs it would cost.
 Each copy still logs `[DistCp] cost estimate Xs vs actual Ys`; it is
 informational only — there is nothing to adjust in response to it.
 
+How many mappers and how much bandwidth each copy inside a batch gets is a
+separate decision, covered in [DistCp Performance Tuning](DistCp_Performance_Tuning.md).
+
 **One caveat.** Estimates assume a full first copy. Re-runs use DistCp's
 incremental mode, where most of the time goes on directory scans rather than
 transfer, so estimates come out high and batches correspondingly small. This is
@@ -658,10 +667,11 @@ attempts' worth of work, split the table at the source. Raising that ceiling
 past 28200 seconds requires raising `SSH_COMMAND_TIMEOUT` with it, or an
 abandoned copy can leave an orphaned YARN job writing to the destination.
 
-**Concurrency.** `MIGRATION_DISTCP_COPY_MAX_CONCURRENT` (default 3) caps
-concurrent copies per DAG run. It is read from `env.shared` at parse time, so
-changing it means redeploying with `deploy.py`, not editing an Airflow
-Variable. With `max_active_runs=5`, up to five runs can each use that many
+**Concurrency.** `migration_distcp_copy_max_concurrent` (default 3) caps
+concurrent copies per DAG run. It is read at parse time as Airflow Variable →
+env var `MIGRATION_DISTCP_COPY_MAX_CONCURRENT` → default, so it can be changed
+from the Airflow UI without a redeploy; the same value sets the batch-count
+floor in step 2. With `max_active_runs=5`, up to five runs can each use that many
 slots, so the true ceiling is five times the value — but Airflow's default of
 16 task slots per DAG binds first: at 3 × 5 = 15 the copies leave almost
 nothing for the rest of the pipeline.
@@ -944,8 +954,9 @@ finalize_run
   - If exists, runs `hadoop distcp -update` (incremental sync)
   - If new, runs full copy
 - **DistCp configuration:**
-  - Configurable mapper count (default: 50)
-  - Bandwidth limit per mapper (default: 100 MB/s)
+  - Mapper count and per-mapper bandwidth: 50 × 100 MB/s for every table by default; with
+    `migration_distcp_enable_auto_sizing=true`, sized per table or forced to a fixed pair
+    (see [DistCp Performance Tuning](DistCp_Performance_Tuning.md))
   - Dynamic strategy for load balancing
   - S3 credentials passed via `-D` properties
 - **Partition-filtered copy:** When a `partition_filter` is active, only the matched partitions are copied instead of the whole table root. The copy mode is controlled by `migration_distcp_preserve_delete` (see below).

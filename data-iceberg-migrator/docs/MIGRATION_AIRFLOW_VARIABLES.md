@@ -104,7 +104,10 @@ discovery that doesn't share these knobs; DAG 3 is folder-copy with no discovery
 | `migration_distcp_max_tables_per_batch`          | `MIGRATION_DISTCP_MAX_TABLES_PER_BATCH`         | `25`    | int                              | 1          | Cap on tables packed into one DistCp batch. |
 | `migration_distcp_call_timeout_max_seconds`      | `MIGRATION_DISTCP_CALL_TIMEOUT_MAX_SECONDS`     | `21600` | int (seconds)                    | 1          | Hard ceiling on a single `hadoop distcp` invocation (6h default). |
 
-### 6b. Auto-sizing (DAG 1, opt-in)
+### 6b. Auto-sizing (DAG 1 and DAG 3, opt-in)
+
+How these combine into a mapper count and per-mapper bandwidth, with worked examples, is in
+[DistCp Performance Tuning](DistCp_Performance_Tuning.md).
 
 | Variable                                         | Env                                             | Default            | Values            | Applies to | Description |
 |--------------------------------------------------|-------------------------------------------------|--------------------|-------------------|------------|-------------|
@@ -225,10 +228,16 @@ HMS clients) and/or raise `migration_metastore_retry_attempts`.
 **DistCp jobs queueing in YARN?**
 → lower `migration_distcp_copy_max_concurrent`, or widen the YARN queue.
 
+**Small tables copied with 50 mappers each, or large tables copying slowly?**
+→ auto-sizing is off by default; set `migration_distcp_enable_auto_sizing=true` and keep
+`migration_distcp_mappers`/`migration_distcp_bandwidth` empty. See
+[DistCp Performance Tuning](DistCp_Performance_Tuning.md).
+
 **Want to migrate append-only (preserve dest files on source deletes)?**
 → `migration_distcp_preserve_delete=false`.
 
 **Fixing wrongly-typed partition columns from an older DAG version?**
 → one run with `migration_recreate_tables=true`, then set back to `false`.
 
-See also `README.md` → "Tuning DAG 1 performance" for the operational walk-through.
+See also `README.md` → "Tuning DAG 1 performance" for the operational walk-through, and
+[DistCp Performance Tuning](DistCp_Performance_Tuning.md) for copy sizing and batching.

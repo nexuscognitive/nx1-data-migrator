@@ -4,3 +4,4 @@ plugins:
   - techdocs-core
 nav:
   - Overview: index.md
+  - DistCp Performance Tuning: distcp-tuning.md
