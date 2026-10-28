@@ -41,6 +41,22 @@ class TestMaprToS3DagIntegrity:
         ):
             assert needle in dag_body, needle
 
+    def test_checkpoint_cleanup_runs_before_finalize(self):
+        """Source-text check for the same reason as the test above."""
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        _, _, dag_body = source.partition('with DAG(')
+        for needle in (
+            'cleanup_checkpoints(run_id=t_run_id)',
+            't_checkpoint_cleanup.operator.trigger_rule = "all_done"',
+            't_email >> t_checkpoint_cleanup >> t_final',
+        ):
+            assert needle in dag_body, needle
+        # finalize_run must stay the only leaf: it decides the DAG run state.
+        assert 't_final >>' not in dag_body
+
     def test_distcp_status_writer_has_an_explicit_concurrency_cap(self):
         """t_distcp_status is one Iceberg writer per batch, and retiring
         migration_distcp_max_batches removed the implicit bound on batch count,
