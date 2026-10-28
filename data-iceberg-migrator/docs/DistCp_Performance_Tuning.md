@@ -21,37 +21,45 @@ built-in default**.
 
 ## 2. Three sizing modes: Disabled, Forced, Auto
 
-| Mode | How to select it | What every table gets |
-| --- | --- | --- |
-| **Disabled** (default) | `migration_distcp_enable_auto_sizing` unset or `false` | `migration_distcp_default_mappers` × `migration_distcp_default_bandwidth` (**50 × 100 MB/s**), whatever its size. Every other sizing knob, including the forced pair, is ignored. |
-| **Forced** | Switch `true`, **and** both `migration_distcp_mappers` and `migration_distcp_bandwidth` set | That fixed mapper/bandwidth pair, whatever its size |
-| **Auto** | Switch `true`, **and** both `migration_distcp_mappers` and `migration_distcp_bandwidth` empty | Mappers and bandwidth sized from the table's own size and file count ([section 3](#3-how-auto-sizing-works)) |
+One switch, `migration_distcp_enable_auto_sizing`, decides how mappers and bandwidth are chosen:
 
-**Auto-sizing is opt-in.** The switch defaults to `false`, so an upgrade changes nothing until
-someone sets `migration_distcp_enable_auto_sizing=true`. Disabled mode reproduces the DAG's
-behaviour from before auto-sizing existed.
+| `migration_distcp_enable_auto_sizing` | `migration_distcp_mappers` and `migration_distcp_bandwidth` | Mode | What every table gets |
+| --- | --- | --- | --- |
+| unset or `false` (default) | not used | **Disabled** | `migration_distcp_default_mappers` × `migration_distcp_default_bandwidth` (50 × 100 MB/s unless you set them) |
+| `true` | both set | **Forced** | `migration_distcp_mappers` × `migration_distcp_bandwidth` |
+| `true` | both empty | **Auto** | Calculated per table from its size and file count ([section 3](#3-how-auto-sizing-works)) |
+| `true` | only one set | Error | The DistCp task fails with a message naming the missing one |
 
-**The forced pair must be set together or left empty together.** Setting only one is a
-configuration error: the DAG raises rather than guess. The error surfaces in the DistCp task,
-after discovery has already run.
+### Disabled (default)
 
-> **Trap: an empty Variable masks `env.shared`.** For the forced check, an empty or
-> whitespace-only value counts as **unset**. But an empty Airflow Variable still *exists*, so it
-> hides any value for the same key in the deployed `env.shared`; deleting the Variable exposes
-> that value again. Deployments created from an older `env.shared.example` carry
-> `MIGRATION_DISTCP_MAPPERS=50` and `MIGRATION_DISTCP_BANDWIDTH=100`. With those lines present,
-> turning the switch on leaves the DAG in **Forced** mode at 50 × 100, not Auto. To get Auto,
-> either delete both lines from `env.shared` and redeploy, or set both Airflow Variables to an
-> empty string.
+Every table is copied with the same mapper count and bandwidth, whatever its size:
 
-**Confirming the mode.** Each copy task logs one `[DistCp] Sizing mode:` line (DAG 3:
-`[FolderCopy] Sizing mode:`):
+- Mappers: `migration_distcp_default_mappers` (default **50**)
+- Bandwidth per mapper: `migration_distcp_default_bandwidth` (default **100** MB/s)
 
-| Log line starts with | Meaning |
+To use different values for all tables, set these two Airflow Variables. You don't need to turn auto-sizing on. In this mode `migration_distcp_mappers`, `migration_distcp_bandwidth` and the auto-sizing settings in [section 3](#3-how-auto-sizing-works) are not read, so setting them has no effect.
+
+This is how the DAG behaved before auto-sizing existed, so upgrading changes nothing until someone sets `migration_distcp_enable_auto_sizing=true`.
+
+### Forced
+
+Turn auto-sizing on and set **both** `migration_distcp_mappers` and `migration_distcp_bandwidth`. Every table uses that pair, whatever its size. Useful for troubleshooting, when you want sizing out of the picture. The per-mapper cap (`migration_distcp_max_mapper_bandwidth`) does not apply in this mode.
+
+### Auto
+
+Turn auto-sizing on and leave `migration_distcp_mappers` and `migration_distcp_bandwidth` **empty**. Each table gets its own mapper count and bandwidth, based on how much data it has and how many files it's in. [Section 3](#3-how-auto-sizing-works) explains the calculation.
+
+> **Watch out for `env.shared` when moving to Auto.** Each setting is read from the Airflow Variable first, then `env.shared`, then the built-in default. Older deployments have `MIGRATION_DISTCP_MAPPERS=50` and `MIGRATION_DISTCP_BANDWIDTH=100` in their deployed `env.shared`, so turning auto-sizing on puts them in **Forced** mode at 50 × 100, not Auto. To get Auto, either delete both lines from `env.shared` and redeploy, or create both Airflow Variables with an empty value. An empty Variable hides the `env.shared` value; deleting the Variable brings it back.
+
+### Checking which mode a run used
+
+Each copy task logs one `[DistCp] Sizing mode:` line (DAG 3: `[FolderCopy] Sizing mode:`):
+
+| Log line starts with | Mode |
 | --- | --- |
-| `DISABLED — migration_distcp_enable_auto_sizing is not 'true', so every table is pinned to -m 50 -bandwidth 100 …` | Switch off |
-| `FORCED — every table pinned to -m … -bandwidth … by migration_distcp_mappers/migration_distcp_bandwidth …` | Switch on, forced pair set |
-| `AUTO — sized per table from discovered size: … bytes/mapper, 1-100 mappers, 2000 MB/s aggregate, 500 MB/s per-mapper cap` | Switch on, sizing per table |
+| `DISABLED — migration_distcp_enable_auto_sizing is not 'true', so every table is pinned to -m 50 -bandwidth 100 …` | Disabled |
+| `FORCED — every table pinned to -m … -bandwidth … by migration_distcp_mappers/migration_distcp_bandwidth …` | Forced |
+| `AUTO — sized per table from discovered size: …` | Auto |
 
 Each table then logs what it actually got, for example
 `[DistCp] Sized db.table: 50 mappers x 100 MB/s (= 5000 MB/s aggregate) for 1150 bytes / 3 files`.
@@ -217,7 +225,7 @@ tune in response to it.
 |  | **Disabled (default)** | **Auto (recommended for mixed workloads)** | **Forced** |
 | --- | --- | --- | --- |
 | **How to select** | Switch unset / `false` | Switch `true`, forced pair empty | Switch `true`, forced pair set |
-| **Behaviour** | 50 × 100 MB/s for every table | Mappers and bandwidth scaled to each table's size and file count | Your fixed pair for every table |
+| **Behaviour** | The same default pair for every table (50 × 100 MB/s unless you set `migration_distcp_default_mappers` and `migration_distcp_default_bandwidth`) | Mappers and bandwidth scaled to each table's size and file count | Your fixed pair for every table |
 | **Small tables** | Over-provisioned: a tiny table still gets 50 mappers (5000 MB/s nominal) | Proportionate | Depends on the pair you chose |
 | **Large tables** | May be under-provisioned (50 mappers, 100 MB/s each) | Up to 100 mappers, bounded by the aggregate target and the 500 MB/s per-mapper cap | Depends on the pair; the per-mapper cap does **not** apply |
 | **Predictability** | Fully predictable | Self-adjusting; check the `Sized …` log line per table | Fully predictable |
@@ -271,7 +279,7 @@ location) are listed in [MIGRATION_AIRFLOW_VARIABLES.md](MIGRATION_AIRFLOW_VARIA
 
 ## 9. Summary
 
-- **Auto-sizing is off by default.** Every table gets 50 mappers × 100 MB/s until
+- **Auto-sizing is off by default.** Every table gets the default pair (50 mappers × 100 MB/s unless you change the two default Variables) until
   `migration_distcp_enable_auto_sizing=true`.
 - When enabled, mappers and bandwidth are derived per table from its size and file count,
   aiming at a constant total throughput per table (2000 MB/s by default).
