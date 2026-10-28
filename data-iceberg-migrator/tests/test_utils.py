@@ -113,6 +113,22 @@ class TestVarPrecedence:
             cfg = m.get_config()
         assert cfg['s3_access_key'] == 'PER_RUN'
 
+    def test_run_scoped_variable_keys_on_the_dag_run_not_a_run_id_task_argument(self):
+        """PythonOperator merges op_kwargs into the context, so a task taking a
+        `run_id` argument (the migration run id) shadows context['run_id']."""
+        dag_run = type('DagRun', (), {'conf': {'triggered_by': m.PORTAL_TRIGGER}, 'run_id': 'data_migration_1'})()
+        ctx = patch(
+            'airflow.operators.python.get_current_context',
+            return_value={'run_id': 'run_20261027_160031_623a2de9', 'dag_run': dag_run},
+        )
+        vars_ = self._variables({
+            'nx1_migration_tracking_database__data_migration_1': 'PER_RUN',
+            'nx1_migration_tracking_database': 'FROM_PORTAL',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['tracking_database'] == 'PER_RUN'
+
     def test_absent_run_scoped_variable_falls_through_to_nx1(self):
         """A blank S3 override is not written at all, so the global applies."""
         ctx, vars_ = self._portal({'nx1_s3_access_key': 'FROM_PORTAL'})
