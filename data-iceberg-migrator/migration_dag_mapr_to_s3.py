@@ -258,25 +258,18 @@ def _checkpoint_run_prefixes(config: dict, run_id) -> list[str]:
     return prefixes
 
 
-def _delete_edge_checkpoint_prefixes(ssh, prefixes: list[str], config: dict) -> None:
-    lines = ["rc=0"]
+def _delete_spark_checkpoint_prefixes(spark, prefixes: list[str]) -> None:
+    jvm = spark._jvm
+    hadoop_conf = spark._jsc.hadoopConfiguration()
+    errors = []
     for prefix in prefixes:
-        s3_opts = build_s3_opts(prefix, config)
-        lines.append(f"hadoop fs{s3_opts} -rm -r -f -skipTrash {shlex.quote(prefix)} || rc=1")
-    lines.append('exit "$rc"')
-    command = "\n".join(lines) + "\n"
-    with ssh.get_conn() as client:
-        _, stdout, stderr = client.exec_command(
-            _login_shell(command, config.get("cluster_type", "MapR")), timeout=600
-        )
-        output = stdout.read().decode()
-        error_output = stderr.read().decode()
-        exit_code = stdout.channel.recv_exit_status()
-    if exit_code != 0:
-        raise RuntimeError(
-            f"Could not delete checkpoints (exit={exit_code}): "
-            f"{(error_output or output)[-1000:]}"
-        )
+        try:
+            fs = jvm.org.apache.hadoop.fs.FileSystem.get(jvm.java.net.URI(prefix), hadoop_conf)
+            fs.delete(jvm.org.apache.hadoop.fs.Path(prefix), True)
+        except Exception as e:
+            errors.append(f"{prefix}: {e}")
+    if errors:
+        raise RuntimeError(f"Could not delete checkpoints: {'; '.join(errors)}")
 
 
 def _discovery_checkpoint_identity(record: dict) -> str:
@@ -6193,8 +6186,8 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     }
 
 
-@task
-def cleanup_checkpoints(run_id: str) -> dict:
+@task.pyspark(conn_id="spark_default")
+def cleanup_checkpoints(run_id: str, spark) -> dict:
     """Delete this run's DistCp and discovery checkpoints; best-effort, never raises.
 
     Only task retries and update_distcp_status read them, so they stop being useful when the run ends.
@@ -6202,8 +6195,7 @@ def cleanup_checkpoints(run_id: str) -> dict:
     try:
         config = get_config()
         prefixes = _checkpoint_run_prefixes(config, run_id)
-        ssh = SSHHook(ssh_conn_id=config["ssh_conn_id"])
-        _delete_edge_checkpoint_prefixes(ssh, prefixes, config)
+        _delete_spark_checkpoint_prefixes(spark, prefixes)
         logger.info(f"[cleanup_checkpoints] Deleted {prefixes}")
         return {"run_id": run_id, "deleted": prefixes}
     except Exception as e:

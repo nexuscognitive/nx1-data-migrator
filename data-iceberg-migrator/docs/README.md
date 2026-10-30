@@ -1188,10 +1188,10 @@ the latest attempt for each table into `migration_table_status`; checkpoint
 records take precedence over XCom results.
 
 The `cleanup_checkpoints` task deletes `<checkpoint-location>/<run-id>` and
-`<discovery-checkpoint-location>/<run-id>` from the edge node near the end of every
-run, whatever the outcome. Failures are logged, not raised, so they never change
-the DAG run state. The edge node needs write and delete access to both prefixes;
-the Spark runtime needs list and read access.
+`<discovery-checkpoint-location>/<run-id>` through Spark's Hadoop filesystem near the
+end of every run, whatever the outcome. Failures are logged, not raised, so they never
+change the DAG run state. The edge node needs write access to both prefixes; the Spark
+runtime needs list, read and delete access.
 
 Clearing a failed `run_distcp_ssh` task after the run has finished re-copies its
 whole batch with `-update`: completed tables are not skipped, and their tracking

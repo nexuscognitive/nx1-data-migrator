@@ -4501,60 +4501,39 @@ class TestCleanupCheckpoints:
         with pytest.raises(ValueError):
             m._checkpoint_run_prefixes(m.get_config(), bad)
 
-    def test_delete_runs_one_session_with_skiptrash(self, mock_ssh_hook):
-        hook, client, _, _ = mock_ssh_hook
-        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(0, b''), MagicMock())
-        m._delete_edge_checkpoint_prefixes(hook, ['s3a://trk/a/run_1', 's3a://trk/b/run_1'], m.get_config())
-        assert client.exec_command.call_count == 1
-        cmd = client.exec_command.call_args.args[0]
-        assert cmd.count('-rm -r -f -skipTrash') == 2
-        assert 's3a://trk/a/run_1' in cmd and 's3a://trk/b/run_1' in cmd
+    @staticmethod
+    def _fs(mock_spark):
+        return mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
 
-    def test_each_prefix_uses_its_own_s3_opts(self, mock_ssh_hook):
-        hook, client, _, _ = mock_ssh_hook
-        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(0, b''), MagicMock())
-        with patch.object(m, 'build_s3_opts', side_effect=lambda url, cfg, *a: f' -D{url.split("/")[2]}=1'):
-            m._delete_edge_checkpoint_prefixes(hook, ['s3a://bkt-a/x/run_1', 's3a://bkt-b/y/run_1'], m.get_config())
-        cmd = client.exec_command.call_args.args[0]
-        assert 'hadoop fs -Dbkt-a=1 -rm' in cmd and 'hadoop fs -Dbkt-b=1 -rm' in cmd
+    def test_spark_delete_removes_each_prefix_recursively(self, mock_spark):
+        m._delete_spark_checkpoint_prefixes(mock_spark, ['s3a://trk/a/run_1', 's3a://trk/b/run_1'])
+        path_cls = mock_spark._jvm.org.apache.hadoop.fs.Path
+        assert [c.args[0] for c in path_cls.call_args_list] == ['s3a://trk/a/run_1', 's3a://trk/b/run_1']
+        assert [c.args[1] for c in self._fs(mock_spark).delete.call_args_list] == [True, True]
 
-    def test_one_failed_rm_does_not_stop_the_next(self, mock_ssh_hook):
-        hook, client, _, _ = mock_ssh_hook
-        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(0, b''), MagicMock())
-        m._delete_edge_checkpoint_prefixes(hook, ['s3a://trk/a/run_1', 's3a://trk/b/run_1'], m.get_config())
-        cmd = client.exec_command.call_args.args[0]
-        assert cmd.count('|| rc=1') == 2 and 'exit "$rc"' in cmd
+    def test_spark_delete_failure_does_not_skip_the_next_prefix(self, mock_spark):
+        self._fs(mock_spark).delete.side_effect = [Exception('AccessDeniedException'), True]
+        with pytest.raises(RuntimeError, match='s3a://trk/a/run_1: AccessDeniedException'):
+            m._delete_spark_checkpoint_prefixes(mock_spark, ['s3a://trk/a/run_1', 's3a://trk/b/run_1'])
+        assert self._fs(mock_spark).delete.call_count == 2
 
-    def test_delete_raises_on_nonzero_exit(self, mock_ssh_hook):
-        hook, client, _, _ = mock_ssh_hook
-        stderr = MagicMock()
-        stderr.read.return_value = b'Permission denied'
-        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(1, b''), stderr)
-        with pytest.raises(RuntimeError, match='Permission denied'):
-            m._delete_edge_checkpoint_prefixes(hook, ['s3a://trk/a/run_1'], m.get_config())
+    def test_task_deletes_both_prefixes(self, mock_spark, sample_run_id):
+        result = m.cleanup_checkpoints.function(run_id=sample_run_id, spark=mock_spark)
+        assert 'error' not in result
+        assert [p.rsplit('/', 2)[-2:] for p in result['deleted']] == [
+            ['_distcp_checkpoints', sample_run_id], ['_discovery_checkpoints', sample_run_id],
+        ]
+        assert self._fs(mock_spark).delete.call_count == 2
 
-    def test_task_deletes_both_prefixes(self, mock_ssh_hook, sample_run_id):
-        _, client, _, _ = mock_ssh_hook
-        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(0, b''), MagicMock())
-        result = m.cleanup_checkpoints.function(run_id=sample_run_id)
-        assert len(result['deleted']) == 2 and 'error' not in result
-        cmd = client.exec_command.call_args.args[0]
-        assert f'_distcp_checkpoints/{sample_run_id}' in cmd
-        assert f'_discovery_checkpoints/{sample_run_id}' in cmd
-
-    def test_task_invalid_run_id_skips_ssh(self, mock_ssh_hook):
-        _, client, _, _ = mock_ssh_hook
-        result = m.cleanup_checkpoints.function(run_id=None)
+    def test_task_invalid_run_id_deletes_nothing(self, mock_spark):
+        result = m.cleanup_checkpoints.function(run_id=None, spark=mock_spark)
         assert result['deleted'] == [] and 'run_id' in result['error']
-        client.exec_command.assert_not_called()
+        self._fs(mock_spark).delete.assert_not_called()
 
-    def test_task_swallows_ssh_failure(self, mock_ssh_hook, sample_run_id, caplog):
-        _, client, _, _ = mock_ssh_hook
-        stderr = MagicMock()
-        stderr.read.return_value = b'AccessDeniedException'
-        client.exec_command.return_value = (MagicMock(), mock_ssh_stdout(1, b''), stderr)
+    def test_task_swallows_delete_failure(self, mock_spark, sample_run_id, caplog):
+        self._fs(mock_spark).delete.side_effect = Exception('AccessDeniedException')
         with caplog.at_level(logging.WARNING):
-            result = m.cleanup_checkpoints.function(run_id=sample_run_id)
+            result = m.cleanup_checkpoints.function(run_id=sample_run_id, spark=mock_spark)
         assert result['deleted'] == [] and 'AccessDeniedException' in result['error']
         assert any(r.levelno == logging.WARNING and '[cleanup_checkpoints]' in r.getMessage()
                    for r in caplog.records)
