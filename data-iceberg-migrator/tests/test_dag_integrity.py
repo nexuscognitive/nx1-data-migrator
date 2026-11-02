@@ -73,6 +73,29 @@ class TestMaprToS3DagIntegrity:
         window = dag_body[dag_body.index(anchor):][:200]
         assert 'MIGRATION_DISCOVERY_MAX_CONCURRENT' in window
 
+    def test_source_count_tasks_are_wired_in_order_with_caps(self):
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        _, _, dag_body = source.partition('with DAG(')
+        assert hasattr(m1, 'collect_source_counts_ssh')
+        assert hasattr(m1, 'update_source_counts')
+        for needle in (
+            'collect_source_counts_ssh.partial(cluster_setup=t_cluster).expand(',
+            'table_result=t_tbl_status',
+            'update_source_counts.expand(table_result=t_counts)',
+            'source_validation=t_counts_status',
+            't_tbl_status >> t_counts >> t_counts_status >> t_dest_validation',
+            't_counts.operator.trigger_rule = "all_done"',
+            't_counts_status.operator.trigger_rule = "all_done"',
+        ):
+            assert needle in dag_body, needle
+        anchor = 't_counts.operator.max_active_tis_per_dagrun'
+        assert anchor in dag_body
+        window = dag_body[dag_body.index(anchor):][:200]
+        assert 'MIGRATION_SOURCE_COUNT_MAX_CONCURRENT' in window
+
     def test_parse_path_variable_reads_are_in_the_allowlist(self):
         """Operator attributes are set at parse; every Variable.get() there costs
         a metadata-DB round trip per scheduler parse loop. Keep the set of

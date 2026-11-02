@@ -659,6 +659,13 @@ def get_config() -> dict:
             'MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM',
             '8',
         ),
+        'source_counts_phase': (
+            lambda v: v if v in ('discovery', 'post_copy', 'skip') else 'discovery'
+        )(
+            str(
+                _var('migration_source_counts_phase', 'MIGRATION_SOURCE_COUNTS_PHASE', 'discovery') or ''
+            ).strip().lower()
+        ),
         'metastore_retry_attempts': _var('migration_metastore_retry_attempts', 'MIGRATION_METASTORE_RETRY_ATTEMPTS', '4'),
         'metastore_retry_backoff_seconds': _var('migration_metastore_retry_backoff_seconds', 'MIGRATION_METASTORE_RETRY_BACKOFF_SECONDS', '15'),
         'metastore_socket_timeout': _var('migration_metastore_socket_timeout', 'MIGRATION_METASTORE_SOCKET_TIMEOUT', '600s'),
