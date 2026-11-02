@@ -1628,18 +1628,16 @@ exit 0
         ) from e
 
 
-@task.pyspark(conn_id='spark_default')
-def record_data_copy_status(distcp_result: dict, spark) -> dict:
-    """Insert a row into data_copy_status for the completed/failed folder copy."""
-    if not isinstance(distcp_result, dict) or 'run_id' not in distcp_result:
-        logger.warning(
-            f"[record_data_copy_status] Skipping invalid input: {type(distcp_result)}"
-        )
-        return {}
+TRACKING_WRITE_BATCH_SIZE = 100
 
-    config = get_config()
-    tracking_db = config['tracking_database']
 
+def _chunks(items: list, size: int):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _status_row_sql(distcp_result: dict) -> str:
+    """One VALUES tuple for data_copy_status, built from a folder's copy result."""
     run_id        = distcp_result['run_id']
     source_path   = sql_quote(distcp_result['source_path'])
     dest_bucket   = sql_quote(distcp_result['dest_bucket'])
@@ -1689,22 +1687,7 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
         'edge_mem_available_mb': distcp_result.get('edge_mem_available_mb'),
     }))
 
-    execute_with_iceberg_retry(spark, f"""
-        INSERT INTO {tracking_db}.data_copy_status (
-            run_id, source_path, dest_bucket, dest_path,
-            status, started_at, completed_at,
-            source_file_count, source_size_bytes,
-            dest_file_count, dest_size_bytes,
-            files_copied, bytes_copied,
-            is_incremental, file_count_match, size_match,
-            error_message, updated_at,
-            yarn_application_id, distcp_started_at, distcp_completed_at,
-            distcp_duration_seconds, distcp_bytes_copied, distcp_files_copied,
-            throughput_mbps,
-            parent_source_path, failure_phase, yarn_app_created, script_exit_code,
-            s3_list_before_seconds, source_scan_seconds, s3_list_after_seconds,
-            validation_listing_seconds, diagnostics_json
-        ) VALUES (
+    return f"""(
             '{run_id}',
             '{source_path}',
             '{dest_bucket}',
@@ -1739,13 +1722,53 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
             {s3_list_after_s},
             NULL,
             '{diagnostics_json}'
+        )"""
+
+
+@task.pyspark(conn_id='spark_default')
+def record_data_copy_statuses(distcp_results: list, spark) -> list:
+    """Insert data_copy_status rows for all folder copies, TRACKING_WRITE_BATCH_SIZE rows per INSERT.
+
+    One batched task instead of one INSERT per folder. Returns the valid results so
+    validate_data_copy can still map over them.
+    """
+    results = distcp_results or []
+    valid = [r for r in results if isinstance(r, dict) and 'run_id' in r]
+    if len(valid) != len(results):
+        logger.warning(
+            f"[record_data_copy_statuses] Skipping {len(results) - len(valid)} invalid input(s)"
         )
-    """, task_label=f"record_data_copy_status:{source_path}")
+    if not valid:
+        return []
+
+    tracking_db = get_config()['tracking_database']
+    t0 = time.monotonic()
+    for chunk in _chunks(valid, TRACKING_WRITE_BATCH_SIZE):
+        rows = ',\n'.join(_status_row_sql(r) for r in chunk)
+        execute_with_iceberg_retry(spark, f"""
+        INSERT INTO {tracking_db}.data_copy_status (
+            run_id, source_path, dest_bucket, dest_path,
+            status, started_at, completed_at,
+            source_file_count, source_size_bytes,
+            dest_file_count, dest_size_bytes,
+            files_copied, bytes_copied,
+            is_incremental, file_count_match, size_match,
+            error_message, updated_at,
+            yarn_application_id, distcp_started_at, distcp_completed_at,
+            distcp_duration_seconds, distcp_bytes_copied, distcp_files_copied,
+            throughput_mbps,
+            parent_source_path, failure_phase, yarn_app_created, script_exit_code,
+            s3_list_before_seconds, source_scan_seconds, s3_list_after_seconds,
+            validation_listing_seconds, diagnostics_json
+        ) VALUES
+        {rows}
+    """, task_label=f"record_data_copy_statuses:{len(chunk)} rows")
 
     logger.info(
-        f"[FolderCopy] Recorded status={status} for {source_path} -> {dest_bucket}/{dest_path}"
+        f"[FolderCopy] Recorded {len(valid)} data_copy_status rows in "
+        f"{round(time.monotonic() - t0, 1)}s"
     )
-    return distcp_result
+    return valid
 
 
 @task
@@ -1889,19 +1912,9 @@ fi
     return result
 
 
-@task.pyspark(conn_id='spark_default')
-def update_data_copy_validation(validation_result: dict, spark) -> dict:
-    """Update data_copy_status with final validation metrics and status."""
-    if not isinstance(validation_result, dict) or 'run_id' not in validation_result:
-        logger.warning(
-            f"[update_data_copy_validation] Skipping invalid input: {type(validation_result)}"
-        )
-        return {}
-
-    config = get_config()
-    tracking_db = config['tracking_database']
-
-    run_id      = validation_result['run_id']
+def _validation_row_sql(validation_result: dict) -> str:
+    """One VALUES tuple for the validation MERGE, built from a folder's validation result."""
+    run_id      = sql_quote(validation_result['run_id'])
     source_path = sql_quote(validation_result['source_path'])
     dest_bucket = sql_quote(validation_result['dest_bucket'])
     dest_path   = sql_quote(validation_result['dest_path'])
@@ -1927,39 +1940,98 @@ def update_data_copy_validation(validation_result: dict, spark) -> dict:
     val_list_secs = _sql_num(validation_result.get('validation_listing_seconds'))
     failure_phase = sql_quote(str(validation_result.get('failure_phase') or ''))
 
-    execute_with_iceberg_retry(spark, f"""
-        UPDATE {tracking_db}.data_copy_status
-        SET status           = '{validation_status}',
-            dest_file_count  = {dest_file_count},
-            dest_size_bytes  = {dest_size_bytes},
-            file_count_match = {file_count_match},
-            size_match       = {size_match},
-            yarn_application_id = CASE
-                                 WHEN '{yarn_app_id}' != '' THEN '{yarn_app_id}'
-                                 ELSE yarn_application_id
-                               END,
-            distcp_duration_seconds = {distcp_duration},
-            distcp_bytes_copied     = {distcp_bytes},
-            distcp_files_copied     = {distcp_files},
-            throughput_mbps         = {throughput_mbps},
-            validation_listing_seconds = {val_list_secs},
-            failure_phase    = CASE
-                                 WHEN '{failure_phase}' != '' THEN '{failure_phase}'
-                                 ELSE failure_phase
-                               END,
-            error_message    = CASE
-                                 WHEN '{val_error}' != '' THEN '{val_error}'
-                                 ELSE error_message
-                               END,
-            updated_at       = current_timestamp()
-        WHERE run_id     = '{run_id}'
-          AND source_path = '{source_path}'
-          AND dest_bucket = '{dest_bucket}'
-          AND dest_path   = '{dest_path}'
-    """, task_label=f"update_data_copy_validation:{source_path}")
+    # Explicit casts so NULL-only columns still get a concrete type in the VALUES source.
+    return f"""(
+            '{run_id}', '{source_path}', '{dest_bucket}', '{dest_path}',
+            '{validation_status}',
+            CAST({dest_file_count} AS BIGINT),
+            CAST({dest_size_bytes} AS BIGINT),
+            CAST({file_count_match} AS BOOLEAN),
+            CAST({size_match} AS BOOLEAN),
+            '{yarn_app_id}',
+            CAST({distcp_duration} AS DOUBLE),
+            CAST({distcp_bytes} AS BIGINT),
+            CAST({distcp_files} AS BIGINT),
+            CAST({throughput_mbps} AS DOUBLE),
+            CAST({val_list_secs} AS DOUBLE),
+            '{failure_phase}',
+            '{val_error}'
+        )"""
 
-    logger.info(f"[FolderValidate] Updated tracking: {source_path} -> {validation_status}")
-    return validation_result
+
+@task.pyspark(conn_id='spark_default')
+def update_data_copy_validations(validation_results: list, spark) -> list:
+    """Write final validation metrics and status for all folders, one MERGE per batch.
+
+    Replaces the per-folder UPDATE. Each row is keyed on (run_id, source_path, dest_bucket,
+    dest_path), so a retried batch leaves the table unchanged.
+    """
+    results = validation_results or []
+    valid = [r for r in results if isinstance(r, dict) and 'run_id' in r]
+    if len(valid) != len(results):
+        logger.warning(
+            f"[update_data_copy_validations] Skipping {len(results) - len(valid)} invalid input(s)"
+        )
+    if not valid:
+        return []
+
+    # A MERGE fails if one batch matches the same target row twice, so keep the last result per folder.
+    by_key = {
+        (r['run_id'], r['source_path'], r['dest_bucket'], r['dest_path']): r
+        for r in valid
+    }
+    unique = list(by_key.values())
+
+    tracking_db = get_config()['tracking_database']
+    t0 = time.monotonic()
+    for chunk in _chunks(unique, TRACKING_WRITE_BATCH_SIZE):
+        rows = ',\n'.join(_validation_row_sql(r) for r in chunk)
+        execute_with_iceberg_retry(spark, f"""
+        MERGE INTO {tracking_db}.data_copy_status AS t
+        USING (
+            SELECT * FROM VALUES
+            {rows}
+            AS s (run_id, source_path, dest_bucket, dest_path, status,
+                  dest_file_count, dest_size_bytes, file_count_match, size_match,
+                  yarn_application_id, distcp_duration_seconds, distcp_bytes_copied,
+                  distcp_files_copied, throughput_mbps, validation_listing_seconds,
+                  failure_phase, error_message)
+        ) AS s
+        ON  t.run_id      = s.run_id
+        AND t.source_path = s.source_path
+        AND t.dest_bucket = s.dest_bucket
+        AND t.dest_path   = s.dest_path
+        WHEN MATCHED THEN UPDATE SET
+            t.status            = s.status,
+            t.dest_file_count   = s.dest_file_count,
+            t.dest_size_bytes   = s.dest_size_bytes,
+            t.file_count_match  = s.file_count_match,
+            t.size_match        = s.size_match,
+            t.yarn_application_id = CASE
+                                 WHEN s.yarn_application_id != '' THEN s.yarn_application_id
+                                 ELSE t.yarn_application_id
+                               END,
+            t.distcp_duration_seconds = s.distcp_duration_seconds,
+            t.distcp_bytes_copied     = s.distcp_bytes_copied,
+            t.distcp_files_copied     = s.distcp_files_copied,
+            t.throughput_mbps         = s.throughput_mbps,
+            t.validation_listing_seconds = s.validation_listing_seconds,
+            t.failure_phase   = CASE
+                                 WHEN s.failure_phase != '' THEN s.failure_phase
+                                 ELSE t.failure_phase
+                               END,
+            t.error_message   = CASE
+                                 WHEN s.error_message != '' THEN s.error_message
+                                 ELSE t.error_message
+                               END,
+            t.updated_at      = current_timestamp()
+    """, task_label=f"update_data_copy_validations:{len(chunk)} rows")
+
+    logger.info(
+        f"[FolderValidate] Updated tracking for {len(unique)} folders in "
+        f"{round(time.monotonic() - t0, 1)}s"
+    )
+    return valid
 
 
 @task.pyspark(conn_id='spark_default')
@@ -2826,17 +2898,19 @@ with DAG(
         trigger_rule='all_done', max_active_tis_per_dagrun=3
     ).partial(cluster_setup=t_fc_cluster).expand(folder_config=t_fc_expand)
 
-    t_fc_record = record_data_copy_status.override(
+    # Tracking writes are batched: one task inserts all copy results (TRACKING_WRITE_BATCH_SIZE
+    # per INSERT), validation maps over the recorded list, and one task MERGEs all validation results.
+    t_fc_record = record_data_copy_statuses.override(
         trigger_rule='all_done'
-    ).expand(distcp_result=t_fc_distcp)
+    )(distcp_results=t_fc_distcp)
 
     t_fc_copy_validate = validate_data_copy.override(
         trigger_rule='all_done'
     ).expand(copy_status=t_fc_record)
 
-    t_fc_val_status = update_data_copy_validation.override(
+    t_fc_val_status = update_data_copy_validations.override(
         trigger_rule='all_done'
-    ).expand(validation_result=t_fc_copy_validate)
+    )(validation_results=t_fc_copy_validate)
 
     # Finalize run — waits for all per-folder validation to finish (via dependency chain)
     t_fc_final = finalize_data_copy_run.override(trigger_rule='all_done')(
@@ -2858,7 +2932,7 @@ with DAG(
     )
 
     # Dependency chain — prereqs → init → run_id → excel → cluster → work
-    # Per-folder chain is linear: distcp → record_status → validate → update_validation
+    # Chain: distcp (mapped) → record_statuses (batched) → validate (mapped) → update_validations (batched)
     t_fc_prereq >> t_fc_init >> t_fc_run_id >> t_fc_cluster >> t_fc_excel
     t_fc_excel >> t_fc_expand >> t_fc_distcp >> t_fc_record >> t_fc_copy_validate >> t_fc_val_status
     t_fc_val_status >> t_fc_final >> t_fc_report >> t_fc_email

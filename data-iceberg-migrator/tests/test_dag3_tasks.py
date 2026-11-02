@@ -699,7 +699,7 @@ class TestRunFolderDistcpSsh:
 class TestRecordDataCopyStatus:
 
     def test_inserts_completed(self, mock_spark, sample_folder_distcp_result, mock_iceberg_retry):
-        m.record_data_copy_status.function(distcp_result=sample_folder_distcp_result, spark=mock_spark)
+        m.record_data_copy_statuses.function(distcp_results=[sample_folder_distcp_result], spark=mock_spark)
         sql = mock_iceberg_retry.call_args[0][1]
         assert 'COMPLETED' in sql
         assert '/data/sales/raw' in sql
@@ -710,7 +710,7 @@ class TestRecordDataCopyStatus:
             'status': 'FAILED', 'error': 'exit 1',
             'source_path': '/bad', 'dest_path': 'x',
         }
-        m.record_data_copy_status.function(distcp_result=failed, spark=mock_spark)
+        m.record_data_copy_statuses.function(distcp_results=[failed], spark=mock_spark)
         assert 'FAILED' in mock_iceberg_retry.call_args[0][1]
 
     def test_persists_new_metric_columns(self, mock_spark, sample_folder_distcp_result, mock_iceberg_retry):
@@ -723,16 +723,37 @@ class TestRecordDataCopyStatus:
             'distcp_files_copied': 7,
             'throughput_mbps': 0.08,
         }
-        m.record_data_copy_status.function(distcp_result=enriched, spark=mock_spark)
+        m.record_data_copy_statuses.function(distcp_results=[enriched], spark=mock_spark)
         sql = mock_iceberg_retry.call_args[0][1]
         assert 'yarn_application_id' in sql
         assert 'application_1_1,application_1_2' in sql
         assert '12.5' in sql
         assert 'throughput_mbps' in sql
 
-    def test_returns_empty_dict_for_invalid_input(self, mock_spark, mock_iceberg_retry):
-        assert m.record_data_copy_status.function(distcp_result=None, spark=mock_spark) == {}
-        assert m.record_data_copy_status.function(distcp_result={'x': 1}, spark=mock_spark) == {}
+    def test_many_folders_share_one_insert(self, mock_spark, sample_folder_distcp_result, mock_iceberg_retry):
+        rows = [{**sample_folder_distcp_result, 'source_path': f'/data/f{i}'} for i in range(5)]
+        result = m.record_data_copy_statuses.function(distcp_results=rows, spark=mock_spark)
+        assert mock_iceberg_retry.call_count == 1
+        sql = mock_iceberg_retry.call_args[0][1]
+        assert all(f'/data/f{i}' in sql for i in range(5))
+        assert result == rows
+
+    def test_chunks_by_batch_size(self, mock_spark, sample_folder_distcp_result, mock_iceberg_retry, monkeypatch):
+        monkeypatch.setattr(m, 'TRACKING_WRITE_BATCH_SIZE', 2)
+        rows = [{**sample_folder_distcp_result, 'source_path': f'/data/f{i}'} for i in range(5)]
+        m.record_data_copy_statuses.function(distcp_results=rows, spark=mock_spark)
+        assert mock_iceberg_retry.call_count == 3
+
+    def test_skips_invalid_entries(self, mock_spark, sample_folder_distcp_result, mock_iceberg_retry):
+        result = m.record_data_copy_statuses.function(
+            distcp_results=[None, {'x': 1}, sample_folder_distcp_result], spark=mock_spark,
+        )
+        assert result == [sample_folder_distcp_result]
+        assert mock_iceberg_retry.call_count == 1
+
+    def test_returns_empty_list_for_invalid_input(self, mock_spark, mock_iceberg_retry):
+        assert m.record_data_copy_statuses.function(distcp_results=[None, {'x': 1}], spark=mock_spark) == []
+        assert m.record_data_copy_statuses.function(distcp_results=None, spark=mock_spark) == []
         mock_iceberg_retry.assert_not_called()
 
 
@@ -797,13 +818,15 @@ class TestValidateDataCopy:
 
 class TestUpdateDataCopyValidation:
 
-    def test_updates_validated(self, mock_spark, sample_folder_validation_result, mock_iceberg_retry):
-        m.update_data_copy_validation.function(
-            validation_result=sample_folder_validation_result, spark=mock_spark,
+    def test_merges_validated(self, mock_spark, sample_folder_validation_result, mock_iceberg_retry):
+        m.update_data_copy_validations.function(
+            validation_results=[sample_folder_validation_result], spark=mock_spark,
         )
-        assert 'VALIDATED' in mock_iceberg_retry.call_args[0][1]
+        sql = mock_iceberg_retry.call_args[0][1]
+        assert 'MERGE INTO' in sql
+        assert 'VALIDATED' in sql
 
-    def test_updates_failed_with_error(self, mock_spark, sample_folder_distcp_result, mock_iceberg_retry):
+    def test_merges_failed_with_error(self, mock_spark, sample_folder_distcp_result, mock_iceberg_retry):
         failed = {
             **sample_folder_distcp_result,
             'validation_status': 'VALIDATION_FAILED',
@@ -811,13 +834,28 @@ class TestUpdateDataCopyValidation:
             'file_count_match': False, 'size_match': False,
             'validation_error': 'Destination missing',
         }
-        m.update_data_copy_validation.function(validation_result=failed, spark=mock_spark)
+        m.update_data_copy_validations.function(validation_results=[failed], spark=mock_spark)
         sql = mock_iceberg_retry.call_args[0][1]
         assert 'VALIDATION_FAILED' in sql
         assert 'Destination missing' in sql
 
-    def test_returns_empty_dict_for_invalid_input(self, mock_spark, mock_iceberg_retry):
-        assert m.update_data_copy_validation.function(validation_result=None, spark=mock_spark) == {}
+    def test_one_merge_for_many_folders(self, mock_spark, sample_folder_validation_result, mock_iceberg_retry):
+        rows = [{**sample_folder_validation_result, 'source_path': f'/data/f{i}'} for i in range(5)]
+        result = m.update_data_copy_validations.function(validation_results=rows, spark=mock_spark)
+        assert mock_iceberg_retry.call_count == 1
+        assert result == rows
+
+    def test_duplicate_folder_keeps_last_result(self, mock_spark, sample_folder_validation_result,
+                                                mock_iceberg_retry):
+        first = {**sample_folder_validation_result, 'validation_status': 'VALIDATION_FAILED'}
+        last = {**sample_folder_validation_result, 'validation_status': 'VALIDATED'}
+        m.update_data_copy_validations.function(validation_results=[first, last], spark=mock_spark)
+        sql = mock_iceberg_retry.call_args[0][1]
+        assert 'VALIDATION_FAILED' not in sql
+        assert 'VALIDATED' in sql
+
+    def test_returns_empty_list_for_invalid_input(self, mock_spark, mock_iceberg_retry):
+        assert m.update_data_copy_validations.function(validation_results=[None], spark=mock_spark) == []
         mock_iceberg_retry.assert_not_called()
 
 
