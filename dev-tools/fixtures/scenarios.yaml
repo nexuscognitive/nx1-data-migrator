@@ -58,5 +58,9 @@
     "t_partitioned/dt=2024-01-01": {"bytes": 1048576, "files": 1},
     "t_partitioned/dt=2024-01-02": {"bytes": 6291456, "files": 6},
     "t_empty": {"rows": 0}
+  },
+  "OUT-OF-DIR": {
+    "TC-OOD-1": {"rows": 7, "parts": 5, "out_of_dir_parts": 3},
+    "TC-OOD-2": {"rows": 3, "parts": 2, "out_of_dir_parts": 0}
   }
 }
