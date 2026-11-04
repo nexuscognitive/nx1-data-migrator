@@ -260,6 +260,8 @@ def mock_ssh_hook():
 
         stdout_mock = MagicMock()
         stdout_mock.channel.recv_exit_status.return_value = 0
+        stdout_mock.channel.recv_ready.return_value = False
+        stdout_mock.channel.recv_stderr_ready.return_value = False
         stdout_mock.read.return_value = b'SSH_TEST_OK\nCLUSTER_LOGIN_SUCCESS\nTEMP_DIR=/tmp/migration/run_test\n'
         stderr_mock = MagicMock()
         stderr_mock.read.return_value = b''
