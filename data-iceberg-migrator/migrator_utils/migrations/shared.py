@@ -427,8 +427,10 @@ def get_config() -> dict:
     try:
         from airflow.operators.python import get_current_context
         _ctx = get_current_context()
-        _run_id = _ctx["run_id"]
         _dag_run = _ctx.get("dag_run")
+        # PythonOperator merges op_kwargs into the context, so a task with a `run_id`
+        # argument (the migration run id) shadows context["run_id"]; the DagRun doesn't.
+        _run_id = getattr(_dag_run, "run_id", None) or _ctx["run_id"]
         _dag_run_conf = (_dag_run.conf if _dag_run and hasattr(_dag_run, 'conf') else {}) or {}
     except Exception:
         _run_id = None
