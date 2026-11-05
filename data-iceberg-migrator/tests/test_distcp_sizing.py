@@ -197,6 +197,22 @@ class TestDistcpJvmOpts:
         assert distcp_jvm_opts(cfg) == ''
 
 
+class TestDistcpQueueOpts:
+    def test_queue_emits_queuename_flag(self):
+        cfg = _config(distcp_queue_name='etl_low')
+        assert distcp_jvm_opts(cfg) == " -Dmapreduce.job.queuename=etl_low"
+
+    @pytest.mark.parametrize('blank', ['', '   ', None])
+    def test_blank_queue_emits_nothing(self, blank):
+        cfg = _config(distcp_queue_name=blank)
+        assert 'queuename' not in distcp_jvm_opts(cfg)
+        assert distcp_jvm_opts(cfg) == ''
+
+    def test_queue_precedes_extra_opts(self):
+        cfg = _config(distcp_queue_name='q1', distcp_extra_hadoop_opts='-Dfoo=bar')
+        assert distcp_jvm_opts(cfg) == " -Dmapreduce.job.queuename=q1 -Dfoo=bar"
+
+
 class TestDistcpSizingMode:
     """The forced branch of size_distcp_job returns silently, so a pinned -m 1
     is indistinguishable in the log from auto-sizing that chose 1. This is what

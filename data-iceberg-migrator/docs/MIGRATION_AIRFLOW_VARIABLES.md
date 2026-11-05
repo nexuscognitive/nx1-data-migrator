@@ -135,6 +135,8 @@ How these combine into a mapper count and per-mapper bandwidth, with worked exam
 | `migration_distcp_client_java_opts`              | `MIGRATION_DISTCP_CLIENT_JAVA_OPTS`             | *(empty)*  | JVM opts string            | 1, 3       | Extra JVM opts for the DistCp client (the submitter). |
 | `migration_distcp_extra_hadoop_opts`             | `MIGRATION_DISTCP_EXTRA_HADOOP_OPTS`            | *(empty)*  | `-D key=val` string        | 1          | Pass-through extra `-D` flags. |
 | `migration_distcp_preserve_delete`               | `MIGRATION_DISTCP_PRESERVE_DELETE`              | `true`     | bool                       | 1, 3       | Pass DistCp `-delete` on `-update` runs. Set `false` for append-only semantics. |
+| `migration_distcp_queue_name`                    | `MIGRATION_DISTCP_QUEUE_NAME`                   | *(empty)*  | string                     | 1          | YARN queue for the DistCp job (`-Dmapreduce.job.queuename`). Empty = cluster default queue. |
+| `migration_distcp_skip_crc`                      | `MIGRATION_DISTCP_SKIP_CRC`                     | `true`     | bool                       | 1          | Pass DistCp `-skipcrccheck` after `-update`. Needed for HDFS/MapR-FS to S3 copies, where checksums are not comparable. Empty = `true`. |
 | `migration_distcp_checkpoint_location`           | `MIGRATION_DISTCP_CHECKPOINT_LOCATION`          | *(empty → `{tracking_location}/_distcp_checkpoints`)* | `s3a://` URL or empty | 1 | Where per-DistCp-item checkpoints land. Deleted at the end of each run. |
 
 ---

@@ -673,6 +673,10 @@ def get_config() -> dict:
         'metastore_socket_timeout': _var('migration_metastore_socket_timeout', 'MIGRATION_METASTORE_SOCKET_TIMEOUT', '600s'),
         'metastore_failure_retries': _var('migration_metastore_failure_retries', 'MIGRATION_METASTORE_FAILURE_RETRIES', '5'),
         'distcp_extra_hadoop_opts': _var('migration_distcp_extra_hadoop_opts', 'MIGRATION_DISTCP_EXTRA_HADOOP_OPTS', ''),
+        'distcp_queue_name': str(_var('migration_distcp_queue_name', 'MIGRATION_DISTCP_QUEUE_NAME', '') or '').strip(),
+        'distcp_skip_crc': (
+            str(_var('migration_distcp_skip_crc', 'MIGRATION_DISTCP_SKIP_CRC', 'true') or '').strip().lower() or 'true'
+        ) in ('1', 'true', 'yes', 'y', 'on'),
         'distcp_preserve_delete': str(
             _var(
                 'migration_distcp_preserve_delete',
@@ -1369,6 +1373,10 @@ def distcp_jvm_opts(config: dict) -> str:
     map_java_opts = str(config.get('distcp_map_java_opts') or '').strip()
     if map_java_opts:
         opts += f" -Dmapreduce.map.java.opts={shlex.quote(map_java_opts)}"
+
+    queue = str(config.get('distcp_queue_name') or '').strip()
+    if queue:
+        opts += f" -Dmapreduce.job.queuename={shlex.quote(queue)}"
 
     # Deliberately unquoted: this is a raw flag string, so it must already be
     # -D-formatted and it reaches the shell unescaped. Trusted input only.

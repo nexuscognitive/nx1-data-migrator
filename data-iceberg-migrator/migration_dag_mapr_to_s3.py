@@ -2777,6 +2777,7 @@ def run_distcp_ssh(
     # shlex.quote leaves a bare word like 'dynamic' untouched, so the default
     # command is byte-identical to the pre-branch hardcoded -strategy dynamic.
     strategy = shlex.quote(config["distcp_strategy"])
+    crc_flag = " -skipcrccheck" if config.get("distcp_skip_crc", True) else ""
     client_java_opts = str(config.get("distcp_client_java_opts") or "").strip()
     client_opts_export = (
         f"export HADOOP_CLIENT_OPTS={shlex.quote(client_java_opts)}\n"
@@ -3173,7 +3174,7 @@ def run_distcp_ssh(
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
 if deadline_ok; then
-run_distcp_with_retry {part_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {part_mappers} -bandwidth {part_bandwidth} -strategy {strategy} \\
+run_distcp_with_retry {part_timeout} hadoop distcp{s3_opts}{jvm_opts} -update{crc_flag} -delete -m {part_mappers} -bandwidth {part_bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
 else
@@ -3312,7 +3313,7 @@ echo "=== Creating empty partition directories ==="
 
 echo "=== Running distcp using source path list (delete disabled) ==="
 set +e
-DISTCP_OUTPUT=$(run_distcp_with_retry {call_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
+DISTCP_OUTPUT=$(run_distcp_with_retry {call_timeout} hadoop distcp{s3_opts}{jvm_opts} -update{crc_flag} -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e
@@ -3366,7 +3367,7 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 
 echo "=== Running distcp ==="
 set +e
-DISTCP_OUTPUT=$(run_distcp_with_retry {call_timeout} hadoop distcp{s3_opts}{jvm_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
+DISTCP_OUTPUT=$(run_distcp_with_retry {call_timeout} hadoop distcp{s3_opts}{jvm_opts} -update{crc_flag} -delete -m {mappers} -bandwidth {bandwidth} -strategy {strategy} \\
     -log {distcp_log_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 set -e

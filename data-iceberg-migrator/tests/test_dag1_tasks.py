@@ -2114,6 +2114,33 @@ class TestRunDistcpSsh:
         assert '-strategy dynamic ' in ssh_cmd
         assert "-strategy 'dynamic'" not in ssh_cmd
 
+    def test_default_command_skips_crc_after_update(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_per_partition_sized(mock_ssh_hook, sample_discovery)
+        assert '-update -skipcrccheck -delete' in ssh_cmd
+        assert 'queuename' not in ssh_cmd
+
+    def test_skip_crc_disabled_omits_flag(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_per_partition_sized(
+            mock_ssh_hook, sample_discovery,
+            config_overrides={'distcp_skip_crc': False},
+        )
+        assert '-skipcrccheck' not in ssh_cmd
+        assert '-update -delete' in ssh_cmd
+
+    def test_queue_name_reaches_command(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_per_partition_sized(
+            mock_ssh_hook, sample_discovery,
+            config_overrides={'distcp_queue_name': 'etl_low'},
+        )
+        assert '-Dmapreduce.job.queuename=etl_low' in ssh_cmd
+
+    def test_strategy_override_reaches_command(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_per_partition_sized(
+            mock_ssh_hook, sample_discovery,
+            config_overrides={'distcp_strategy': 'uniformsize'},
+        )
+        assert '-strategy uniformsize ' in ssh_cmd
+
     def test_empty_source_skips_distcp_and_sets_empty_source_status(self, mock_ssh_hook, sample_discovery):
         """If source has 0 files, distcp must be skipped and status set to EMPTY_SOURCE."""
         hook, client, _, _ = mock_ssh_hook
