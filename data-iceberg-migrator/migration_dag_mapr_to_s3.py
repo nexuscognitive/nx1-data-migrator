@@ -1218,6 +1218,9 @@ def init_tracking_tables(spark) -> dict:
         ("empty_partition_names", "STRING"),
         ("distcp_mappers", "INT"),
         ("distcp_bandwidth_mbps", "INT"),
+        ("source_count_status", "STRING"),
+        ("source_count_phase", "STRING"),
+        ("source_count_error", "STRING"),
     ):
         try:
             spark.sql(
@@ -1576,6 +1579,30 @@ def discover_tables_via_spark_ssh(db_config: dict, **context) -> dict:
         cached_by_identity, ensure_ascii=True, separators=(",", ":")
     )
 
+    counts_in_discovery = config.get("source_counts_phase", "discovery") == "discovery"
+    full_count_code = (
+        '        try:\n'
+        '            row_count = spark.sql(\n'
+        '                "SELECT COUNT(*) as c FROM {0}.{1}".format(src_db, tbl)\n'
+        '            ).collect()[0].c\n'
+        '        except Exception:\n'
+        '            pass\n'
+        if counts_in_discovery
+        else ""
+    )
+    filtered_count_code = (
+        '        if partition_filter_active and filtered_partitions:\n'
+        '            try:\n'
+        '                where_clause = partitions_to_where_clause(filtered_partitions)\n'
+        '                row_count = spark.sql(\n'
+        '                    "SELECT COUNT(*) as c FROM {0}.{1} WHERE ".format(src_db, tbl) + where_clause\n'
+        '                ).collect()[0].c\n'
+        '            except Exception:\n'
+        '                pass\n'
+        if counts_in_discovery
+        else ""
+    )
+
     with ssh.get_conn() as client:
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
@@ -1623,6 +1650,7 @@ dest_endpoint = "{dest_endpoint_escaped}"
 tokens = json.loads('{tokens_json_escaped}')
 exclude_tokens = json.loads('{exclude_tokens_json_escaped}')
 filter_expr = "{filter_expr_escaped}"
+COUNT_DEFAULT = {count_default}
 
 # Per-table discovery checkpoints: on retry, skip tables whose record has
 # already been loaded. The dict is pre-populated by the Airflow task (which
@@ -1676,7 +1704,7 @@ def _default_metadata_record(tbl):
         "partitions": [],
         "partition_columns": "",
         "partition_count": 0,
-        "row_count": 0,
+        "row_count": COUNT_DEFAULT,
         "is_partitioned": False,
         "unregistered_partitions": False,
         "table_type": "UNKNOWN",
@@ -1686,10 +1714,10 @@ def _default_metadata_record(tbl):
         "partition_filter": filter_expr or None,
         "filtered_partitions": [],
         "partition_filter_active": False,
-        "filtered_row_count": 0,
+        "filtered_row_count": COUNT_DEFAULT,
         "filtered_source_size_bytes": 0,
         "filtered_file_count": 0,
-        "full_table_row_count": 0,
+        "full_table_row_count": COUNT_DEFAULT,
         "full_table_partition_count": 0,
         "partition_file_counts": {{}},
     }}
@@ -1834,12 +1862,12 @@ def discover_one_table(tbl):
     input_format = None
     serde_properties = {{}}
     in_serde_section = False
-    row_count = 0
+    row_count = COUNT_DEFAULT
     filtered_partitions = []
     partition_filter_active = False
     filtered_source_size = 0
     filtered_file_count = 0
-    full_row_count = 0
+    full_row_count = COUNT_DEFAULT
     full_partition_count = 0
     # Race window: a table dropped between SHOW TABLES and DESCRIBE here is
     # classified FAILED (not TABLE_NOT_FOUND). Tolerable; retry resolves it.
@@ -1935,13 +1963,8 @@ def discover_one_table(tbl):
             elif "text" in input_format.lower():
                 file_format = "TEXTFILE"
 
-        row_count = 0
-        try:
-            row_count = spark.sql(
-                "SELECT COUNT(*) as c FROM {{0}}.{{1}}".format(src_db, tbl)
-            ).collect()[0].c
-        except Exception:
-            pass
+        row_count = COUNT_DEFAULT
+{full_count_code}
 
         partition_cols_from_describe = []
         in_partition_section = False
@@ -2046,14 +2069,7 @@ def discover_one_table(tbl):
                 filtered_file_count  += part_files
 
         # Filtered row count
-        if partition_filter_active and filtered_partitions:
-            try:
-                where_clause = partitions_to_where_clause(filtered_partitions)
-                row_count = spark.sql(
-                    "SELECT COUNT(*) as c FROM {{0}}.{{1}} WHERE ".format(src_db, tbl) + where_clause
-                ).collect()[0].c
-            except Exception:
-                pass
+{filtered_count_code}
 
         is_partitioned = partition_definition
         unregistered_partitions = partition_definition and registered_partition_count == 0
@@ -2171,6 +2187,9 @@ spark.stop()
             ),
             temp_dir=temp_dir,
             include_db_in_path=include_db_in_path,
+            count_default="0" if counts_in_discovery else "None",
+            full_count_code=full_count_code.rstrip("\n"),
+            filtered_count_code=filtered_count_code.rstrip("\n"),
             hive_scratch_dir=_hive_scratch_dir(config),
             metastore_retry_attempts=_int_setting(config, "metastore_retry_attempts", 4, 1, 10),
             metastore_retry_backoff_seconds=_int_setting(
@@ -2315,7 +2334,7 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee discovery_{run_
     for t in metadata:
         if "error" not in t:
             logger.info(
-                f"  Discovered: {src_db}.{t['source_table']} | format={t['file_format']} | partitions={t['partition_count']} | rows={t['row_count']} | size={t.get('source_total_size_bytes',0)/(1024**2):.1f} MB"
+                f"  Discovered: {src_db}.{t['source_table']} | format={t['file_format']} | partitions={t['partition_count']} | rows={t['row_count'] if t['row_count'] is not None else 'not collected'} | size={t.get('source_total_size_bytes',0)/(1024**2):.1f} MB"
             )
         elif t.get("error_type") == "TABLE_NOT_FOUND":
             logger.warning(
@@ -2457,6 +2476,13 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
             tracking_file_count = t.get("source_file_count", 0)
 
         full_table_row_count = t.get("full_table_row_count", t.get("row_count", 0))
+        counts_present = tracking_row_count is not None and full_table_row_count is not None
+        tracking_row_count = "NULL" if tracking_row_count is None else tracking_row_count
+        full_table_row_count = (
+            "NULL" if full_table_row_count is None else full_table_row_count
+        )
+        count_phase_sql = sql_quote(config.get("source_counts_phase", "discovery"))
+        count_status_sql = "COLLECTED" if counts_present else "NOT_COLLECTED"
         full_table_partition_count = t.get(
             "full_table_partition_count", t.get("partition_count", 0)
         )
@@ -2503,6 +2529,8 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     full_table_row_count = {full_table_row_count},
                     full_table_partition_count = {full_table_partition_count},
                     partition_schema_json = '{partition_schema_json}',
+                    source_count_phase = '{count_phase_sql}',
+                    source_count_status = '{count_status_sql}',
                     overall_status = {overall_status_update},
                     error_message = {error_msg_update},
                     updated_at = current_timestamp()
@@ -2543,7 +2571,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     updated_at, partition_filter, filtered_partition_count, full_table_row_count, full_table_partition_count,
                     yarn_application_id,
                     partition_schema_json, partition_schema_match, partition_schema_differences,
-                    empty_partition_names
+                    empty_partition_names, source_count_phase, source_count_status
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
                     '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
@@ -2569,7 +2597,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count},
                     NULL,
                     '{partition_schema_json}', NULL, NULL,
-                    NULL
+                    NULL, '{count_phase_sql}', '{count_status_sql}'
                 )
             """,
                 task_label=f"record_discovered_tables:{t['source_table']}",
@@ -3750,7 +3778,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         else:
             src_size = src_t.get("source_total_size_bytes", 0)
         if (
-            src_t.get("row_count", 0) == 0
+            (src_t.get("row_count") or 0) == 0
             and not src_size
             and r.get("bytes_copied", 0) == 0
             and r.get("files_copied", 0) == 0
@@ -4531,6 +4559,279 @@ def update_table_create_status(table_result: dict, spark) -> dict:
     return table_result
 
 
+@task
+@track_duration
+def collect_source_counts_ssh(table_result: dict, cluster_setup: dict, **context) -> dict:
+    """Run the source row counts that discovery skipped, after copy and table creation."""
+    config = get_config()
+    if (
+        config.get("source_counts_phase") != "post_copy"
+        or not isinstance(table_result, dict)
+        or "tables" not in table_result
+    ):
+        return table_result
+
+    def _key(item: dict) -> tuple:
+        return (str(item.get("source_table")), str(item.get("partition_filter") or ""))
+
+    copied = {
+        _key(r)
+        for r in table_result.get("distcp_results", [])
+        if r.get("status") == "COMPLETED"
+    }
+    created = {
+        _key(r)
+        for r in table_result.get("table_results", [])
+        if r.get("status") == "COMPLETED"
+    }
+    eligible = [
+        t
+        for t in table_result["tables"]
+        if _key(t) in copied and _key(t) in created and t.get("row_count") is None
+    ]
+    if not eligible:
+        return table_result
+
+    run_id = table_result["run_id"]
+    src_db = table_result["source_database"]
+    inputs = [
+        {
+            "source_database": t.get("source_database", src_db),
+            "source_table": t["source_table"],
+            "partition_filter": t.get("partition_filter"),
+            "partition_filter_active": bool(t.get("partition_filter_active")),
+            "filtered_partitions": t.get("filtered_partitions") or [],
+        }
+        for t in eligible
+    ]
+
+    ti = context.get("ti")
+    task_obj = context.get("task") or getattr(ti, "task", None)
+    max_tries = (getattr(task_obj, "retries", 0) or 0) + 1
+    is_final_attempt = ti is not None and (ti.try_number or 0) >= max_tries
+
+    ssh = SSHHook(ssh_conn_id=config["ssh_conn_id"])
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{run_id}_{src_db}")
+    temp_dir = f"{cluster_setup['temp_dir']}/source_counts_{slug}_{uuid.uuid4().hex[:8]}"
+
+    pyspark_script = """# -*- coding: utf-8 -*-
+import contextlib
+import json
+import sys
+from multiprocessing.dummy import Pool as ThreadPool
+from pyspark.sql import SparkSession
+sys.path.insert(0, "{temp_dir}")
+from partition_utils import partitions_to_where_clause
+
+spark = SparkSession.builder \\
+    .appName("source_counts_{slug}") \\
+    .config("spark.scheduler.mode", "FAIR") \\
+    .config("spark.hadoop.hive.exec.scratchdir", "{hive_scratch_dir}") \\
+    .config("spark.hadoop.hive.exec.local.scratchdir", "{hive_scratch_dir}") \\
+    .config("spark.hadoop.hive.metastore.client.socket.timeout", "{metastore_socket_timeout}") \\
+    .config("spark.hadoop.hive.metastore.client.connect.retry.delay", "5s") \\
+    .config("spark.hadoop.hive.metastore.failure.retries", "{metastore_failure_retries}") \\
+    .enableHiveSupport() \\
+    .getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+
+with open("{temp_dir}/count_input.json") as f:
+    entries = json.load(f)
+
+def _err(e):
+    try:
+        return str(e)[:500]
+    except Exception:
+        return repr(e)[:500]
+
+def count_one(e):
+    out = {{
+        "source_database": e["source_database"],
+        "source_table": e["source_table"],
+        "partition_filter": e.get("partition_filter"),
+        "row_count": None,
+        "full_table_row_count": None,
+        "count_status": "FAILED",
+        "count_error": None,
+    }}
+    try:
+        name = "{{0}}.{{1}}".format(e["source_database"], e["source_table"])
+        full_count = spark.sql("SELECT COUNT(*) as c FROM " + name).collect()[0].c
+        row_count = full_count
+        if e.get("partition_filter_active") and e.get("filtered_partitions"):
+            where_clause = partitions_to_where_clause(e["filtered_partitions"])
+            row_count = spark.sql(
+                "SELECT COUNT(*) as c FROM " + name + " WHERE " + where_clause
+            ).collect()[0].c
+        out["row_count"] = row_count
+        out["full_table_row_count"] = full_count
+        out["count_status"] = "COLLECTED"
+    except Exception as ex:
+        out["count_error"] = _err(ex)
+    return out
+
+with contextlib.closing(ThreadPool({per_table_parallelism})) as pool:
+    results = pool.map(count_one, entries)
+
+print ("===JSON_START===")
+sys.stdout.flush()
+print (json.dumps(results))
+sys.stdout.flush()
+print ("===JSON_END===")
+sys.stdout.flush()
+
+spark.stop()
+""".format(
+        temp_dir=temp_dir,
+        slug=slug,
+        hive_scratch_dir=_hive_scratch_dir(config),
+        metastore_failure_retries=_int_setting(config, "metastore_failure_retries", 5, 0, 20),
+        metastore_socket_timeout=_duration_setting(config, "metastore_socket_timeout", "600s"),
+        per_table_parallelism=_int_setting(config, "discovery_per_table_parallelism", 8, 1, 64),
+    )
+
+    try:
+        with ssh.get_conn() as client:
+            _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
+            cmd_stdout.channel.recv_exit_status()
+
+            script_path = f"{temp_dir}/collect_source_counts.py"
+            sftp = client.open_sftp()
+            with sftp.file(script_path, "w") as f:
+                f.write(pyspark_script)
+            with sftp.file(f"{temp_dir}/count_input.json", "w") as f:
+                f.write(json.dumps(inputs))
+            local_utils = (
+                Path(__file__).resolve().parent
+                / "migrator_utils"
+                / "migrations"
+                / "partition_utils.py"
+            )
+            sftp.put(str(local_utils), f"{temp_dir}/partition_utils.py")
+            sftp.close()
+
+            _drv_mem = str(config.get("discovery_driver_memory") or "").strip()
+            _drv_flag = f" --driver-memory {shlex.quote(_drv_mem)}" if _drv_mem else ""
+            _master = shlex.quote(_discovery_master(config))
+
+            cmd = f"""
+cd {temp_dir}
+pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee source_counts_{slug}.log
+"""
+            _, stdout, stderr = client.exec_command(
+                _login_shell(cmd, config.get("cluster_type", "MapR")),
+                timeout=3600,
+                get_pty=True,
+            )
+            output = stdout.read().decode()
+            error_output = stderr.read().decode()
+            exit_code = stdout.channel.recv_exit_status()
+
+            logger.info("=== Source Counts Output ===")
+            logger.info(output[-1000:])
+
+            if exit_code != 0:
+                raise Exception(
+                    f"Source count Spark job failed with exit code {exit_code}\n"
+                    f"Error: {error_output[:1000]}\n"
+                    f"Output: {output[-500:]}"
+                )
+
+            json_start = output.find("===JSON_START===")
+            json_end = output.find("===JSON_END===")
+            if json_start == -1 or json_end == -1:
+                raise Exception(f"Could not find JSON markers in output: {output}")
+
+            counted = json.loads(
+                output[json_start + len("===JSON_START===") : json_end].strip()
+            )
+    except Exception as e:
+        if not is_final_attempt:
+            raise
+        logger.error(
+            f"Final attempt: source counts failed for {src_db}: {e}. "
+            f"Marking {len(eligible)} table(s) FAILED."
+        )
+        counted = [
+            {
+                "source_table": t["source_table"],
+                "partition_filter": t.get("partition_filter"),
+                "row_count": None,
+                "full_table_row_count": None,
+                "count_status": "FAILED",
+                "count_error": str(e)[:500],
+            }
+            for t in eligible
+        ]
+
+    by_key = {_key(c): c for c in counted}
+    for t in eligible:
+        c = by_key.get(_key(t)) or {
+            "row_count": None,
+            "full_table_row_count": None,
+            "count_status": "FAILED",
+            "count_error": "no count returned",
+        }
+        t["row_count"] = c.get("row_count")
+        t["filtered_row_count"] = c.get("row_count")
+        t["full_table_row_count"] = c.get("full_table_row_count")
+        t["source_count_status"] = c.get("count_status")
+        t["source_count_error"] = c.get("count_error")
+    return table_result
+
+
+@task.pyspark(conn_id="spark_default")
+def update_source_counts(table_result: dict, spark) -> dict:
+    """Write the post-copy source counts into the tracking table."""
+    config = get_config()
+    if (
+        config.get("source_counts_phase") != "post_copy"
+        or not isinstance(table_result, dict)
+        or "tables" not in table_result
+    ):
+        return table_result
+
+    tracking_db = config["tracking_database"]
+    run_id = table_result["run_id"]
+    src_db = table_result["source_database"]
+
+    def _num(v) -> str:
+        return "NULL" if v is None else str(int(v))
+
+    for t in table_result["tables"]:
+        status = t.get("source_count_status")
+        if not status:
+            continue
+        per_table_dest_db = t.get("dest_database", table_result.get("dest_database"))
+        pf_val = sql_quote(t.get("partition_filter") or "")
+        pf_clause = (
+            f"AND partition_filter = '{pf_val}'"
+            if pf_val
+            else "AND (partition_filter IS NULL OR partition_filter = '')"
+        )
+        error = t.get("source_count_error")
+        error_sql = "NULL" if error is None else f"'{sql_quote(str(error), 2000)}'"
+        execute_with_iceberg_retry(
+            spark,
+            f"""
+            UPDATE {tracking_db}.migration_table_status
+            SET source_row_count = {_num(t.get('row_count'))},
+                full_table_row_count = {_num(t.get('full_table_row_count'))},
+                source_count_status = '{sql_quote(str(status))}',
+                source_count_error = {error_sql},
+                updated_at = current_timestamp()
+            WHERE run_id = '{run_id}'
+              AND source_database = '{t.get('source_database', src_db)}'
+              AND dest_database = '{per_table_dest_db}'
+              AND source_table = '{t['source_table']}'
+              {pf_clause}
+        """,
+            task_label=f"update_source_counts:{t['source_table']}",
+        )
+
+    return table_result
+
+
 @task.pyspark(conn_id="spark_default")
 @track_duration
 def validate_destination_tables(source_validation: dict, spark, **context) -> dict:
@@ -4728,7 +5029,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 )
                 continue
 
-            source_row_count = source_metrics[0]["source_row_count"] or 0
+            source_row_count = source_metrics[0]["source_row_count"]
             source_partition_count = source_metrics[0][
                 "source_partition_count"
             ] or t.get("partition_count", 0)
@@ -4827,11 +5128,13 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             )
 
             # Validations
-            row_count_match = source_row_count == dest_row_count
+            row_count_match = (
+                None if source_row_count is None else source_row_count == dest_row_count
+            )
             partition_count_match = source_partition_count == dest_partition_count
 
             match_summary = (
-                f"rows={'✓' if row_count_match else '✗'} "
+                f"rows={'?' if row_count_match is None else '✓' if row_count_match else '✗'} "
                 f"partitions={'✓' if partition_count_match else '✗'} "
                 f"schema={'✓' if schema_match else '✗'} "
                 f"partition_schema={'✓' if partition_schema_match else '✗'}"
@@ -4850,7 +5153,9 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 )
 
             mismatch_parts = []
-            if not row_count_match:
+            if row_count_match is None:
+                mismatch_parts.append("Row count not checked: source count not collected")
+            elif not row_count_match:
                 mismatch_parts.append(
                     f"Row count mismatch: source={source_row_count}, dest={dest_row_count}"
                 )
@@ -4920,7 +5225,9 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
     if warned_count_checks:
         for v in warned_count_checks:
             warn_parts = []
-            if not v.get("row_count_match", True):
+            if "row_count_match" in v and v["row_count_match"] is None:
+                warn_parts.append("row count not checked (source count not collected)")
+            elif not v.get("row_count_match", True):
                 warn_parts.append(
                     f"row count mismatch (source={v.get('source_row_count')}, dest={v.get('dest_hive_row_count')})"
                 )
@@ -4992,12 +5299,14 @@ def update_validation_status(validation_result: dict, spark) -> dict:
             and v.get("schema_match", False)
             and partition_schema_match
         )
+        rcm = v.get("row_count_match", True)
         has_mismatch_only = (
             not is_validated
             and v["status"] == "COMPLETED"
             and (
-                not v.get("row_count_match", True)
+                rcm is False
                 or not v.get("partition_count_match", True)
+                or (rcm is None and v.get("schema_match", False) and partition_schema_match)
             )
         )
         final_overall_status = (
@@ -5036,11 +5345,11 @@ def update_validation_status(validation_result: dict, spark) -> dict:
             SET validation_status = '{v['status']}',
                 validation_completed_at = current_timestamp(),
                 validation_duration_seconds = {validation_duration},
-                source_row_count = {v.get('source_row_count', 0)},
+                source_row_count = {'NULL' if v.get('source_row_count', 0) is None else v.get('source_row_count', 0)},
                 dest_hive_row_count = {v.get('dest_hive_row_count', 0)},
                 source_partition_count = {v.get('source_partition_count', 0)},
                 dest_partition_count = {v.get('dest_partition_count', 0)},
-                row_count_match = {str(v.get('row_count_match', False)).lower()},
+                row_count_match = {'NULL' if v.get('row_count_match', False) is None else str(v.get('row_count_match', False)).lower()},
                 partition_count_match = {str(v.get('partition_count_match', False)).lower()},
                 schema_match = {str(v.get('schema_match', False)).lower()},
                 schema_differences = '{schema_diffs}',
@@ -5559,6 +5868,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                 <h3>TOTAL ROWS</h3>
                 <p class="value">{total_rows:,}</p>
             </div>
+            <div class="summary-card info">
+                <h3>SOURCE COUNT PHASE</h3>
+                <p class="value">{config.get('source_counts_phase', 'discovery')}</p>
+            </div>
             <div class="summary-card">
                 <h3>INCREMENTAL RUNS</h3>
                 <p class="value">{incremental_runs}</p>
@@ -5962,7 +6275,10 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
     """
             continue
 
-        if t.row_count_match:
+        if t.row_count_match is None or t.source_row_count is None:
+            row_match_class = "validation-warn"
+            row_match_icon = "not checked"
+        elif t.row_count_match:
             row_match_class = "validation-pass"
             row_match_icon = "✓ PASS"
         elif not t.partition_count_match:
@@ -6004,7 +6320,7 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                     <td>{t.source_database}</td>
                     <td><strong>{t.source_table}</strong></td>
                     <td>{t.partition_filter or '<span style="color:#bdc3c7;font-size:11px;">—</span>'}</td>
-                    <td class="metric">{(t.source_row_count or 0):,}</td>
+                    <td class="metric">{'not checked' if t.source_row_count is None else format(t.source_row_count, ',')}</td>
                     <td class="metric">{(t.dest_hive_row_count or 0):,}</td>
                     <td class="{row_match_class}">{row_match_icon}</td>
                     <td class="metric">{t.source_partition_count or 0}</td>
@@ -6495,9 +6811,19 @@ with DAG(
     t_tbl_status = update_table_create_status.expand(table_result=t_tables)
     t_tbl_status.operator.trigger_rule = "all_done"
 
+    t_counts = collect_source_counts_ssh.partial(cluster_setup=t_cluster).expand(
+        table_result=t_tbl_status
+    )
+    t_counts.operator.trigger_rule = "all_done"
+    t_counts.operator.max_active_tis_per_dagrun = _var_or_env_int(
+        "migration_source_count_max_concurrent", "MIGRATION_SOURCE_COUNT_MAX_CONCURRENT", 3
+    )
+    t_counts_status = update_source_counts.expand(table_result=t_counts)
+    t_counts_status.operator.trigger_rule = "all_done"
+
     # Validation tasks
     t_dest_validation = validate_destination_tables.expand(
-        source_validation=t_tbl_status
+        source_validation=t_counts_status
     )
     t_dest_validation.operator.max_active_tis_per_dagrun = _env_int(
         "MIGRATION_VALIDATION_MAX_CONCURRENT", 3
@@ -6532,5 +6858,5 @@ with DAG(
     # Dependencies
     t_validate >> t_init >> t_run_id >> t_excel >> t_cluster >> t_discover >> t_record
     t_record >> t_batches >> t_distcp >> t_distcp_status >> t_tables >> t_tbl_status
-    t_tbl_status >> t_dest_validation >> t_val_status >> t_reconcile
+    t_tbl_status >> t_counts >> t_counts_status >> t_dest_validation >> t_val_status >> t_reconcile
     t_reconcile >> t_report >> t_email >> t_checkpoint_cleanup >> t_final  # >> t_cleanup
