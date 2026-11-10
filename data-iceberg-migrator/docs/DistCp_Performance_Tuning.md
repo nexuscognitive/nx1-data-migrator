@@ -275,6 +275,8 @@ Defaults apply when neither the Airflow Variable nor the env var is set.
 Lower-level DistCp settings (strategy, map memory, JVM options, `-delete` behaviour, checkpoint
 location) are listed in [MIGRATION_AIRFLOW_VARIABLES.md](MIGRATION_AIRFLOW_VARIABLES.md#6-distcp-copy-behavior).
 
+`migration_distcp_queue_name` (YARN queue, default unset) and `migration_distcp_skip_crc` (`-skipcrccheck`, default `true`) are also tuned there.
+
 ---
 
 ## 9. Summary

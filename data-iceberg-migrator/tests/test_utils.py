@@ -374,6 +374,28 @@ class TestDistcpKnobValidation:
             assert m.get_config()[key.replace('migration_', '')] == 7
 
 
+class TestDistcpSkipCrcAndQueue:
+
+    def test_skip_crc_defaults_true(self):
+        assert m.get_config()['distcp_skip_crc'] is True
+
+    def test_skip_crc_false(self):
+        with _only('migration_distcp_skip_crc', 'false'):
+            assert m.get_config()['distcp_skip_crc'] is False
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_skip_crc_blank_resolves_to_default_true(self, blank):
+        with _only('migration_distcp_skip_crc', blank):
+            assert m.get_config()['distcp_skip_crc'] is True
+
+    def test_queue_defaults_empty(self):
+        assert m.get_config()['distcp_queue_name'] == ''
+
+    def test_queue_is_stripped(self):
+        with _only('migration_distcp_queue_name', '  etl  '):
+            assert m.get_config()['distcp_queue_name'] == 'etl'
+
+
 class TestDistcpStrategy:
 
     def test_defaults_to_dynamic(self):
