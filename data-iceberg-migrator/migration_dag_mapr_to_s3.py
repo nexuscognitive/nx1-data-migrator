@@ -2571,7 +2571,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     updated_at, partition_filter, filtered_partition_count, full_table_row_count, full_table_partition_count,
                     yarn_application_id,
                     partition_schema_json, partition_schema_match, partition_schema_differences,
-                    empty_partition_names, source_count_phase, source_count_status
+                    empty_partition_names, source_count_phase, source_count_status, source_count_error
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
                     '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
@@ -2597,7 +2597,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
                     current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count},
                     NULL,
                     '{partition_schema_json}', NULL, NULL,
-                    NULL, '{count_phase_sql}', '{count_status_sql}'
+                    NULL, '{count_phase_sql}', '{count_status_sql}', NULL
                 )
             """,
                 task_label=f"record_discovered_tables:{t['source_table']}",
