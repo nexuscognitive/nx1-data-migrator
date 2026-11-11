@@ -5869,10 +5869,6 @@ def generate_html_report(run_id: str, spark, cluster_setup: dict = None, **conte
                 <h3>TOTAL ROWS</h3>
                 <p class="value">{total_rows:,}</p>
             </div>
-            <div class="summary-card info">
-                <h3>SOURCE COUNT PHASE</h3>
-                <p class="value">{config.get('source_counts_phase', 'discovery')}</p>
-            </div>
             <div class="summary-card">
                 <h3>INCREMENTAL RUNS</h3>
                 <p class="value">{incremental_runs}</p>
