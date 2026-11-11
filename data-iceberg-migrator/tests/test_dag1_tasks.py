@@ -5238,5 +5238,5 @@ class TestReportWithNullSourceCount:
         fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
         html = fs_mock.create.return_value.write.call_args[0][0].decode('utf-8')
         assert 'not checked' in html
-        assert 'SOURCE COUNT PHASE' in html
-        assert 'post_copy' in html
+        assert 'SOURCE COUNT PHASE' not in html
+        assert 'post_copy' not in html
