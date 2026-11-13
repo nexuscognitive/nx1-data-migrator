@@ -29,7 +29,12 @@ PORTAL_TRIGGER = "portal"
 # deployment baseline and resolves the same way for both — see _var.
 PORTAL_OWNED_KEYS = frozenset({
     'auth_method',
+    # nx1-aiapi's Infrastructure Config writes the cluster paths as
+    # nx1_cluster_*, so a plain value set by hand must not reach a portal run.
+    'cluster_distcp_log_root',
+    'cluster_edge_discovery_temp_path',
     'cluster_edge_temp_path',
+    'cluster_hive_scratch_dir',
     'cluster_ssh_conn_id',
     'mapr_ticketfile_location',
     'migration_dag_owner',
@@ -591,7 +596,10 @@ def get_config() -> dict:
         # (50/100 out of the box), reproducing the pre-auto-sizing DAG
         # exactly. Only when explicitly set to true does size_distcp_job look
         # at size/file count at all.
-        'distcp_enable_auto_sizing': str(
+        # Portal runs are always on: the portal sends its DistCp pair per run,
+        # and with the switch off that pair would be ignored in favour of
+        # distcp_default_*. A blank pair then auto-sizes.
+        'distcp_enable_auto_sizing': _portal_run or str(
             _var(
                 'migration_distcp_enable_auto_sizing',
                 'MIGRATION_DISTCP_ENABLE_AUTO_SIZING', 'false'

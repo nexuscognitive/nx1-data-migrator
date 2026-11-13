@@ -232,6 +232,55 @@ class TestVarPrecedence:
             cfg = m.get_config()
         assert cfg['hdfs_nameservice'] == 'ns1'
 
+    # nx1-aiapi's Infrastructure Config writes these as nx1_cluster_*.
+    _CLUSTER_PATH_KEYS = [
+        ('cluster_distcp_log_root', 'distcp_log_root'),
+        ('cluster_edge_discovery_temp_path', 'edge_discovery_temp_path'),
+        ('cluster_hive_scratch_dir', 'hive_scratch_dir'),
+    ]
+
+    @pytest.mark.parametrize('key,cfg_name', _CLUSTER_PATH_KEYS)
+    def test_portal_run_reads_cluster_path_from_nx1_not_plain(self, key, cfg_name):
+        ctx, vars_ = self._portal({key: '/plain', f'nx1_{key}': '/from_portal'})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg[cfg_name] == '/from_portal'
+
+    @pytest.mark.parametrize('key,cfg_name', _CLUSTER_PATH_KEYS)
+    def test_manual_run_still_reads_plain_cluster_path(self, key, cfg_name):
+        with self._context(triggered_by=None), self._variables({key: '/plain', f'nx1_{key}': '/from_portal'}):
+            cfg = m.get_config()
+        assert cfg[cfg_name] == '/plain'
+
+    # -- portal runs size DistCp from their own run-scoped pair ---------------
+
+    def test_portal_run_enables_auto_sizing_even_when_variable_false(self):
+        ctx, vars_ = self._portal({'migration_distcp_enable_auto_sizing': 'false'})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['distcp_enable_auto_sizing'] is True
+
+    def test_manual_run_auto_sizing_defaults_false(self):
+        with self._context(triggered_by=None), self._variables({}):
+            cfg = m.get_config()
+        assert cfg['distcp_enable_auto_sizing'] is False
+
+    def test_portal_run_with_run_scoped_pair_takes_forced_branch(self):
+        ctx, vars_ = self._portal({
+            'nx1_migration_distcp_mappers__data_migration_1': '7',
+            'nx1_migration_distcp_bandwidth__data_migration_1': '30',
+        })
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert m.distcp_sizing_mode(cfg).startswith('FORCED')
+        assert m.size_distcp_job(10**12, 10**4, cfg) == (7, 30)
+
+    def test_portal_run_with_blank_pair_auto_sizes(self):
+        ctx, vars_ = self._portal({})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert m.distcp_sizing_mode(cfg).startswith('AUTO')
+
     def test_manual_run_ignores_the_prefixed_run_scoped_variable(self):
         with self._context(triggered_by=None), self._variables({
             'nx1_s3_access_key__data_migration_1': 'PER_RUN',
