@@ -117,6 +117,7 @@ All DAG tasks use `@task.pyspark(conn_id='spark_default')` for Spark tasks. The 
 - `_has_failures` and `_failure_summary` keys in result dicts propagate failure info through the DAG
 - Tasks use `trigger_rule = 'all_done'` so downstream steps run even when upstream tasks partially fail
 - Errors are tracked in Iceberg tracking tables for auditing
+- New tracking-table columns go through `ensure_tracking_columns()` (shared.py) in the DAG's init task, never a bare `ALTER TABLE ... ADD COLUMN` in a try/except: tracking tables are shared with older DAG versions, and a swallowed failure only surfaced later, in the INSERT that names the column, after the copy had run
 
 ### Deployment
 

@@ -208,6 +208,84 @@ def execute_with_iceberg_retry(spark, sql: str, max_retries: int = 6, task_label
     if not status:
         raise last_exception
 
+
+def _describe_column_names(spark, table: str) -> set[str] | None:
+    """Lower-cased column names of `table`, or None if DESCRIBE can't be read.
+
+    DESCRIBE lists the columns, then a blank row and the partitioning section;
+    only the part before the blank row is columns.
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE {table}").collect()
+    except Exception as exc:
+        logger.warning(f"[TrackingSchema] Could not DESCRIBE {table}: {exc}")
+        return None
+    names = set()
+    for row in rows:
+        name = str(row['col_name']).strip()
+        if not name or name.startswith('#'):
+            break
+        names.add(name.lower())
+    return names
+
+
+def ensure_tracking_columns(spark, table: str, columns, attempts: int = 3,
+                            backoff_seconds: float = 5.0) -> list[str]:
+    """Add the `(name, type)` columns an existing tracking table lacks.
+
+    CREATE TABLE IF NOT EXISTS leaves a table made by an older DAG version as it
+    was, so its new columns have to be added here. A failed ADD COLUMN used to be
+    swallowed, and the run then failed much later, in the INSERT that names the
+    column, after the copy had already run. Now a failure is retried and, if the
+    column is still missing, the task fails here with the reason.
+
+    An ADD COLUMN that didn't raise is taken as done, so a Spark without a usable
+    DESCRIBE (the task-test mocks) still works. Returns the names added.
+    """
+    present = _describe_column_names(spark, table)
+    todo = [(n, t) for n, t in columns if present is None or n.lower() not in present]
+    added: list[str] = []
+    errors: dict[str, Exception] = {}
+    for attempt in range(1, attempts + 1):
+        failed = []
+        for name, col_type in todo:
+            try:
+                spark.sql(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+                added.append(name)
+                logger.info(f"[TrackingSchema] Added column {name} to {table}")
+            except Exception as exc:
+                if 'already exists' in str(exc).lower():
+                    continue
+                errors[name] = exc
+                failed.append((name, col_type))
+        if not failed:
+            return added
+        present = _describe_column_names(spark, table)
+        if present is None:
+            # Without DESCRIBE there is no way to confirm, so don't fail the
+            # task on a guess.
+            logger.warning(
+                f"[TrackingSchema] ADD COLUMN on {table} refused for "
+                f"{', '.join(n for n, _ in failed)}; assuming they already exist"
+            )
+            return added
+        todo = [(n, t) for n, t in failed if n.lower() not in present]
+        if not todo:
+            return added
+        for name, _ in todo:
+            logger.warning(
+                f"[TrackingSchema] ADD COLUMN {name} on {table} failed "
+                f"(attempt {attempt}/{attempts}): {errors[name]}"
+            )
+        if attempt < attempts:
+            time.sleep(backoff_seconds * attempt)
+    detail = '; '.join(f"{n}: {errors[n]}" for n, _ in todo)
+    raise RuntimeError(
+        f"Tracking table {table} is missing column(s) {', '.join(n for n, _ in todo)} "
+        f"after {attempts} attempts to add them — {detail}"
+    )
+
+
 def compute_dest_path(source_location: str, dest_database: str, table_name: str,
                       dest_bucket: str, source_s3_prefix: str, dest_s3_prefix: str) -> str:
     """ Compute the destination S3 path for a table. """

@@ -136,6 +136,23 @@ class TestInitTrackingTables:
         for table in ['migration_runs', 'migration_table_status']:
             assert table in all_sql
 
+    def test_adds_columns_newer_versions_write(self, mock_spark):
+        m.init_tracking_tables.function(spark=mock_spark)
+        sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert 'ALTER TABLE migration_tracking.migration_table_status ADD COLUMN source_count_error STRING' in sql
+        assert 'ALTER TABLE migration_tracking.migration_runs ADD COLUMN service_account_source STRING' in sql
+
+    def test_a_column_that_cannot_be_added_fails_the_init_task(self, mock_spark):
+        def _sql(stmt, *a, **kw):
+            if 'ADD COLUMN source_count_phase' in stmt:
+                raise Exception("CommitFailedException: Cannot commit, metadata changed")
+            return MagicMock()
+
+        mock_spark.sql.side_effect = _sql
+        with patch('migrator_utils.migrations.shared.time.sleep'), \
+                pytest.raises(RuntimeError, match=r'migration_table_status.*source_count_phase'):
+            m.init_tracking_tables.function(spark=mock_spark)
+
 
 class TestCreateMigrationRun:
 

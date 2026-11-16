@@ -6,6 +6,7 @@ Tests for shared utility functions:
 """
 
 import json
+import re
 import subprocess
 import time
 from unittest.mock import MagicMock, patch
@@ -1666,3 +1667,113 @@ class TestSourceRelativePathConfig:
             cfg = m.get_config()
         assert cfg['use_source_relative_path'] is True
         assert cfg['source_path_strip_prefixes'] == ['/mapr/prod', '/warehouse/managed']
+
+
+# ---------------------------------------------------------------------------
+# ensure_tracking_columns — schema evolution of existing tracking tables
+# ---------------------------------------------------------------------------
+class _FakeTrackingSpark:
+    """A tracking table whose columns DESCRIBE reports and ALTER can add.
+
+    `alter_failures` maps a column to how many ADD COLUMN attempts fail before
+    one succeeds (a very large number means it never succeeds).
+    """
+
+    def __init__(self, columns, alter_failures=None, describe_fails=False, hidden_once=()):
+        self.columns = list(columns)
+        self.alter_failures = dict(alter_failures or {})
+        self.describe_fails = describe_fails
+        # Columns another writer adds between our first DESCRIBE and our ALTER.
+        self.hidden_once = set(hidden_once)
+        self.alters = []
+
+    def sql(self, statement):
+        statement = ' '.join(statement.split())
+        if statement.startswith('DESCRIBE '):
+            if self.describe_fails:
+                raise RuntimeError('DESCRIBE unavailable')
+            rows = [{'col_name': c, 'data_type': 'string'} for c in self.columns if c not in self.hidden_once]
+            self.hidden_once = set()
+            rows += [{'col_name': '', 'data_type': ''}, {'col_name': '# Partitioning', 'data_type': ''},
+                     {'col_name': 'Part 0', 'data_type': 'run_id'}]
+            result = MagicMock()
+            result.collect.return_value = rows
+            return result
+        match = re.match(r'ALTER TABLE \S+ ADD COLUMN (\w+) (\w+)', statement)
+        assert match, statement
+        name = match.group(1)
+        self.alters.append(name)
+        if name in self.columns:
+            raise RuntimeError(f'Cannot add column, because {name} already exists')
+        if self.alter_failures.get(name, 0) > 0:
+            self.alter_failures[name] -= 1
+            raise RuntimeError(f'CommitFailedException: concurrent update while adding {name}')
+        self.columns.append(name)
+        return MagicMock()
+
+
+class TestEnsureTrackingColumns:
+
+    COLUMNS = (('a', 'STRING'), ('b', 'INT'))
+
+    def _ensure(self, spark, **kw):
+        with patch.object(m.time, 'sleep') as sleep:
+            added = m.ensure_tracking_columns(spark, 'db.t', self.COLUMNS, **kw)
+        return added, sleep
+
+    def test_present_columns_are_left_alone(self):
+        spark = _FakeTrackingSpark(['run_id', 'a', 'b'])
+        added, _ = self._ensure(spark)
+        assert added == []
+        assert spark.alters == []
+
+    def test_missing_columns_are_added(self):
+        spark = _FakeTrackingSpark(['run_id', 'a'])
+        added, _ = self._ensure(spark)
+        assert added == ['b']
+        assert 'b' in spark.columns
+
+    def test_a_failed_add_is_retried(self):
+        # The es-tenant-2 case: one ADD COLUMN failed among several that worked.
+        spark = _FakeTrackingSpark(['run_id'], alter_failures={'b': 1})
+        added, sleep = self._ensure(spark)
+        assert added == ['a', 'b']
+        assert spark.alters.count('b') == 2
+        sleep.assert_called()
+
+    def test_a_column_that_cannot_be_added_fails_loudly(self):
+        spark = _FakeTrackingSpark(['run_id'], alter_failures={'b': 99})
+        with pytest.raises(RuntimeError, match=r'db\.t.*\bb\b.*CommitFailedException'):
+            self._ensure(spark, attempts=3)
+        assert spark.alters.count('b') == 3
+
+    def test_an_add_that_raced_another_writer_counts_once_describe_shows_it(self):
+        # Our ALTER says "already exists" because another run added it first.
+        spark = _FakeTrackingSpark(['run_id', 'a', 'b'], hidden_once={'b'})
+        added, _ = self._ensure(spark)
+        assert added == []
+        assert spark.alters == ['b']
+
+    def test_without_describe_it_still_adds_and_does_not_raise(self):
+        # Spark mocks in the DAG task tests have no real DESCRIBE.
+        spark = _FakeTrackingSpark(['run_id', 'a'], describe_fails=True)
+        added, _ = self._ensure(spark)
+        assert added == ['b']
+
+    def test_already_exists_counts_as_present_even_if_describe_omits_it(self):
+        # The refusal itself says the column is there, whatever DESCRIBE showed.
+        spark = _AlwaysEmptyDescribeSpark()
+        added, sleep = self._ensure(spark)
+        assert added == []
+        sleep.assert_not_called()
+
+
+class _AlwaysEmptyDescribeSpark:
+    """DESCRIBE lists nothing, every ADD COLUMN says the column already exists."""
+
+    def sql(self, statement):
+        result = MagicMock()
+        result.collect.return_value = []
+        if statement.strip().startswith('ALTER TABLE'):
+            raise RuntimeError('AnalysisException: Cannot add column, name already exists')
+        return result

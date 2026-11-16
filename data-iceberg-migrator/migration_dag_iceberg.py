@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from migrator_utils.migrations.shared import (
+    ensure_tracking_columns,
     execute_with_iceberg_retry,
     get_config,
     is_permanent_error,
@@ -276,19 +277,9 @@ def init_iceberg_tracking_tables(spark) -> dict:
         PARTITIONED BY (source_database)
         LOCATION '{tracking_loc}/iceberg_migration_table_status'
     """)
-    for _col_name, _col_type in (
+    ensure_tracking_columns(spark, f"{tracking_db}.iceberg_migration_table_status", (
         ("empty_partition_names", "STRING"),
-    ):
-        try:
-            spark.sql(
-                f"ALTER TABLE {tracking_db}.iceberg_migration_table_status "
-                f"ADD COLUMN {_col_name} {_col_type}"
-            )
-            logger.info(
-                f"[init_iceberg_tracking_tables] Added column {_col_name} to iceberg_migration_table_status"
-            )
-        except Exception:
-            pass
+    ))
     return {'status': 'initialized', 'database': tracking_db}
 
 @task.pyspark(conn_id='spark_default')

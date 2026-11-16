@@ -50,6 +50,7 @@ from migrator_utils.migrations.shared import (
     distcp_jvm_opts,
     distcp_sizing_mode,
     effective_source_metrics,
+    ensure_tracking_columns,
     estimate_distcp_cost,
     execute_with_iceberg_retry,
     find_destination_conflicts,
@@ -1207,11 +1208,9 @@ def init_tracking_tables(spark) -> dict:
             LOCATION '{tracking_loc}/migration_table_status'
         """)
 
-    # Idempotently add partition-schema validation columns to tracking tables
-    # created by an earlier DAG version (CREATE TABLE IF NOT EXISTS above is a
-    # no-op for an existing table, so new columns would otherwise be missing and
-    # the INSERT/UPDATE statements that reference them would fail).
-    for _col_name, _col_type in (
+    # CREATE TABLE IF NOT EXISTS above leaves a table made by an earlier DAG
+    # version as it was; add the columns this version writes.
+    ensure_tracking_columns(spark, f"{tracking_db}.migration_table_status", (
         ("partition_schema_json", "STRING"),
         ("partition_schema_match", "BOOLEAN"),
         ("partition_schema_differences", "STRING"),
@@ -1221,34 +1220,11 @@ def init_tracking_tables(spark) -> dict:
         ("source_count_status", "STRING"),
         ("source_count_phase", "STRING"),
         ("source_count_error", "STRING"),
-    ):
-        try:
-            spark.sql(
-                f"ALTER TABLE {tracking_db}.migration_table_status "
-                f"ADD COLUMN {_col_name} {_col_type}"
-            )
-            logger.info(
-                f"[init_tracking_tables] Added column {_col_name} to migration_table_status"
-            )
-        except Exception:
-            # Column already exists — expected on every run after the first.
-            pass
-
-    for _col_name, _col_type in (
+    ))
+    ensure_tracking_columns(spark, f"{tracking_db}.migration_runs", (
         ("service_account_user_id", "STRING"),
         ("service_account_source", "STRING"),
-    ):
-        try:
-            spark.sql(
-                f"ALTER TABLE {tracking_db}.migration_runs "
-                f"ADD COLUMN {_col_name} {_col_type}"
-            )
-            logger.info(
-                f"[init_tracking_tables] Added column {_col_name} to migration_runs"
-            )
-        except Exception:
-            # Column already exists — expected on every run after the first.
-            pass
+    ))
 
     return {"status": "initialized", "database": tracking_db}
 

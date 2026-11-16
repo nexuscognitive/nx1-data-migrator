@@ -162,13 +162,18 @@ class TestInitFolderCopyTrackingTables:
             for col, col_type in columns:
                 assert f"ALTER TABLE migration_tracking.{table} ADD COLUMN {col} {col_type}" in sql
 
-    def test_warns_once_per_table_when_describe_shows_missing_columns(self, mock_spark):
-        with patch.object(m.logger, 'warning') as warn:
+    def test_a_column_that_cannot_be_added_fails_the_init_task(self, mock_spark):
+        # Failing here, before anything is copied, instead of in
+        # record_data_copy_statuses after the copy (seen on es-tenant-2).
+        def _sql(stmt, *a, **kw):
+            if 'ADD COLUMN throughput_mbps' in stmt:
+                raise Exception("CommitFailedException: Cannot commit, metadata changed")
+            return MagicMock()
+
+        mock_spark.sql.side_effect = _sql
+        with patch('migrator_utils.migrations.shared.time.sleep'), \
+                pytest.raises(RuntimeError, match=r'data_copy_status.*throughput_mbps'):
             m.init_folder_copy_tracking_tables.function(spark=mock_spark)
-        messages = [str(c[0][0]) for c in warn.call_args_list]
-        assert any('data_copy_status' in msg and 'missing' in msg for msg in messages)
-        assert any('data_copy_runs' in msg and 'missing' in msg for msg in messages)
-        assert any('throughput_mbps' in msg for msg in messages)
 
     def test_no_missing_column_warning_when_describe_lists_everything(self, mock_spark):
         expected = {c for _t, cols in EXPECTED_SCHEMA_ADDITIONS for c, _ in cols}
