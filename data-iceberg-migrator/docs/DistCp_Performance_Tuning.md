@@ -132,9 +132,11 @@ parts that affect tuning are:
 
 1. **Each table gets a cost estimate, in seconds:**
    `30 + size ÷ rate + 45 per DistCp job + 24 per partition directory + 0.002 per file`, where
-   the rate is 150 MB/s, or a job's share of the budget's bandwidth when that is lower
-   (`total_bandwidth_mbps ÷ concurrent_jobs`). Under a small share the estimate, and so every
-   call timeout below, grows with it, so a slow but healthy copy isn't killed.
+   the rate is 150 MB/s, or what a job can copy under the budget when that is lower:
+   the per-mapper bandwidth × its mappers, counting at most one mapper per file (DistCp never
+   runs more maps than files, so a one-file table copies at one mapper's speed). Under a small
+   share the estimate, and so every call timeout below, grows with it, so a slow but healthy
+   copy isn't killed.
    A partition-filtered table with `migration_distcp_preserve_delete=true` runs one DistCp job
    per partition, so partition count can dominate size. The weights are fixed in code and not
    configurable: the plan depends on the *ratio* between size and partition count, which barely

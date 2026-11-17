@@ -1358,18 +1358,21 @@ def effective_source_metrics(table: dict) -> tuple[int, int]:
     return int(size or 0), int(files or 0)
 
 
-def _cost_mbps(config: dict) -> int:
-    """Copy rate the estimate assumes: 150 MB/s, or a job's budget share if lower.
+def _cost_mbps(config: dict, files_per_job: int | None = None) -> int:
+    """Copy rate the estimate assumes: 150 MB/s, or what a job's budget share allows.
 
-    Under a budget a job copies at most total_bandwidth / concurrent_jobs, which
-    can be far below 150 MB/s; estimating at 150 would set call timeouts that
-    kill healthy copies of large tables (timeouts are never retried).
+    Under a budget each map is capped at the per-mapper bandwidth, and DistCp
+    runs at most one map per file, so a job copies at most
+    per_mapper_bw * min(per_job_mappers, files) — far below 150 MB/s for a
+    one-file table. Estimating faster would set call timeouts that kill healthy
+    copies (timeouts are never retried). Without a budget the rate stays 150.
     """
-    budget = distcp_budget(config)
-    if budget:
-        _, total_bandwidth, concurrent = budget
-        return min(_COST_MBPS, total_bandwidth // concurrent)
-    return _COST_MBPS
+    if not distcp_budget(config):
+        return _COST_MBPS
+    mappers, per_mapper_bw = distcp_job_size(config)
+    if files_per_job is not None:
+        mappers = min(mappers, max(files_per_job, 1))
+    return min(_COST_MBPS, mappers * per_mapper_bw)
 
 
 def estimate_distcp_cost(table: dict, config: dict) -> float:
@@ -1411,7 +1414,7 @@ def estimate_distcp_cost(table: dict, config: dict) -> float:
 
     return (
         _COST_BASE_SECONDS
-        + size_bytes / (_cost_mbps(config) * 1024 * 1024)
+        + size_bytes / (_cost_mbps(config, max(1, file_count // jobs)) * 1024 * 1024)
         + jobs * _COST_SECONDS_PER_JOB
         + paths * _COST_SECONDS_PER_PATH_SCAN * 2
         + file_count * _COST_SECONDS_PER_FILE
