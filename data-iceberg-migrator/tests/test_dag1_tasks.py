@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import migration_dag_mapr_to_s3 as m
 import pytest
 
-from .helpers import distcp_call, make_excel_bytes, mock_ssh_stdout, setup_spark_excel
+from .helpers import distcp_call, make_excel_bytes, mock_ssh_stdout, pool_wiring, setup_spark_excel
 
 
 def _make_distcp_stdout(incremental=False):
@@ -1840,17 +1840,8 @@ class TestRunDistcpSsh:
         with pytest.raises(Exception, match="DistCp failed"):
             m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
 
-    def test_master_switch_default_off_uses_fixed_defaults_for_full_table(
-        self, mock_ssh_hook, sample_discovery,
-    ):
-        """E2E: with migration_distcp_enable_auto_sizing unset, the real
-        get_config() resolves distcp_enable_auto_sizing=False. MOCK_VARIABLES
-        also carries a forced override pair (migration_distcp_mappers=10,
-        migration_distcp_bandwidth=50) — that must be ignored too. The
-        table's own source_total_size_bytes/source_file_count (10MB/5 files)
-        would auto-size to (1, 500) if the switch were on, so landing on
-        (50, 100) here proves the switch — not a coincidence of the inputs —
-        is what picked the value."""
+    def test_without_budget_jobs_use_the_fixed_pair(self, mock_ssh_hook, sample_discovery):
+        """No budget: MOCK_VARIABLES carries the forced pair (10, 50), which wins over the defaults."""
         hook, client, _, _ = mock_ssh_hook
         stderr = MagicMock()
         stderr.read.return_value = b''
@@ -1860,8 +1851,23 @@ class TestRunDistcpSsh:
 
         m.run_distcp_ssh.function.__wrapped__(**distcp_call(sample_discovery))
         ssh_cmd = self._distcp_command(client)
-        assert '-m 50 -bandwidth 100' in ssh_cmd
-        assert '-m 10 -bandwidth 50' not in ssh_cmd
+        assert '-m 10 -bandwidth 50' in ssh_cmd
+
+    def test_sizing_log_names_the_mode_and_pool(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), _make_distcp_stdout(incremental=False), stderr
+        )
+        cfg = {**m.get_config(), 'distcp_total_mappers': 8, 'distcp_total_bandwidth_mbps': 80,
+               'distcp_concurrent_jobs': 2}
+        call = {**distcp_call(sample_discovery), 'task': MagicMock(pool='migration_distcp_nx1')}
+        with patch.object(m, 'get_config', return_value=cfg), patch.object(m.logger, 'info') as info:
+            m.run_distcp_ssh.function.__wrapped__(**call)
+        messages = ' '.join(str(c[0][0]) for c in info.call_args_list)
+        assert 'BUDGET —' in messages
+        assert 'migration_distcp_nx1' in messages
 
     def test_partition_filter_active_uses_per_partition_distcp(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
@@ -2057,48 +2063,31 @@ class TestRunDistcpSsh:
             )
         return self._distcp_command(client)
 
-    def test_master_switch_default_off_uses_fixed_defaults_per_partition(
-        self, mock_ssh_hook, sample_discovery,
-    ):
-        """E2E: nothing overridden — real get_config() resolves
-        distcp_enable_auto_sizing=False (unset) and a forced override pair of
-        (10, 50) from MOCK_VARIABLES. Both partitions (100 vs. 200 of the
-        300 files) would size differently under auto-sizing (see
-        test_per_partition_mappers_scale_with_partition_file_share, which
-        gets [7, 14] for the same split with the switch on) — landing on the
-        same (50, 100) pair for both here proves the master switch, not the
-        forced pair or the partition split, decided the outcome."""
-        ssh_cmd = self._run_per_partition_sized(mock_ssh_hook, sample_discovery)
-        pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
-        assert len(pairs) == 2
-        assert set(pairs) == {('50', '100')}
-
-    def test_per_partition_mappers_scale_with_partition_file_share(self, mock_ssh_hook,
-                                                                   sample_discovery):
+    def test_every_job_in_a_batch_gets_the_budget_share(self, mock_ssh_hook, sample_discovery):
+        """Each partition job gets the same equal share, whatever its size."""
         ssh_cmd = self._run_per_partition_sized(
             mock_ssh_hook, sample_discovery,
-            config_overrides={
-                'distcp_enable_auto_sizing': True,
-                'distcp_mappers': '', 'distcp_bandwidth': '',
-            },
+            config_overrides={'distcp_total_mappers': 8, 'distcp_total_bandwidth_mbps': 80,
+                              'distcp_concurrent_jobs': 2},
         )
         pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
         assert len(pairs) == 2
-        mapper_counts = [int(m_) for m_, _ in pairs]
-        assert len(set(mapper_counts)) == 2, f"expected distinct -m values, got {pairs}"
-        # dt=2024-01-01 holds 100 of the 300 files, dt=2024-01-02 holds 200, and
-        # the partitions are emitted in filtered_partitions order.
-        assert mapper_counts[0] < mapper_counts[1]
-        assert mapper_counts == [7, 14]
+        assert set(pairs) == {('4', '10')}
+
+    def test_without_budget_or_pair_jobs_use_defaults(self, mock_ssh_hook, sample_discovery):
+        ssh_cmd = self._run_per_partition_sized(
+            mock_ssh_hook, sample_discovery,
+            config_overrides={'distcp_mappers': '', 'distcp_bandwidth': ''},
+        )
+        pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
+        assert len(pairs) == 2
+        assert set(pairs) == {('50', '100')}
 
     def test_per_partition_override_forces_same_values_everywhere(self, mock_ssh_hook,
                                                                  sample_discovery):
         ssh_cmd = self._run_per_partition_sized(
             mock_ssh_hook, sample_discovery,
-            config_overrides={
-                'distcp_enable_auto_sizing': True,
-                'distcp_mappers': '50', 'distcp_bandwidth': '100',
-            },
+            config_overrides={'distcp_mappers': '50', 'distcp_bandwidth': '100'},
         )
         pairs = re.findall(r'-m (\d+) -bandwidth (\d+)', ssh_cmd)
         assert len(pairs) == 2
@@ -5257,3 +5246,16 @@ class TestReportWithNullSourceCount:
         assert 'not checked' in html
         assert 'SOURCE COUNT PHASE' not in html
         assert 'post_copy' not in html
+
+
+class TestDistcpPoolWiring:
+    """The conftest's fake Airflow drops override() kwargs, so the wiring is read from source."""
+
+    def test_distcp_task_is_in_the_copies_pool(self):
+        assert pool_wiring('migration_dag_mapr_to_s3.py', 'run_distcp_ssh') == (
+            'dag_mapr_to_s3', 'source_to_s3_migration')
+
+    def test_bare_test_dag_without_budget_uses_default_pool(self, monkeypatch):
+        monkeypatch.delenv('MIGRATION_DISTCP_CONCURRENT_JOBS', raising=False)
+        with patch('airflow.models.Variable.get', side_effect=lambda k, default_var=None, **kw: default_var):
+            assert m.distcp_pool(m.dag_mapr_to_s3.dag_id, 'source_to_s3_migration') == 'default_pool'

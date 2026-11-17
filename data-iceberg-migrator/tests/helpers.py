@@ -71,3 +71,25 @@ def distcp_call(discovery, table_names=None, budget=0.0, cluster_setup=None,
         'source_task_id': 'record_discovered_tables',
         'ti': ti,
     }
+
+
+def pool_wiring(dag_file: str, task_name: str) -> tuple[str, str] | None:
+    """(dag variable, base dag id) from `<task>.override(pool=distcp_pool(<dag>.dag_id, '<base>'))`.
+
+    Read from the DAG source because the conftest's fake Airflow ignores
+    override() keyword arguments.
+    """
+    import ast
+    from pathlib import Path
+    tree = ast.parse((Path(__file__).resolve().parent.parent / dag_file).read_text())
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'override' and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == task_name):
+            continue
+        pool = next((kw.value for kw in node.keywords if kw.arg == 'pool'), None)
+        if (isinstance(pool, ast.Call) and getattr(pool.func, 'id', None) == 'distcp_pool'
+                and len(pool.args) == 2 and isinstance(pool.args[0], ast.Attribute)
+                and pool.args[0].attr == 'dag_id' and isinstance(pool.args[1], ast.Constant)):
+            return pool.args[0].value.id, pool.args[1].value
+    return None
