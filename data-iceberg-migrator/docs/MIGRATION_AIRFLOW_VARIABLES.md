@@ -107,23 +107,34 @@ discovery that doesn't share these knobs; DAG 3 is folder-copy with no discovery
 | `migration_distcp_max_tables_per_batch`          | `MIGRATION_DISTCP_MAX_TABLES_PER_BATCH`         | `25`    | int                              | 1          | Cap on tables packed into one DistCp batch. |
 | `migration_distcp_call_timeout_max_seconds`      | `MIGRATION_DISTCP_CALL_TIMEOUT_MAX_SECONDS`     | `21600` | int (seconds)                    | 1          | Hard ceiling on a single `hadoop distcp` invocation (6h default). |
 
-### 6b. Auto-sizing (DAG 1 and DAG 3, opt-in)
+### 6b. DistCp sizing: the queue budget (DAG 1 and DAG 3)
 
-How these combine into a mapper count and per-mapper bandwidth, with worked examples, is in
+How these combine, the pool that keeps the budget across runs, and examples are in
 [DistCp Performance Tuning](DistCp_Performance_Tuning.md).
 
 | Variable                                         | Env                                             | Default            | Values            | Applies to | Description |
 |--------------------------------------------------|-------------------------------------------------|--------------------|-------------------|------------|-------------|
-| `migration_distcp_enable_auto_sizing`            | `MIGRATION_DISTCP_ENABLE_AUTO_SIZING`           | `false`            | bool              | 1          | Master switch for per-table mapper/bandwidth sizing. When off, every table uses `distcp_default_mappers` + `distcp_default_bandwidth` (pre-auto-sizing behavior). Always on for portal-triggered runs: the run's own mappers/bandwidth pair forces the values, a blank pair auto-sizes. |
-| `migration_distcp_mappers`                       | `MIGRATION_DISTCP_MAPPERS`                      | *(empty = auto)*   | int or empty      | 1          | Force a fixed mapper count (only consulted when auto-sizing is on). Must be set together with `distcp_bandwidth`. |
-| `migration_distcp_bandwidth`                     | `MIGRATION_DISTCP_BANDWIDTH`                    | *(empty = auto)*   | int or empty      | 1          | Force a fixed per-mapper MB/s (only consulted when auto-sizing is on). |
-| `migration_distcp_default_mappers`               | `MIGRATION_DISTCP_DEFAULT_MAPPERS`              | `50`               | int               | 1          | Used when the size probe returns nothing usable, and when auto-sizing is off. |
-| `migration_distcp_default_bandwidth`             | `MIGRATION_DISTCP_DEFAULT_BANDWIDTH`            | `100`              | int (MB/s)        | 1          | Per-mapper bandwidth fallback. |
-| `migration_distcp_target_bytes_per_mapper`       | `MIGRATION_DISTCP_TARGET_BYTES_PER_MAPPER`      | `2147483648` (2 GiB) | int (bytes)     | 1          | Auto-sizing input. Mapper count ≈ `source_bytes / target`. |
-| `migration_distcp_min_mappers`                   | `MIGRATION_DISTCP_MIN_MAPPERS`                  | `1`                | int               | 1          | Floor for auto-sized mapper count. |
-| `migration_distcp_max_mappers`                   | `MIGRATION_DISTCP_MAX_MAPPERS`                  | `100`              | int               | 1          | Ceiling for auto-sized mapper count. |
-| `migration_distcp_target_aggregate_mbps`         | `MIGRATION_DISTCP_TARGET_AGGREGATE_MBPS`        | `2000`             | int (MB/s)        | 1          | Aggregate throughput target the auto-sizer tries to match across all mappers. |
-| `migration_distcp_max_mapper_bandwidth`          | `MIGRATION_DISTCP_MAX_MAPPER_BANDWIDTH`         | `500`              | int (MB/s)        | 1          | Per-mapper ceiling. Prevents a table with few mappers from being asked to sustain multi-GB/s per stream. |
+| `migration_distcp_total_mappers`                 | `MIGRATION_DISTCP_TOTAL_MAPPERS`                | *(unset)*          | positive int      | 1, 3       | Budget: map containers shared by all running DistCp jobs. Set all three budget keys or none. |
+| `migration_distcp_total_bandwidth_mbps`          | `MIGRATION_DISTCP_TOTAL_BANDWIDTH_MBPS`         | *(unset)*          | positive int (MB/s) | 1, 3     | Budget: MB/s shared by all running DistCp mappers. |
+| `migration_distcp_concurrent_jobs` `[parse]`     | `MIGRATION_DISTCP_CONCURRENT_JOBS`              | *(unset)*          | positive int      | 1, 3       | Budget: DistCp jobs at once across all runs of this copy; the size of its pool `migration_distcp_<suffix>`. Every job gets `total_mappers // concurrent_jobs` mappers and the matching bandwidth share. |
+| `migration_distcp_mappers`                       | `MIGRATION_DISTCP_MAPPERS`                      | *(empty)*          | int or empty      | 1, 3       | No budget: with `migration_distcp_bandwidth`, fixes every job's mappers. One without the other fails the run. |
+| `migration_distcp_bandwidth`                     | `MIGRATION_DISTCP_BANDWIDTH`                    | *(empty)*          | int or empty      | 1, 3       | No budget: with `migration_distcp_mappers`, fixes every job's MB/s per mapper. |
+| `migration_distcp_default_mappers`               | `MIGRATION_DISTCP_DEFAULT_MAPPERS`              | `50`               | int               | 1, 3       | No budget and no pair: mappers per job. |
+| `migration_distcp_default_bandwidth`             | `MIGRATION_DISTCP_DEFAULT_BANDWIDTH`            | `100`              | int (MB/s)        | 1, 3       | No budget and no pair: MB/s per mapper. |
+
+**Retired** (a warning is logged if set): `migration_distcp_enable_auto_sizing`,
+`migration_distcp_target_bytes_per_mapper`, `migration_distcp_min_mappers`,
+`migration_distcp_max_mappers`, `migration_distcp_target_aggregate_mbps`,
+`migration_distcp_max_mapper_bandwidth`.
+
+**Pools.** A hand-deployed copy's DistCp tasks run in `migration_distcp_<suffix>` once
+`migration_distcp_concurrent_jobs` is set for it, and in `default_pool` until then. **Create
+the pool before setting the budget** (`airflow pools set migration_distcp_<suffix> <concurrent_jobs> "..."`):
+Airflow 3 never schedules a task whose pool doesn't exist, so the task would wait forever. The
+pool is chosen at parse time, so a budget set after the last parse gets its pool on the next
+parse. The NX1 portal's copy (`_nx1`) always uses `migration_distcp_nx1`, which aiapi manages;
+triggering an `_nx1` DAG by hand from the Airflow UI uses that pool with the plain budget
+Variables.
 
 ### 6c. Low-level knobs (DAG 1 and DAG 3)
 
@@ -210,6 +221,7 @@ deliberate decision (guarded by `test_parse_path_variable_reads_are_in_the_allow
 - `migration_dag_owner` — All DAGs
 - `migration_discovery_max_concurrent` — DAG 1
 - `migration_distcp_copy_max_concurrent` — DAG 1
+- `migration_distcp_concurrent_jobs` — DAG 1 and DAG 3 of a hand-deployed copy (chooses its pool)
 
 A failure reading any of these (bad int, DB blip, non-positive) silently falls
 through to env/default — a bad Variable can never drop the DAG from Airflow.
@@ -233,9 +245,9 @@ HMS clients) and/or raise `migration_metastore_retry_attempts`.
 **DistCp jobs queueing in YARN?**
 → lower `migration_distcp_copy_max_concurrent`, or widen the YARN queue.
 
-**Small tables copied with 50 mappers each, or large tables copying slowly?**
-→ auto-sizing is off by default; set `migration_distcp_enable_auto_sizing=true` and keep
-`migration_distcp_mappers`/`migration_distcp_bandwidth` empty. See
+**DistCp overloading the queue, or each job too small or too large?**
+→ set a queue budget (`migration_distcp_total_mappers`, `migration_distcp_total_bandwidth_mbps`,
+`migration_distcp_concurrent_jobs`) and create the copy's pool first. See
 [DistCp Performance Tuning](DistCp_Performance_Tuning.md).
 
 **Want to migrate append-only (preserve dest files on source deletes)?**
