@@ -253,34 +253,63 @@ class TestVarPrecedence:
             cfg = m.get_config()
         assert cfg[cfg_name] == '/plain'
 
-    # -- portal runs size DistCp from their own run-scoped pair ---------------
+    # -- the DistCp queue budget ---------------------------------------------
 
-    def test_portal_run_enables_auto_sizing_even_when_variable_false(self):
-        ctx, vars_ = self._portal({'migration_distcp_enable_auto_sizing': 'false'})
+    _PLAIN_BUDGET = {
+        'migration_distcp_total_mappers': '8',
+        'migration_distcp_total_bandwidth_mbps': '80',
+        'migration_distcp_concurrent_jobs': '2',
+    }
+    _NX1_BUDGET = {
+        'nx1_migration_distcp_total_mappers': '4',
+        'nx1_migration_distcp_total_bandwidth_mbps': '40',
+        'nx1_migration_distcp_concurrent_jobs': '1',
+    }
+
+    def test_portal_run_reads_budget_from_nx1_only(self):
+        ctx, vars_ = self._portal({**self._PLAIN_BUDGET, **self._NX1_BUDGET})
         with ctx, vars_:
             cfg = m.get_config()
-        assert cfg['distcp_enable_auto_sizing'] is True
+        assert (cfg['distcp_total_mappers'], cfg['distcp_concurrent_jobs']) == (4, 1)
 
-    def test_manual_run_auto_sizing_defaults_false(self):
-        with self._context(triggered_by=None), self._variables({}):
+    def test_manual_run_reads_budget_from_plain_only(self):
+        with self._context(triggered_by=None), self._variables({**self._PLAIN_BUDGET, **self._NX1_BUDGET}):
             cfg = m.get_config()
-        assert cfg['distcp_enable_auto_sizing'] is False
+        assert (cfg['distcp_total_mappers'], cfg['distcp_concurrent_jobs']) == (8, 2)
 
-    def test_portal_run_with_run_scoped_pair_takes_forced_branch(self):
-        ctx, vars_ = self._portal({
-            'nx1_migration_distcp_mappers__data_migration_1': '7',
-            'nx1_migration_distcp_bandwidth__data_migration_1': '30',
-        })
+    def test_portal_run_ignores_plain_default_mappers(self):
+        ctx, vars_ = self._portal({'migration_distcp_default_mappers': '7'})
         with ctx, vars_:
             cfg = m.get_config()
-        assert m.distcp_sizing_mode(cfg).startswith('FORCED')
-        assert m.size_distcp_job(10**12, 10**4, cfg) == (7, 30)
+        assert cfg['distcp_default_mappers'] == 50
 
-    def test_portal_run_with_blank_pair_auto_sizes(self):
-        ctx, vars_ = self._portal({})
-        with ctx, vars_:
-            cfg = m.get_config()
-        assert m.distcp_sizing_mode(cfg).startswith('AUTO')
+    def test_half_set_budget_names_the_missing_keys(self):
+        with self._context(triggered_by=None), self._variables({'migration_distcp_total_mappers': '8'}), \
+                pytest.raises(ValueError) as exc:
+            m.get_config()
+        assert 'migration_distcp_total_bandwidth_mbps' in str(exc.value)
+        assert 'migration_distcp_concurrent_jobs' in str(exc.value)
+
+    def test_budget_needs_a_mapper_per_job(self):
+        budget = {'migration_distcp_total_mappers': '2', 'migration_distcp_total_bandwidth_mbps': '100',
+                  'migration_distcp_concurrent_jobs': '3'}
+        with self._context(triggered_by=None), self._variables(budget), \
+                pytest.raises(ValueError, match='total_mappers'):
+            m.get_config()
+
+    def test_budget_needs_one_mbps_per_mapper(self):
+        budget = {'migration_distcp_total_mappers': '8', 'migration_distcp_total_bandwidth_mbps': '3',
+                  'migration_distcp_concurrent_jobs': '2'}
+        with self._context(triggered_by=None), self._variables(budget), \
+                pytest.raises(ValueError, match='total_bandwidth_mbps'):
+            m.get_config()
+
+    def test_retired_auto_sizing_key_warns(self):
+        with self._context(triggered_by=None), \
+                self._variables({'migration_distcp_target_aggregate_mbps': '2000'}), \
+                patch.object(m.logger, 'warning') as warn:
+            m.get_config()
+        assert any('migration_distcp_target_aggregate_mbps' in str(c[0][0]) for c in warn.call_args_list)
 
     def test_manual_run_ignores_the_prefixed_run_scoped_variable(self):
         with self._context(triggered_by=None), self._variables({
@@ -296,11 +325,19 @@ class TestVarPrecedence:
         One key at a time: service_account_user_id and mapr_user resolve through
         one `or` chain, so seeding both at once hides whichever loses.
         """
+        # Numeric keys can't hold text, and a budget key alone is half a budget,
+        # so those are seeded with distinct numbers inside a valid budget.
+        budget = {'migration_distcp_total_mappers': '911', 'migration_distcp_total_bandwidth_mbps': '9122',
+                  'migration_distcp_concurrent_jobs': '3'}
+        numeric = {'migration_distcp_default_mappers': '914', 'migration_distcp_default_bandwidth': '915'}
         for key in sorted(m.PORTAL_OWNED_KEYS):
-            ctx, vars_ = self._portal({f'nx1_{key}': f'value_of_{key}'})
+            value = budget.get(key) or numeric.get(key) or f'value_of_{key}'
+            seeded = {f'nx1_{k}': v for k, v in budget.items()} if key in budget else {}
+            seeded[f'nx1_{key}'] = value
+            ctx, vars_ = self._portal(seeded)
             with ctx, vars_:
                 cfg = m.get_config()
-            assert f'value_of_{key}' in {str(v) for v in cfg.values()}, \
+            assert value in {str(v) for v in cfg.values()}, \
                 f'in PORTAL_OWNED_KEYS but never read by get_config: {key}'
 
 
@@ -378,10 +415,6 @@ class TestServiceAccountAlias:
 # DistCp knob validation — get_config rejects values that would only fail later
 # ---------------------------------------------------------------------------
 _SIZING_KNOBS = [
-    'migration_distcp_target_bytes_per_mapper',
-    'migration_distcp_min_mappers',
-    'migration_distcp_max_mappers',
-    'migration_distcp_target_aggregate_mbps',
     'migration_distcp_default_mappers',
     'migration_distcp_default_bandwidth',
 ]
@@ -415,8 +448,8 @@ class TestDistcpKnobValidation:
     @pytest.mark.parametrize('blank', ['', '   '])
     def test_cleared_sizing_knob_falls_back_to_default(self, blank):
         # Airflow reports a Variable cleared in the UI as present-but-empty.
-        with _only('migration_distcp_max_mappers', blank):
-            assert m.get_config()['distcp_max_mappers'] == 100
+        with _only('migration_distcp_default_mappers', blank):
+            assert m.get_config()['distcp_default_mappers'] == 50
 
     @pytest.mark.parametrize('key', _SIZING_KNOBS)
     def test_positive_sizing_knob_is_accepted_as_int(self, key):
