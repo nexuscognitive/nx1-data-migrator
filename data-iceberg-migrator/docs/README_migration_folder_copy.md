@@ -43,7 +43,6 @@ Set these when triggering the DAG.
 | `tenant` | blank | Tenant or environment key from the `migration_tenant_profiles` Variable. Blank uses the global `cluster_*` Variables |
 | `split_subfolders` | blank | Copy each subfolder as its own job. Blank follows the Airflow Variable or the Excel column, which default to off |
 | `split_depth` | blank (1) | How many directory levels to split |
-| `listing_strategy` | blank (`ls_r`) | How files and sizes are counted: `ls_r` or `count` |
 
 ## 4. Tunable settings
 
@@ -56,7 +55,6 @@ Each setting below is read in this order, and the first value found is used:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `listing_strategy` | `ls_r` | `ls_r` runs a recursive `hadoop fs -ls -R` plus `-du -s`. `count` runs a single `hadoop fs -count`, which is usually faster on very large folder trees. The same method is used for the source, the S3 counts before and after the copy, and validation. An unknown value falls back to `ls_r` with a warning |
 | `split_subfolders` | off | Copies each immediate subfolder as a separate DistCp job. Use it for very large, deeply nested folders, so that no single listing has to walk the whole tree |
 | `split_depth` | 1 | Levels of subfolders to split. A value below 1 is replaced by 1 |
 | `max_split_entries` | 1000 | If splitting would create more jobs than this for one folder, the folder is copied whole |
@@ -64,6 +62,17 @@ Each setting below is read in this order, and the first value found is used:
 | `allow_delete` | off | Together with `distcp_preserve_delete` in the migration config, lets DistCp remove files from the destination that no longer exist in the source. See "Deleting" below |
 
 Other settings, such as the S3 credentials, the tracking database, the report location, and the DistCp memory and strategy options, are shared with the other migration DAGs. See `docs/MIGRATION_AIRFLOW_VARIABLES.md`.
+
+### Listing strategy (administrator setting)
+
+The listing strategy decides how files and sizes are counted on the source and at the S3 destination, for both the copy and the validation. It is not a run parameter, so users never have to choose it. An administrator can set it with the Airflow Variable `folder_copy_listing_strategy` (or the environment variable `FOLDER_COPY_LISTING_STRATEGY`). If neither is set, the default is used.
+
+| Value | Meaning |
+|---|---|
+| `ls_r` (default, recommended for most cases) | Recursive `hadoop fs -ls -R` plus `-du -s` |
+| `count` | A single `hadoop fs -count`, which is usually cheaper on very large or deeply nested folder trees |
+
+An unknown value falls back to `ls_r` with a warning. Consider `count` when runs are slow or fail in the counting steps (see `failure_phase` in section 7).
 
 ### Subfolder splitting
 
@@ -152,7 +161,7 @@ Use `failure_phase` in the tracking table or the report to see where a folder fa
 
 | `failure_phase` | Meaning | What to check |
 |---|---|---|
-| `source_check`, `s3_list_before`, `source_scan`, `s3_list_after` | The edge script stopped while counting files. DistCp was not submitted if `yarn_app_created` is `false` | Folder size and listing time. Try `listing_strategy=count`, or turn on subfolder splitting |
+| `source_check`, `s3_list_before`, `source_scan`, `s3_list_after` | The edge script stopped while counting files. DistCp was not submitted if `yarn_app_created` is `false` | Folder size and listing time. Ask your administrator to switch the listing strategy (see section 4), or turn on subfolder splitting |
 | `distcp` | DistCp itself failed | The DistCp output in the task log and the YARN application |
 | `script` | The edge script failed outside DistCp | The task log for the script output |
 | `ssh_or_startup` | The SSH connection failed or the script never started | SSH connection and cluster login |

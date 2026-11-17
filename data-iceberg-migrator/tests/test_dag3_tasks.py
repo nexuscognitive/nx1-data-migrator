@@ -1583,3 +1583,44 @@ class TestExpandFolderSubfolders:
         with patch.object(m, '_split_folder_config', return_value=self._entries(folder, 1)) as split:
             m.expand_folder_subfolders.function([folder])
         assert split.call_args.args[3] == 1
+
+
+class TestListingStrategySetting:
+    """listing_strategy is an admin setting (Variable / env), not a DAG Param."""
+
+    @pytest.fixture
+    def variables(self, monkeypatch):
+        values = {}
+        monkeypatch.delenv('FOLDER_COPY_LISTING_STRATEGY', raising=False)
+        with patch('airflow.models.Variable.get',
+                   side_effect=lambda key, default_var=None: values.get(key, default_var)):
+            yield values
+
+    def test_defaults_to_ls_r(self, variables):
+        assert m._resolve_listing_strategy() == 'ls_r'
+
+    def test_reads_airflow_variable(self, variables):
+        variables['folder_copy_listing_strategy'] = 'count'
+        assert m._resolve_listing_strategy() == 'count'
+
+    def test_reads_env_var_when_variable_unset(self, variables, monkeypatch):
+        monkeypatch.setenv('FOLDER_COPY_LISTING_STRATEGY', 'count')
+        assert m._resolve_listing_strategy() == 'count'
+
+    def test_variable_wins_over_env_var(self, variables, monkeypatch):
+        variables['folder_copy_listing_strategy'] = 'ls_r'
+        monkeypatch.setenv('FOLDER_COPY_LISTING_STRATEGY', 'count')
+        assert m._resolve_listing_strategy() == 'ls_r'
+
+    def test_value_ignores_case_and_whitespace(self, variables):
+        variables['folder_copy_listing_strategy'] = ' COUNT '
+        assert m._resolve_listing_strategy() == 'count'
+
+    def test_unknown_value_falls_back_to_ls_r_with_warning(self, variables):
+        variables['folder_copy_listing_strategy'] = 'fast'
+        with patch.object(m.logger, 'warning') as warn:
+            assert m._resolve_listing_strategy() == 'ls_r'
+        warn.assert_called_once()
+
+    def test_not_exposed_as_dag_param(self):
+        assert 'listing_strategy' not in m.dag_folder_copy.params
