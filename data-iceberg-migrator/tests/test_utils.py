@@ -304,6 +304,21 @@ class TestVarPrecedence:
                 pytest.raises(ValueError, match='total_bandwidth_mbps'):
             m.get_config()
 
+    @pytest.mark.parametrize('queue', [
+        'x\n__LOGIN_SHELL_EOF__\nid\n#', 'a;b', '$(id)', 'a b', 'q' * 256,
+    ])
+    def test_queue_name_outside_yarn_names_is_refused(self, queue):
+        with self._context(triggered_by=None), \
+                self._variables({'migration_distcp_queue_name': queue}), \
+                pytest.raises(ValueError, match='migration_distcp_queue_name'):
+            m.get_config()
+
+    @pytest.mark.parametrize('queue', ['etl_low', 'root.etl.migration', 'q-1'])
+    def test_queue_name_accepts_yarn_names(self, queue):
+        with self._context(triggered_by=None), \
+                self._variables({'migration_distcp_queue_name': f'  {queue} '}):
+            assert m.get_config()['distcp_queue_name'] == queue
+
     def test_retired_auto_sizing_key_warns(self):
         with self._context(triggered_by=None), \
                 self._variables({'migration_distcp_target_aggregate_mbps': '2000'}), \

@@ -754,7 +754,8 @@ def get_config() -> dict:
         'metastore_socket_timeout': _var('migration_metastore_socket_timeout', 'MIGRATION_METASTORE_SOCKET_TIMEOUT', '600s'),
         'metastore_failure_retries': _var('migration_metastore_failure_retries', 'MIGRATION_METASTORE_FAILURE_RETRIES', '5'),
         'distcp_extra_hadoop_opts': _var('migration_distcp_extra_hadoop_opts', 'MIGRATION_DISTCP_EXTRA_HADOOP_OPTS', ''),
-        'distcp_queue_name': str(_var('migration_distcp_queue_name', 'MIGRATION_DISTCP_QUEUE_NAME', '') or '').strip(),
+        'distcp_queue_name': _queue_name(
+            str(_var('migration_distcp_queue_name', 'MIGRATION_DISTCP_QUEUE_NAME', '') or '').strip()),
         'distcp_skip_crc': (
             str(_var('migration_distcp_skip_crc', 'MIGRATION_DISTCP_SKIP_CRC', 'true') or '').strip().lower() or 'true'
         ) in ('1', 'true', 'yes', 'y', 'on'),
@@ -1193,6 +1194,21 @@ _BUDGET_KEYS = {
     'total_bandwidth_mbps': 'migration_distcp_total_bandwidth_mbps',
     'concurrent_jobs': 'migration_distcp_concurrent_jobs',
 }
+
+
+# A YARN queue name or dotted path (root.etl.migration). The name reaches a
+# bash heredoc over SSH, where shlex quoting doesn't stop a newline from ending
+# the heredoc, so anything else is refused rather than quoted.
+_QUEUE_NAME = re.compile(r'[A-Za-z0-9_.-]{1,255}')
+
+
+def _queue_name(queue: str) -> str:
+    if queue and not _QUEUE_NAME.fullmatch(queue):
+        raise ValueError(
+            "migration_distcp_queue_name must be a YARN queue name: letters, digits, "
+            f"dots, dashes and underscores, at most 255 characters (got {queue[:40]!r})."
+        )
+    return queue
 
 
 def _validate_distcp_budget(budget: dict) -> None:
