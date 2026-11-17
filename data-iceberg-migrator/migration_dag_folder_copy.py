@@ -6,8 +6,10 @@ For migrating raw data directories that don't have associated Hive tables.
 
 Excel columns: source_path | target_bucket | dest_folder | endpoint | split_subfolders (optional)
 
-Performance / diagnostics knobs (DAG Param > Airflow Variable folder_copy_<name> > env FOLDER_COPY_<NAME>):
+Admin setting (Airflow Variable folder_copy_listing_strategy > env FOLDER_COPY_LISTING_STRATEGY; not a DAG Param):
   - listing_strategy : 'ls_r' (default, `hadoop fs -ls -R` + `-du -s`) or 'count' (`hadoop fs -count`)
+
+Performance knobs (DAG Param > Airflow Variable folder_copy_<name> > env FOLDER_COPY_<NAME>):
   - split_subfolders : copy immediate subfolders as separate DistCp tasks instead of one big folder
   - split_depth      : how many directory levels to split when split_subfolders is on (default 1)
   - max_split_entries: safety cap on generated tasks; above it the folder is copied unsplit (default 1000)
@@ -185,8 +187,8 @@ def _sql_int(value) -> str:
 def _resolve_setting(name: str, context: dict = None, default=None):
     """DAG Param > Airflow Variable folder_copy_<name> > env FOLDER_COPY_<NAME> > default.
 
-    Params make A/B runs on the same data possible without redeploying (e.g. the
-    same folder with listing_strategy=ls_r and then =count).
+    Pass context=None to skip the Param step and read only the Variable and env var
+    (used for admin-only settings such as listing_strategy).
     """
     value = None
     try:
@@ -209,8 +211,11 @@ def _resolve_setting(name: str, context: dict = None, default=None):
     return default
 
 
-def _resolve_listing_strategy(context: dict = None) -> str:
-    value = str(_resolve_setting('listing_strategy', context, default='ls_r')).strip().lower()
+def _resolve_listing_strategy() -> str:
+    """Admin-only setting: Airflow Variable folder_copy_listing_strategy > env
+    FOLDER_COPY_LISTING_STRATEGY > 'ls_r'. Deliberately not a DAG Param, so users
+    never have to choose it."""
+    value = str(_resolve_setting('listing_strategy', None, default='ls_r')).strip().lower()
     if value not in _LISTING_STRATEGIES:
         logger.warning(
             f"[FolderCopy] Unknown listing_strategy {value!r} — using 'ls_r'. "
@@ -1107,7 +1112,7 @@ def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **con
     shallow = bool(folder_config.get('shallow'))
     source_files = list(folder_config.get('source_files') or []) if shallow else []
     source_files_bytes = int(folder_config.get('source_files_bytes') or 0) if shallow else 0
-    listing_strategy = _resolve_listing_strategy(context)
+    listing_strategy = _resolve_listing_strategy()
     diag_extra = {
         'parent_source_path': folder_config.get('parent_source_path'),
         'split_role': folder_config.get('split_role'),
@@ -1819,7 +1824,7 @@ def validate_data_copy(copy_status: dict, **context) -> dict:
         return result
 
     # Same listing the copy used, so validation timings are comparable with the copy's.
-    listing_strategy = copy_status.get('listing_strategy') or _resolve_listing_strategy(context)
+    listing_strategy = copy_status.get('listing_strategy') or _resolve_listing_strategy()
     shallow = bool(copy_status.get('shallow'))
     dest_count_snippet = _listing_snippet(
         f'hadoop fs{s3_opts}', f'"{s3_dest}"', 'DEST_FILE_COUNT', 'DEST_TOTAL_SIZE', listing_strategy, shallow
@@ -2850,16 +2855,6 @@ with DAG(
             default=None,
             type=['null', 'integer'],
             description='Directory levels to split when split_subfolders is on. Blank = 1.'
-        ),
-        'listing_strategy': Param(
-            default='',
-            type='string',
-            enum=['', 'ls_r', 'count'],
-            description=(
-                "How file counts/sizes are measured on source and S3: 'ls_r' = recursive ls + du "
-                "(original), 'count' = hadoop fs -count. Blank = Variable "
-                "folder_copy_listing_strategy, else 'ls_r'."
-            )
         ),
     },
     render_template_as_native_obj=True,

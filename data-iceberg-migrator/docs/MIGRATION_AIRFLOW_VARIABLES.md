@@ -181,6 +181,7 @@ How these combine into a mapper count and per-mapper bandwidth, with worked exam
 | Variable                              | Env                                       | Default | Values  | Applies to | Description |
 |---------------------------------------|-------------------------------------------|---------|---------|------------|-------------|
 | `migration_folder_copy_allow_delete`  | `MIGRATION_FOLDER_COPY_ALLOW_DELETE`      | `false` | bool    | 3          | When true, DAG 3's folder copy may remove destination files that no longer exist at the source (DistCp `-delete`). Default protects against accidental data loss on first-time cutovers. |
+| `folder_copy_listing_strategy`        | `FOLDER_COPY_LISTING_STRATEGY`            | `ls_r`  | `ls_r` / `count` | 3   | How DAG 3 counts files and sizes on the source and at the S3 destination, for both the copy and the validation. `ls_r` (recommended default) = recursive `hadoop fs -ls -R` + `-du -s`. `count` = a single `hadoop fs -count`, usually cheaper on very large or deeply nested trees; consider it when runs are slow or fail in the listing phases (`failure_phase` of `source_check`, `s3_list_before`, `source_scan` or `s3_list_after`). Admin-only: not a DAG Param, so users cannot change it per run. Unknown values fall back to `ls_r` with a warning. |
 
 ---
 
