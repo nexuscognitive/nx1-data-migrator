@@ -3,8 +3,8 @@
 import pytest
 from migrator_utils.migrations.shared import (
     distcp_budget,
-    distcp_jvm_opts,
     distcp_job_size,
+    distcp_jvm_opts,
     distcp_sizing_mode,
 )
 
