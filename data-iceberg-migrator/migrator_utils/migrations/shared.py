@@ -1313,6 +1313,20 @@ def effective_source_metrics(table: dict) -> tuple[int, int]:
     return int(size or 0), int(files or 0)
 
 
+def _cost_mbps(config: dict) -> int:
+    """Copy rate the estimate assumes: 150 MB/s, or a job's budget share if lower.
+
+    Under a budget a job copies at most total_bandwidth / concurrent_jobs, which
+    can be far below 150 MB/s; estimating at 150 would set call timeouts that
+    kill healthy copies of large tables (timeouts are never retried).
+    """
+    budget = distcp_budget(config)
+    if budget:
+        _, total_bandwidth, concurrent = budget
+        return min(_COST_MBPS, total_bandwidth // concurrent)
+    return _COST_MBPS
+
+
 def estimate_distcp_cost(table: dict, config: dict) -> float:
     """Estimated wall-clock seconds to copy one table.
 
@@ -1352,7 +1366,7 @@ def estimate_distcp_cost(table: dict, config: dict) -> float:
 
     return (
         _COST_BASE_SECONDS
-        + size_bytes / (_COST_MBPS * 1024 * 1024)
+        + size_bytes / (_cost_mbps(config) * 1024 * 1024)
         + jobs * _COST_SECONDS_PER_JOB
         + paths * _COST_SECONDS_PER_PATH_SCAN * 2
         + file_count * _COST_SECONDS_PER_FILE

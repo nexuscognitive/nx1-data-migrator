@@ -4,6 +4,7 @@ import random
 
 import pytest
 from migrator_utils.migrations.shared import (
+    _cost_mbps,
     distcp_batching_mode,
     effective_source_metrics,
     estimate_distcp_cost,
@@ -63,6 +64,31 @@ class TestEffectiveSourceMetrics:
     def test_none_values_coerce_to_zero(self):
         t = _table(source_total_size_bytes=None, source_file_count=None)
         assert effective_source_metrics(t) == (0, 0)
+
+
+class TestCostRate:
+    """The data term of the estimate follows the budget's per-job bandwidth share."""
+
+    @staticmethod
+    def _budget(total_mappers, total_bandwidth_mbps, concurrent_jobs):
+        return _config(distcp_total_mappers=total_mappers,
+                       distcp_total_bandwidth_mbps=total_bandwidth_mbps,
+                       distcp_concurrent_jobs=concurrent_jobs)
+
+    def test_cost_rate_is_150_without_budget(self):
+        assert _cost_mbps(_config()) == 150
+
+    def test_cost_rate_is_the_jobs_bandwidth_share(self):
+        assert _cost_mbps(self._budget(8, 80, 2)) == 40
+
+    def test_cost_rate_never_exceeds_150(self):
+        assert _cost_mbps(self._budget(100, 100000, 2)) == 150
+
+    def test_estimate_uses_budget_rate(self):
+        table = _table(source_total_size_bytes=40 * GB)
+        slower = estimate_distcp_cost(table, self._budget(8, 80, 2))
+        default = estimate_distcp_cost(table, _config())
+        assert slower - default == pytest.approx(40 * 1024 / 40 - 40 * 1024 / 150, abs=1)
 
 
 class TestEstimateDistcpCost:
