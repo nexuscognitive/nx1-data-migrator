@@ -116,6 +116,7 @@ __all__ = [
     "distcp_batching_mode",
     "distcp_jvm_opts",
     "distcp_budget",
+    "distcp_pool",
     "distcp_job_size",
     "distcp_sizing_mode",
     "effective_source_metrics",
@@ -1250,6 +1251,40 @@ def distcp_job_size(config: dict) -> tuple[int, int]:
             f"Set both migration_distcp_mappers and migration_distcp_bandwidth, or neither."
         )
     return int(config['distcp_default_mappers']), int(config['distcp_default_bandwidth'])
+
+
+PORTAL_DAG_SUFFIX = '_nx1'
+DEFAULT_POOL = 'default_pool'
+DISTCP_POOL_PREFIX = 'migration_distcp'
+
+
+def distcp_pool(dag_id: str, base_dag_id: str) -> str:
+    """The Airflow pool this copy's DistCp task runs in. Called at DAG parse time.
+
+    The pool is named after the copy's suffix (`migration_distcp_nx1` for the
+    portal's copy, `migration_distcp_<suffix>` for one deployed by deploy.py),
+    so DAG 1 and the folder copy of one copy share it. Airflow 3 never schedules
+    a task whose pool doesn't exist, so a pool is only used where something
+    guarantees it: aiapi ensures the portal's, and a hand copy only uses its
+    own once a budget is set for it (the operator creates the pool first).
+    Never raises: the DAG must parse whatever the Variables say.
+    """
+    suffix = dag_id[len(base_dag_id):] if dag_id.startswith(base_dag_id) else ''
+    pool = DISTCP_POOL_PREFIX + suffix
+    if suffix == PORTAL_DAG_SUFFIX:
+        return pool
+    raw = ''
+    try:
+        from airflow.models import Variable
+        raw = str(Variable.get('migration_distcp_concurrent_jobs', default_var='') or '').strip()
+    except Exception:
+        raw = ''
+    if not raw:
+        raw = os.getenv('MIGRATION_DISTCP_CONCURRENT_JOBS', '').strip()
+    try:
+        return pool if int(raw) > 0 else DEFAULT_POOL
+    except ValueError:
+        return DEFAULT_POOL
 
 
 def size_distcp_job(size_bytes: int, file_count: int, config: dict) -> tuple[int, int]:

@@ -1810,3 +1810,48 @@ class _AlwaysEmptyDescribeSpark:
         if statement.strip().startswith('ALTER TABLE'):
             raise RuntimeError('AnalysisException: Cannot add column, name already exists')
         return result
+
+
+class TestDistcpPool:
+    """Which Airflow pool a copy's DistCp task uses (decided when the DAG is parsed)."""
+
+    @staticmethod
+    def _variables(mapping):
+        return patch('airflow.models.Variable.get',
+                     side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var))
+
+    def test_portal_copy_always_gets_its_pool(self, monkeypatch):
+        monkeypatch.delenv('MIGRATION_DISTCP_CONCURRENT_JOBS', raising=False)
+        with self._variables({}):
+            assert m.distcp_pool('source_to_s3_migration_nx1', 'source_to_s3_migration') == 'migration_distcp_nx1'
+
+    def test_hand_copy_without_budget_stays_in_default_pool(self, monkeypatch):
+        monkeypatch.delenv('MIGRATION_DISTCP_CONCURRENT_JOBS', raising=False)
+        with self._variables({}):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'default_pool'
+
+    def test_hand_copy_with_variable_budget_gets_its_pool(self, monkeypatch):
+        monkeypatch.delenv('MIGRATION_DISTCP_CONCURRENT_JOBS', raising=False)
+        with self._variables({'migration_distcp_concurrent_jobs': '2'}):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'migration_distcp_aleks'
+
+    def test_hand_copy_with_env_budget_gets_its_pool(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_DISTCP_CONCURRENT_JOBS', '2')
+        with self._variables({}):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'migration_distcp_aleks'
+
+    def test_unreadable_variable_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_DISTCP_CONCURRENT_JOBS', '2')
+        with patch('airflow.models.Variable.get', side_effect=RuntimeError('metadata DB down')):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'migration_distcp_aleks'
+
+    def test_a_bad_budget_value_does_not_break_parsing(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_DISTCP_CONCURRENT_JOBS', 'two')
+        with self._variables({}):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'default_pool'
+
+    def test_dag3_and_dag1_of_a_copy_share_a_pool(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_DISTCP_CONCURRENT_JOBS', '2')
+        with self._variables({}):
+            assert m.distcp_pool('folder_only_data_copy_aleks', 'folder_only_data_copy') == \
+                m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration')
