@@ -8,7 +8,7 @@ import migration_dag_folder_copy as m
 import pandas as pd
 import pytest
 
-from .helpers import make_excel_bytes, setup_spark_excel
+from .helpers import make_excel_bytes, pool_wiring, setup_spark_excel
 from .helpers import mock_ssh_stdout as _raw_mock_ssh_stdout
 
 
@@ -401,42 +401,39 @@ class TestRunFolderDistcpSsh:
         assert result['source_file_count'] == 42
         assert result['file_count_match'] is True
 
-    def test_master_switch_default_off_uses_fixed_defaults(self, mock_ssh_hook, sample_folder_config):
-        """E2E: migration_distcp_enable_auto_sizing is unset (real get_config(),
-        no patching). MOCK_VARIABLES also carries a forced override pair
-        (migration_distcp_mappers=10, migration_distcp_bandwidth=50) that must
-        be ignored too. The probed source (40 GB / 800 files) would auto-size
-        to (20, 100) if the switch were on — landing on (50, 100) here proves
-        the switch, not the probe result or the forced pair, decided it."""
+    def _run_with_only_the_distcp_response(self, mock_ssh_hook, sample_folder_config, config_overrides=None):
+        """One SSH response, for the DistCp script: a size probe before it would exhaust the list."""
         hook, client, _, _ = mock_ssh_hook
-
-        probe_stdout = MagicMock()
-        probe_stdout.channel.recv_exit_status.return_value = 0
-        # `hadoop fs -count` output: DIR_COUNT FILE_COUNT CONTENT_SIZE PATH
-        probe_stdout.read.return_value = b'1        800  42949672960 /data/sales/raw\n'
-        probe_stderr = MagicMock()
-        probe_stderr.read.return_value = b''
-        wire_channel(probe_stdout, probe_stderr)
-
         distcp_stdout = MagicMock()
         distcp_stdout.channel.recv_exit_status.return_value = 0
         distcp_stdout.read.return_value = self._success_output()
         distcp_stderr = MagicMock()
         distcp_stderr.read.return_value = b''
         wire_channel(distcp_stdout, distcp_stderr)
-
-        client.exec_command.side_effect = [
-            (MagicMock(), probe_stdout, probe_stderr),
-            (MagicMock(), distcp_stdout, distcp_stderr),
-        ]
-
-        m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
-
+        client.exec_command.side_effect = [(MagicMock(), distcp_stdout, distcp_stderr)]
+        cfg = {**m.get_config(), **(config_overrides or {})}
+        with patch.object(m, 'get_config', return_value=cfg):
+            result = m.run_folder_distcp_ssh.function(folder_config=sample_folder_config)
         commands = [call.args[0] for call in client.exec_command.call_args_list]
-        distcp_cmd = next(c for c in commands if '-m ' in c)
-        assert '-m 50 -bandwidth 100' in distcp_cmd
-        assert '-m 20 -bandwidth 100' not in distcp_cmd  # what auto-sizing would give
-        assert '-m 10 -bandwidth 50' not in distcp_cmd   # the forced override pair
+        return result, commands
+
+    def test_folder_job_gets_the_budget_share(self, mock_ssh_hook, sample_folder_config):
+        result, commands = self._run_with_only_the_distcp_response(
+            mock_ssh_hook, sample_folder_config,
+            {'distcp_total_mappers': 8, 'distcp_total_bandwidth_mbps': 80, 'distcp_concurrent_jobs': 2},
+        )
+        assert result['status'] == 'COMPLETED'
+        assert '-m 4 -bandwidth 10' in commands[0]
+
+    def test_folder_copy_no_longer_probes_size(self, mock_ssh_hook, sample_folder_config):
+        result, commands = self._run_with_only_the_distcp_response(mock_ssh_hook, sample_folder_config)
+        assert result['status'] == 'COMPLETED'
+        assert len(commands) == 1
+
+    def test_without_budget_folder_job_uses_the_fixed_pair(self, mock_ssh_hook, sample_folder_config):
+        """MOCK_VARIABLES carries the forced pair (10, 50)."""
+        _, commands = self._run_with_only_the_distcp_response(mock_ssh_hook, sample_folder_config)
+        assert '-m 10 -bandwidth 50' in commands[0]
 
     def test_file_count_mismatch(self, mock_ssh_hook, sample_folder_config):
         hook, client, stdout_mock, _ = mock_ssh_hook
@@ -1588,3 +1585,10 @@ class TestExpandFolderSubfolders:
         with patch.object(m, '_split_folder_config', return_value=self._entries(folder, 1)) as split:
             m.expand_folder_subfolders.function([folder])
         assert split.call_args.args[3] == 1
+
+
+class TestFolderDistcpPoolWiring:
+
+    def test_folder_distcp_task_is_in_the_copies_pool(self):
+        assert pool_wiring('migration_dag_folder_copy.py', 'run_folder_distcp_ssh') == (
+            'dag_folder_copy', 'folder_only_data_copy')

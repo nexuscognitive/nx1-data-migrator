@@ -432,7 +432,7 @@ class TestDistcpKnobValidation:
     @pytest.mark.parametrize('key', _SIZING_KNOBS)
     @pytest.mark.parametrize('bad', ['0', '-1', ' -4 '])
     def test_non_positive_sizing_knob_raises_at_config_resolution(self, key, bad):
-        """Every knob is a divisor or a bound in size_distcp_job.
+        """Every knob is a divisor in DistCp sizing.
 
         Left to reach the task, 0 surfaces as a ZeroDivisionError mid-copy after
         discovery has already run, which is what the docstring promises against.

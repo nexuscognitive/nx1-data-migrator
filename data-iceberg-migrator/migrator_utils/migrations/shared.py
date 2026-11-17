@@ -129,7 +129,6 @@ __all__ = [
     "pack_tables_into_batches",
     "permanent_fail",
     "resolve_batch_cap",
-    "size_distcp_job",
     "track_duration",
     "validate_bucket_endpoint_pairs",
 ]
@@ -650,7 +649,7 @@ def get_config() -> dict:
         resolution, rather than producing a malformed DistCp command mid-copy.
 
         Zero and negatives are rejected, not just non-numerics: every knob this
-        resolves is a divisor or a bound in size_distcp_job, so 0 would surface
+        resolves is a divisor in DistCp sizing, so 0 would surface
         as a ZeroDivisionError inside the DistCp task, after discovery has run.
         """
         raw = str(_var(base_key, env_var, default) or '').strip()
@@ -1285,11 +1284,6 @@ def distcp_pool(dag_id: str, base_dag_id: str) -> str:
         return pool if int(raw) > 0 else DEFAULT_POOL
     except ValueError:
         return DEFAULT_POOL
-
-
-def size_distcp_job(size_bytes: int, file_count: int, config: dict) -> tuple[int, int]:
-    """Deprecated: the size no longer matters. Kept until the DAGs call distcp_job_size."""
-    return distcp_job_size(config)
 
 
 def distcp_sizing_mode(config: dict) -> str:
