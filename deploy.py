@@ -199,6 +199,12 @@ def resolve_interactive(args):
         if not args.suffix:
             print("Error: Suffix cannot be empty.")
             sys.exit(1)
+    if args.suffix.strip().lower() == "nx1":
+        # nx1-aiapi uploads its own copy of these DAGs as <dag_id>_nx1 and runs
+        # their DistCp in the pool migration_distcp_nx1; a hand copy with the
+        # same suffix would replace those DAGs and share that pool.
+        print("Error: suffix 'nx1' is reserved for the NX1 portal's copy of the DAGs.")
+        sys.exit(1)
 
     if interactive and not args.skip_env_shared:
         env_shared_path = SCRIPT_DIR / "env.shared"
@@ -367,6 +373,16 @@ def upload_to_s3(
         print(f"  Uploaded: s3://{bucket}/{s3_key}")
 
 
+def print_distcp_pool_hint(suffix: str) -> None:
+    """Tell the operator which Airflow pool this copy's DistCp tasks will need."""
+    pool = f"migration_distcp_{suffix}"
+    print(
+        "DistCp pool for this copy (needed only once migration_distcp_concurrent_jobs is set for it;\n"
+        "Airflow never runs a task whose pool doesn't exist, so create it before setting the budget):\n"
+        f'  airflow pools set {pool} <concurrent_jobs> "DistCp budget for {suffix}"\n'
+    )
+
+
 def main():
     args = parse_args()
     resolve_interactive(args)
@@ -374,6 +390,8 @@ def main():
 
     uploads = build_upload_plan(args)
     print_upload_plan(uploads, args.s3_bucket)
+    if args.project == "migrator":
+        print_distcp_pool_hint(args.suffix)
 
     if args.dry_run:
         print("Dry run — no files uploaded.")

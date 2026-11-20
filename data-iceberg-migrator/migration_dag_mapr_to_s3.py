@@ -47,9 +47,12 @@ from migrator_utils.migrations.shared import (
     build_s3_opts,
     cluster_login,
     distcp_batching_mode,
+    distcp_job_size,
     distcp_jvm_opts,
+    distcp_pool,
     distcp_sizing_mode,
     effective_source_metrics,
+    ensure_tracking_columns,
     estimate_distcp_cost,
     execute_with_iceberg_retry,
     find_destination_conflicts,
@@ -59,7 +62,6 @@ from migrator_utils.migrations.shared import (
     pack_tables_into_batches,
     permanent_fail,
     resolve_batch_cap,
-    size_distcp_job,
     source_relative_dest_path,
     sql_quote,
     track_duration,
@@ -1207,11 +1209,9 @@ def init_tracking_tables(spark) -> dict:
             LOCATION '{tracking_loc}/migration_table_status'
         """)
 
-    # Idempotently add partition-schema validation columns to tracking tables
-    # created by an earlier DAG version (CREATE TABLE IF NOT EXISTS above is a
-    # no-op for an existing table, so new columns would otherwise be missing and
-    # the INSERT/UPDATE statements that reference them would fail).
-    for _col_name, _col_type in (
+    # CREATE TABLE IF NOT EXISTS above leaves a table made by an earlier DAG
+    # version as it was; add the columns this version writes.
+    ensure_tracking_columns(spark, f"{tracking_db}.migration_table_status", (
         ("partition_schema_json", "STRING"),
         ("partition_schema_match", "BOOLEAN"),
         ("partition_schema_differences", "STRING"),
@@ -1221,34 +1221,11 @@ def init_tracking_tables(spark) -> dict:
         ("source_count_status", "STRING"),
         ("source_count_phase", "STRING"),
         ("source_count_error", "STRING"),
-    ):
-        try:
-            spark.sql(
-                f"ALTER TABLE {tracking_db}.migration_table_status "
-                f"ADD COLUMN {_col_name} {_col_type}"
-            )
-            logger.info(
-                f"[init_tracking_tables] Added column {_col_name} to migration_table_status"
-            )
-        except Exception:
-            # Column already exists — expected on every run after the first.
-            pass
-
-    for _col_name, _col_type in (
+    ))
+    ensure_tracking_columns(spark, f"{tracking_db}.migration_runs", (
         ("service_account_user_id", "STRING"),
         ("service_account_source", "STRING"),
-    ):
-        try:
-            spark.sql(
-                f"ALTER TABLE {tracking_db}.migration_runs "
-                f"ADD COLUMN {_col_name} {_col_type}"
-            )
-            logger.info(
-                f"[init_tracking_tables] Added column {_col_name} to migration_runs"
-            )
-        except Exception:
-            # Column already exists — expected on every run after the first.
-            pass
+    ))
 
     return {"status": "initialized", "database": tracking_db}
 
@@ -2770,9 +2747,12 @@ def run_distcp_ssh(
     temp_dir = cluster_setup["temp_dir"]
     distcp_log_dir = cluster_setup.get("distcp_log_dir") or temp_dir
     preserve_delete = config.get("distcp_preserve_delete", True)
-    # Once per task: size_distcp_job's forced branch returns silently, so without
-    # this a pinned -m 1 reads exactly like auto-sizing that chose 1.
-    logger.info(f"[DistCp] Sizing mode: {distcp_sizing_mode(config)}")
+    # Once per task: every job of this task gets the same -m/-bandwidth, and the
+    # pool is what keeps the budget's concurrency across runs.
+    logger.info(
+        f"[DistCp] Sizing mode: {distcp_sizing_mode(config)} | "
+        f"pool={getattr(context.get('task'), 'pool', 'unknown')}"
+    )
     jvm_opts = distcp_jvm_opts(config)
     # shlex.quote leaves a bare word like 'dynamic' untouched, so the default
     # command is byte-identical to the pre-branch hardcoded -strategy dynamic.
@@ -2974,9 +2954,7 @@ def run_distcp_ssh(
         # different from the one this loop runs.
         effective_size, effective_file_count = effective_source_metrics(t)
 
-        mappers, bandwidth = size_distcp_job(
-            effective_size, effective_file_count, config
-        )
+        mappers, bandwidth = distcp_job_size(config)
         table_estimate = estimate_distcp_cost(t, config)
         call_timeout = _call_timeout_seconds(table_estimate, config)
         logger.info(
@@ -3128,27 +3106,15 @@ def run_distcp_ssh(
                 for part_idx, (part_name, (src_part, dst_part)) in enumerate(
                     zip(non_empty_partitions, partition_copy_pairs, strict=True)
                 ):
-                    # Each partition is its own DistCp job, so it gets its own
-                    # mapper count. Sizing every one at the table level would
-                    # give a ten-file partition the whole table's mappers.
+                    # Every partition job gets the same budget share as any other
+                    # job. Its size is only apportioned for its own call timeout.
                     part_files = partition_file_counts.get(part_name, 0)
-                    if part_files > 0:
-                        # Discovery records a file count per partition but not a
-                        # size, so apportion the table's bytes by file share.
-                        part_size = (
-                            effective_size * part_files // effective_file_count
-                            if effective_file_count > 0
-                            else 0
-                        )
-                        part_mappers, part_bandwidth = size_distcp_job(
-                            part_size, part_files, config
-                        )
-                    else:
-                        # No per-partition count (empty dict from an older
-                        # discovery payload). Keep the table-level sizing rather
-                        # than reading the absence as a one-file partition.
-                        part_size = 0
-                        part_mappers, part_bandwidth = mappers, bandwidth
+                    part_size = (
+                        effective_size * part_files // effective_file_count
+                        if part_files > 0 and effective_file_count > 0
+                        else 0
+                    )
+                    part_mappers, part_bandwidth = mappers, bandwidth
                     # Debug, not info: a 200-partition table would flood the log.
                     logger.debug(
                         f"[DistCp]   Partition {part_name}: {part_mappers} mappers "
@@ -6782,7 +6748,9 @@ with DAG(
     t_record.operator.trigger_rule = "all_done"
     t_batches = flatten_and_batch(discoveries=t_record)
     t_batches.operator.trigger_rule = "all_done"
-    t_distcp = run_distcp_ssh.partial(
+    t_distcp = run_distcp_ssh.override(
+        pool=distcp_pool(dag_mapr_to_s3.dag_id, "source_to_s3_migration")
+    ).partial(
         cluster_setup=t_cluster, source_task_id="record_discovered_tables"
     ).expand(batch=t_batches)
     t_distcp.operator.trigger_rule = "all_done"

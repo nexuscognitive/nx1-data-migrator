@@ -41,14 +41,16 @@ from migrator_utils.migrations.shared import (
     _login_shell,
     build_s3_opts,
     cluster_login,
+    distcp_job_size,
     distcp_jvm_opts,
+    distcp_pool,
     distcp_sizing_mode,
+    ensure_tracking_columns,
     execute_with_iceberg_retry,
     get_config,
     is_permanent_error,
     normalize_s3,
     permanent_fail,
-    size_distcp_job,
     sql_quote,
 )
 
@@ -720,7 +722,7 @@ def init_folder_copy_tracking_tables(spark) -> dict:
         LOCATION '{tracking_loc}/data_copy_status'
     """)
 
-    for _col_name, _col_type in (
+    ensure_tracking_columns(spark, f"{tracking_db}.data_copy_status", (
         ("yarn_application_id", "STRING"),
         ("distcp_started_at", "TIMESTAMP"),
         ("distcp_completed_at", "TIMESTAMP"),
@@ -738,84 +740,13 @@ def init_folder_copy_tracking_tables(spark) -> dict:
         ("s3_list_after_seconds", "DOUBLE"),
         ("validation_listing_seconds", "DOUBLE"),
         ("diagnostics_json", "STRING"),
-    ):
-        try:
-            spark.sql(
-                f"ALTER TABLE {tracking_db}.data_copy_status "
-                f"ADD COLUMN {_col_name} {_col_type}"
-            )
-            logger.info(f"[FolderCopy] Added column {_col_name} to data_copy_status")
-        except Exception as _alter_exc:
-            logger.debug(
-                f"[FolderCopy] ALTER TABLE {tracking_db}.data_copy_status "
-                f"ADD COLUMN {_col_name} {_col_type} did not apply: {_alter_exc}"
-            )
-
-    for _col_name, _col_type in (
+    ))
+    ensure_tracking_columns(spark, f"{tracking_db}.data_copy_runs", (
         ("dag_run_id", "STRING"),
         ("service_account_user_id", "STRING"),
         ("service_account_source", "STRING"),
         ("skipped_folders", "INT"),
-    ):
-        try:
-            spark.sql(
-                f"ALTER TABLE {tracking_db}.data_copy_runs "
-                f"ADD COLUMN {_col_name} {_col_type}"
-            )
-            logger.info(f"[FolderCopy] Added column {_col_name} to data_copy_runs")
-        except Exception as _alter_exc:
-            logger.debug(
-                f"[FolderCopy] ALTER TABLE {tracking_db}.data_copy_runs "
-                f"ADD COLUMN {_col_name} {_col_type} did not apply: {_alter_exc}"
-            )
-
-    for _table_name, _expected in (
-        ('data_copy_status', (
-            'yarn_application_id',
-            'distcp_started_at',
-            'distcp_completed_at',
-            'distcp_duration_seconds',
-            'distcp_bytes_copied',
-            'distcp_files_copied',
-            'throughput_mbps',
-            'parent_source_path',
-            'failure_phase',
-            'yarn_app_created',
-            'script_exit_code',
-            's3_list_before_seconds',
-            'source_scan_seconds',
-            's3_list_after_seconds',
-            'validation_listing_seconds',
-            'diagnostics_json',
-        )),
-        ('data_copy_runs', (
-            'dag_run_id',
-            'service_account_user_id',
-            'service_account_source',
-            'skipped_folders',
-        )),
-    ):
-        try:
-            described = spark.sql(f"DESCRIBE {tracking_db}.{_table_name}").collect()
-            present = set()
-            for _row in described:
-                try:
-                    present.add(str(_row['col_name']).strip().lower())
-                except Exception:
-                    continue
-            missing = sorted(c for c in _expected if c.lower() not in present)
-        except Exception as _desc_exc:
-            logger.debug(
-                f"[FolderCopy] Could not DESCRIBE {tracking_db}.{_table_name}: {_desc_exc}"
-            )
-            missing = []
-        if missing:
-            logger.warning(
-                f"[FolderCopy] Tracking table {tracking_db}.{_table_name} is missing "
-                f"expected column(s) after schema evolution: {', '.join(missing)}. "
-                f"Subsequent INSERT/UPDATE statements referencing them will fail — "
-                f"check ALTER TABLE privileges on {tracking_db}."
-            )
+    ))
 
     logger.info("[FolderCopy] Tracking tables initialized: data_copy_runs, data_copy_status")
     return {'status': 'initialized', 'database': tracking_db}
@@ -951,52 +882,6 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
     return configs
 
 
-def _probe_source_size(ssh, source_path: str, config: dict) -> tuple[int, int]:
-    """Probe a source path with `hadoop fs -count`, returning (content_size, file_count)."""
-    # (0, 1) is the "size probe unusable" pair size_distcp_job routes to the
-    # configured defaults. This DAG has no discovery task to fall back on, and a
-    # probe failure must not fail the copy.
-    unusable = (0, 1)
-    cmd = f'hadoop fs -count "{source_path}"'
-    try:
-        with ssh.get_conn() as client:
-            _, stdout, stderr = client.exec_command(
-                _login_shell(cmd, config.get('cluster_type', 'MapR')),
-                timeout=SSH_COMMAND_TIMEOUT,
-            )
-            output = stdout.read().decode()
-            exit_code = stdout.channel.recv_exit_status()
-            error_output = stderr.read().decode()
-
-        if exit_code != 0:
-            logger.warning(
-                f"[FolderCopy] Size probe for {source_path} exited {exit_code} — "
-                f"falling back to configured DistCp defaults. {error_output.strip()[:300]}"
-            )
-            return unusable
-
-        for line in reversed(output.splitlines()):
-            fields = line.split()
-            if len(fields) < 4:
-                continue
-            try:
-                return int(fields[2]), int(fields[1])
-            except ValueError:
-                continue
-
-        logger.warning(
-            f"[FolderCopy] Could not parse `hadoop fs -count` output for {source_path} — "
-            f"falling back to configured DistCp defaults. Output: {output.strip()[:300]}"
-        )
-        return unusable
-    except Exception as exc:
-        logger.warning(
-            f"[FolderCopy] Size probe for {source_path} failed ({exc}) — "
-            f"falling back to configured DistCp defaults."
-        )
-        return unusable
-
-
 @task
 def expand_folder_subfolders(folder_configs: list, cluster_setup: dict = None, **context) -> list:
     """Optionally split each folder into one DistCp task per subfolder.
@@ -1115,20 +1000,13 @@ def run_folder_distcp_ssh(folder_config: dict, cluster_setup: dict = None, **con
     partial_output: list = []
     diag: dict = {}
 
+    # Every folder job gets the same budget share; the pool keeps the budget's
+    # concurrency across runs.
+    mappers, bandwidth = distcp_job_size(config)
     logger.info(
         f"[FolderCopy] Sizing mode: {distcp_sizing_mode(config)} | "
+        f"pool={getattr(context.get('task'), 'pool', 'unknown')} | "
         f"listing_strategy={listing_strategy} | shallow={shallow}"
-    )
-    if shallow:
-        # The parent folder holds the rest of the data; only these files are in scope.
-        probe_size, probe_files = source_files_bytes, max(len(source_files), 1)
-    else:
-        probe_size, probe_files = _probe_source_size(ssh, source_path, config)
-    mappers, bandwidth = size_distcp_job(probe_size, probe_files, config)
-    logger.info(
-        f"[FolderCopy] Sized {source_path}: {mappers} mappers x {bandwidth} MB/s "
-        f"(= {mappers * bandwidth} MB/s aggregate) for "
-        f"{probe_size} bytes / {probe_files} files"
     )
 
     jvm_opts = distcp_jvm_opts(config)
@@ -2895,7 +2773,8 @@ with DAG(
     # Per-folder: copy → record → validate → update validation (dynamically mapped)
     # max_active_tis_per_dagrun=3 caps concurrent DistCp YARN jobs
     t_fc_distcp = run_folder_distcp_ssh.override(
-        trigger_rule='all_done', max_active_tis_per_dagrun=3
+        trigger_rule='all_done', max_active_tis_per_dagrun=3,
+        pool=distcp_pool(dag_folder_copy.dag_id, 'folder_only_data_copy'),
     ).partial(cluster_setup=t_fc_cluster).expand(folder_config=t_fc_expand)
 
     # Tracking writes are batched: one task inserts all copy results (TRACKING_WRITE_BATCH_SIZE

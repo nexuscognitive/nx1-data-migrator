@@ -29,13 +29,24 @@ PORTAL_TRIGGER = "portal"
 # deployment baseline and resolves the same way for both — see _var.
 PORTAL_OWNED_KEYS = frozenset({
     'auth_method',
+    # nx1-aiapi's Infrastructure Config writes the cluster paths as
+    # nx1_cluster_*, so a plain value set by hand must not reach a portal run.
+    'cluster_distcp_log_root',
+    'cluster_edge_discovery_temp_path',
     'cluster_edge_temp_path',
+    'cluster_hive_scratch_dir',
     'cluster_ssh_conn_id',
     'mapr_ticketfile_location',
     'migration_dag_owner',
     'migration_default_s3_bucket',
     'migration_distcp_bandwidth',
+    'migration_distcp_concurrent_jobs',
+    'migration_distcp_default_bandwidth',
+    'migration_distcp_default_mappers',
     'migration_distcp_mappers',
+    'migration_distcp_queue_name',
+    'migration_distcp_total_bandwidth_mbps',
+    'migration_distcp_total_mappers',
     'migration_email_recipients',
     'migration_report_location',
     'migration_smtp_conn_id',
@@ -66,9 +77,10 @@ PORTAL_VARIABLE_ALIASES = {
 # masked prefill stored it literally as their identity.
 _AIRFLOW_MASKED_VALUE = '***'
 
-# Keys retired by the calibration-free batching change. Warned about rather
-# than ignored: all five are commented out in env.shared.example, so a value
-# here means someone deliberately set it and is owed an explanation.
+# Retired keys: the calibration-free batching change's cost keys, then the
+# auto-sizing keys the DistCp queue budget replaced. Warned about rather than
+# ignored: a value here means someone deliberately set it and is owed an
+# explanation.
 _RETIRED_DISTCP_KEYS = {
     'migration_distcp_cost_mbps': 'throughput is a fixed constant',
     'migration_distcp_cost_seconds_per_job': 'per-job cost is a fixed constant',
@@ -78,6 +90,18 @@ _RETIRED_DISTCP_KEYS = {
         'the batch cap derives from execution_timeout',
     'migration_distcp_max_batches':
         'the batch cap derives from execution_timeout',
+    **{
+        key: 'replaced by the DistCp queue budget (migration_distcp_total_mappers, '
+             '_total_bandwidth_mbps, _concurrent_jobs)'
+        for key in (
+            'migration_distcp_enable_auto_sizing',
+            'migration_distcp_target_bytes_per_mapper',
+            'migration_distcp_min_mappers',
+            'migration_distcp_max_mappers',
+            'migration_distcp_target_aggregate_mbps',
+            'migration_distcp_max_mapper_bandwidth',
+        )
+    },
 }
 
 __all__ = [
@@ -91,6 +115,9 @@ __all__ = [
     "compute_dest_path",
     "distcp_batching_mode",
     "distcp_jvm_opts",
+    "distcp_budget",
+    "distcp_pool",
+    "distcp_job_size",
     "distcp_sizing_mode",
     "effective_source_metrics",
     "estimate_distcp_cost",
@@ -102,7 +129,6 @@ __all__ = [
     "pack_tables_into_batches",
     "permanent_fail",
     "resolve_batch_cap",
-    "size_distcp_job",
     "track_duration",
     "validate_bucket_endpoint_pairs",
 ]
@@ -202,6 +228,84 @@ def execute_with_iceberg_retry(spark, sql: str, max_retries: int = 6, task_label
 
     if not status:
         raise last_exception
+
+
+def _describe_column_names(spark, table: str) -> set[str] | None:
+    """Lower-cased column names of `table`, or None if DESCRIBE can't be read.
+
+    DESCRIBE lists the columns, then a blank row and the partitioning section;
+    only the part before the blank row is columns.
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE {table}").collect()
+    except Exception as exc:
+        logger.warning(f"[TrackingSchema] Could not DESCRIBE {table}: {exc}")
+        return None
+    names = set()
+    for row in rows:
+        name = str(row['col_name']).strip()
+        if not name or name.startswith('#'):
+            break
+        names.add(name.lower())
+    return names
+
+
+def ensure_tracking_columns(spark, table: str, columns, attempts: int = 3,
+                            backoff_seconds: float = 5.0) -> list[str]:
+    """Add the `(name, type)` columns an existing tracking table lacks.
+
+    CREATE TABLE IF NOT EXISTS leaves a table made by an older DAG version as it
+    was, so its new columns have to be added here. A failed ADD COLUMN used to be
+    swallowed, and the run then failed much later, in the INSERT that names the
+    column, after the copy had already run. Now a failure is retried and, if the
+    column is still missing, the task fails here with the reason.
+
+    An ADD COLUMN that didn't raise is taken as done, so a Spark without a usable
+    DESCRIBE (the task-test mocks) still works. Returns the names added.
+    """
+    present = _describe_column_names(spark, table)
+    todo = [(n, t) for n, t in columns if present is None or n.lower() not in present]
+    added: list[str] = []
+    errors: dict[str, Exception] = {}
+    for attempt in range(1, attempts + 1):
+        failed = []
+        for name, col_type in todo:
+            try:
+                spark.sql(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+                added.append(name)
+                logger.info(f"[TrackingSchema] Added column {name} to {table}")
+            except Exception as exc:
+                if 'already exists' in str(exc).lower():
+                    continue
+                errors[name] = exc
+                failed.append((name, col_type))
+        if not failed:
+            return added
+        present = _describe_column_names(spark, table)
+        if present is None:
+            # Without DESCRIBE there is no way to confirm, so don't fail the
+            # task on a guess.
+            logger.warning(
+                f"[TrackingSchema] ADD COLUMN on {table} refused for "
+                f"{', '.join(n for n, _ in failed)}; assuming they already exist"
+            )
+            return added
+        todo = [(n, t) for n, t in failed if n.lower() not in present]
+        if not todo:
+            return added
+        for name, _ in todo:
+            logger.warning(
+                f"[TrackingSchema] ADD COLUMN {name} on {table} failed "
+                f"(attempt {attempt}/{attempts}): {errors[name]}"
+            )
+        if attempt < attempts:
+            time.sleep(backoff_seconds * attempt)
+    detail = '; '.join(f"{n}: {errors[n]}" for n, _ in todo)
+    raise RuntimeError(
+        f"Tracking table {table} is missing column(s) {', '.join(n for n, _ in todo)} "
+        f"after {attempts} attempts to add them — {detail}"
+    )
+
 
 def compute_dest_path(source_location: str, dest_database: str, table_name: str,
                       dest_bucket: str, source_s3_prefix: str, dest_s3_prefix: str) -> str:
@@ -545,7 +649,7 @@ def get_config() -> dict:
         resolution, rather than producing a malformed DistCp command mid-copy.
 
         Zero and negatives are rejected, not just non-numerics: every knob this
-        resolves is a divisor or a bound in size_distcp_job, so 0 would surface
+        resolves is a divisor in DistCp sizing, so 0 would surface
         as a ZeroDivisionError inside the DistCp task, after discovery has run.
         """
         raw = str(_var(base_key, env_var, default) or '').strip()
@@ -556,6 +660,25 @@ def get_config() -> dict:
                 f"Set it above zero or unset it to use the default ({default})."
             )
         return value
+
+    def _opt_int_var(base_key: str, env_var: str) -> int | None:
+        """Like _int_var, but unset (or cleared to '') means None, not a default."""
+        raw = str(_var(base_key, env_var, '') or '').strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{base_key} must be a positive integer, got {raw!r}.") from None
+        if value <= 0:
+            raise ValueError(f"{base_key} must be a positive integer, got {value!r}.")
+        return value
+
+    _budget = {
+        name: _opt_int_var(f'migration_distcp_{name}', f'MIGRATION_DISTCP_{name.upper()}')
+        for name in ('total_mappers', 'total_bandwidth_mbps', 'concurrent_jobs')
+    }
+    _validate_distcp_budget(_budget)
 
     for _retired_key, _reason in _RETIRED_DISTCP_KEYS.items():
         if str(_var(_retired_key, _retired_key.upper(), '') or '').strip():
@@ -584,57 +707,15 @@ def get_config() -> dict:
         's3_access_key': _var('s3_access_key', 'S3_ACCESS_KEY', ''),
         's3_secret_key': _var('s3_secret_key', 'S3_SECRET_KEY', ''),
 
-        # DistCp Configuration
-        # Master switch for the whole sizing feature below. Defaults to
-        # false/off so an upgrade is a no-op until someone opts in: every
-        # table is pinned to distcp_default_mappers/distcp_default_bandwidth
-        # (50/100 out of the box), reproducing the pre-auto-sizing DAG
-        # exactly. Only when explicitly set to true does size_distcp_job look
-        # at size/file count at all.
-        'distcp_enable_auto_sizing': str(
-            _var(
-                'migration_distcp_enable_auto_sizing',
-                'MIGRATION_DISTCP_ENABLE_AUTO_SIZING', 'false'
-            )
-        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
-
-        # Empty = auto-size from the source size probe (see size_distcp_job).
-        # Both must be set together to force a fixed value. Only consulted
-        # when distcp_enable_auto_sizing is true.
+        # DistCp sizing. With the queue budget (all three of total mappers,
+        # total bandwidth and concurrent jobs) every job gets an equal share; see
+        # distcp_job_size. Without it, every job gets fixed values: the forced
+        # pair below if both are set, otherwise the defaults.
+        'distcp_total_mappers': _budget['total_mappers'],
+        'distcp_total_bandwidth_mbps': _budget['total_bandwidth_mbps'],
+        'distcp_concurrent_jobs': _budget['concurrent_jobs'],
         'distcp_mappers': _var('migration_distcp_mappers', 'MIGRATION_DISTCP_MAPPERS', ''),
         'distcp_bandwidth': _var('migration_distcp_bandwidth', 'MIGRATION_DISTCP_BANDWIDTH', ''),
-
-        # Auto-sizing inputs, coerced here rather than at the call site so a
-        # malformed Variable fails at config resolution, not mid-copy.
-        'distcp_target_bytes_per_mapper': _int_var(
-            'migration_distcp_target_bytes_per_mapper',
-            'MIGRATION_DISTCP_TARGET_BYTES_PER_MAPPER', str(2 * 1024 ** 3)
-        ),
-        'distcp_min_mappers': _int_var(
-            'migration_distcp_min_mappers', 'MIGRATION_DISTCP_MIN_MAPPERS', '1'
-        ),
-        'distcp_max_mappers': _int_var(
-            'migration_distcp_max_mappers', 'MIGRATION_DISTCP_MAX_MAPPERS', '100'
-        ),
-        'distcp_target_aggregate_mbps': _int_var(
-            'migration_distcp_target_aggregate_mbps',
-            'MIGRATION_DISTCP_TARGET_AGGREGATE_MBPS', '2000'
-        ),
-        # Per-mapper ceiling. Without this, a table with few files (a handful
-        # of huge files, or one huge file) gets few mappers, and the aggregate
-        # budget piles onto them — e.g. 1 mapper at a 6500 MB/s aggregate
-        # target means that single stream is told to sustain 6500 MB/s, which
-        # can exceed real link capacity and saturate the source cluster/
-        # network path. Default 500: well above the old fixed per-mapper rate
-        # (100 MB/s) so well-distributed tables still benefit from auto-sizing,
-        # but far below the multi-GB/s-per-stream values that triggered the
-        # connection timeouts this knob exists to prevent. Tune to the
-        # measured link capacity between the edge node and the destination.
-        'distcp_max_mapper_bandwidth': _int_var(
-            'migration_distcp_max_mapper_bandwidth',
-            'MIGRATION_DISTCP_MAX_MAPPER_BANDWIDTH', '500'
-        ),
-        # Used when the size probe returns nothing usable.
         'distcp_default_mappers': _int_var(
             'migration_distcp_default_mappers', 'MIGRATION_DISTCP_DEFAULT_MAPPERS', '50'
         ),
@@ -673,7 +754,8 @@ def get_config() -> dict:
         'metastore_socket_timeout': _var('migration_metastore_socket_timeout', 'MIGRATION_METASTORE_SOCKET_TIMEOUT', '600s'),
         'metastore_failure_retries': _var('migration_metastore_failure_retries', 'MIGRATION_METASTORE_FAILURE_RETRIES', '5'),
         'distcp_extra_hadoop_opts': _var('migration_distcp_extra_hadoop_opts', 'MIGRATION_DISTCP_EXTRA_HADOOP_OPTS', ''),
-        'distcp_queue_name': str(_var('migration_distcp_queue_name', 'MIGRATION_DISTCP_QUEUE_NAME', '') or '').strip(),
+        'distcp_queue_name': _queue_name(
+            str(_var('migration_distcp_queue_name', 'MIGRATION_DISTCP_QUEUE_NAME', '') or '').strip()),
         'distcp_skip_crc': (
             str(_var('migration_distcp_skip_crc', 'MIGRATION_DISTCP_SKIP_CRC', 'true') or '').strip().lower() or 'true'
         ) in ('1', 'true', 'yes', 'y', 'on'),
@@ -1107,83 +1189,133 @@ def _endpoint_credentials(ep_hostname: str, config: dict) -> tuple[str, str]:
     return (config.get('s3_access_key') or '', config.get('s3_secret_key') or '')
 
 
-def size_distcp_job(size_bytes: int, file_count: int, config: dict) -> tuple[int, int]:
-    """Derive (mappers, bandwidth_mb_per_mapper) for one DistCp job from its source size."""
-    if not config.get('distcp_enable_auto_sizing', False):
-        # Master switch is off (default) — reproduce the pre-auto-sizing DAG
-        # exactly. Every table gets the same fixed values; size/file count,
-        # the forced-override pair, and every other knob below are unused.
-        return int(config['distcp_default_mappers']), int(config['distcp_default_bandwidth'])
+_BUDGET_KEYS = {
+    'total_mappers': 'migration_distcp_total_mappers',
+    'total_bandwidth_mbps': 'migration_distcp_total_bandwidth_mbps',
+    'concurrent_jobs': 'migration_distcp_concurrent_jobs',
+}
+
+
+# A YARN queue name or dotted path (root.etl.migration). The name reaches a
+# bash heredoc over SSH, where shlex quoting doesn't stop a newline from ending
+# the heredoc, so anything else is refused rather than quoted.
+_QUEUE_NAME = re.compile(r'[A-Za-z0-9_.-]{1,255}')
+
+
+def _queue_name(queue: str) -> str:
+    if queue and not _QUEUE_NAME.fullmatch(queue):
+        raise ValueError(
+            "migration_distcp_queue_name must be a YARN queue name: letters, digits, "
+            f"dots, dashes and underscores, at most 255 characters (got {queue[:40]!r})."
+        )
+    return queue
+
+
+def _validate_distcp_budget(budget: dict) -> None:
+    """Refuse a budget that is half set or can't give every job a mapper and 1 MB/s."""
+    missing = [_BUDGET_KEYS[k] for k, v in budget.items() if v is None]
+    if missing and len(missing) < len(_BUDGET_KEYS):
+        raise ValueError(
+            f"The DistCp queue budget is half set: {', '.join(missing)} "
+            f"{'is' if len(missing) == 1 else 'are'} missing. Set all three, or none."
+        )
+    if missing:
+        return
+    total_mappers, total_bandwidth, concurrent = (
+        budget['total_mappers'], budget['total_bandwidth_mbps'], budget['concurrent_jobs'])
+    if total_mappers < concurrent:
+        raise ValueError(
+            f"migration_distcp_total_mappers ({total_mappers}) must be at least "
+            f"migration_distcp_concurrent_jobs ({concurrent}): every job needs a mapper."
+        )
+    if total_bandwidth < concurrent * (total_mappers // concurrent):
+        raise ValueError(
+            f"migration_distcp_total_bandwidth_mbps ({total_bandwidth}) must be at least "
+            f"{concurrent * (total_mappers // concurrent)}: every mapper needs 1 MB/s."
+        )
+
+
+def distcp_budget(config: dict) -> tuple[int, int, int] | None:
+    """(total_mappers, total_bandwidth_mbps, concurrent_jobs), or None when no budget is set."""
+    values = (config.get('distcp_total_mappers'), config.get('distcp_total_bandwidth_mbps'),
+              config.get('distcp_concurrent_jobs'))
+    return None if None in values else values
+
+
+def distcp_job_size(config: dict) -> tuple[int, int]:
+    """(mappers, bandwidth MB/s per mapper) for every DistCp job of this run.
+
+    With a budget each job gets an equal share; DistCp itself never launches
+    more maps than its copy listing has entries, so a small input uses less.
+    Without one, the forced pair if both halves are set, else the defaults.
+    """
+    budget = distcp_budget(config)
+    if budget:
+        total_mappers, total_bandwidth, concurrent = budget
+        mappers = total_mappers // concurrent
+        return mappers, total_bandwidth // (concurrent * mappers)
 
     forced_m = str(config.get('distcp_mappers') or '').strip()
     forced_b = str(config.get('distcp_bandwidth') or '').strip()
-
     if forced_m and forced_b:
         return int(forced_m), int(forced_b)
     if forced_m or forced_b:
-        missing = 'distcp_bandwidth' if forced_m else 'distcp_mappers'
+        missing = 'migration_distcp_bandwidth' if forced_m else 'migration_distcp_mappers'
         raise ValueError(
-            f"DistCp override is half-configured: {missing} is not set. "
-            f"Set both migration_distcp_mappers and migration_distcp_bandwidth "
-            f"to force fixed values, or neither to auto-size."
+            f"DistCp fixed sizing is half-configured: {missing} is not set. "
+            f"Set both migration_distcp_mappers and migration_distcp_bandwidth, or neither."
         )
+    return int(config['distcp_default_mappers']), int(config['distcp_default_bandwidth'])
 
-    min_mappers = int(config['distcp_min_mappers'])
-    max_mappers = int(config['distcp_max_mappers'])
 
-    if size_bytes <= 0 and file_count > 0:
-        logger.warning(
-            f"[size_distcp_job] Source size probe returned {size_bytes} bytes for "
-            f"{file_count} file(s) — unusable for sizing. Falling back to configured "
-            f"defaults: {config['distcp_default_mappers']} mappers / "
-            f"{config['distcp_default_bandwidth']} MB/s per mapper."
-        )
-        return int(config['distcp_default_mappers']), int(config['distcp_default_bandwidth'])
+PORTAL_DAG_SUFFIX = '_nx1'
+DEFAULT_POOL = 'default_pool'
+DISTCP_POOL_PREFIX = 'migration_distcp'
 
-    # Integer ceiling. Float division loses precision above 2**53 bytes.
-    by_size = -(-size_bytes // int(config['distcp_target_bytes_per_mapper']))
-    mappers = max(min_mappers, min(by_size, max_mappers))
-    # Hadoop 2.7 has no -blocksperchunk, so a mapper beyond the file count idles.
-    if file_count > 0:
-        mappers = min(mappers, file_count)
-    mappers = max(mappers, min_mappers)
 
-    bandwidth = max(1, int(config['distcp_target_aggregate_mbps']) // mappers)
+def distcp_pool(dag_id: str, base_dag_id: str) -> str:
+    """The Airflow pool this copy's DistCp task runs in. Called at DAG parse time.
 
-    # Cap the per-mapper rate independently of how few mappers a low-file-count
-    # table ended up with. Lowers the effective aggregate for that table instead
-    # of raising mapper count — mappers stay bound by file count above.
-    bandwidth = min(bandwidth, int(config['distcp_max_mapper_bandwidth']))
-
-    return mappers, bandwidth
+    The pool is named after the copy's suffix (`migration_distcp_nx1` for the
+    portal's copy, `migration_distcp_<suffix>` for one deployed by deploy.py),
+    so DAG 1 and the folder copy of one copy share it. Airflow 3 never schedules
+    a task whose pool doesn't exist, so a pool is only used where something
+    guarantees it: aiapi ensures the portal's, and a hand copy only uses its
+    own once a budget is set for it (the operator creates the pool first).
+    Never raises: the DAG must parse whatever the Variables say.
+    """
+    suffix = dag_id[len(base_dag_id):] if dag_id.startswith(base_dag_id) else ''
+    pool = DISTCP_POOL_PREFIX + suffix
+    if suffix == PORTAL_DAG_SUFFIX:
+        return pool
+    raw = ''
+    try:
+        from airflow.models import Variable
+        raw = str(Variable.get('migration_distcp_concurrent_jobs', default_var='') or '').strip()
+    except Exception:
+        raw = ''
+    if not raw:
+        raw = os.getenv('MIGRATION_DISTCP_CONCURRENT_JOBS', '').strip()
+    try:
+        return pool if int(raw) > 0 else DEFAULT_POOL
+    except ValueError:
+        return DEFAULT_POOL
 
 
 def distcp_sizing_mode(config: dict) -> str:
-    """Describe where size_distcp_job's numbers come from, for the task log.
-
-    The forced branch returns early and silently, so a pinned `-m 1` looks
-    identical in the log to auto-sizing that happened to choose 1. Callers log
-    this once per task so the numbers below it can be read for what they are.
-    """
-    if not config.get('distcp_enable_auto_sizing', False):
-        return (f"DISABLED — migration_distcp_enable_auto_sizing is not 'true', so every "
-                f"table is pinned to -m {config['distcp_default_mappers']} "
-                f"-bandwidth {config['distcp_default_bandwidth']} (distcp_default_mappers/"
-                f"distcp_default_bandwidth). Set migration_distcp_enable_auto_sizing=true "
-                f"to size per table instead.")
-
-    forced_m = str(config.get('distcp_mappers') or '').strip()
-    forced_b = str(config.get('distcp_bandwidth') or '').strip()
-    if forced_m and forced_b:
-        return (f"FORCED — every table pinned to -m {forced_m} -bandwidth {forced_b} by "
-                f"migration_distcp_mappers/migration_distcp_bandwidth. Auto-sizing is off. "
-                f"Note a value in the deployed env.shared counts as set; clear both to "
-                f"empty Airflow Variables to mask it.")
-    return (f"AUTO — sized per table from discovered size: "
-            f"{config['distcp_target_bytes_per_mapper']} bytes/mapper, "
-            f"{config['distcp_min_mappers']}-{config['distcp_max_mappers']} mappers, "
-            f"{config['distcp_target_aggregate_mbps']} MB/s aggregate, "
-            f"{config['distcp_max_mapper_bandwidth']} MB/s per-mapper cap")
+    """Where this run's DistCp numbers come from, for the task log."""
+    mappers, bandwidth = distcp_job_size(config)
+    budget = distcp_budget(config)
+    if budget:
+        total_mappers, total_bandwidth, concurrent = budget
+        return (f"BUDGET — every job gets -m {mappers} -bandwidth {bandwidth}: "
+                f"{total_mappers} mappers and {total_bandwidth} MB/s shared by "
+                f"{concurrent} concurrent DistCp jobs.")
+    if str(config.get('distcp_mappers') or '').strip():
+        return (f"FIXED — forced pair: every job gets -m {mappers} -bandwidth {bandwidth} "
+                f"(migration_distcp_mappers/migration_distcp_bandwidth). No budget is set.")
+    return (f"FIXED — defaults: every job gets -m {mappers} -bandwidth {bandwidth} "
+            f"(migration_distcp_default_mappers/_default_bandwidth). No budget is set.")
 
 
 # =============================================================================
@@ -1226,6 +1358,23 @@ def effective_source_metrics(table: dict) -> tuple[int, int]:
     return int(size or 0), int(files or 0)
 
 
+def _cost_mbps(config: dict, files_per_job: int | None = None) -> int:
+    """Copy rate the estimate assumes: 150 MB/s, or what a job's budget share allows.
+
+    Under a budget each map is capped at the per-mapper bandwidth, and DistCp
+    runs at most one map per file, so a job copies at most
+    per_mapper_bw * min(per_job_mappers, files) — far below 150 MB/s for a
+    one-file table. Estimating faster would set call timeouts that kill healthy
+    copies (timeouts are never retried). Without a budget the rate stays 150.
+    """
+    if not distcp_budget(config):
+        return _COST_MBPS
+    mappers, per_mapper_bw = distcp_job_size(config)
+    if files_per_job is not None:
+        mappers = min(mappers, max(files_per_job, 1))
+    return min(_COST_MBPS, mappers * per_mapper_bw)
+
+
 def estimate_distcp_cost(table: dict, config: dict) -> float:
     """Estimated wall-clock seconds to copy one table.
 
@@ -1265,7 +1414,7 @@ def estimate_distcp_cost(table: dict, config: dict) -> float:
 
     return (
         _COST_BASE_SECONDS
-        + size_bytes / (_COST_MBPS * 1024 * 1024)
+        + size_bytes / (_cost_mbps(config, max(1, file_count // jobs)) * 1024 * 1024)
         + jobs * _COST_SECONDS_PER_JOB
         + paths * _COST_SECONDS_PER_PATH_SCAN * 2
         + file_count * _COST_SECONDS_PER_FILE

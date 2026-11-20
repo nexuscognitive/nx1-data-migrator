@@ -25,6 +25,23 @@ class TestInitIcebergTrackingTables:
         assert 'iceberg_migration_runs' in sql
         assert 'iceberg_migration_table_status' in sql
 
+    def test_adds_columns_newer_versions_write(self, mock_spark):
+        m.init_iceberg_tracking_tables.function(spark=mock_spark)
+        sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
+        assert ('ALTER TABLE migration_tracking.iceberg_migration_table_status '
+                'ADD COLUMN empty_partition_names STRING') in sql
+
+    def test_a_column_that_cannot_be_added_fails_the_init_task(self, mock_spark):
+        def _sql(stmt, *a, **kw):
+            if 'ADD COLUMN empty_partition_names' in stmt:
+                raise Exception("CommitFailedException: Cannot commit, metadata changed")
+            return MagicMock()
+
+        mock_spark.sql.side_effect = _sql
+        with patch('migrator_utils.migrations.shared.time.sleep'), \
+                pytest.raises(RuntimeError, match=r'iceberg_migration_table_status.*empty_partition_names'):
+            m.init_iceberg_tracking_tables.function(spark=mock_spark)
+
 
 class TestCreateIcebergMigrationRun:
 

@@ -6,6 +6,7 @@ Tests for shared utility functions:
 """
 
 import json
+import re
 import subprocess
 import time
 from unittest.mock import MagicMock, patch
@@ -232,6 +233,99 @@ class TestVarPrecedence:
             cfg = m.get_config()
         assert cfg['hdfs_nameservice'] == 'ns1'
 
+    # nx1-aiapi's Infrastructure Config writes these as nx1_cluster_*.
+    _CLUSTER_PATH_KEYS = [
+        ('cluster_distcp_log_root', 'distcp_log_root'),
+        ('cluster_edge_discovery_temp_path', 'edge_discovery_temp_path'),
+        ('cluster_hive_scratch_dir', 'hive_scratch_dir'),
+    ]
+
+    @pytest.mark.parametrize('key,cfg_name', _CLUSTER_PATH_KEYS)
+    def test_portal_run_reads_cluster_path_from_nx1_not_plain(self, key, cfg_name):
+        ctx, vars_ = self._portal({key: '/plain', f'nx1_{key}': '/from_portal'})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg[cfg_name] == '/from_portal'
+
+    @pytest.mark.parametrize('key,cfg_name', _CLUSTER_PATH_KEYS)
+    def test_manual_run_still_reads_plain_cluster_path(self, key, cfg_name):
+        with self._context(triggered_by=None), self._variables({key: '/plain', f'nx1_{key}': '/from_portal'}):
+            cfg = m.get_config()
+        assert cfg[cfg_name] == '/plain'
+
+    # -- the DistCp queue budget ---------------------------------------------
+
+    _PLAIN_BUDGET = {
+        'migration_distcp_total_mappers': '8',
+        'migration_distcp_total_bandwidth_mbps': '80',
+        'migration_distcp_concurrent_jobs': '2',
+    }
+    _NX1_BUDGET = {
+        'nx1_migration_distcp_total_mappers': '4',
+        'nx1_migration_distcp_total_bandwidth_mbps': '40',
+        'nx1_migration_distcp_concurrent_jobs': '1',
+    }
+
+    def test_portal_run_reads_budget_from_nx1_only(self):
+        ctx, vars_ = self._portal({**self._PLAIN_BUDGET, **self._NX1_BUDGET})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert (cfg['distcp_total_mappers'], cfg['distcp_concurrent_jobs']) == (4, 1)
+
+    def test_manual_run_reads_budget_from_plain_only(self):
+        with self._context(triggered_by=None), self._variables({**self._PLAIN_BUDGET, **self._NX1_BUDGET}):
+            cfg = m.get_config()
+        assert (cfg['distcp_total_mappers'], cfg['distcp_concurrent_jobs']) == (8, 2)
+
+    def test_portal_run_ignores_plain_default_mappers(self):
+        ctx, vars_ = self._portal({'migration_distcp_default_mappers': '7'})
+        with ctx, vars_:
+            cfg = m.get_config()
+        assert cfg['distcp_default_mappers'] == 50
+
+    def test_half_set_budget_names_the_missing_keys(self):
+        with self._context(triggered_by=None), self._variables({'migration_distcp_total_mappers': '8'}), \
+                pytest.raises(ValueError) as exc:
+            m.get_config()
+        assert 'migration_distcp_total_bandwidth_mbps' in str(exc.value)
+        assert 'migration_distcp_concurrent_jobs' in str(exc.value)
+
+    def test_budget_needs_a_mapper_per_job(self):
+        budget = {'migration_distcp_total_mappers': '2', 'migration_distcp_total_bandwidth_mbps': '100',
+                  'migration_distcp_concurrent_jobs': '3'}
+        with self._context(triggered_by=None), self._variables(budget), \
+                pytest.raises(ValueError, match='total_mappers'):
+            m.get_config()
+
+    def test_budget_needs_one_mbps_per_mapper(self):
+        budget = {'migration_distcp_total_mappers': '8', 'migration_distcp_total_bandwidth_mbps': '3',
+                  'migration_distcp_concurrent_jobs': '2'}
+        with self._context(triggered_by=None), self._variables(budget), \
+                pytest.raises(ValueError, match='total_bandwidth_mbps'):
+            m.get_config()
+
+    @pytest.mark.parametrize('queue', [
+        'x\n__LOGIN_SHELL_EOF__\nid\n#', 'a;b', '$(id)', 'a b', 'q' * 256,
+    ])
+    def test_queue_name_outside_yarn_names_is_refused(self, queue):
+        with self._context(triggered_by=None), \
+                self._variables({'migration_distcp_queue_name': queue}), \
+                pytest.raises(ValueError, match='migration_distcp_queue_name'):
+            m.get_config()
+
+    @pytest.mark.parametrize('queue', ['etl_low', 'root.etl.migration', 'q-1'])
+    def test_queue_name_accepts_yarn_names(self, queue):
+        with self._context(triggered_by=None), \
+                self._variables({'migration_distcp_queue_name': f'  {queue} '}):
+            assert m.get_config()['distcp_queue_name'] == queue
+
+    def test_retired_auto_sizing_key_warns(self):
+        with self._context(triggered_by=None), \
+                self._variables({'migration_distcp_target_aggregate_mbps': '2000'}), \
+                patch.object(m.logger, 'warning') as warn:
+            m.get_config()
+        assert any('migration_distcp_target_aggregate_mbps' in str(c[0][0]) for c in warn.call_args_list)
+
     def test_manual_run_ignores_the_prefixed_run_scoped_variable(self):
         with self._context(triggered_by=None), self._variables({
             'nx1_s3_access_key__data_migration_1': 'PER_RUN',
@@ -246,11 +340,19 @@ class TestVarPrecedence:
         One key at a time: service_account_user_id and mapr_user resolve through
         one `or` chain, so seeding both at once hides whichever loses.
         """
+        # Numeric keys can't hold text, and a budget key alone is half a budget,
+        # so those are seeded with distinct numbers inside a valid budget.
+        budget = {'migration_distcp_total_mappers': '911', 'migration_distcp_total_bandwidth_mbps': '9122',
+                  'migration_distcp_concurrent_jobs': '3'}
+        numeric = {'migration_distcp_default_mappers': '914', 'migration_distcp_default_bandwidth': '915'}
         for key in sorted(m.PORTAL_OWNED_KEYS):
-            ctx, vars_ = self._portal({f'nx1_{key}': f'value_of_{key}'})
+            value = budget.get(key) or numeric.get(key) or f'value_of_{key}'
+            seeded = {f'nx1_{k}': v for k, v in budget.items()} if key in budget else {}
+            seeded[f'nx1_{key}'] = value
+            ctx, vars_ = self._portal(seeded)
             with ctx, vars_:
                 cfg = m.get_config()
-            assert f'value_of_{key}' in {str(v) for v in cfg.values()}, \
+            assert value in {str(v) for v in cfg.values()}, \
                 f'in PORTAL_OWNED_KEYS but never read by get_config: {key}'
 
 
@@ -328,10 +430,6 @@ class TestServiceAccountAlias:
 # DistCp knob validation — get_config rejects values that would only fail later
 # ---------------------------------------------------------------------------
 _SIZING_KNOBS = [
-    'migration_distcp_target_bytes_per_mapper',
-    'migration_distcp_min_mappers',
-    'migration_distcp_max_mappers',
-    'migration_distcp_target_aggregate_mbps',
     'migration_distcp_default_mappers',
     'migration_distcp_default_bandwidth',
 ]
@@ -349,7 +447,7 @@ class TestDistcpKnobValidation:
     @pytest.mark.parametrize('key', _SIZING_KNOBS)
     @pytest.mark.parametrize('bad', ['0', '-1', ' -4 '])
     def test_non_positive_sizing_knob_raises_at_config_resolution(self, key, bad):
-        """Every knob is a divisor or a bound in size_distcp_job.
+        """Every knob is a divisor in DistCp sizing.
 
         Left to reach the task, 0 surfaces as a ZeroDivisionError mid-copy after
         discovery has already run, which is what the docstring promises against.
@@ -365,8 +463,8 @@ class TestDistcpKnobValidation:
     @pytest.mark.parametrize('blank', ['', '   '])
     def test_cleared_sizing_knob_falls_back_to_default(self, blank):
         # Airflow reports a Variable cleared in the UI as present-but-empty.
-        with _only('migration_distcp_max_mappers', blank):
-            assert m.get_config()['distcp_max_mappers'] == 100
+        with _only('migration_distcp_default_mappers', blank):
+            assert m.get_config()['distcp_default_mappers'] == 50
 
     @pytest.mark.parametrize('key', _SIZING_KNOBS)
     def test_positive_sizing_knob_is_accepted_as_int(self, key):
@@ -1617,3 +1715,158 @@ class TestSourceRelativePathConfig:
             cfg = m.get_config()
         assert cfg['use_source_relative_path'] is True
         assert cfg['source_path_strip_prefixes'] == ['/mapr/prod', '/warehouse/managed']
+
+
+# ---------------------------------------------------------------------------
+# ensure_tracking_columns — schema evolution of existing tracking tables
+# ---------------------------------------------------------------------------
+class _FakeTrackingSpark:
+    """A tracking table whose columns DESCRIBE reports and ALTER can add.
+
+    `alter_failures` maps a column to how many ADD COLUMN attempts fail before
+    one succeeds (a very large number means it never succeeds).
+    """
+
+    def __init__(self, columns, alter_failures=None, describe_fails=False, hidden_once=()):
+        self.columns = list(columns)
+        self.alter_failures = dict(alter_failures or {})
+        self.describe_fails = describe_fails
+        # Columns another writer adds between our first DESCRIBE and our ALTER.
+        self.hidden_once = set(hidden_once)
+        self.alters = []
+
+    def sql(self, statement):
+        statement = ' '.join(statement.split())
+        if statement.startswith('DESCRIBE '):
+            if self.describe_fails:
+                raise RuntimeError('DESCRIBE unavailable')
+            rows = [{'col_name': c, 'data_type': 'string'} for c in self.columns if c not in self.hidden_once]
+            self.hidden_once = set()
+            rows += [{'col_name': '', 'data_type': ''}, {'col_name': '# Partitioning', 'data_type': ''},
+                     {'col_name': 'Part 0', 'data_type': 'run_id'}]
+            result = MagicMock()
+            result.collect.return_value = rows
+            return result
+        match = re.match(r'ALTER TABLE \S+ ADD COLUMN (\w+) (\w+)', statement)
+        assert match, statement
+        name = match.group(1)
+        self.alters.append(name)
+        if name in self.columns:
+            raise RuntimeError(f'Cannot add column, because {name} already exists')
+        if self.alter_failures.get(name, 0) > 0:
+            self.alter_failures[name] -= 1
+            raise RuntimeError(f'CommitFailedException: concurrent update while adding {name}')
+        self.columns.append(name)
+        return MagicMock()
+
+
+class TestEnsureTrackingColumns:
+
+    COLUMNS = (('a', 'STRING'), ('b', 'INT'))
+
+    def _ensure(self, spark, **kw):
+        with patch.object(m.time, 'sleep') as sleep:
+            added = m.ensure_tracking_columns(spark, 'db.t', self.COLUMNS, **kw)
+        return added, sleep
+
+    def test_present_columns_are_left_alone(self):
+        spark = _FakeTrackingSpark(['run_id', 'a', 'b'])
+        added, _ = self._ensure(spark)
+        assert added == []
+        assert spark.alters == []
+
+    def test_missing_columns_are_added(self):
+        spark = _FakeTrackingSpark(['run_id', 'a'])
+        added, _ = self._ensure(spark)
+        assert added == ['b']
+        assert 'b' in spark.columns
+
+    def test_a_failed_add_is_retried(self):
+        # The es-tenant-2 case: one ADD COLUMN failed among several that worked.
+        spark = _FakeTrackingSpark(['run_id'], alter_failures={'b': 1})
+        added, sleep = self._ensure(spark)
+        assert added == ['a', 'b']
+        assert spark.alters.count('b') == 2
+        sleep.assert_called()
+
+    def test_a_column_that_cannot_be_added_fails_loudly(self):
+        spark = _FakeTrackingSpark(['run_id'], alter_failures={'b': 99})
+        with pytest.raises(RuntimeError, match=r'db\.t.*\bb\b.*CommitFailedException'):
+            self._ensure(spark, attempts=3)
+        assert spark.alters.count('b') == 3
+
+    def test_an_add_that_raced_another_writer_counts_once_describe_shows_it(self):
+        # Our ALTER says "already exists" because another run added it first.
+        spark = _FakeTrackingSpark(['run_id', 'a', 'b'], hidden_once={'b'})
+        added, _ = self._ensure(spark)
+        assert added == []
+        assert spark.alters == ['b']
+
+    def test_without_describe_it_still_adds_and_does_not_raise(self):
+        # Spark mocks in the DAG task tests have no real DESCRIBE.
+        spark = _FakeTrackingSpark(['run_id', 'a'], describe_fails=True)
+        added, _ = self._ensure(spark)
+        assert added == ['b']
+
+    def test_already_exists_counts_as_present_even_if_describe_omits_it(self):
+        # The refusal itself says the column is there, whatever DESCRIBE showed.
+        spark = _AlwaysEmptyDescribeSpark()
+        added, sleep = self._ensure(spark)
+        assert added == []
+        sleep.assert_not_called()
+
+
+class _AlwaysEmptyDescribeSpark:
+    """DESCRIBE lists nothing, every ADD COLUMN says the column already exists."""
+
+    def sql(self, statement):
+        result = MagicMock()
+        result.collect.return_value = []
+        if statement.strip().startswith('ALTER TABLE'):
+            raise RuntimeError('AnalysisException: Cannot add column, name already exists')
+        return result
+
+
+class TestDistcpPool:
+    """Which Airflow pool a copy's DistCp task uses (decided when the DAG is parsed)."""
+
+    @staticmethod
+    def _variables(mapping):
+        return patch('airflow.models.Variable.get',
+                     side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var))
+
+    def test_portal_copy_always_gets_its_pool(self, monkeypatch):
+        monkeypatch.delenv('MIGRATION_DISTCP_CONCURRENT_JOBS', raising=False)
+        with self._variables({}):
+            assert m.distcp_pool('source_to_s3_migration_nx1', 'source_to_s3_migration') == 'migration_distcp_nx1'
+
+    def test_hand_copy_without_budget_stays_in_default_pool(self, monkeypatch):
+        monkeypatch.delenv('MIGRATION_DISTCP_CONCURRENT_JOBS', raising=False)
+        with self._variables({}):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'default_pool'
+
+    def test_hand_copy_with_variable_budget_gets_its_pool(self, monkeypatch):
+        monkeypatch.delenv('MIGRATION_DISTCP_CONCURRENT_JOBS', raising=False)
+        with self._variables({'migration_distcp_concurrent_jobs': '2'}):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'migration_distcp_aleks'
+
+    def test_hand_copy_with_env_budget_gets_its_pool(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_DISTCP_CONCURRENT_JOBS', '2')
+        with self._variables({}):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'migration_distcp_aleks'
+
+    def test_unreadable_variable_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_DISTCP_CONCURRENT_JOBS', '2')
+        with patch('airflow.models.Variable.get', side_effect=RuntimeError('metadata DB down')):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'migration_distcp_aleks'
+
+    def test_a_bad_budget_value_does_not_break_parsing(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_DISTCP_CONCURRENT_JOBS', 'two')
+        with self._variables({}):
+            assert m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration') == 'default_pool'
+
+    def test_dag3_and_dag1_of_a_copy_share_a_pool(self, monkeypatch):
+        monkeypatch.setenv('MIGRATION_DISTCP_CONCURRENT_JOBS', '2')
+        with self._variables({}):
+            assert m.distcp_pool('folder_only_data_copy_aleks', 'folder_only_data_copy') == \
+                m.distcp_pool('source_to_s3_migration_aleks', 'source_to_s3_migration')

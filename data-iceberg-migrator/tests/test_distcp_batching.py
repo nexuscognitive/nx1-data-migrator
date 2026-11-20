@@ -4,6 +4,7 @@ import random
 
 import pytest
 from migrator_utils.migrations.shared import (
+    _cost_mbps,
     distcp_batching_mode,
     effective_source_metrics,
     estimate_distcp_cost,
@@ -63,6 +64,62 @@ class TestEffectiveSourceMetrics:
     def test_none_values_coerce_to_zero(self):
         t = _table(source_total_size_bytes=None, source_file_count=None)
         assert effective_source_metrics(t) == (0, 0)
+
+
+class TestCostRate:
+    """The data term of the estimate follows the budget's per-job bandwidth share."""
+
+    @staticmethod
+    def _budget(total_mappers, total_bandwidth_mbps, concurrent_jobs):
+        return _config(distcp_total_mappers=total_mappers,
+                       distcp_total_bandwidth_mbps=total_bandwidth_mbps,
+                       distcp_concurrent_jobs=concurrent_jobs)
+
+    def test_cost_rate_is_150_without_budget(self):
+        assert _cost_mbps(_config()) == 150
+
+    def test_cost_rate_is_the_jobs_bandwidth_share(self):
+        assert _cost_mbps(self._budget(8, 80, 2)) == 40
+
+    def test_cost_rate_never_exceeds_150(self):
+        assert _cost_mbps(self._budget(100, 100000, 2)) == 150
+
+    def test_estimate_uses_budget_rate(self):
+        table = _table(source_total_size_bytes=40 * GB)
+        slower = estimate_distcp_cost(table, self._budget(8, 80, 2))
+        default = estimate_distcp_cost(table, _config())
+        assert slower - default == pytest.approx(40 * 1024 / 40 - 40 * 1024 / 150, abs=1)
+
+    def test_cost_rate_counts_one_map_per_file(self):
+        # DistCp runs at most one map per file: one file copies at one mapper's share.
+        assert _cost_mbps(self._budget(40, 400, 10), files_per_job=1) == 10
+
+    def test_cost_rate_with_enough_files_is_the_whole_share(self):
+        assert _cost_mbps(self._budget(40, 400, 10), files_per_job=50) == 40
+
+    def test_files_do_not_change_the_rate_without_budget(self):
+        assert _cost_mbps(_config(), files_per_job=1) == 150
+
+    def test_estimate_for_a_one_file_table_uses_one_maps_rate(self):
+        table = _table(source_total_size_bytes=30 * GB, source_file_count=1)
+        base = estimate_distcp_cost(_table(source_total_size_bytes=0, source_file_count=1),
+                                    self._budget(40, 400, 10))
+        cost = estimate_distcp_cost(table, self._budget(40, 400, 10))
+        assert cost - base == pytest.approx(30 * 1024 / 10, abs=1)
+
+    def test_partition_jobs_are_rated_by_their_own_files(self):
+        cfg = self._budget(40, 400, 10)
+        t = _table(
+            partition_filter_active=True,
+            filtered_source_size_bytes=3 * GB,
+            filtered_file_count=3,
+            filtered_partitions=['d=1', 'd=2', 'd=3'],
+            partition_file_counts={'d=1': 1, 'd=2': 1, 'd=3': 1},
+        )
+        cfg['distcp_preserve_delete'] = True
+        empty = dict(t, filtered_source_size_bytes=0)
+        assert estimate_distcp_cost(t, cfg) - estimate_distcp_cost(empty, cfg) == \
+            pytest.approx(3 * 1024 / 10, abs=1)
 
 
 class TestEstimateDistcpCost:

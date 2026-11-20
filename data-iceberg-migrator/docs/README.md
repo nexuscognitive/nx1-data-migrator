@@ -82,16 +82,13 @@ to end; see its `README.md` for setup and the DAG settings.
 | `s3_endpoint`                      | _(empty)_        | Default S3 endpoint URL (all buckets)                                                                                                                                                                            | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_access_key`                    | _(empty)_        | Default S3 access key (all buckets)                                                                                                                                                                              | `source_to_s3_migration`, `folder_only_data_copy` |
 | `s3_secret_key`                    | _(empty)_        | Default S3 secret key (all buckets)                                                                                                                                                                              | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_enable_auto_sizing` | `false`        | Master switch for per-table DistCp sizing. `false`/unset (default): every table is pinned to `migration_distcp_default_mappers`/`migration_distcp_default_bandwidth` (50/100 out of the box) — reproduces the pre-auto-sizing DAG exactly, so an upgrade is a no-op until this is explicitly set. `true`: enables the sizing behavior described below (`migration_distcp_mappers`/`migration_distcp_bandwidth` forced pair, or full auto-sizing from discovered size) | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_mappers`         | _(empty)_        | Only consulted when `migration_distcp_enable_auto_sizing=true`. Number of DistCp mappers. Empty (default) auto-sizes each table from its discovered source size; set together with `migration_distcp_bandwidth` to force a fixed value for every table                           | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_bandwidth`       | _(empty)_        | Bandwidth limit per mapper (MB/s). Empty (default) auto-sizes; must be set together with `migration_distcp_mappers` — one alone fails the DistCp task (`size_distcp_job`), after discovery has already run                                                 | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_target_bytes_per_mapper` | `2147483648`     | Bytes of source data per mapper (2 GiB) before another mapper is added, when auto-sizing                                                                                                                         | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_min_mappers`     | `1`              | Floor on the auto-derived mapper count                                                                                                                                                                           | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_max_mappers`     | `100`            | Ceiling on the auto-derived mapper count                                                                                                                                                                         | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_target_aggregate_mbps` | `2000`           | Total MB/s spread across the mappers; per-mapper bandwidth is this divided by the mapper count                                                                                                                   | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_max_mapper_bandwidth` | `500`            | Per-mapper ceiling (MB/s), applied after the aggregate is divided across mappers. Protects tables with very few files (a handful of huge files, or one huge file) from having the whole aggregate budget piled onto 1-3 mappers, which can exceed real link capacity. Raise or lower to match the measured throughput of the edge-node-to-destination link. Auto-sizing only — ignored when `migration_distcp_mappers`/`migration_distcp_bandwidth` force fixed values | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_default_mappers` | `50`             | Mapper count used when the source size probe returns nothing usable                                                                                                                                              | `source_to_s3_migration`, `folder_only_data_copy` |
-| `migration_distcp_default_bandwidth` | `100`            | Per-mapper bandwidth (MB/s) used when the source size probe returns nothing usable                                                                                                                               | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_total_mappers` | _(unset)_ | Queue budget: map containers shared by all running DistCp jobs. Set all three budget keys or none; see [DistCp Performance Tuning](DistCp_Performance_Tuning.md) | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_total_bandwidth_mbps` | _(unset)_ | Queue budget: MB/s shared by all running DistCp mappers | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_concurrent_jobs` | _(unset)_ | Queue budget: DistCp jobs at once across all runs of this copy, and the size of its pool `migration_distcp_<suffix>` (create the pool first). Every job gets `total_mappers // concurrent_jobs` mappers and the matching bandwidth share | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_mappers`         | _(empty)_        | No budget: set together with `migration_distcp_bandwidth` to fix every job's mapper count; one without the other fails the run | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_bandwidth`       | _(empty)_        | No budget: set together with `migration_distcp_mappers` to fix every job's MB/s per mapper | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_default_mappers` | `50`             | No budget and no fixed pair: mappers per job | `source_to_s3_migration`, `folder_only_data_copy` |
+| `migration_distcp_default_bandwidth` | `100`            | No budget and no fixed pair: MB/s per mapper | `source_to_s3_migration`, `folder_only_data_copy` |
 | `migration_distcp_strategy`        | `dynamic`        | Copy strategy passed to DistCp `-strategy`                                                                                                                                                                       | `source_to_s3_migration`, `folder_only_data_copy` |
 | `migration_distcp_map_memory_mb`   | _(empty)_        | When set, emits `-Dmapreduce.map.memory.mb`; empty emits nothing                                                                                                                                                 | `source_to_s3_migration`, `folder_only_data_copy` |
 | `migration_distcp_map_java_opts`   | _(empty)_        | When set, emits `-Dmapreduce.map.java.opts` (shell-quoted); empty emits nothing                                                                                                                                  | `source_to_s3_migration`, `folder_only_data_copy` |
@@ -118,19 +115,15 @@ to end; see its `README.md` for setup and the DAG settings.
 | `migration_email_recipients`       | _(empty)_        | Comma-separated email addresses for reports                                                                                                                                                                      | All DAGs                                          |
 | `hdfs_nameservice`                 | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR                                                                                                                                                     | `source_to_s3_migration`, `folder_only_data_copy` |
 
-> **Upgrading an existing deployment:** auto-sizing only engages when
-> `migration_distcp_enable_auto_sizing` is `true` **and**
-> `migration_distcp_mappers` **and** `migration_distcp_bandwidth` are unset at *every*
-> tier — Airflow Variable, then env var, then the built-in default. Deployments created
-> from an earlier `env.shared.example` carry `MIGRATION_DISTCP_MAPPERS=50` and
-> `MIGRATION_DISTCP_BANDWIDTH=100` in their **deployed** `env.shared`, which is a
-> fully-set pair, so the DAG keeps using those fixed values and auto-sizing never runs.
-> Changing `env.shared.example` in this repo does not affect an already-deployed
-> `env.shared`. Either delete both lines from `env.shared` and redeploy, or set both
-> Airflow Variables to an **empty string** — Airflow reports an empty Variable as
-> present, so it masks the env file where deleting the Variable would expose it.
-> `[DistCp] Sizing mode:` in the task log says which mode is active. See
-> [DistCp Performance Tuning](DistCp_Performance_Tuning.md) for how each mode sizes a copy.
+> **Upgrading an existing deployment:** auto-sizing is retired, and its six keys
+> (`migration_distcp_enable_auto_sizing`, `_target_bytes_per_mapper`, `_min_mappers`,
+> `_max_mappers`, `_target_aggregate_mbps`, `_max_mapper_bandwidth`) are ignored with a
+> warning. Without a queue budget every job gets fixed values: the
+> `migration_distcp_mappers`/`migration_distcp_bandwidth` pair if both are set at any tier
+> (Airflow Variable, then the deployed env file), otherwise the defaults (50 × 100 MB/s).
+> Unlike before, the pair now applies even though auto-sizing is off: a deployment whose
+> `env.shared` carries a pair other than 50/100 starts using it. The pair from the earlier
+> `env.shared.example` (50/100) is the same as the defaults, so it changes nothing.
 
 
 #### Service account configuration
@@ -954,8 +947,8 @@ finalize_run
   - If exists, runs `hadoop distcp -update` (incremental sync)
   - If new, runs full copy
 - **DistCp configuration:**
-  - Mapper count and per-mapper bandwidth: 50 × 100 MB/s for every table by default; with
-    `migration_distcp_enable_auto_sizing=true`, sized per table or forced to a fixed pair
+  - Mapper count and per-mapper bandwidth: the job's share of the queue budget, or fixed
+    values without one (50 × 100 MB/s by default); the task runs in the copy's pool
     (see [DistCp Performance Tuning](DistCp_Performance_Tuning.md))
   - Dynamic strategy for load balancing
   - S3 credentials passed via `-D` properties

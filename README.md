@@ -169,14 +169,18 @@ Three Airflow Variables control discovery and DistCp parallelism. Each is read w
 
 ### DistCp copy tuning
 
-How many mappers and how much bandwidth each table's copy gets is covered in
+How many mappers and how much bandwidth each copy gets is covered in
 **[DistCp Performance Tuning](data-iceberg-migrator/docs/DistCp_Performance_Tuning.md)**:
-the three sizing modes, how auto-sizing works, worked examples, cluster-load guidance, and
-how copies are batched and time-budgeted.
+the queue budget, the Airflow pool that keeps it across runs, fixed values without a budget,
+and how copies are batched and time-budgeted.
 
-Per-table auto-sizing is **off by default**: every table is copied with 50 mappers × 100 MB/s
-until `migration_distcp_enable_auto_sizing` is set to `true`. Check the `[DistCp] Sizing mode:`
-line in a `run_distcp_ssh` log to see which mode a run used.
+Set a **queue budget** (`migration_distcp_total_mappers`, `migration_distcp_total_bandwidth_mbps`,
+`migration_distcp_concurrent_jobs`) and every DistCp job gets an equal share of it, with no more
+than `concurrent_jobs` running across all runs. Create the copy's pool
+(`airflow pools set migration_distcp_<suffix> <concurrent_jobs> "..."`, printed by `deploy.py`)
+**before** setting the budget: Airflow never runs a task whose pool doesn't exist. Without a
+budget every job gets 50 mappers × 100 MB/s (or your fixed pair). The `[DistCp] Sizing mode:`
+line in a `run_distcp_ssh` log shows which applied, and the pool.
 
 ### Discovery resumes on retry
 
