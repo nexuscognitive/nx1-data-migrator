@@ -11,6 +11,7 @@ Usage:
     python s3_data_relocate.py tables.xlsx [--dry-run]
 """
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -53,10 +54,17 @@ def main():
         if "*" in str(table):
             print(f"row {n}: SKIPPED, wildcards are not supported in table ('{table}'); list each table")
             continue
+        bucket = re.sub(r"^s3[an]?://", "", str(bucket).strip(), flags=re.I).strip("/")  # s3a://b, s3://b, b
+        if "/" in bucket:
+            print(f"row {n}: SKIPPED, bucket must be a bucket name only, got '{bucket}'")
+            continue
         table, dest_db, part = str(table).strip("/"), str(dest_db).strip("/"), (part or "").lstrip("/")
         src_prefix, dst_prefix = f"{table}/", f"{dest_db}/{table}/"
         s3 = boto3.client(
             "s3", endpoint_url=endpoint, verify=ca_bundle,
+            # S3_ACCESS_KEY / S3_SECRET_KEY if set, otherwise boto3's default lookup (AWS_* env vars, ~/.aws)
+            aws_access_key_id=os.environ.get("S3_ACCESS_KEY"),
+            aws_secret_access_key=os.environ.get("S3_SECRET_KEY"),
             config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 10, "mode": "standard"},
                           max_pool_connections=workers * 2),
         )
