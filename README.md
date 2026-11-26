@@ -159,6 +159,11 @@ Three Airflow Variables control discovery and DistCp parallelism. Each is read w
 | `migration_discovery_per_table_parallelism`  | `8`     | within one DB  | How many tables inside **one** discovery task walk through metastore + FS probe + row count at the same time (threadpool on one SparkSession, FAIR scheduler so concurrent spark.sql don't FIFO). | A single giant database (hundreds of tables in one Excel row — this is the biggest lever for that case). Healthy HMS (HDP/CDP Hive 2.3+): try 16; a Hive 3 metastore handles 32 easily. | Metastore throws `TTransportException` under load (MapR Hive 1.2 on an old deployment is the usual culprit): drop to 4.             |
 | `migration_distcp_copy_max_concurrent`       | `3`     | across batches | How many DistCp copies run **in parallel** on the shared YARN queue. Also used by `flatten_and_batch` for lane-aware batch sizing, so the two stay in sync when you tune this.                     | YARN queue has unused capacity and the edge SSH session can absorb more concurrent `hadoop distcp` processes. Watch RM UI for queued apps before raising.                               | DistCp jobs queue in YARN or hit cluster quotas. Also lower if the edge node is CPU-bound shelling out to Hadoop clients.           |
 
+Runs started from the NX1 portal don't read these plain names: the portal's copy of the DAGs reads
+`nx1_migration_discovery_max_concurrent`, `nx1_migration_discovery_per_table_parallelism` and
+`nx1_migration_distcp_copy_max_concurrent`, which nx1-aiapi's Performance Tuning page sets. See
+"Runs started from the NX1 portal" in `data-iceberg-migrator/docs/MIGRATION_AIRFLOW_VARIABLES.md`.
+
 **Reading order of operations when discovery is slow:**
 
 1. Open the run's Gantt in Airflow; find whether one `discover_tables_via_spark_ssh` map index is holding up the DAG (one giant DB) or whether many of them run back-to-back (many DBs serialized behind the cap).

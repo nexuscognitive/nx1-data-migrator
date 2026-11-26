@@ -327,6 +327,55 @@ class TestVarOrEnvInt:
         ):
             assert m1._var_or_env_int(self._VAR, self._ENV, 3) == 5
 
+    @staticmethod
+    def _variables(mapping):
+        return patch(
+            'airflow.models.Variable.get',
+            side_effect=lambda key, default_var=None, **kw: mapping.get(key, default_var),
+        )
+
+    def test_portal_copy_reads_the_nx1_name(self, monkeypatch):
+        """nx1-aiapi's Performance Tuning page owns the portal copy's caps."""
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.delenv(self._ENV, raising=False)
+        with self._variables({f'nx1_{self._VAR}': '8', self._VAR: '5'}):
+            assert m1._var_or_env_int(
+                self._VAR, self._ENV, 3, dag_id='source_to_s3_migration_nx1') == 8
+
+    def test_portal_copy_never_reads_the_plain_name(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.delenv(self._ENV, raising=False)
+        with self._variables({self._VAR: '5'}):
+            assert m1._var_or_env_int(
+                self._VAR, self._ENV, 3, dag_id='source_to_s3_migration_nx1') == 3
+
+    def test_hand_copy_reads_the_plain_name(self, monkeypatch):
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.delenv(self._ENV, raising=False)
+        with self._variables({f'nx1_{self._VAR}': '8', self._VAR: '5'}):
+            assert m1._var_or_env_int(
+                self._VAR, self._ENV, 3, dag_id='source_to_s3_migration_aleks') == 5
+
+    def test_a_hand_copy_whose_suffix_ends_in_nx1_is_not_the_portal(self, monkeypatch):
+        """deploy.py only refuses the suffix nx1 itself, so _test_nx1 is a hand copy."""
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.delenv(self._ENV, raising=False)
+        with self._variables({f'nx1_{self._VAR}': '8', self._VAR: '5'}):
+            assert m1._var_or_env_int(
+                self._VAR, self._ENV, 3, dag_id='source_to_s3_migration_test_nx1') == 5
+
+    def test_every_parse_time_cap_names_its_dag(self):
+        """Without the dag_id a portal copy would read the hand copies' value."""
+        from pathlib import Path
+        source = (
+            Path(__file__).resolve().parent.parent / 'migration_dag_mapr_to_s3.py'
+        ).read_text()
+        body = source[source.index('as dag_mapr_to_s3:'):]
+        calls = body.split('_var_or_env_int(')[1:]
+        assert len(calls) == 4
+        for call in calls:
+            assert 'dag_id=dag_mapr_to_s3.dag_id' in call[:200], call[:200]
+
     def test_whitespace_only_variable_is_treated_as_empty(self, monkeypatch):
         import migration_dag_mapr_to_s3 as m1
         monkeypatch.setenv(self._ENV, '7')
