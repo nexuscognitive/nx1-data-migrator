@@ -40,6 +40,7 @@ from migrator_utils.migrations.partition_utils import (
 from migrator_utils.migrations.shared import (
     _BATCH_BUDGET_FRACTION,
     DISTCP_CHECK_CMD,
+    PORTAL_DAG_SUFFIX,
     SSH_COMMAND_TIMEOUT,
     _cluster_auth_check_cmd,
     _hive_scratch_dir,
@@ -563,8 +564,15 @@ def _env_int(env_var: str, default: int) -> int:
     return value
 
 
-def _var_or_env_int(var_name: str, env_var: str, default: int) -> int:
+def _var_or_env_int(
+    var_name: str, env_var: str, default: int, dag_id: str | None = None
+) -> int:
     """Resolve a positive int with precedence Airflow Variable > env > default.
+
+    The portal's copy of the DAG (dag_id ending PORTAL_DAG_SUFFIX) reads the
+    Variable as nx1_<var_name>, which nx1-aiapi's Performance Tuning page owns,
+    and never the plain name a hand-deployed copy reads. Parse time has no run to
+    tell the origin by (see PORTAL_OWNED_KEYS), so the DAG id decides.
 
     Use for parse-time operator attributes where UI tunability outweighs the
     per-scheduler-parse metadata-DB round trip. Each call site must be
@@ -578,6 +586,8 @@ def _var_or_env_int(var_name: str, env_var: str, default: int) -> int:
     """
     try:
         from airflow.models import Variable
+        if dag_id and dag_id.endswith(PORTAL_DAG_SUFFIX):
+            var_name = f"nx1_{var_name}"
         raw = (Variable.get(var_name, default_var='') or '').strip()
         if raw:
             try:
@@ -2592,7 +2602,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
 
 
 @task
-def flatten_and_batch(discoveries) -> list[dict]:
+def flatten_and_batch(discoveries, **context) -> list[dict]:
     """Re-key the copy stage from one task per group to one task per batch.
 
     Takes record_discovered_tables' per-group output and returns one lightweight
@@ -2634,8 +2644,12 @@ def flatten_and_batch(discoveries) -> list[dict]:
     # Same precedence as the parse-time cap: Variable > env > default. Keeps
     # batch sizing in sync with the operator concurrency when a user tunes
     # migration_distcp_copy_max_concurrent from the Airflow UI.
+    ti = context.get("ti")
     lanes = _var_or_env_int(
-        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+        "migration_distcp_copy_max_concurrent",
+        "MIGRATION_DISTCP_COPY_MAX_CONCURRENT",
+        3,
+        dag_id=getattr(ti, "dag_id", None),
     )
     cap = resolve_batch_cap(total_cost, lanes, backstop)
     logger.info(f"[Batching] {distcp_batching_mode(cap, lanes, backstop, config)}")
@@ -6742,7 +6756,8 @@ with DAG(
     # Tunable from Airflow UI via Variable migration_discovery_max_concurrent;
     # the env var is the deployed-env fallback.
     t_discover.operator.max_active_tis_per_dagrun = _var_or_env_int(
-        "migration_discovery_max_concurrent", "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3
+        "migration_discovery_max_concurrent", "MIGRATION_DISCOVERY_MAX_CONCURRENT", 3,
+        dag_id=dag_mapr_to_s3.dag_id,
     )
     t_record = record_discovered_tables.expand(discovery=t_discover)
     t_record.operator.trigger_rule = "all_done"
@@ -6760,7 +6775,8 @@ with DAG(
     # Tunable from Airflow UI via Variable migration_distcp_copy_max_concurrent;
     # the env var is the deployed-env fallback.
     t_distcp.operator.max_active_tis_per_dagrun = _var_or_env_int(
-        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3,
+        dag_id=dag_mapr_to_s3.dag_id,
     )
     t_distcp.operator.execution_timeout = _DISTCP_EXECUTION_TIMEOUT
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
@@ -6769,7 +6785,8 @@ with DAG(
     # a config ceiling. Reuses the copy lane count: a status write is far
     # cheaper than a copy and never needs more lanes than the stage feeding it.
     t_distcp_status.operator.max_active_tis_per_dagrun = _var_or_env_int(
-        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3
+        "migration_distcp_copy_max_concurrent", "MIGRATION_DISTCP_COPY_MAX_CONCURRENT", 3,
+        dag_id=dag_mapr_to_s3.dag_id,
     )
     t_tables = create_hive_tables.expand(distcp_result=t_distcp_status)
     t_tables.operator.trigger_rule = "all_done"
@@ -6781,7 +6798,8 @@ with DAG(
     )
     t_counts.operator.trigger_rule = "all_done"
     t_counts.operator.max_active_tis_per_dagrun = _var_or_env_int(
-        "migration_source_count_max_concurrent", "MIGRATION_SOURCE_COUNT_MAX_CONCURRENT", 3
+        "migration_source_count_max_concurrent", "MIGRATION_SOURCE_COUNT_MAX_CONCURRENT", 3,
+        dag_id=dag_mapr_to_s3.dag_id,
     )
     t_counts_status = update_source_counts.expand(table_result=t_counts)
     t_counts_status.operator.trigger_rule = "all_done"

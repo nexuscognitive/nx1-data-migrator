@@ -20,6 +20,15 @@ back as present-but-empty; empty is treated as unset for most keys. Non-integer,
 zero/negative, or unreadable Variables silently fall through to env/default so a
 bad value can never drop the DAG from Airflow.
 
+**Runs started from the NX1 portal** read the keys the portal owns (`PORTAL_OWNED_KEYS` in
+`migrator_utils/migrations/shared.py`) only as `nx1_<key>`, which nx1-aiapi writes, and never the
+plain name. A run started by hand reads only the plain name. The keys nx1-aiapi's Performance Tuning
+page sets are owned this way: the DistCp queue budget and its queue, `migration_distcp_call_timeout_max_seconds`,
+`migration_distcp_max_tables_per_batch`, `migration_distcp_map_memory_mb`, `migration_distcp_map_java_opts`,
+`migration_distcp_client_java_opts`, `migration_discovery_per_table_parallelism`,
+`migration_discovery_driver_memory` and `migration_source_counts_phase`. The three parse-time caps below
+are read as `nx1_<name>` by the portal's copy of the DAG (ids ending `_nx1`), whoever triggers it.
+
 **Parse-time vs. run-time:** most Variables are read inside tasks at run time
 (cheap). A small allowlist is read at DAG **parse time** — every scheduler parse
 loop (~30s) hits the Airflow metadata DB for these. They're kept small and
@@ -222,6 +231,11 @@ deliberate decision (guarded by `test_parse_path_variable_reads_are_in_the_allow
 - `migration_discovery_max_concurrent` — DAG 1
 - `migration_distcp_copy_max_concurrent` — DAG 1
 - `migration_distcp_concurrent_jobs` — DAG 1 and DAG 3 of a hand-deployed copy (chooses its pool)
+
+The portal's copy of DAG 1 (`source_to_s3_migration_nx1`) reads `migration_discovery_max_concurrent`,
+`migration_distcp_copy_max_concurrent` and `migration_source_count_max_concurrent` as
+`nx1_<name>` instead (set on nx1-aiapi's Performance Tuning page). Parse time has no run to tell
+a portal run from a hand-triggered one, so the DAG id decides.
 
 A failure reading any of these (bad int, DB blip, non-positive) silently falls
 through to env/default — a bad Variable can never drop the DAG from Airflow.

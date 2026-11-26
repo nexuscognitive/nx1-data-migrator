@@ -344,7 +344,11 @@ class TestVarPrecedence:
         # so those are seeded with distinct numbers inside a valid budget.
         budget = {'migration_distcp_total_mappers': '911', 'migration_distcp_total_bandwidth_mbps': '9122',
                   'migration_distcp_concurrent_jobs': '3'}
-        numeric = {'migration_distcp_default_mappers': '914', 'migration_distcp_default_bandwidth': '915'}
+        numeric = {'migration_distcp_default_mappers': '914', 'migration_distcp_default_bandwidth': '915',
+                   'migration_distcp_call_timeout_max_seconds': '21601',
+                   'migration_distcp_max_tables_per_batch': '916',
+                   # Only its three choices are kept; anything else reads as the default.
+                   'migration_source_counts_phase': 'post_copy'}
         for key in sorted(m.PORTAL_OWNED_KEYS):
             value = budget.get(key) or numeric.get(key) or f'value_of_{key}'
             seeded = {f'nx1_{k}': v for k, v in budget.items()} if key in budget else {}
@@ -354,6 +358,45 @@ class TestVarPrecedence:
                 cfg = m.get_config()
             assert value in {str(v) for v in cfg.values()}, \
                 f'in PORTAL_OWNED_KEYS but never read by get_config: {key}'
+
+
+class TestPerformanceTuningKeysArePortalOwned:
+    """nx1-aiapi's Performance Tuning page stores these as nx1_ Variables, so a
+    plain value set by hand for a hand-deployed copy must not reach a portal run,
+    and the page's values must not reach hand-launched runs."""
+
+    PAGE_KEYS = {
+        'migration_distcp_call_timeout_max_seconds': ('distcp_call_timeout_max_seconds', '7200'),
+        'migration_distcp_max_tables_per_batch': ('distcp_max_tables_per_batch', '40'),
+        'migration_distcp_map_memory_mb': ('distcp_map_memory_mb', '4096'),
+        'migration_distcp_map_java_opts': ('distcp_map_java_opts', '-Xmx3276m'),
+        'migration_distcp_client_java_opts': ('distcp_client_java_opts', '-Xmx6g'),
+        'migration_discovery_per_table_parallelism': ('discovery_per_table_parallelism', '16'),
+        'migration_discovery_driver_memory': ('discovery_driver_memory', '4g'),
+        'migration_source_counts_phase': ('source_counts_phase', 'post_copy'),
+    }
+
+    def test_page_keys_are_owned(self):
+        assert set(self.PAGE_KEYS) <= m.PORTAL_OWNED_KEYS
+
+    def test_portal_run_reads_the_nx1_value_and_ignores_the_plain_one(self):
+        defaults = {}
+        with TestVarPrecedence._context(triggered_by=m.PORTAL_TRIGGER), \
+                TestVarPrecedence._variables({}):
+            defaults = m.get_config()
+        for key, (field, value) in self.PAGE_KEYS.items():
+            with TestVarPrecedence._context(triggered_by=m.PORTAL_TRIGGER), \
+                    TestVarPrecedence._variables({key: value}):
+                assert m.get_config()[field] == defaults[field], key
+            with TestVarPrecedence._context(triggered_by=m.PORTAL_TRIGGER), \
+                    TestVarPrecedence._variables({f'nx1_{key}': value}):
+                assert str(m.get_config()[field]) == value, key
+
+    def test_manual_run_ignores_the_nx1_value(self):
+        for key, (field, value) in self.PAGE_KEYS.items():
+            with TestVarPrecedence._context(triggered_by=None), \
+                    TestVarPrecedence._variables({key: value, f'nx1_{key}': 'ignored'}):
+                assert str(m.get_config()[field]) == value, key
 
 
 class TestServiceAccountAlias:

@@ -4626,6 +4626,15 @@ class TestFlattenAndBatch:
         with pytest.raises(ValueError, match='_map_index'):
             m.flatten_and_batch.function(discoveries=[stale])
 
+    def test_lanes_follow_the_copy_cap_of_the_dag_copy_being_run(self):
+        """The batch floor uses the same copies-per-run cap as the operator, so
+        the portal copy (_nx1) reads it under the portal's nx1_ name."""
+        groups = [self._group(0, 'db_a', ['t1'])]
+        ti = MagicMock(dag_id='source_to_s3_migration_nx1')
+        with patch.object(m, '_var_or_env_int', return_value=3) as lanes:
+            m.flatten_and_batch.function(discoveries=groups, ti=ti)
+        assert lanes.call_args.kwargs['dag_id'] == 'source_to_s3_migration_nx1'
+
     def test_descriptors_are_ordered_by_cost_descending(self):
         groups = [
             self._group(0, 'db_a', ['small'], source_total_size_bytes=1024,
