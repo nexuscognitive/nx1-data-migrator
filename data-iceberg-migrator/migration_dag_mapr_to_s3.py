@@ -564,12 +564,17 @@ def _env_int(env_var: str, default: int) -> int:
     return value
 
 
+# This file's dag_id before any deploy suffix. Only `dag_id="..."` is renamed at
+# deploy (deploy.py, and nx1-aiapi's upload), so this literal stays the base.
+_BASE_DAG_ID = "source_to_s3_migration"
+
+
 def _var_or_env_int(
     var_name: str, env_var: str, default: int, dag_id: str | None = None
 ) -> int:
     """Resolve a positive int with precedence Airflow Variable > env > default.
 
-    The portal's copy of the DAG (dag_id ending PORTAL_DAG_SUFFIX) reads the
+    The portal's copy of the DAG (dag_id = base + PORTAL_DAG_SUFFIX) reads the
     Variable as nx1_<var_name>, which nx1-aiapi's Performance Tuning page owns,
     and never the plain name a hand-deployed copy reads. Parse time has no run to
     tell the origin by (see PORTAL_OWNED_KEYS), so the DAG id decides.
@@ -586,7 +591,7 @@ def _var_or_env_int(
     """
     try:
         from airflow.models import Variable
-        if dag_id and dag_id.endswith(PORTAL_DAG_SUFFIX):
+        if dag_id == _BASE_DAG_ID + PORTAL_DAG_SUFFIX:
             var_name = f"nx1_{var_name}"
         raw = (Variable.get(var_name, default_var='') or '').strip()
         if raw:

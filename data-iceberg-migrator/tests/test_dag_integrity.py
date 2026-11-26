@@ -356,6 +356,14 @@ class TestVarOrEnvInt:
             assert m1._var_or_env_int(
                 self._VAR, self._ENV, 3, dag_id='source_to_s3_migration_aleks') == 5
 
+    def test_a_hand_copy_whose_suffix_ends_in_nx1_is_not_the_portal(self, monkeypatch):
+        """deploy.py only refuses the suffix nx1 itself, so _test_nx1 is a hand copy."""
+        import migration_dag_mapr_to_s3 as m1
+        monkeypatch.delenv(self._ENV, raising=False)
+        with self._variables({f'nx1_{self._VAR}': '8', self._VAR: '5'}):
+            assert m1._var_or_env_int(
+                self._VAR, self._ENV, 3, dag_id='source_to_s3_migration_test_nx1') == 5
+
     def test_every_parse_time_cap_names_its_dag(self):
         """Without the dag_id a portal copy would read the hand copies' value."""
         from pathlib import Path
