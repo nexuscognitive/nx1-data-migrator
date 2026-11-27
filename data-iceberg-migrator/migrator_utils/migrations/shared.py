@@ -19,6 +19,36 @@ from airflow.models import Variable
 
 logger = logging.getLogger(__name__)
 
+
+_MAX_TASK_RETRIES = 10
+
+
+def resolve_task_retries(default: int = 1) -> int:
+    for source, read in (
+        ('Variable migration_task_retries', lambda: Variable.get('migration_task_retries', default_var='')),
+        ('env MIGRATION_TASK_RETRIES', lambda: os.environ.get('MIGRATION_TASK_RETRIES', '')),
+    ):
+        try:
+            raw = str(read() or '').strip()
+        except Exception as exc:
+            logger.warning("%s could not be read (%s) — falling through", source, exc)
+            continue
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("%s=%r is not an integer — falling through", source, raw)
+            continue
+        if value < 0:
+            logger.warning("%s=%d is negative — falling through", source, value)
+            continue
+        if value > _MAX_TASK_RETRIES:
+            logger.warning("%s=%d exceeds the cap — using %d", source, value, _MAX_TASK_RETRIES)
+            return _MAX_TASK_RETRIES
+        return value
+    return min(max(default, 0), _MAX_TASK_RETRIES)
+
 # dag_run.conf['triggered_by'] value the portal sends. Gates access to the
 # nx1_-prefixed Airflow Variables the portal owns.
 PORTAL_TRIGGER = "portal"

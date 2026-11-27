@@ -51,6 +51,7 @@ from migrator_utils.migrations.shared import (
     is_permanent_error,
     normalize_s3,
     permanent_fail,
+    resolve_task_retries,
     sql_quote,
 )
 
@@ -89,7 +90,7 @@ def _resolve_dag_owner() -> str:
 default_args = {
     "owner": _resolve_dag_owner(),
     "depends_on_past": False,
-    "retries": 2,
+    "retries": resolve_task_retries(),
     "retry_delay": timedelta(minutes=5),
 }
 

@@ -209,6 +209,7 @@ Variables.
 | Variable                 | Env                     | Default           | Values              | Applies to | Description |
 |--------------------------|-------------------------|-------------------|---------------------|------------|-------------|
 | `migration_dag_owner` `[parse]` | `MIGRATION_DAG_OWNER`   | `data-migration`  | single Unix username (no commas) | All | Owner shown in Airflow AND the task pod's `HADOOP_USER_NAME` / `SPARK_USER` via the `pod_mutation_hook`. This is the principal Ranger authorizes for direct S3/HDFS access. Blank or comma-bearing values fall through to the literal injected by `deploy.py --owner`. **Not run-scoped**: one value per DAG, refreshed each parse. |
+| `migration_task_retries` `[parse]` | `MIGRATION_TASK_RETRIES` | `1` | int 0–10 | All | Retries per task after the first attempt, so the default `1` means 2 attempts. `0` disables retries. Negative or non-integer values are ignored and the next source is used; values above 10 are capped at 10. |
 
 ---
 
@@ -219,6 +220,7 @@ scheduler parse loop (~30s). Kept small and explicit — adding a new one is a
 deliberate decision (guarded by `test_parse_path_variable_reads_are_in_the_allowlist`).
 
 - `migration_dag_owner` — All DAGs
+- `migration_task_retries` — All DAGs
 - `migration_discovery_max_concurrent` — DAG 1
 - `migration_distcp_copy_max_concurrent` — DAG 1
 - `migration_distcp_concurrent_jobs` — DAG 1 and DAG 3 of a hand-deployed copy (chooses its pool)

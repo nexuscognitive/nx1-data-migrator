@@ -29,6 +29,7 @@ from migrator_utils.migrations.shared import (
     execute_with_iceberg_retry,
     get_config,
     normalize_s3,
+    resolve_task_retries,
     sql_quote,
     track_duration,
 )
@@ -77,7 +78,7 @@ def _resolve_dag_owner() -> str:
 default_args = {
     "owner": _resolve_dag_owner(),
     "depends_on_past": False,
-    "retries": 2,
+    "retries": resolve_task_retries(),
     "retry_delay": timedelta(minutes=5),
 }
 

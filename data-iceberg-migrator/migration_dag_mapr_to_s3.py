@@ -62,6 +62,7 @@ from migrator_utils.migrations.shared import (
     pack_tables_into_batches,
     permanent_fail,
     resolve_batch_cap,
+    resolve_task_retries,
     source_relative_dest_path,
     sql_quote,
     track_duration,
@@ -796,7 +797,7 @@ def _kill_yarn_apps(ssh, app_ids: list[str], config: dict, label: str) -> None:
 default_args = {
     "owner": _resolve_dag_owner(),
     "depends_on_past": False,
-    "retries": 2,
+    "retries": resolve_task_retries(),
     "retry_delay": timedelta(minutes=5),
 }
 
