@@ -483,6 +483,79 @@ def _discovery_master(config: dict) -> str:
     return v if re.fullmatch(r"[A-Za-z0-9_\[\]*:.,/-]+", v) else "local[*]"
 
 
+_SPARK_MEMORY_RE = r"\d+[kmgtKMGT]?[bB]?"
+
+# Marks one per-table result line in the source count job's stdout.
+_COUNT_RESULT_MARKER = "===COUNT_RESULT==="
+
+
+def _source_count_spark_flags(config: dict) -> str:
+    """pyspark flags for the post-copy source count job.
+
+    Master and driver memory fall back to the discovery settings; executor and
+    queue flags are emitted only when set. With no source_count_* key set this
+    is the same command discovery-era counts ran. An invalid value is dropped
+    with a warning rather than reaching the remote shell.
+    """
+    master = str(config.get("source_count_spark_master") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\[\]*:.,/-]+", master):
+        master = _discovery_master(config)
+    flags = [f"--master {shlex.quote(master)}"]
+
+    def _add(flag: str, key: str, pattern: str, fallback_key: str | None = None) -> None:
+        value = str(config.get(key) or "").strip()
+        if not value and fallback_key:
+            key, value = fallback_key, str(config.get(fallback_key) or "").strip()
+        if not value:
+            return
+        if not re.fullmatch(pattern, value):
+            logger.warning(f"[SourceCounts] Ignoring invalid {key}={value!r}")
+            return
+        flags.append(f"{flag} {shlex.quote(value)}")
+
+    _add("--driver-memory", "source_count_driver_memory", _SPARK_MEMORY_RE, "discovery_driver_memory")
+    _add("--num-executors", "source_count_num_executors", r"[1-9]\d*")
+    _add("--executor-cores", "source_count_executor_cores", r"[1-9]\d*")
+    _add("--executor-memory", "source_count_executor_memory", _SPARK_MEMORY_RE)
+    _add("--queue", "source_count_queue", r"[A-Za-z0-9_.-]+")
+    return " " + " ".join(flags)
+
+
+def _parse_count_results(text: str, marker: str | None = None) -> list[dict]:
+    """Per-table count results from the results file (one JSON object per line)
+    or from stdout (lines carrying ``marker``). Unparseable lines are skipped: a
+    line cut off by a kill is just a table without a result."""
+    results = []
+    for line in (text or "").splitlines():
+        if marker:
+            pos = line.find(marker)
+            if pos == -1:
+                continue
+            line = line[pos + len(marker):]
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("source_table"):
+            results.append(record)
+    return results
+
+
+def _read_remote_text(sftp, path: str) -> str:
+    """Contents of a remote file, or '' when it does not exist yet."""
+    try:
+        with sftp.file(path, "r") as f:
+            data = f.read()
+    except IOError:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return data if isinstance(data, str) else ""
+
+
 def _skippable_discovery_message(table: dict) -> str:
     """Reason a table was skipped; the fallback only covers an empty exception str()."""
     return table.get("error") or "Skipped during discovery"
@@ -1557,30 +1630,6 @@ def discover_tables_via_spark_ssh(db_config: dict, **context) -> dict:
         cached_by_identity, ensure_ascii=True, separators=(",", ":")
     )
 
-    counts_in_discovery = config.get("source_counts_phase", "discovery") == "discovery"
-    full_count_code = (
-        '        try:\n'
-        '            row_count = spark.sql(\n'
-        '                "SELECT COUNT(*) as c FROM {0}.{1}".format(src_db, tbl)\n'
-        '            ).collect()[0].c\n'
-        '        except Exception:\n'
-        '            pass\n'
-        if counts_in_discovery
-        else ""
-    )
-    filtered_count_code = (
-        '        if partition_filter_active and filtered_partitions:\n'
-        '            try:\n'
-        '                where_clause = partitions_to_where_clause(filtered_partitions)\n'
-        '                row_count = spark.sql(\n'
-        '                    "SELECT COUNT(*) as c FROM {0}.{1} WHERE ".format(src_db, tbl) + where_clause\n'
-        '                ).collect()[0].c\n'
-        '            except Exception:\n'
-        '                pass\n'
-        if counts_in_discovery
-        else ""
-    )
-
     with ssh.get_conn() as client:
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
@@ -1628,7 +1677,8 @@ dest_endpoint = "{dest_endpoint_escaped}"
 tokens = json.loads('{tokens_json_escaped}')
 exclude_tokens = json.loads('{exclude_tokens_json_escaped}')
 filter_expr = "{filter_expr_escaped}"
-COUNT_DEFAULT = {count_default}
+# Row counts are never taken here: collect_source_counts_ssh counts after the copy.
+COUNT_DEFAULT = None
 
 # Per-table discovery checkpoints: on retry, skip tables whose record has
 # already been loaded. The dict is pre-populated by the Airflow task (which
@@ -1942,7 +1992,6 @@ def discover_one_table(tbl):
                 file_format = "TEXTFILE"
 
         row_count = COUNT_DEFAULT
-{full_count_code}
 
         partition_cols_from_describe = []
         in_partition_section = False
@@ -2045,9 +2094,6 @@ def discover_one_table(tbl):
                 partition_file_counts[part_str] = part_files
                 filtered_source_size += part_size
                 filtered_file_count  += part_files
-
-        # Filtered row count
-{filtered_count_code}
 
         is_partitioned = partition_definition
         unregistered_partitions = partition_definition and registered_partition_count == 0
@@ -2165,9 +2211,6 @@ spark.stop()
             ),
             temp_dir=temp_dir,
             include_db_in_path=include_db_in_path,
-            count_default="0" if counts_in_discovery else "None",
-            full_count_code=full_count_code.rstrip("\n"),
-            filtered_count_code=filtered_count_code.rstrip("\n"),
             hive_scratch_dir=_hive_scratch_dir(config),
             metastore_retry_attempts=_int_setting(config, "metastore_retry_attempts", 4, 1, 10),
             metastore_retry_backoff_seconds=_int_setting(
@@ -2459,7 +2502,7 @@ def record_discovered_tables(discovery: dict, spark, **context) -> dict:
         full_table_row_count = (
             "NULL" if full_table_row_count is None else full_table_row_count
         )
-        count_phase_sql = sql_quote(config.get("source_counts_phase", "discovery"))
+        count_phase_sql = "post_copy"
         count_status_sql = "COLLECTED" if counts_present else "NOT_COLLECTED"
         full_table_partition_count = t.get(
             "full_table_partition_count", t.get("partition_count", 0)
@@ -4530,20 +4573,33 @@ def update_table_create_status(table_result: dict, spark) -> dict:
 @task
 @track_duration
 def collect_source_counts_ssh(table_result: dict, cluster_setup: dict, **context) -> dict:
-    """Run the source row counts that discovery skipped, after copy and table creation."""
+    """Run the source row counts that discovery skipped, after copy and table creation.
+
+    One pyspark job per batch on the edge node (``source_count_*`` settings pick
+    the master, executors and queue). Inside it, tables run largest first on a
+    thread pool, and each result is appended to a results file on the edge as
+    soon as that table finishes. A retry of this task instance reads that file
+    and only counts what is still missing; a result is reused only while the
+    table's DistCp completion time is unchanged, so a re-copy is re-counted.
+    """
     config = get_config()
-    if (
-        config.get("source_counts_phase") != "post_copy"
-        or not isinstance(table_result, dict)
-        or "tables" not in table_result
-    ):
+    # Local override: a MIGRATION_SOURCE_COUNT_* env value beats the Airflow Variable
+    # for this task only. Empty env values are ignored, so the Variable still applies.
+    for _key_name in list(config):
+        if _key_name.startswith("source_count_"):
+            _env_val = os.environ.get("MIGRATION_" + _key_name.upper(), "").strip()
+            if _env_val and isinstance(config[_key_name], bool):
+                config[_key_name] = _env_val.lower() in ("1", "true", "yes", "y", "on")
+            elif _env_val:
+                config[_key_name] = _env_val
+    if not isinstance(table_result, dict) or "tables" not in table_result:
         return table_result
 
     def _key(item: dict) -> tuple:
         return (str(item.get("source_table")), str(item.get("partition_filter") or ""))
 
-    copied = {
-        _key(r)
+    copied_at = {
+        _key(r): str(r.get("distcp_completed_at") or "")
         for r in table_result.get("distcp_results", [])
         if r.get("status") == "COMPLETED"
     }
@@ -4555,13 +4611,50 @@ def collect_source_counts_ssh(table_result: dict, cluster_setup: dict, **context
     eligible = [
         t
         for t in table_result["tables"]
-        if _key(t) in copied and _key(t) in created and t.get("row_count") is None
+        if _key(t) in copied_at and _key(t) in created and t.get("row_count") is None
     ]
     if not eligible:
         return table_result
 
+    def _size(t: dict) -> int:
+        if t.get("partition_filter_active"):
+            return t.get("filtered_source_size_bytes") or 0
+        return t.get("source_total_size_bytes") or 0
+
+    # Largest first: the biggest table bounds the batch, so it must not start last.
+    eligible.sort(key=_size, reverse=True)
+
     run_id = table_result["run_id"]
     src_db = table_result["source_database"]
+
+    ti = context.get("ti")
+    task_obj = context.get("task") or getattr(ti, "task", None)
+    max_tries = (getattr(task_obj, "retries", 0) or 0) + 1
+    is_final_attempt = ti is not None and (ti.try_number or 0) >= max_tries
+    map_index = getattr(ti, "map_index", None)
+    map_index = map_index if isinstance(map_index, int) and map_index >= 0 else 0
+
+    ssh = SSHHook(ssh_conn_id=config["ssh_conn_id"])
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{run_id}_{src_db}")
+    # Stable across retries of this mapped instance, so a retry finds the results
+    # file the previous attempt left behind.
+    state_dir = f"{cluster_setup['temp_dir']}/source_counts_{slug}_m{map_index}"
+    results_path = f"{state_dir}/count_results.jsonl"
+
+    counted: dict = {}
+
+    def _take(records: list[dict], reused: bool) -> None:
+        for rec in records:
+            key = _key(rec)
+            if key not in copied_at:
+                continue
+            if reused and (
+                rec.get("count_status") != "COLLECTED"
+                or str(rec.get("copied_at") or "") != copied_at[key]
+            ):
+                continue
+            counted[key] = dict(rec, reused=reused)
+
     inputs = [
         {
             "source_database": t.get("source_database", src_db),
@@ -4569,27 +4662,25 @@ def collect_source_counts_ssh(table_result: dict, cluster_setup: dict, **context
             "partition_filter": t.get("partition_filter"),
             "partition_filter_active": bool(t.get("partition_filter_active")),
             "filtered_partitions": t.get("filtered_partitions") or [],
+            "copied_at": copied_at[_key(t)],
         }
         for t in eligible
     ]
 
-    ti = context.get("ti")
-    task_obj = context.get("task") or getattr(ti, "task", None)
-    max_tries = (getattr(task_obj, "retries", 0) or 0) + 1
-    is_final_attempt = ti is not None and (ti.try_number or 0) >= max_tries
-
-    ssh = SSHHook(ssh_conn_id=config["ssh_conn_id"])
-    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{run_id}_{src_db}")
-    temp_dir = f"{cluster_setup['temp_dir']}/source_counts_{slug}_{uuid.uuid4().hex[:8]}"
-
     pyspark_script = """# -*- coding: utf-8 -*-
 import contextlib
 import json
+import os
 import sys
+import time
 from multiprocessing.dummy import Pool as ThreadPool
 from pyspark.sql import SparkSession
-sys.path.insert(0, "{temp_dir}")
+sys.path.insert(0, "{state_dir}")
 from partition_utils import partitions_to_where_clause
+
+AGGREGATE_PUSHDOWN = {aggregate_pushdown}
+COUNT_FULL_TABLE = {count_full_table}
+RESULTS_PATH = "{results_path}"
 
 spark = SparkSession.builder \\
     .appName("source_counts_{slug}") \\
@@ -4602,8 +4693,12 @@ spark = SparkSession.builder \\
     .enableHiveSupport() \\
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
+if AGGREGATE_PUSHDOWN:
+    # COUNT(*) on Parquet/ORC is answered from file footers; other formats scan as before.
+    spark.conf.set("spark.sql.parquet.aggregatePushdown", "true")
+    spark.conf.set("spark.sql.orc.aggregatePushdown", "true")
 
-with open("{temp_dir}/count_input.json") as f:
+with open("{state_dir}/count_input.json") as f:
     entries = json.load(f)
 
 def _err(e):
@@ -4612,46 +4707,64 @@ def _err(e):
     except Exception:
         return repr(e)[:500]
 
+def _count(sql):
+    return spark.sql(sql).collect()[0].c
+
 def count_one(e):
     out = {{
         "source_database": e["source_database"],
         "source_table": e["source_table"],
         "partition_filter": e.get("partition_filter"),
+        "copied_at": e.get("copied_at"),
         "row_count": None,
         "full_table_row_count": None,
         "count_status": "FAILED",
         "count_error": None,
+        "count_seconds": None,
     }}
+    t0 = time.time()
     try:
         name = "{{0}}.{{1}}".format(e["source_database"], e["source_table"])
-        full_count = spark.sql("SELECT COUNT(*) as c FROM " + name).collect()[0].c
-        row_count = full_count
+        full_sql = "SELECT COUNT(*) as c FROM " + name
         if e.get("partition_filter_active") and e.get("filtered_partitions"):
+            # Only the migrated partitions are scanned (partition pruning).
             where_clause = partitions_to_where_clause(e["filtered_partitions"])
-            row_count = spark.sql(
-                "SELECT COUNT(*) as c FROM " + name + " WHERE " + where_clause
-            ).collect()[0].c
+            row_count = _count(full_sql + " WHERE " + where_clause)
+            full_count = _count(full_sql) if COUNT_FULL_TABLE else None
+        else:
+            row_count = _count(full_sql)
+            full_count = row_count
         out["row_count"] = row_count
         out["full_table_row_count"] = full_count
         out["count_status"] = "COLLECTED"
     except Exception as ex:
         out["count_error"] = _err(ex)
+    out["count_seconds"] = round(time.time() - t0, 1)
     return out
 
-with contextlib.closing(ThreadPool({per_table_parallelism})) as pool:
-    results = pool.map(count_one, entries)
+def emit(result):
+    line = json.dumps(result)
+    # Appended and synced per table, so a kill or timeout keeps every finished count.
+    with open(RESULTS_PATH, "a") as f:
+        f.write(line + "\\n")
+        f.flush()
+        os.fsync(f.fileno())
+    print ("{marker}" + line)
+    sys.stdout.flush()
 
-print ("===JSON_START===")
-sys.stdout.flush()
-print (json.dumps(results))
-sys.stdout.flush()
-print ("===JSON_END===")
-sys.stdout.flush()
+# chunksize 1: each idle thread takes the next-largest table, in order.
+with contextlib.closing(ThreadPool({per_table_parallelism})) as pool:
+    for result in pool.imap_unordered(count_one, entries, 1):
+        emit(result)
 
 spark.stop()
 """.format(
-        temp_dir=temp_dir,
+        state_dir=state_dir,
+        results_path=results_path,
         slug=slug,
+        marker=_COUNT_RESULT_MARKER,
+        aggregate_pushdown=bool(config.get("source_count_aggregate_pushdown")),
+        count_full_table=bool(config.get("source_count_full_table")),
         hive_scratch_dir=_hive_scratch_dir(config),
         metastore_failure_retries=_int_setting(config, "metastore_failure_retries", 5, 0, 20),
         metastore_socket_timeout=_duration_setting(config, "metastore_socket_timeout", "600s"),
@@ -4660,81 +4773,96 @@ spark.stop()
 
     try:
         with ssh.get_conn() as client:
-            _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
+            _, cmd_stdout, _ = client.exec_command(
+                f"mkdir -p {shlex.quote(state_dir)}", timeout=60
+            )
             cmd_stdout.channel.recv_exit_status()
 
-            script_path = f"{temp_dir}/collect_source_counts.py"
+            script_path = f"{state_dir}/collect_source_counts.py"
             sftp = client.open_sftp()
-            with sftp.file(script_path, "w") as f:
-                f.write(pyspark_script)
-            with sftp.file(f"{temp_dir}/count_input.json", "w") as f:
-                f.write(json.dumps(inputs))
-            local_utils = (
-                Path(__file__).resolve().parent
-                / "migrator_utils"
-                / "migrations"
-                / "partition_utils.py"
-            )
-            sftp.put(str(local_utils), f"{temp_dir}/partition_utils.py")
-            sftp.close()
+            try:
+                _take(_parse_count_results(_read_remote_text(sftp, results_path)), reused=True)
+                pending = [i for i in inputs if _key(i) not in counted]
+                if pending:
+                    with sftp.file(script_path, "w") as f:
+                        f.write(pyspark_script)
+                    with sftp.file(f"{state_dir}/count_input.json", "w") as f:
+                        f.write(json.dumps(pending))
+                    local_utils = (
+                        Path(__file__).resolve().parent
+                        / "migrator_utils"
+                        / "migrations"
+                        / "partition_utils.py"
+                    )
+                    sftp.put(str(local_utils), f"{state_dir}/partition_utils.py")
+            finally:
+                sftp.close()
 
-            _drv_mem = str(config.get("discovery_driver_memory") or "").strip()
-            _drv_flag = f" --driver-memory {shlex.quote(_drv_mem)}" if _drv_mem else ""
-            _master = shlex.quote(_discovery_master(config))
-
-            cmd = f"""
-cd {temp_dir}
-pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee source_counts_{slug}.log
-"""
-            _, stdout, stderr = client.exec_command(
-                _login_shell(cmd, config.get("cluster_type", "MapR")),
-                timeout=3600,
-                get_pty=True,
-            )
-            output = stdout.read().decode()
-            error_output = stderr.read().decode()
-            exit_code = stdout.channel.recv_exit_status()
-
-            logger.info("=== Source Counts Output ===")
-            logger.info(output[-1000:])
-
-            if exit_code != 0:
-                raise Exception(
-                    f"Source count Spark job failed with exit code {exit_code}\n"
-                    f"Error: {error_output[:1000]}\n"
-                    f"Output: {output[-500:]}"
+            if counted:
+                logger.info(
+                    f"[SourceCounts] Reusing {len(counted)} count(s) from an earlier attempt; "
+                    f"{len(pending)} table(s) left to count"
                 )
 
-            json_start = output.find("===JSON_START===")
-            json_end = output.find("===JSON_END===")
-            if json_start == -1 or json_end == -1:
-                raise Exception(f"Could not find JSON markers in output: {output}")
+            if pending:
+                cmd = f"""
+cd {shlex.quote(state_dir)}
+pyspark{_source_count_spark_flags(config)} < {shlex.quote(script_path)} 2>&1 | tee source_counts_{slug}.log
+"""
+                _, stdout, stderr = client.exec_command(
+                    _login_shell(cmd, config.get("cluster_type", "MapR")),
+                    timeout=_int_setting(config, "source_count_timeout_seconds", 3600, 60, 86400),
+                    get_pty=True,
+                )
+                output = stdout.read().decode()
+                error_output = stderr.read().decode()
+                exit_code = stdout.channel.recv_exit_status()
 
-            counted = json.loads(
-                output[json_start + len("===JSON_START===") : json_end].strip()
-            )
+                logger.info("=== Source Counts Output ===")
+                logger.info(output[-1000:])
+                _take(_parse_count_results(output, _COUNT_RESULT_MARKER), reused=False)
+
+                if exit_code != 0:
+                    raise Exception(
+                        f"Source count Spark job failed with exit code {exit_code}\n"
+                        f"Error: {error_output[:1000]}\n"
+                        f"Output: {output[-500:]}"
+                    )
+                missing = [i for i in pending if _key(i) not in counted]
+                if missing:
+                    raise Exception(
+                        f"Source count job returned no result for {len(missing)} table(s) "
+                        f"(e.g. {missing[0]['source_table']}). Output: {output[-500:]}"
+                    )
     except Exception as e:
         if not is_final_attempt:
             raise
+        # The stdout read may have died mid-job (timeout); the results file still
+        # holds every table that finished before that.
+        try:
+            with ssh.get_conn() as client:
+                sftp = client.open_sftp()
+                try:
+                    _take(_parse_count_results(_read_remote_text(sftp, results_path)), reused=True)
+                finally:
+                    sftp.close()
+        except Exception as read_err:
+            logger.warning(f"[SourceCounts] Could not read {results_path}: {read_err}")
+        unfinished = [t for t in eligible if _key(t) not in counted]
         logger.error(
             f"Final attempt: source counts failed for {src_db}: {e}. "
-            f"Marking {len(eligible)} table(s) FAILED."
+            f"Marking {len(unfinished)} of {len(eligible)} table(s) FAILED."
         )
-        counted = [
-            {
-                "source_table": t["source_table"],
-                "partition_filter": t.get("partition_filter"),
+        for t in unfinished:
+            counted[_key(t)] = {
                 "row_count": None,
                 "full_table_row_count": None,
                 "count_status": "FAILED",
                 "count_error": str(e)[:500],
             }
-            for t in eligible
-        ]
 
-    by_key = {_key(c): c for c in counted}
     for t in eligible:
-        c = by_key.get(_key(t)) or {
+        c = counted.get(_key(t)) or {
             "row_count": None,
             "full_table_row_count": None,
             "count_status": "FAILED",
@@ -4745,6 +4873,14 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee source_counts_{
         t["full_table_row_count"] = c.get("full_table_row_count")
         t["source_count_status"] = c.get("count_status")
         t["source_count_error"] = c.get("count_error")
+        t["source_count_seconds"] = c.get("count_seconds")
+        logger.info(
+            f"[SourceCounts] {t.get('source_database', src_db)}.{t['source_table']}"
+            f"{' [' + t['partition_filter'] + ']' if t.get('partition_filter') else ''}: "
+            f"status={c.get('count_status')} rows={c.get('row_count')} "
+            f"size_bytes={_size(t)} secs={c.get('count_seconds')} "
+            f"reused={bool(c.get('reused'))}"
+        )
     return table_result
 
 
@@ -4752,11 +4888,7 @@ pyspark --master {_master}{_drv_flag} < {script_path} 2>&1 | tee source_counts_{
 def update_source_counts(table_result: dict, spark) -> dict:
     """Write the post-copy source counts into the tracking table."""
     config = get_config()
-    if (
-        config.get("source_counts_phase") != "post_copy"
-        or not isinstance(table_result, dict)
-        or "tables" not in table_result
-    ):
+    if not isinstance(table_result, dict) or "tables" not in table_result:
         return table_result
 
     tracking_db = config["tracking_database"]

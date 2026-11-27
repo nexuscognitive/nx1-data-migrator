@@ -2,9 +2,12 @@
 
 import itertools
 import logging
+import os
 import re
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -4764,29 +4767,10 @@ class TestReportTicketFileLine:
         assert line == ''
 
 
-def _phase_config(monkeypatch, phase):
-    original = m.get_config
-    monkeypatch.setattr(m, 'get_config', lambda: {**original(), 'source_counts_phase': phase})
+class TestDiscoveryScriptNeverCounts:
 
-
-class TestSourceCountsPhaseConfig:
-
-    @pytest.mark.parametrize('raw,expected', [
-        (None, 'discovery'), ('post_copy', 'post_copy'), ('  POST_COPY ', 'post_copy'),
-        ('skip', 'skip'), ('bogus', 'discovery'), ('', 'discovery'),
-    ])
-    def test_phase_normalised(self, monkeypatch, raw, expected):
-        monkeypatch.delenv('MIGRATION_SOURCE_COUNTS_PHASE', raising=False)
-        if raw is not None:
-            monkeypatch.setenv('MIGRATION_SOURCE_COUNTS_PHASE', raw)
-        assert m.get_config()['source_counts_phase'] == expected
-
-
-class TestDiscoveryScriptCountsPhase:
-
-    def _script(self, mock_ssh_hook, sample_run_id, monkeypatch, phase):
+    def test_discovery_script_has_no_count_queries(self, mock_ssh_hook, sample_run_id):
         _, client, _, _ = mock_ssh_hook
-        _phase_config(monkeypatch, phase)
         helper = TestDiscoverTablesViaSshSpark()
         helper._run_discovery(
             client, [helper._make_metadata_record('orders')], sample_run_id, ['orders'],
@@ -4794,23 +4778,11 @@ class TestDiscoveryScriptCountsPhase:
         sftp_file = client.open_sftp.return_value.file.return_value
         script = sftp_file.__enter__.return_value.write.call_args_list[0].args[0]
         compile(script, 'discover_tables.py', 'exec')
-        return script
-
-    @pytest.mark.parametrize('phase', ['post_copy', 'skip'])
-    def test_no_count_queries_outside_discovery(self, mock_ssh_hook, sample_run_id, monkeypatch, phase):
-        script = self._script(mock_ssh_hook, sample_run_id, monkeypatch, phase)
         assert 'SELECT COUNT(*) as c' not in script
         assert 'COUNT_DEFAULT = None' in script
 
-    def test_discovery_phase_keeps_both_counts(self, mock_ssh_hook, sample_run_id, monkeypatch):
-        script = self._script(mock_ssh_hook, sample_run_id, monkeypatch, 'discovery')
-        assert script.count('SELECT COUNT(*) as c') == 2
-        assert 'COUNT_DEFAULT = 0' in script
-        assert 'row_count = COUNT_DEFAULT\n        try:\n            row_count = spark.sql(' in script
-
     def test_driver_log_handles_none_row_count(self, mock_ssh_hook, sample_run_id, monkeypatch):
         _, client, _, _ = mock_ssh_hook
-        _phase_config(monkeypatch, 'post_copy')
         helper = TestDiscoverTablesViaSshSpark()
         record = helper._make_metadata_record(
             'orders', row_count=None, filtered_row_count=None, full_table_row_count=None
@@ -4821,8 +4793,7 @@ class TestDiscoveryScriptCountsPhase:
 
 class TestRecordDiscoveredTablesNullCounts:
 
-    def _record(self, mock_spark, discovery, retry, phase, monkeypatch, **overrides):
-        _phase_config(monkeypatch, phase)
+    def _record(self, mock_spark, discovery, retry, monkeypatch, **overrides):
         row = MagicMock()
         row.__getitem__ = lambda self, k: 0
         df = MagicMock()
@@ -4838,7 +4809,7 @@ class TestRecordDiscoveredTablesNullCounts:
         self, mock_spark, sample_discovery, mock_iceberg_retry, monkeypatch
     ):
         sql = self._record(
-            mock_spark, sample_discovery, mock_iceberg_retry, 'post_copy', monkeypatch,
+            mock_spark, sample_discovery, mock_iceberg_retry, monkeypatch,
             row_count=None, filtered_row_count=None, full_table_row_count=None,
         )
         assert 'None' not in sql
@@ -4848,14 +4819,13 @@ class TestRecordDiscoveredTablesNullCounts:
     def test_present_counts_are_collected(
         self, mock_spark, sample_discovery, mock_iceberg_retry, monkeypatch
     ):
-        sql = self._record(mock_spark, sample_discovery, mock_iceberg_retry, 'discovery', monkeypatch)
-        assert "'discovery', 'COLLECTED'" in sql
+        sql = self._record(mock_spark, sample_discovery, mock_iceberg_retry, monkeypatch)
+        assert "'post_copy', 'COLLECTED'" in sql
         assert "'EXTERNAL', 1000," in sql
 
     def test_update_path_writes_null(
         self, mock_spark, sample_discovery, mock_iceberg_retry, monkeypatch
     ):
-        _phase_config(monkeypatch, 'skip')
         row = MagicMock()
         row.__getitem__ = lambda self, k: 1
         df = MagicMock()
@@ -4871,7 +4841,7 @@ class TestRecordDiscoveredTablesNullCounts:
         assert 'source_row_count = NULL' in sql
         assert 'full_table_row_count = NULL' in sql
         assert "source_count_status = 'NOT_COLLECTED'" in sql
-        assert "source_count_phase = 'skip'" in sql
+        assert "source_count_phase = 'post_copy'" in sql
 
 
 class TestEmptySourceWithNullRowCount:
@@ -4911,20 +4881,30 @@ class TestCollectSourceCountsSsh:
 
     def _counts_output(self, rows):
         import json
-        return f'log\n===JSON_START===\n{json.dumps(rows)}\n===JSON_END===\n'.encode()
+        lines = ''.join(f'{m._COUNT_RESULT_MARKER}{json.dumps(r)}\r\n' for r in rows)
+        return f'log\r\n{lines}'.encode()
 
-    @pytest.mark.parametrize('phase', ['discovery', 'skip'])
-    def test_passes_through_unless_post_copy(
-        self, mock_ssh_hook, sample_table_result, monkeypatch, phase
-    ):
-        _, client, _, _ = mock_ssh_hook
-        _phase_config(monkeypatch, phase)
-        result = self._result(sample_table_result)
-        assert self._run(result) is result
-        client.exec_command.assert_not_called()
+    def _remote_results(self, client, rows):
+        """Make the edge-node results file (left by an earlier attempt) hold ``rows``."""
+        import json
+        from unittest.mock import MagicMock as _MM
+        sftp = client.open_sftp.return_value
+        writer = sftp.file.return_value
+        reader = _MM()
+        reader.__enter__.return_value.read.return_value = ''.join(
+            json.dumps(r) + '\n' for r in rows
+        ).encode()
+        sftp.file.side_effect = lambda path, mode='r': reader if mode == 'r' else writer
+        return sftp
+
+    def _row(self, table='transactions', status='COLLECTED', rows=40, copied_at='2025-01-01 12:05:00', **kw):
+        return {
+            'source_database': 'sales_data', 'source_table': table, 'partition_filter': None,
+            'copied_at': copied_at, 'row_count': rows, 'full_table_row_count': rows,
+            'count_status': status, 'count_error': None, 'count_seconds': 1.5, **kw,
+        }
 
     def test_invalid_input_passes_through(self, mock_ssh_hook, monkeypatch):
-        _phase_config(monkeypatch, 'post_copy')
         assert self._run({}) == {}
         assert self._run(None) is None
 
@@ -4932,7 +4912,6 @@ class TestCollectSourceCountsSsh:
         self, mock_ssh_hook, sample_table_result, monkeypatch
     ):
         _, client, _, _ = mock_ssh_hook
-        _phase_config(monkeypatch, 'post_copy')
         assert sample_table_result['tables'][0]['row_count'] == 1000
         assert self._run(sample_table_result) is sample_table_result
         client.exec_command.assert_not_called()
@@ -4942,7 +4921,6 @@ class TestCollectSourceCountsSsh:
         self, mock_ssh_hook, sample_table_result, monkeypatch, stage
     ):
         _, client, _, _ = mock_ssh_hook
-        _phase_config(monkeypatch, 'post_copy')
         result = self._result(sample_table_result)
         result[stage][0]['status'] = 'FAILED'
         assert self._run(result) is result
@@ -4952,7 +4930,6 @@ class TestCollectSourceCountsSsh:
         self, mock_ssh_hook, sample_table_result, monkeypatch
     ):
         _, client, _, _ = mock_ssh_hook
-        _phase_config(monkeypatch, 'post_copy')
         result = self._result(sample_table_result)
         other = dict(result['tables'][0], source_table='failed_tbl')
         done = dict(result['tables'][0], source_table='counted', row_count=7)
@@ -4981,8 +4958,9 @@ class TestCollectSourceCountsSsh:
         assert [e['source_table'] for e in entries] == ['transactions']
         assert set(entries[0]) == {
             'source_database', 'source_table', 'partition_filter',
-            'partition_filter_active', 'filtered_partitions',
+            'partition_filter_active', 'filtered_partitions', 'copied_at',
         }
+        assert entries[0]['copied_at'] == '2025-01-01 12:05:00'
         assert sftp.put.call_args.args[1].endswith('/partition_utils.py')
         assert 'pyspark --master' in client.exec_command.call_args_list[1].args[0]
 
@@ -4990,7 +4968,6 @@ class TestCollectSourceCountsSsh:
         self, mock_ssh_hook, sample_table_result, monkeypatch
     ):
         _, client, _, _ = mock_ssh_hook
-        _phase_config(monkeypatch, 'post_copy')
         result = self._result(sample_table_result)
         client.exec_command.side_effect = [
             (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
@@ -5015,22 +4992,260 @@ class TestCollectSourceCountsSsh:
         self, mock_ssh_hook, sample_table_result, monkeypatch
     ):
         _, client, _, _ = mock_ssh_hook
-        _phase_config(monkeypatch, 'post_copy')
         self._failing_script(client)
-        with pytest.raises(Exception, match='Could not find JSON markers'):
+        with pytest.raises(Exception, match='returned no result for 1 table'):
             self._run(self._result(sample_table_result), ti=MagicMock(try_number=2))
 
     def test_final_attempt_marks_every_eligible_table_failed(
         self, mock_ssh_hook, sample_table_result, monkeypatch
     ):
         _, client, _, _ = mock_ssh_hook
-        _phase_config(monkeypatch, 'post_copy')
         self._failing_script(client)
         out = self._run(self._result(sample_table_result), ti=MagicMock(try_number=3))
         t = out['tables'][0]
         assert t['source_count_status'] == 'FAILED'
         assert t['row_count'] is None
-        assert 'Could not find JSON markers' in t['source_count_error']
+        assert 'returned no result for 1 table' in t['source_count_error']
+
+    def _two_tables(self, sample_table_result, big='big_tbl', small_size=10, big_size=999):
+        result = self._result(sample_table_result)
+        result['tables'][0]['source_total_size_bytes'] = small_size
+        result['tables'].append(dict(
+            result['tables'][0], source_table=big, source_total_size_bytes=big_size,
+        ))
+        result['distcp_results'].append(dict(result['distcp_results'][0], source_table=big))
+        result['table_results'].append(dict(result['table_results'][0], source_table=big))
+        return result
+
+    def test_largest_table_is_counted_first(
+        self, mock_ssh_hook, sample_table_result, monkeypatch
+    ):
+        import json
+        _, client, _, _ = mock_ssh_hook
+        result = self._two_tables(sample_table_result)
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, self._counts_output(
+                [self._row(), self._row('big_tbl', rows=9)])), MagicMock()),
+        ]
+        out = self._run(result)
+        sftp = client.open_sftp.return_value
+        written = [c.args[0] for c in sftp.file.return_value.__enter__.return_value.write.call_args_list]
+        assert [e['source_table'] for e in json.loads(written[1])] == ['big_tbl', 'transactions']
+        assert 'imap_unordered(count_one, entries, 1)' in written[0]
+        assert [t['row_count'] for t in out['tables']] == [40, 9]
+        assert out['tables'][0]['source_count_seconds'] == 1.5
+        # Input order in table_result is untouched.
+        assert [t['source_table'] for t in out['tables']] == ['transactions', 'big_tbl']
+
+    def test_retry_reuses_counts_from_results_file_and_counts_only_the_rest(
+        self, mock_ssh_hook, sample_table_result, monkeypatch
+    ):
+        import json
+        _, client, _, _ = mock_ssh_hook
+        result = self._two_tables(sample_table_result)
+        sftp = self._remote_results(client, [self._row('big_tbl', rows=9)])
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, self._counts_output([self._row()])), MagicMock()),
+        ]
+        out = self._run(result, ti=MagicMock(try_number=2, map_index=4))
+        written = [c.args[0] for c in sftp.file.return_value.__enter__.return_value.write.call_args_list]
+        assert [e['source_table'] for e in json.loads(written[1])] == ['transactions']
+        assert [t['row_count'] for t in out['tables']] == [40, 9]
+        assert '_m4/count_results.jsonl' in sftp.file.call_args_list[0].args[0]
+
+    def test_all_counts_reused_skips_the_spark_job(
+        self, mock_ssh_hook, sample_table_result, monkeypatch
+    ):
+        _, client, _, _ = mock_ssh_hook
+        self._remote_results(client, [self._row()])
+        client.exec_command.side_effect = [(MagicMock(), mock_ssh_stdout(0, b''), MagicMock())]
+        t = self._run(self._result(sample_table_result))['tables'][0]
+        assert (t['row_count'], t['source_count_status']) == (40, 'COLLECTED')
+        assert client.exec_command.call_count == 1  # mkdir only
+
+    @pytest.mark.parametrize('stale', [
+        {'copied_at': '2024-12-31 00:00:00'},  # table was re-copied since
+        {'count_status': 'FAILED', 'rows': None},
+    ])
+    def test_stale_or_failed_results_are_recounted(
+        self, mock_ssh_hook, sample_table_result, monkeypatch, stale
+    ):
+        _, client, _, _ = mock_ssh_hook
+        status = stale.pop('count_status', 'COLLECTED')
+        self._remote_results(client, [self._row(status=status, **{'rows': 1, **stale})])
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, self._counts_output([self._row(rows=77)])), MagicMock()),
+        ]
+        t = self._run(self._result(sample_table_result))['tables'][0]
+        assert t['row_count'] == 77
+        assert client.exec_command.call_count == 2
+
+    def test_final_attempt_keeps_counts_finished_before_the_failure(
+        self, mock_ssh_hook, sample_table_result, monkeypatch
+    ):
+        _, client, _, _ = mock_ssh_hook
+        result = self._two_tables(sample_table_result)
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(1, self._counts_output([self._row('big_tbl', rows=9)])), MagicMock()),
+        ]
+        out = self._run(result, ti=MagicMock(try_number=3))
+        small, big = out['tables']
+        assert (big['row_count'], big['source_count_status']) == (9, 'COLLECTED')
+        assert (small['row_count'], small['source_count_status']) == (None, 'FAILED')
+        assert 'exit code 1' in small['source_count_error']
+
+    @pytest.mark.parametrize('pushdown,full', [(False, False), (True, True)])
+    def test_script_carries_pushdown_and_full_count_switches(
+        self, mock_ssh_hook, sample_table_result, monkeypatch, pushdown, full
+    ):
+        _, client, _, _ = mock_ssh_hook
+        original = m.get_config
+        monkeypatch.setattr(m, 'get_config', lambda: {
+            **original(),
+            'source_count_aggregate_pushdown': pushdown, 'source_count_full_table': full,
+        })
+        client.exec_command.side_effect = [
+            (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, self._counts_output([self._row()])), MagicMock()),
+        ]
+        self._run(self._result(sample_table_result))
+        sftp = client.open_sftp.return_value
+        script = sftp.file.return_value.__enter__.return_value.write.call_args_list[0].args[0]
+        assert f'AGGREGATE_PUSHDOWN = {pushdown}' in script
+        assert f'COUNT_FULL_TABLE = {full}' in script
+
+    def test_generated_script_counts_filtered_partitions_once(self, tmp_path, monkeypatch):
+        """Run the generated script against a fake Spark to check what it queries."""
+        import json
+        import types
+        captured = {}
+
+        class _Spark:
+            def __init__(self):
+                self.sqls, self.conf = [], MagicMock()
+                self.sparkContext = MagicMock()
+
+            def sql(self, q):
+                self.sqls.append(q)
+                df = MagicMock()
+                df.collect.return_value = [types.SimpleNamespace(c=5 if 'WHERE' in q else 50)]
+                return df
+
+            def stop(self):
+                pass
+
+        spark = _Spark()
+        builder = MagicMock()
+        builder.appName.return_value = builder
+        builder.config.return_value = builder
+        builder.enableHiveSupport.return_value = builder
+        builder.getOrCreate.return_value = spark
+        fake_sql = types.ModuleType('pyspark.sql')
+        fake_sql.SparkSession = types.SimpleNamespace(builder=builder)
+        monkeypatch.setitem(sys.modules, 'pyspark', types.ModuleType('pyspark'))
+        monkeypatch.setitem(sys.modules, 'pyspark.sql', fake_sql)
+
+        # Build the script text through the task, capturing the sftp writes.
+        state = str(tmp_path).replace('\\', '/')
+        for full, expected in [(False, 1), (True, 2)]:
+            spark.sqls.clear()
+            original = m.get_config
+            monkeypatch.setattr(m, 'get_config', lambda: {
+                **original(),
+                'source_count_full_table': full, 'source_count_aggregate_pushdown': True,
+            })
+            with patch.object(m, 'SSHHook') as hook:
+                client = MagicMock()
+                hook.return_value.get_conn.return_value.__enter__.return_value = client
+                client.exec_command.side_effect = [
+                    (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+                    (MagicMock(), mock_ssh_stdout(0, b''), MagicMock()),
+                ]
+                result = {
+                    'run_id': 'r', 'source_database': 'db',
+                    'tables': [{'source_table': 't', 'row_count': None, 'partition_filter': "dt='1'",
+                                'partition_filter_active': True,
+                                'filtered_partitions': ['dt=1']}],
+                    'distcp_results': [{'source_table': 't', 'partition_filter': "dt='1'",
+                                        'status': 'COMPLETED', 'distcp_completed_at': 'x'}],
+                    'table_results': [{'source_table': 't', 'partition_filter': "dt='1'",
+                                       'status': 'COMPLETED'}],
+                }
+                m.collect_source_counts_ssh.function.__wrapped__(
+                    table_result=result, cluster_setup={'temp_dir': state},
+                    ti=MagicMock(try_number=3), task=MagicMock(retries=2),
+                )
+                writes = client.open_sftp.return_value.file.return_value.__enter__.return_value.write
+                script, entries = (c.args[0] for c in writes.call_args_list[:2])
+            monkeypatch.setattr(m, 'get_config', original)
+            state_dir = f'{state}/source_counts_r_db_m0'
+            os.makedirs(state_dir, exist_ok=True)
+            with open(f'{state_dir}/count_input.json', 'w') as f:
+                f.write(entries)
+            shutil.copy(
+                Path(m.__file__).parent / 'migrator_utils' / 'migrations' / 'partition_utils.py',
+                f'{state_dir}/partition_utils.py',
+            )
+            results = f'{state_dir}/count_results.jsonl'
+            if os.path.exists(results):
+                os.remove(results)
+            exec(compile(script, 'collect_source_counts.py', 'exec'), {'__name__': '__main__'})
+            assert len(spark.sqls) == expected
+            assert 'WHERE' in spark.sqls[0]
+            rec = json.loads(open(results).read().splitlines()[0])
+            assert rec['row_count'] == 5
+            assert rec['full_table_row_count'] == (50 if full else None)
+            assert rec['count_status'] == 'COLLECTED' and rec['copied_at'] == 'x'
+            spark.conf.set.assert_any_call('spark.sql.parquet.aggregatePushdown', 'true')
+            sys.modules.pop('partition_utils', None)
+            sys.path.remove(state_dir)
+
+
+class TestSourceCountSparkFlags:
+
+    def test_defaults_match_the_discovery_command(self):
+        assert m._source_count_spark_flags({}) == " --master 'local[*]'"
+        assert m._source_count_spark_flags(
+            {'discovery_spark_master': 'yarn', 'discovery_driver_memory': '4g'}
+        ) == ' --master yarn --driver-memory 4g'
+
+    def test_source_count_keys_override_and_add_executor_flags(self):
+        flags = m._source_count_spark_flags({
+            'discovery_spark_master': 'local[*]', 'discovery_driver_memory': '4g',
+            'source_count_spark_master': 'yarn', 'source_count_driver_memory': '8g',
+            'source_count_num_executors': '20', 'source_count_executor_cores': '4',
+            'source_count_executor_memory': '16g', 'source_count_queue': 'migration.q',
+        })
+        assert flags == (
+            ' --master yarn --driver-memory 8g --num-executors 20 --executor-cores 4'
+            ' --executor-memory 16g --queue migration.q'
+        )
+
+    @pytest.mark.parametrize('key,value', [
+        ('source_count_num_executors', '0'),
+        ('source_count_executor_cores', 'four'),
+        ('source_count_executor_memory', '16g; rm -rf /'),
+        ('source_count_queue', 'q $(id)'),
+        ('source_count_spark_master', 'yarn; id'),
+    ])
+    def test_invalid_values_are_dropped(self, key, value):
+        assert m._source_count_spark_flags({key: value}) == " --master 'local[*]'"
+
+
+class TestParseCountResults:
+
+    def test_reads_file_lines_and_skips_truncated_ones(self):
+        text = '{"source_table": "a", "row_count": 1}\n{"source_table": "b", "row_c\n\n'
+        assert [r['source_table'] for r in m._parse_count_results(text)] == ['a']
+
+    def test_reads_marked_stdout_lines_only(self):
+        mk = m._COUNT_RESULT_MARKER
+        text = f'noise {{"source_table": "x"}}\r\n{mk}{{"source_table": "a"}}\r\n'
+        assert [r['source_table'] for r in m._parse_count_results(text, mk)] == ['a']
 
 
 class TestUpdateSourceCounts:
@@ -5041,18 +5256,9 @@ class TestUpdateSourceCounts:
         )
         return sample_table_result
 
-    def test_passes_through_unless_post_copy(
-        self, mock_spark, sample_table_result, mock_iceberg_retry, monkeypatch
-    ):
-        _phase_config(monkeypatch, 'skip')
-        out = m.update_source_counts.function(table_result=sample_table_result, spark=mock_spark)
-        assert out is sample_table_result
-        mock_iceberg_retry.assert_not_called()
-
     def test_writes_counts_and_status(
         self, mock_spark, sample_table_result, mock_iceberg_retry, monkeypatch
     ):
-        _phase_config(monkeypatch, 'post_copy')
         result = self._tables(sample_table_result)
         result['tables'][0].update(
             row_count=40, filtered_row_count=40, full_table_row_count=50,
@@ -5073,7 +5279,6 @@ class TestUpdateSourceCounts:
     def test_failed_count_writes_null_and_escaped_error(
         self, mock_spark, sample_table_result, mock_iceberg_retry, monkeypatch
     ):
-        _phase_config(monkeypatch, 'post_copy')
         result = self._tables(
             sample_table_result, source_count_status='FAILED', source_count_error="it's bad"
         )
@@ -5088,7 +5293,6 @@ class TestUpdateSourceCounts:
     def test_tables_without_status_are_not_updated(
         self, mock_spark, sample_table_result, mock_iceberg_retry, monkeypatch
     ):
-        _phase_config(monkeypatch, 'post_copy')
         m.update_source_counts.function(table_result=self._tables(sample_table_result), spark=mock_spark)
         mock_iceberg_retry.assert_not_called()
 
@@ -5188,7 +5392,6 @@ class TestValidationWithNullSourceCount:
 class TestReportWithNullSourceCount:
 
     def test_not_checked_rendered(self, mock_spark, sample_run_id, monkeypatch):
-        _phase_config(monkeypatch, 'post_copy')
         run_row = SimpleNamespace(dag_run_id='dag_run_test')
         tbl_row = SimpleNamespace(
             source_database='sales_data', source_table='transactions',
