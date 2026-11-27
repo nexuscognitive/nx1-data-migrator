@@ -772,13 +772,28 @@ def get_config() -> dict:
             'MIGRATION_DISCOVERY_PER_TABLE_PARALLELISM',
             '8',
         ),
-        'source_counts_phase': (
-            lambda v: v if v in ('discovery', 'post_copy', 'skip') else 'discovery'
-        )(
-            str(
-                _var('migration_source_counts_phase', 'MIGRATION_SOURCE_COUNTS_PHASE', 'discovery') or ''
-            ).strip().lower()
-        ),
+        # Source row counts always run after the copy, in collect_source_counts_ssh;
+        # discovery never counts. Every Spark setting here is empty by default and
+        # then falls back to the matching discovery_* setting or is left off the
+        # command.
+        'source_count_spark_master': _var('migration_source_count_spark_master', 'MIGRATION_SOURCE_COUNT_SPARK_MASTER', ''),
+        'source_count_driver_memory': _var('migration_source_count_driver_memory', 'MIGRATION_SOURCE_COUNT_DRIVER_MEMORY', ''),
+        'source_count_num_executors': _var('migration_source_count_num_executors', 'MIGRATION_SOURCE_COUNT_NUM_EXECUTORS', ''),
+        'source_count_executor_cores': _var('migration_source_count_executor_cores', 'MIGRATION_SOURCE_COUNT_EXECUTOR_CORES', ''),
+        'source_count_executor_memory': _var('migration_source_count_executor_memory', 'MIGRATION_SOURCE_COUNT_EXECUTOR_MEMORY', ''),
+        'source_count_queue': _var('migration_source_count_queue', 'MIGRATION_SOURCE_COUNT_QUEUE', ''),
+        'source_count_timeout_seconds': _var('migration_source_count_timeout_seconds', 'MIGRATION_SOURCE_COUNT_TIMEOUT_SECONDS', '3600'),
+        # Parquet/ORC COUNT(*) from file footers instead of a row scan. Off until
+        # a sample run shows the footer counts equal a full scan.
+        'source_count_aggregate_pushdown': str(
+            _var('migration_source_count_aggregate_pushdown', 'MIGRATION_SOURCE_COUNT_AGGREGATE_PUSHDOWN', 'false')
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
+        # A partition-filtered table is counted over its filtered partitions only.
+        # True also scans the whole table for full_table_row_count, which nothing
+        # validates against, so it is off by default.
+        'source_count_full_table': str(
+            _var('migration_source_count_full_table', 'MIGRATION_SOURCE_COUNT_FULL_TABLE', 'false')
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
         'metastore_retry_attempts': _var('migration_metastore_retry_attempts', 'MIGRATION_METASTORE_RETRY_ATTEMPTS', '4'),
         'metastore_retry_backoff_seconds': _var('migration_metastore_retry_backoff_seconds', 'MIGRATION_METASTORE_RETRY_BACKOFF_SECONDS', '15'),
         'metastore_socket_timeout': _var('migration_metastore_socket_timeout', 'MIGRATION_METASTORE_SOCKET_TIMEOUT', '600s'),
