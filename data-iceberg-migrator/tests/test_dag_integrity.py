@@ -332,3 +332,91 @@ class TestVarOrEnvInt:
         monkeypatch.setenv(self._ENV, '7')
         with patch('airflow.models.Variable.get', return_value='   '):
             assert m1._var_or_env_int(self._VAR, self._ENV, 3) == 7
+
+
+class TestResolveTaskRetries:
+    """Precedence: Airflow Variable > env var > default. 0 is valid (no retries).
+    Nothing here may raise, or a bad value would drop the DAGs from Airflow."""
+
+    _ENV = 'MIGRATION_TASK_RETRIES'
+    _VAR = 'migration_task_retries'
+
+    def test_default_is_one(self, monkeypatch):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.delenv(self._ENV, raising=False)
+        with patch('airflow.models.Variable.get', return_value=''):
+            assert resolve_task_retries() == 1
+
+    def test_variable_wins_over_env(self, monkeypatch):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.setenv(self._ENV, '5')
+        with patch('airflow.models.Variable.get', return_value='3') as mock_get:
+            assert resolve_task_retries() == 3
+        assert mock_get.call_args.args[0] == self._VAR
+
+    def test_zero_is_accepted(self, monkeypatch):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.setenv(self._ENV, '5')
+        with patch('airflow.models.Variable.get', return_value='0'):
+            assert resolve_task_retries() == 0
+
+    def test_zero_env_is_accepted(self, monkeypatch):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.setenv(self._ENV, '0')
+        with patch('airflow.models.Variable.get', return_value=''):
+            assert resolve_task_retries() == 0
+
+    def test_empty_or_whitespace_variable_falls_to_env(self, monkeypatch):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.setenv(self._ENV, '4')
+        for blank in ('', '   '):
+            with patch('airflow.models.Variable.get', return_value=blank):
+                assert resolve_task_retries() == 4
+
+    def test_non_integer_variable_falls_through(self, monkeypatch):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.setenv(self._ENV, '4')
+        with patch('airflow.models.Variable.get', return_value='lots'):
+            assert resolve_task_retries() == 4
+        monkeypatch.setenv(self._ENV, 'also-bad')
+        with patch('airflow.models.Variable.get', return_value='2.5'):
+            assert resolve_task_retries() == 1
+
+    def test_negative_variable_falls_through(self, monkeypatch):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.setenv(self._ENV, '4')
+        with patch('airflow.models.Variable.get', return_value='-1'):
+            assert resolve_task_retries() == 4
+        monkeypatch.setenv(self._ENV, '-3')
+        with patch('airflow.models.Variable.get', return_value='-1'):
+            assert resolve_task_retries() == 1
+
+    def test_db_error_falls_through_not_a_dag_crash(self, monkeypatch):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.setenv(self._ENV, '4')
+        with patch(
+            'airflow.models.Variable.get',
+            side_effect=RuntimeError('metadata db unreachable'),
+        ):
+            assert resolve_task_retries() == 4
+
+    def test_value_is_capped_at_ten(self, monkeypatch):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.delenv(self._ENV, raising=False)
+        with patch('airflow.models.Variable.get', return_value='99'):
+            assert resolve_task_retries() == 10
+        monkeypatch.setenv(self._ENV, '50')
+        with patch('airflow.models.Variable.get', return_value=''):
+            assert resolve_task_retries() == 10
+
+    def test_rejected_value_logs_a_warning(self, monkeypatch, caplog):
+        from migrator_utils.migrations.shared import resolve_task_retries
+        monkeypatch.delenv(self._ENV, raising=False)
+        with caplog.at_level('WARNING'), patch('airflow.models.Variable.get', return_value='-2'):
+            resolve_task_retries()
+        assert any('-2' in r.getMessage() for r in caplog.records)
+
+    def test_all_five_dags_default_to_one_retry(self):
+        import migration_dag_iceberg_catalog as m5
+        for module in (m1, m2, m3, m4, m5):
+            assert module.default_args['retries'] == 1, module.__name__

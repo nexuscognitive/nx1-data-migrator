@@ -655,8 +655,8 @@ it once the estimate passes 7.2 hours — nine tenths of the eight-hour task
 timeout, which is the most any batch can be budgeted. Between those two figures
 a table retries silently: expect it to succeed on a later attempt rather than to
 be announced in advance. Either way it is not stuck, because every copy runs
-`-update` and each attempt resumes where the last stopped. Past roughly three
-attempts' worth of work, split the table at the source. Raising that ceiling
+`-update` and each attempt resumes where the last stopped. Past roughly two
+attempts' worth of work (the default; `migration_task_retries` changes it), split the table at the source. Raising that ceiling
 past 28200 seconds requires raising `SSH_COMMAND_TIMEOUT` with it, or an
 abandoned copy can leave an orphaned YARN job writing to the destination.
 
@@ -675,7 +675,8 @@ all — nothing was copied. `batch budget exhausted while copying this table`
 means the copy had started; how much landed is in the row's own byte and file
 counts. Both are followed by an automatic retry, and because every copy runs
 `-update`, each attempt resumes where the last stopped rather than starting
-over. If a table still fails after all three attempts, it needs more time than
+over. If a table still fails after all attempts (two by default, configurable through
+`migration_task_retries`), it needs more time than
 one task can be given — split it at the source, or have the eight-hour task
 timeout raised in the DAG source — unlike the settings above, it is a constant
 in code rather than a configurable value. `not processed by any batch` means no
